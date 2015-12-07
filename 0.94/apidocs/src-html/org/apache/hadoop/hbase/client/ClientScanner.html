@@ -1,0 +1,470 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/**<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.client;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.IOException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.ArrayList;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.LinkedList;<a name="line.22"></a>
+<span class="sourceLineNo">023</span><a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.commons.logging.Log;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.commons.logging.LogFactory;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.conf.Configuration;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.DoNotRetryIOException;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.HConstants;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.NotServingRegionException;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.CallSequenceOutOfOrderException;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.UnknownScannerException;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.client.metrics.ScanMetrics;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.io.DataOutputBuffer;<a name="line.37"></a>
+<span class="sourceLineNo">038</span><a name="line.38"></a>
+<span class="sourceLineNo">039</span>/**<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * Implements the scanner interface for the HBase client.<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * If there are multiple regions in a table, this scanner will iterate<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * through them all.<a name="line.42"></a>
+<span class="sourceLineNo">043</span> */<a name="line.43"></a>
+<span class="sourceLineNo">044</span>public class ClientScanner extends AbstractClientScanner {<a name="line.44"></a>
+<span class="sourceLineNo">045</span>    private final Log LOG = LogFactory.getLog(this.getClass());<a name="line.45"></a>
+<span class="sourceLineNo">046</span>    protected Scan scan;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>    protected boolean closed = false;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>    // Current region scanner is against.  Gets cleared if current region goes<a name="line.48"></a>
+<span class="sourceLineNo">049</span>    // wonky: e.g. if it splits on us.<a name="line.49"></a>
+<span class="sourceLineNo">050</span>    protected HRegionInfo currentRegion = null;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>    private ScannerCallable callable = null;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>    protected final LinkedList&lt;Result&gt; cache = new LinkedList&lt;Result&gt;();<a name="line.52"></a>
+<span class="sourceLineNo">053</span>    protected final int caching;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>    protected long lastNext;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>    // Keep lastResult returned successfully in case we have to reset scanner.<a name="line.55"></a>
+<span class="sourceLineNo">056</span>    protected Result lastResult = null;<a name="line.56"></a>
+<span class="sourceLineNo">057</span>    protected ScanMetrics scanMetrics = null;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>    protected final long maxScannerResultSize;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>    private final HConnection connection;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>    private final byte[] tableName;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>    private final int scannerTimeout;<a name="line.61"></a>
+<span class="sourceLineNo">062</span>    private boolean scanMetricsPublished = false;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>    <a name="line.63"></a>
+<span class="sourceLineNo">064</span>    /**<a name="line.64"></a>
+<span class="sourceLineNo">065</span>     * Create a new ClientScanner for the specified table. An HConnection will be<a name="line.65"></a>
+<span class="sourceLineNo">066</span>     * retrieved using the passed Configuration.<a name="line.66"></a>
+<span class="sourceLineNo">067</span>     * Note that the passed {@link Scan}'s start row maybe changed changed. <a name="line.67"></a>
+<span class="sourceLineNo">068</span>     * <a name="line.68"></a>
+<span class="sourceLineNo">069</span>     * @param conf The {@link Configuration} to use.<a name="line.69"></a>
+<span class="sourceLineNo">070</span>     * @param scan {@link Scan} to use in this scanner<a name="line.70"></a>
+<span class="sourceLineNo">071</span>     * @param tableName The table that we wish to scan<a name="line.71"></a>
+<span class="sourceLineNo">072</span>     * @throws IOException<a name="line.72"></a>
+<span class="sourceLineNo">073</span>     */<a name="line.73"></a>
+<span class="sourceLineNo">074</span>    @Deprecated<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    public ClientScanner(final Configuration conf, final Scan scan,<a name="line.75"></a>
+<span class="sourceLineNo">076</span>        final byte[] tableName) throws IOException {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>      this(conf, scan, tableName, HConnectionManager.getConnection(conf));<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    }<a name="line.78"></a>
+<span class="sourceLineNo">079</span> <a name="line.79"></a>
+<span class="sourceLineNo">080</span>    /**<a name="line.80"></a>
+<span class="sourceLineNo">081</span>     * Create a new ClientScanner for the specified table<a name="line.81"></a>
+<span class="sourceLineNo">082</span>     * Note that the passed {@link Scan}'s start row maybe changed changed. <a name="line.82"></a>
+<span class="sourceLineNo">083</span>     * <a name="line.83"></a>
+<span class="sourceLineNo">084</span>     * @param conf The {@link Configuration} to use.<a name="line.84"></a>
+<span class="sourceLineNo">085</span>     * @param scan {@link Scan} to use in this scanner<a name="line.85"></a>
+<span class="sourceLineNo">086</span>     * @param tableName The table that we wish to scan<a name="line.86"></a>
+<span class="sourceLineNo">087</span>     * @param connection Connection identifying the cluster<a name="line.87"></a>
+<span class="sourceLineNo">088</span>     * @throws IOException<a name="line.88"></a>
+<span class="sourceLineNo">089</span>     */<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    public ClientScanner(final Configuration conf, final Scan scan,<a name="line.90"></a>
+<span class="sourceLineNo">091</span>      final byte[] tableName, HConnection connection) throws IOException {<a name="line.91"></a>
+<span class="sourceLineNo">092</span>      if (LOG.isDebugEnabled()) {<a name="line.92"></a>
+<span class="sourceLineNo">093</span>        LOG.debug("Creating scanner over "<a name="line.93"></a>
+<span class="sourceLineNo">094</span>            + Bytes.toString(tableName)<a name="line.94"></a>
+<span class="sourceLineNo">095</span>            + " starting at key '" + Bytes.toStringBinary(scan.getStartRow()) + "'");<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      }<a name="line.96"></a>
+<span class="sourceLineNo">097</span>      this.scan = scan;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      this.tableName = tableName;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>      this.lastNext = System.currentTimeMillis();<a name="line.99"></a>
+<span class="sourceLineNo">100</span>      this.connection = connection;<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      this.maxScannerResultSize = conf.getLong(<a name="line.101"></a>
+<span class="sourceLineNo">102</span>          HConstants.HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE_KEY,<a name="line.102"></a>
+<span class="sourceLineNo">103</span>          HConstants.DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE);<a name="line.103"></a>
+<span class="sourceLineNo">104</span>      this.scannerTimeout = (int) conf.getLong(<a name="line.104"></a>
+<span class="sourceLineNo">105</span>          HConstants.HBASE_REGIONSERVER_LEASE_PERIOD_KEY,<a name="line.105"></a>
+<span class="sourceLineNo">106</span>          HConstants.DEFAULT_HBASE_REGIONSERVER_LEASE_PERIOD);<a name="line.106"></a>
+<span class="sourceLineNo">107</span><a name="line.107"></a>
+<span class="sourceLineNo">108</span>      // check if application wants to collect scan metrics<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      byte[] enableMetrics = scan.getAttribute(<a name="line.109"></a>
+<span class="sourceLineNo">110</span>        Scan.SCAN_ATTRIBUTES_METRICS_ENABLE);<a name="line.110"></a>
+<span class="sourceLineNo">111</span>      if (enableMetrics != null &amp;&amp; Bytes.toBoolean(enableMetrics)) {<a name="line.111"></a>
+<span class="sourceLineNo">112</span>        scanMetrics = new ScanMetrics();<a name="line.112"></a>
+<span class="sourceLineNo">113</span>      }<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>      // Use the caching from the Scan.  If not set, use the default cache setting for this table.<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      if (this.scan.getCaching() &gt; 0) {<a name="line.116"></a>
+<span class="sourceLineNo">117</span>        this.caching = this.scan.getCaching();<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      } else {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>        this.caching = conf.getInt("hbase.client.scanner.caching", 1);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>      }<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>      // initialize the scanner<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      initializeScannerInConstruction();<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    }<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    <a name="line.125"></a>
+<span class="sourceLineNo">126</span>    protected void initializeScannerInConstruction() throws IOException{<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      // initialize the scanner<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      nextScanner(this.caching, false);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    }<a name="line.129"></a>
+<span class="sourceLineNo">130</span><a name="line.130"></a>
+<span class="sourceLineNo">131</span>    protected HConnection getConnection() {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      return this.connection;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>    protected byte[] getTableName() {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      return this.tableName;<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    }<a name="line.137"></a>
+<span class="sourceLineNo">138</span><a name="line.138"></a>
+<span class="sourceLineNo">139</span>    protected Scan getScan() {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      return scan;<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>    protected long getTimestamp() {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      return lastNext;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    }<a name="line.145"></a>
+<span class="sourceLineNo">146</span><a name="line.146"></a>
+<span class="sourceLineNo">147</span>    // returns true if the passed region endKey<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    protected boolean checkScanStopRow(final byte [] endKey) {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      if (this.scan.getStopRow().length &gt; 0) {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>        // there is a stop row, check to see if we are past it.<a name="line.150"></a>
+<span class="sourceLineNo">151</span>        byte [] stopRow = scan.getStopRow();<a name="line.151"></a>
+<span class="sourceLineNo">152</span>        int cmp = Bytes.compareTo(stopRow, 0, stopRow.length,<a name="line.152"></a>
+<span class="sourceLineNo">153</span>          endKey, 0, endKey.length);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>        if (cmp &lt;= 0) {<a name="line.154"></a>
+<span class="sourceLineNo">155</span>          // stopRow &lt;= endKey (endKey is equals to or larger than stopRow)<a name="line.155"></a>
+<span class="sourceLineNo">156</span>          // This is a stop.<a name="line.156"></a>
+<span class="sourceLineNo">157</span>          return true;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>        }<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      }<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      return false; //unlikely.<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    }<a name="line.161"></a>
+<span class="sourceLineNo">162</span><a name="line.162"></a>
+<span class="sourceLineNo">163</span>    /*<a name="line.163"></a>
+<span class="sourceLineNo">164</span>     * Gets a scanner for the next region.  If this.currentRegion != null, then<a name="line.164"></a>
+<span class="sourceLineNo">165</span>     * we will move to the endrow of this.currentRegion.  Else we will get<a name="line.165"></a>
+<span class="sourceLineNo">166</span>     * scanner at the scan.getStartRow().  We will go no further, just tidy<a name="line.166"></a>
+<span class="sourceLineNo">167</span>     * up outstanding scanners, if &lt;code&gt;currentRegion != null&lt;/code&gt; and<a name="line.167"></a>
+<span class="sourceLineNo">168</span>     * &lt;code&gt;done&lt;/code&gt; is true.<a name="line.168"></a>
+<span class="sourceLineNo">169</span>     * @param nbRows<a name="line.169"></a>
+<span class="sourceLineNo">170</span>     * @param done Server-side says we're done scanning.<a name="line.170"></a>
+<span class="sourceLineNo">171</span>     */<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    private boolean nextScanner(int nbRows, final boolean done)<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    throws IOException {<a name="line.173"></a>
+<span class="sourceLineNo">174</span>      // Close the previous scanner if it's open<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      if (this.callable != null) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>        this.callable.setClose();<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        callable.withRetries();<a name="line.177"></a>
+<span class="sourceLineNo">178</span>        this.callable = null;<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      }<a name="line.179"></a>
+<span class="sourceLineNo">180</span><a name="line.180"></a>
+<span class="sourceLineNo">181</span>      // Where to start the next scanner<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      byte [] localStartKey;<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>      // if we're at end of table, close and return false to stop iterating<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      if (this.currentRegion != null) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>        byte [] endKey = this.currentRegion.getEndKey();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>        if (endKey == null ||<a name="line.187"></a>
+<span class="sourceLineNo">188</span>            Bytes.equals(endKey, HConstants.EMPTY_BYTE_ARRAY) ||<a name="line.188"></a>
+<span class="sourceLineNo">189</span>            checkScanStopRow(endKey) ||<a name="line.189"></a>
+<span class="sourceLineNo">190</span>            done) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>          close();<a name="line.191"></a>
+<span class="sourceLineNo">192</span>          if (LOG.isDebugEnabled()) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>            LOG.debug("Finished with scanning at " + this.currentRegion);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>          }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>          return false;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>        }<a name="line.196"></a>
+<span class="sourceLineNo">197</span>        localStartKey = endKey;<a name="line.197"></a>
+<span class="sourceLineNo">198</span>        if (LOG.isDebugEnabled()) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          LOG.debug("Finished with region " + this.currentRegion);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>        }<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      } else {<a name="line.201"></a>
+<span class="sourceLineNo">202</span>        localStartKey = this.scan.getStartRow();<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      }<a name="line.203"></a>
+<span class="sourceLineNo">204</span><a name="line.204"></a>
+<span class="sourceLineNo">205</span>      if (LOG.isDebugEnabled()) {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        LOG.debug("Advancing internal scanner to startKey at '" +<a name="line.206"></a>
+<span class="sourceLineNo">207</span>          Bytes.toStringBinary(localStartKey) + "'");<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      }<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      try {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        callable = getScannerCallable(localStartKey, nbRows);<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        // Open a scanner on the region server starting at the<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        // beginning of the region<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        callable.withRetries();<a name="line.213"></a>
+<span class="sourceLineNo">214</span>        this.currentRegion = callable.getHRegionInfo();<a name="line.214"></a>
+<span class="sourceLineNo">215</span>        if (this.scanMetrics != null) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>          this.scanMetrics.countOfRegions.inc();<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        }<a name="line.217"></a>
+<span class="sourceLineNo">218</span>      } catch (IOException e) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        close();<a name="line.219"></a>
+<span class="sourceLineNo">220</span>        throw e;<a name="line.220"></a>
+<span class="sourceLineNo">221</span>      }<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      return true;<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    }<a name="line.223"></a>
+<span class="sourceLineNo">224</span><a name="line.224"></a>
+<span class="sourceLineNo">225</span>    protected ScannerCallable getScannerCallable(byte [] localStartKey,<a name="line.225"></a>
+<span class="sourceLineNo">226</span>        int nbRows) {<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      scan.setStartRow(localStartKey);<a name="line.227"></a>
+<span class="sourceLineNo">228</span>      ScannerCallable s = new ScannerCallable(getConnection(),<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        getTableName(), scan, this.scanMetrics);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>      s.setCaching(nbRows);<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      return s;<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    }<a name="line.232"></a>
+<span class="sourceLineNo">233</span><a name="line.233"></a>
+<span class="sourceLineNo">234</span>    /**<a name="line.234"></a>
+<span class="sourceLineNo">235</span>     * Publish the scan metrics. For now, we use scan.setAttribute to pass the metrics back to the<a name="line.235"></a>
+<span class="sourceLineNo">236</span>     * application or TableInputFormat.Later, we could push it to other systems. We don't use metrics<a name="line.236"></a>
+<span class="sourceLineNo">237</span>     * framework because it doesn't support multi-instances of the same metrics on the same machine;<a name="line.237"></a>
+<span class="sourceLineNo">238</span>     * for scan/map reduce scenarios, we will have multiple scans running at the same time.<a name="line.238"></a>
+<span class="sourceLineNo">239</span>     *<a name="line.239"></a>
+<span class="sourceLineNo">240</span>     * By default, scan metrics are disabled; if the application wants to collect them, this behavior<a name="line.240"></a>
+<span class="sourceLineNo">241</span>     * can be turned on by calling calling:<a name="line.241"></a>
+<span class="sourceLineNo">242</span>     *<a name="line.242"></a>
+<span class="sourceLineNo">243</span>     * scan.setAttribute(SCAN_ATTRIBUTES_METRICS_ENABLE, Bytes.toBytes(Boolean.TRUE))<a name="line.243"></a>
+<span class="sourceLineNo">244</span>     */<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    protected void writeScanMetrics() throws IOException {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      if (this.scanMetrics == null || scanMetricsPublished) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        return;<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      }<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      final DataOutputBuffer d = new DataOutputBuffer();<a name="line.249"></a>
+<span class="sourceLineNo">250</span>      scanMetrics.write(d);<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      scan.setAttribute(Scan.SCAN_ATTRIBUTES_METRICS_DATA, d.getData());<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      scanMetricsPublished = true;<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
+<span class="sourceLineNo">254</span><a name="line.254"></a>
+<span class="sourceLineNo">255</span>    public Result next() throws IOException {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      // If the scanner is closed and there's nothing left in the cache, next is a no-op.<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      if (cache.size() == 0 &amp;&amp; this.closed) {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>        return null;<a name="line.258"></a>
+<span class="sourceLineNo">259</span>      }<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      if (cache.size() == 0) {<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        Result [] values = null;<a name="line.261"></a>
+<span class="sourceLineNo">262</span>        long remainingResultSize = maxScannerResultSize;<a name="line.262"></a>
+<span class="sourceLineNo">263</span>        int countdown = this.caching;<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        // We need to reset it if it's a new callable that was created<a name="line.264"></a>
+<span class="sourceLineNo">265</span>        // with a countdown in nextScanner<a name="line.265"></a>
+<span class="sourceLineNo">266</span>        callable.setCaching(this.caching);<a name="line.266"></a>
+<span class="sourceLineNo">267</span>        // This flag is set when we want to skip the result returned.  We do<a name="line.267"></a>
+<span class="sourceLineNo">268</span>        // this when we reset scanner because it split under us.<a name="line.268"></a>
+<span class="sourceLineNo">269</span>        boolean skipFirst = false;<a name="line.269"></a>
+<span class="sourceLineNo">270</span>        do {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>          try {<a name="line.271"></a>
+<span class="sourceLineNo">272</span>            if (skipFirst) {<a name="line.272"></a>
+<span class="sourceLineNo">273</span>              // Skip only the first row (which was the last row of the last<a name="line.273"></a>
+<span class="sourceLineNo">274</span>              // already-processed batch).<a name="line.274"></a>
+<span class="sourceLineNo">275</span>              callable.setCaching(1);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>              values = callable.withRetries();<a name="line.276"></a>
+<span class="sourceLineNo">277</span>              callable.setCaching(this.caching);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>              skipFirst = false;<a name="line.278"></a>
+<span class="sourceLineNo">279</span>            }<a name="line.279"></a>
+<span class="sourceLineNo">280</span>            // Server returns a null values if scanning is to stop.  Else,<a name="line.280"></a>
+<span class="sourceLineNo">281</span>            // returns an empty array if scanning is to go on and we've just<a name="line.281"></a>
+<span class="sourceLineNo">282</span>            // exhausted current region.<a name="line.282"></a>
+<span class="sourceLineNo">283</span>            values = callable.withRetries();<a name="line.283"></a>
+<span class="sourceLineNo">284</span>          } catch (DoNotRetryIOException e) {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>            if (e instanceof UnknownScannerException) {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>              long timeout = lastNext + scannerTimeout;<a name="line.286"></a>
+<span class="sourceLineNo">287</span>              // If we are over the timeout, throw this exception to the client<a name="line.287"></a>
+<span class="sourceLineNo">288</span>              // Else, it's because the region moved and we used the old id<a name="line.288"></a>
+<span class="sourceLineNo">289</span>              // against the new region server; reset the scanner.<a name="line.289"></a>
+<span class="sourceLineNo">290</span>              if (timeout &lt; System.currentTimeMillis()) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>                long elapsed = System.currentTimeMillis() - lastNext;<a name="line.291"></a>
+<span class="sourceLineNo">292</span>                ScannerTimeoutException ex = new ScannerTimeoutException(<a name="line.292"></a>
+<span class="sourceLineNo">293</span>                    elapsed + "ms passed since the last invocation, " +<a name="line.293"></a>
+<span class="sourceLineNo">294</span>                        "timeout is currently set to " + scannerTimeout);<a name="line.294"></a>
+<span class="sourceLineNo">295</span>                ex.initCause(e);<a name="line.295"></a>
+<span class="sourceLineNo">296</span>                throw ex;<a name="line.296"></a>
+<span class="sourceLineNo">297</span>              }<a name="line.297"></a>
+<span class="sourceLineNo">298</span>            } else {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>              Throwable cause = e.getCause();<a name="line.299"></a>
+<span class="sourceLineNo">300</span>              if ((cause == null || (!(cause instanceof NotServingRegionException)<a name="line.300"></a>
+<span class="sourceLineNo">301</span>                  &amp;&amp; !(cause instanceof RegionServerStoppedException)))<a name="line.301"></a>
+<span class="sourceLineNo">302</span>                  &amp;&amp; !(e instanceof CallSequenceOutOfOrderException)) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>                throw e;<a name="line.303"></a>
+<span class="sourceLineNo">304</span>              }<a name="line.304"></a>
+<span class="sourceLineNo">305</span>            }<a name="line.305"></a>
+<span class="sourceLineNo">306</span>            // Else, its signal from depths of ScannerCallable that we got an<a name="line.306"></a>
+<span class="sourceLineNo">307</span>            // NSRE on a next and that we need to reset the scanner.<a name="line.307"></a>
+<span class="sourceLineNo">308</span>            if (this.lastResult != null) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>              // The region has moved. We need to open a brand new scanner at<a name="line.309"></a>
+<span class="sourceLineNo">310</span>              // the new location.<a name="line.310"></a>
+<span class="sourceLineNo">311</span>              // Reset the startRow to the row we've seen last so that the new<a name="line.311"></a>
+<span class="sourceLineNo">312</span>              // scanner starts at the correct row. Otherwise we may see previously<a name="line.312"></a>
+<span class="sourceLineNo">313</span>              // returned rows again.<a name="line.313"></a>
+<span class="sourceLineNo">314</span>              // (ScannerCallable by now has "relocated" the correct region)<a name="line.314"></a>
+<span class="sourceLineNo">315</span>              this.scan.setStartRow(this.lastResult.getRow());<a name="line.315"></a>
+<span class="sourceLineNo">316</span><a name="line.316"></a>
+<span class="sourceLineNo">317</span>              // Skip first row returned.  We already let it out on previous<a name="line.317"></a>
+<span class="sourceLineNo">318</span>              // invocation.<a name="line.318"></a>
+<span class="sourceLineNo">319</span>              skipFirst = true;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>            }<a name="line.320"></a>
+<span class="sourceLineNo">321</span>            // Clear region<a name="line.321"></a>
+<span class="sourceLineNo">322</span>            this.currentRegion = null;<a name="line.322"></a>
+<span class="sourceLineNo">323</span>            continue;<a name="line.323"></a>
+<span class="sourceLineNo">324</span>          }<a name="line.324"></a>
+<span class="sourceLineNo">325</span>          long currentTime = System.currentTimeMillis();<a name="line.325"></a>
+<span class="sourceLineNo">326</span>          if (this.scanMetrics != null ) {<a name="line.326"></a>
+<span class="sourceLineNo">327</span>            this.scanMetrics.sumOfMillisSecBetweenNexts.inc(currentTime-lastNext);<a name="line.327"></a>
+<span class="sourceLineNo">328</span>          }<a name="line.328"></a>
+<span class="sourceLineNo">329</span>          lastNext = currentTime;<a name="line.329"></a>
+<span class="sourceLineNo">330</span>          if (values != null &amp;&amp; values.length &gt; 0) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>            for (Result rs : values) {<a name="line.331"></a>
+<span class="sourceLineNo">332</span>              cache.add(rs);<a name="line.332"></a>
+<span class="sourceLineNo">333</span>              for (KeyValue kv : rs.raw()) {<a name="line.333"></a>
+<span class="sourceLineNo">334</span>                  remainingResultSize -= kv.heapSize();<a name="line.334"></a>
+<span class="sourceLineNo">335</span>              }<a name="line.335"></a>
+<span class="sourceLineNo">336</span>              countdown--;<a name="line.336"></a>
+<span class="sourceLineNo">337</span>              this.lastResult = rs;<a name="line.337"></a>
+<span class="sourceLineNo">338</span>            }<a name="line.338"></a>
+<span class="sourceLineNo">339</span>          }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>          // Values == null means server-side filter has determined we must STOP<a name="line.340"></a>
+<span class="sourceLineNo">341</span>        } while (remainingResultSize &gt; 0 &amp;&amp; countdown &gt; 0 &amp;&amp; nextScanner(countdown, values == null));<a name="line.341"></a>
+<span class="sourceLineNo">342</span>      }<a name="line.342"></a>
+<span class="sourceLineNo">343</span><a name="line.343"></a>
+<span class="sourceLineNo">344</span>      if (cache.size() &gt; 0) {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>        return cache.poll();<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      }<a name="line.346"></a>
+<span class="sourceLineNo">347</span><a name="line.347"></a>
+<span class="sourceLineNo">348</span>      // if we exhausted this scanner before calling close, write out the scan metrics<a name="line.348"></a>
+<span class="sourceLineNo">349</span>      writeScanMetrics();<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      return null;<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    }<a name="line.351"></a>
+<span class="sourceLineNo">352</span><a name="line.352"></a>
+<span class="sourceLineNo">353</span>    /**<a name="line.353"></a>
+<span class="sourceLineNo">354</span>     * Get &lt;param&gt;nbRows&lt;/param&gt; rows.<a name="line.354"></a>
+<span class="sourceLineNo">355</span>     * How many RPCs are made is determined by the {@link Scan#setCaching(int)}<a name="line.355"></a>
+<span class="sourceLineNo">356</span>     * setting (or hbase.client.scanner.caching in hbase-site.xml).<a name="line.356"></a>
+<span class="sourceLineNo">357</span>     * @param nbRows number of rows to return<a name="line.357"></a>
+<span class="sourceLineNo">358</span>     * @return Between zero and &lt;param&gt;nbRows&lt;/param&gt; RowResults.  Scan is done<a name="line.358"></a>
+<span class="sourceLineNo">359</span>     * if returned array is of zero-length (We never return null).<a name="line.359"></a>
+<span class="sourceLineNo">360</span>     * @throws IOException<a name="line.360"></a>
+<span class="sourceLineNo">361</span>     */<a name="line.361"></a>
+<span class="sourceLineNo">362</span>    public Result [] next(int nbRows) throws IOException {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>      // Collect values to be returned here<a name="line.363"></a>
+<span class="sourceLineNo">364</span>      ArrayList&lt;Result&gt; resultSets = new ArrayList&lt;Result&gt;(nbRows);<a name="line.364"></a>
+<span class="sourceLineNo">365</span>      for(int i = 0; i &lt; nbRows; i++) {<a name="line.365"></a>
+<span class="sourceLineNo">366</span>        Result next = next();<a name="line.366"></a>
+<span class="sourceLineNo">367</span>        if (next != null) {<a name="line.367"></a>
+<span class="sourceLineNo">368</span>          resultSets.add(next);<a name="line.368"></a>
+<span class="sourceLineNo">369</span>        } else {<a name="line.369"></a>
+<span class="sourceLineNo">370</span>          break;<a name="line.370"></a>
+<span class="sourceLineNo">371</span>        }<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      }<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      return resultSets.toArray(new Result[resultSets.size()]);<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    }<a name="line.374"></a>
+<span class="sourceLineNo">375</span><a name="line.375"></a>
+<span class="sourceLineNo">376</span>    public void close() {<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      if (!scanMetricsPublished){<a name="line.377"></a>
+<span class="sourceLineNo">378</span>        try {<a name="line.378"></a>
+<span class="sourceLineNo">379</span>          writeScanMetrics();<a name="line.379"></a>
+<span class="sourceLineNo">380</span>        } catch (IOException e) {<a name="line.380"></a>
+<span class="sourceLineNo">381</span>        }<a name="line.381"></a>
+<span class="sourceLineNo">382</span>      }<a name="line.382"></a>
+<span class="sourceLineNo">383</span>      <a name="line.383"></a>
+<span class="sourceLineNo">384</span>      if (callable != null) {<a name="line.384"></a>
+<span class="sourceLineNo">385</span>        callable.setClose();<a name="line.385"></a>
+<span class="sourceLineNo">386</span>        try {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>          callable.withRetries();<a name="line.387"></a>
+<span class="sourceLineNo">388</span>        } catch (IOException e) {<a name="line.388"></a>
+<span class="sourceLineNo">389</span>          // We used to catch this error, interpret, and rethrow. However, we<a name="line.389"></a>
+<span class="sourceLineNo">390</span>          // have since decided that it's not nice for a scanner's close to<a name="line.390"></a>
+<span class="sourceLineNo">391</span>          // throw exceptions. Chances are it was just an UnknownScanner<a name="line.391"></a>
+<span class="sourceLineNo">392</span>          // exception due to lease time out.<a name="line.392"></a>
+<span class="sourceLineNo">393</span>        }<a name="line.393"></a>
+<span class="sourceLineNo">394</span>        callable = null;<a name="line.394"></a>
+<span class="sourceLineNo">395</span>      }<a name="line.395"></a>
+<span class="sourceLineNo">396</span>      closed = true;<a name="line.396"></a>
+<span class="sourceLineNo">397</span>    }<a name="line.397"></a>
+<span class="sourceLineNo">398</span>}<a name="line.398"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>

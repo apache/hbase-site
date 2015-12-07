@@ -1,0 +1,402 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/**<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.procedure;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.IOException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.concurrent.Callable;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.concurrent.CountDownLatch;<a name="line.22"></a>
+<span class="sourceLineNo">023</span><a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.commons.logging.Log;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.commons.logging.LogFactory;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.errorhandling.ForeignException;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.errorhandling.ForeignExceptionSnare;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.errorhandling.ForeignExceptionListener;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.errorhandling.TimeoutExceptionInjector;<a name="line.30"></a>
+<span class="sourceLineNo">031</span><a name="line.31"></a>
+<span class="sourceLineNo">032</span>/**<a name="line.32"></a>
+<span class="sourceLineNo">033</span> * Distributed procedure member's Subprocedure.  A procedure is sarted on a ProcedureCoordinator<a name="line.33"></a>
+<span class="sourceLineNo">034</span> * which communicates with ProcedureMembers who create and start its part of the Procedure.  This<a name="line.34"></a>
+<span class="sourceLineNo">035</span> * sub part is called a Subprocedure<a name="line.35"></a>
+<span class="sourceLineNo">036</span> *<a name="line.36"></a>
+<span class="sourceLineNo">037</span> * Users should subclass this and implement {@link #acquireBarrier()} (get local barrier for this<a name="line.37"></a>
+<span class="sourceLineNo">038</span> * member), {@link #insideBarrier()} (execute while globally barriered and release barrier) and<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * {@link #cleanup(Exception)} (release state associated with subprocedure.)<a name="line.39"></a>
+<span class="sourceLineNo">040</span> *<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * When submitted to a ProcedureMemeber, the call method is executed in a separate thread.<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * Latches are use too block its progress and trigger continuations when barrier conditions are<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * met.<a name="line.43"></a>
+<span class="sourceLineNo">044</span> *<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * Exception that makes it out of calls to {@link #acquireBarrier()} or {@link #insideBarrier()}<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * gets converted into {@link ForeignException}, which will get propagated to the<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * {@link ProcedureCoordinator}.<a name="line.47"></a>
+<span class="sourceLineNo">048</span> *<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * There is a category of procedure (ex: online-snapshots), and a user-specified instance-specific<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * barrierName. (ex: snapshot121126).<a name="line.50"></a>
+<span class="sourceLineNo">051</span> */<a name="line.51"></a>
+<span class="sourceLineNo">052</span>abstract public class Subprocedure implements Callable&lt;Void&gt; {<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  private static final Log LOG = LogFactory.getLog(Subprocedure.class);<a name="line.53"></a>
+<span class="sourceLineNo">054</span><a name="line.54"></a>
+<span class="sourceLineNo">055</span>  // Name of the procedure<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  final private String barrierName;<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  //<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  // Execution state<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  //<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  /** wait on before allowing the in barrier phase to proceed */<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  private final CountDownLatch inGlobalBarrier;<a name="line.63"></a>
+<span class="sourceLineNo">064</span>  /** counted down when the Subprocedure has completed */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private final CountDownLatch releasedLocalBarrier;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  //<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  // Error handling<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  //<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  /** monitor to check for errors */<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  protected final ForeignExceptionDispatcher monitor;<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  /** frequency to check for errors (ms) */<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  protected final long wakeFrequency;<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  protected final TimeoutExceptionInjector executionTimeoutTimer;<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  protected final ProcedureMemberRpcs rpcs;<a name="line.75"></a>
+<span class="sourceLineNo">076</span><a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private volatile boolean complete = false;<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>  /**<a name="line.79"></a>
+<span class="sourceLineNo">080</span>   * @param member reference to the member managing this subprocedure<a name="line.80"></a>
+<span class="sourceLineNo">081</span>   * @param procName name of the procedure this subprocedure is associated with<a name="line.81"></a>
+<span class="sourceLineNo">082</span>   * @param monitor notified if there is an error in the subprocedure<a name="line.82"></a>
+<span class="sourceLineNo">083</span>   * @param wakeFrequency time in millis to wake to check if there is an error via the monitor (in<a name="line.83"></a>
+<span class="sourceLineNo">084</span>   *          milliseconds).<a name="line.84"></a>
+<span class="sourceLineNo">085</span>   * @param timeout time in millis that will trigger a subprocedure abort if it has not completed<a name="line.85"></a>
+<span class="sourceLineNo">086</span>   */<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  public Subprocedure(ProcedureMember member, String procName, ForeignExceptionDispatcher monitor,<a name="line.87"></a>
+<span class="sourceLineNo">088</span>      long wakeFrequency, long timeout) {<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    // Asserts should be caught during unit testing<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    assert member != null : "procedure member should be non-null";<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    assert member.getRpcs() != null : "rpc handlers should be non-null";<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    assert procName != null : "procedure name should be non-null";<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    assert monitor != null : "monitor should be non-null";<a name="line.93"></a>
+<span class="sourceLineNo">094</span><a name="line.94"></a>
+<span class="sourceLineNo">095</span>    // Default to a very large timeout<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    this.rpcs = member.getRpcs();<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    this.barrierName = procName;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    this.monitor = monitor;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    // forward any failures to coordinator.  Since this is a dispatcher, resend loops should not be<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    // possible.<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    this.monitor.addListener(new ForeignExceptionListener() {<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      @Override<a name="line.102"></a>
+<span class="sourceLineNo">103</span>      public void receive(ForeignException ee) {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>        // if this is a notification from a remote source, just log<a name="line.104"></a>
+<span class="sourceLineNo">105</span>        if (ee.isRemote()) {<a name="line.105"></a>
+<span class="sourceLineNo">106</span>          LOG.debug("Was remote foreign exception, not redispatching error", ee);<a name="line.106"></a>
+<span class="sourceLineNo">107</span>          return;<a name="line.107"></a>
+<span class="sourceLineNo">108</span>        }<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>        // if it is local, then send it to the coordinator<a name="line.110"></a>
+<span class="sourceLineNo">111</span>        try {<a name="line.111"></a>
+<span class="sourceLineNo">112</span>          rpcs.sendMemberAborted(Subprocedure.this, ee);<a name="line.112"></a>
+<span class="sourceLineNo">113</span>        } catch (IOException e) {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>          // this will fail all the running procedures, since the connection is down<a name="line.114"></a>
+<span class="sourceLineNo">115</span>          LOG.error("Can't reach controller, not propagating error", e);<a name="line.115"></a>
+<span class="sourceLineNo">116</span>        }<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      }<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    });<a name="line.118"></a>
+<span class="sourceLineNo">119</span><a name="line.119"></a>
+<span class="sourceLineNo">120</span>    this.wakeFrequency = wakeFrequency;<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    this.inGlobalBarrier = new CountDownLatch(1);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    this.releasedLocalBarrier = new CountDownLatch(1);<a name="line.122"></a>
+<span class="sourceLineNo">123</span><a name="line.123"></a>
+<span class="sourceLineNo">124</span>    // accept error from timer thread, this needs to be started.<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    this.executionTimeoutTimer = new TimeoutExceptionInjector(monitor, timeout);<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  }<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  public String getName() {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>     return barrierName;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>  }<a name="line.130"></a>
+<span class="sourceLineNo">131</span><a name="line.131"></a>
+<span class="sourceLineNo">132</span>  public String getMemberName() {<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    return rpcs.getMemberName();<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  private void rethrowException() throws ForeignException {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    monitor.rethrowException();<a name="line.137"></a>
+<span class="sourceLineNo">138</span>  }<a name="line.138"></a>
+<span class="sourceLineNo">139</span><a name="line.139"></a>
+<span class="sourceLineNo">140</span>  /**<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   * Execute the Subprocedure {@link #acquireBarrier()} and {@link #insideBarrier()} methods<a name="line.141"></a>
+<span class="sourceLineNo">142</span>   * while keeping some state for other threads to access.<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   *<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   * This would normally be executed by the ProcedureMemeber when a acquire message comes from the<a name="line.144"></a>
+<span class="sourceLineNo">145</span>   * coordinator.  Rpcs are used to spend message back to the coordinator after different phases<a name="line.145"></a>
+<span class="sourceLineNo">146</span>   * are executed.  Any exceptions caught during the execution (except for InterrupedException) get<a name="line.146"></a>
+<span class="sourceLineNo">147</span>   * converted and propagated to coordinator via {@link ProcedureMemberRpcs#sendMemberAborted(<a name="line.147"></a>
+<span class="sourceLineNo">148</span>   * Subprocedure, ForeignException)}.<a name="line.148"></a>
+<span class="sourceLineNo">149</span>   */<a name="line.149"></a>
+<span class="sourceLineNo">150</span>  @SuppressWarnings("finally")<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  final public Void call() {<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    LOG.debug("Starting subprocedure '" + barrierName + "' with timeout " +<a name="line.152"></a>
+<span class="sourceLineNo">153</span>        executionTimeoutTimer.getMaxTime() + "ms");<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    // start the execution timeout timer<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    executionTimeoutTimer.start();<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>    try {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      // start by checking for error first<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      rethrowException();<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      LOG.debug("Subprocedure '" + barrierName + "' starting 'acquire' stage");<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      acquireBarrier();<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      LOG.debug("Subprocedure '" + barrierName + "' locally acquired");<a name="line.162"></a>
+<span class="sourceLineNo">163</span><a name="line.163"></a>
+<span class="sourceLineNo">164</span>      // vote yes to coordinator about being prepared<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      rpcs.sendMemberAcquired(this);<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      LOG.debug("Subprocedure '" + barrierName + "' coordinator notified of 'acquire', waiting on" +<a name="line.166"></a>
+<span class="sourceLineNo">167</span>          " 'reached' or 'abort' from coordinator");<a name="line.167"></a>
+<span class="sourceLineNo">168</span><a name="line.168"></a>
+<span class="sourceLineNo">169</span>      // wait for the procedure to reach global barrier before proceding<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      waitForReachedGlobalBarrier();<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      rethrowException(); // if Coordinator aborts, will bail from here with exception<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>      // In traditional 2PC, if a member reaches this state the TX has been committed and the<a name="line.173"></a>
+<span class="sourceLineNo">174</span>      // member is responsible for rolling forward and recovering and completing the subsequent<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      // operations in the case of failure.  It cannot rollback.<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      //<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      // This implementation is not 2PC since it can still rollback here, and thus has different<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      // semantics.<a name="line.178"></a>
+<span class="sourceLineNo">179</span><a name="line.179"></a>
+<span class="sourceLineNo">180</span>      LOG.debug("Subprocedure '" + barrierName + "' received 'reached' from coordinator.");<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      insideBarrier();<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      LOG.debug("Subprocedure '" + barrierName + "' locally completed");<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>      // Ack that the member has executed and released local barrier<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      rpcs.sendMemberCompleted(this);<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      LOG.debug("Subprocedure '" + barrierName + "' has notified controller of completion");<a name="line.186"></a>
+<span class="sourceLineNo">187</span><a name="line.187"></a>
+<span class="sourceLineNo">188</span>      // make sure we didn't get an external exception<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      rethrowException();<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    } catch (Exception e) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      String msg = null;<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      if (e instanceof InterruptedException) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        msg = "Procedure '" + barrierName + "' aborting due to interrupt!" +<a name="line.193"></a>
+<span class="sourceLineNo">194</span>            " Likely due to pool shutdown.";<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        Thread.currentThread().interrupt();<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      } else if (e instanceof ForeignException) {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>        msg = "Subprocedure '" + barrierName + "' aborting due to a ForeignException!";<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      } else {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>        msg = "Subprocedure '" + barrierName + "' failed!";<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      }<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      cancel(msg, e);<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>      LOG.debug("Subprocedure '" + barrierName + "' running cleanup.");<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      cleanup(e);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    } finally {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      releasedLocalBarrier.countDown();<a name="line.206"></a>
+<span class="sourceLineNo">207</span><a name="line.207"></a>
+<span class="sourceLineNo">208</span>      // tell the timer we are done, if we get here successfully<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      executionTimeoutTimer.complete();<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      complete = true;<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      LOG.debug("Subprocedure '" + barrierName + "' completed.");<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      return null;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>    }<a name="line.213"></a>
+<span class="sourceLineNo">214</span>  }<a name="line.214"></a>
+<span class="sourceLineNo">215</span><a name="line.215"></a>
+<span class="sourceLineNo">216</span>  boolean isComplete() {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>    return complete;<a name="line.217"></a>
+<span class="sourceLineNo">218</span>  }<a name="line.218"></a>
+<span class="sourceLineNo">219</span><a name="line.219"></a>
+<span class="sourceLineNo">220</span>  /**<a name="line.220"></a>
+<span class="sourceLineNo">221</span>   * exposed for testing.<a name="line.221"></a>
+<span class="sourceLineNo">222</span>   */<a name="line.222"></a>
+<span class="sourceLineNo">223</span>  ForeignExceptionSnare getErrorCheckable() {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    return this.monitor;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>  }<a name="line.225"></a>
+<span class="sourceLineNo">226</span><a name="line.226"></a>
+<span class="sourceLineNo">227</span>  /**<a name="line.227"></a>
+<span class="sourceLineNo">228</span>   * The implementation of this method should gather and hold required resources (locks, disk<a name="line.228"></a>
+<span class="sourceLineNo">229</span>   * space, etc) to satisfy the Procedures barrier condition.  For example, this would be where<a name="line.229"></a>
+<span class="sourceLineNo">230</span>   * to make all the regions on a RS on the quiescent for an procedure that required all regions<a name="line.230"></a>
+<span class="sourceLineNo">231</span>   * to be globally quiesed.<a name="line.231"></a>
+<span class="sourceLineNo">232</span>   *<a name="line.232"></a>
+<span class="sourceLineNo">233</span>   * Users should override this method.  If a quiescent is not required, this is overkill but<a name="line.233"></a>
+<span class="sourceLineNo">234</span>   * can still be used to execute a procedure on all members and to propagate any exceptions.<a name="line.234"></a>
+<span class="sourceLineNo">235</span>   *<a name="line.235"></a>
+<span class="sourceLineNo">236</span>   * @throws ForeignException<a name="line.236"></a>
+<span class="sourceLineNo">237</span>   */<a name="line.237"></a>
+<span class="sourceLineNo">238</span>  abstract public void acquireBarrier() throws ForeignException;<a name="line.238"></a>
+<span class="sourceLineNo">239</span><a name="line.239"></a>
+<span class="sourceLineNo">240</span>  /**<a name="line.240"></a>
+<span class="sourceLineNo">241</span>   * The implementation of this method should act with the assumption that the barrier condition<a name="line.241"></a>
+<span class="sourceLineNo">242</span>   * has been satisfied.  Continuing the previous example, a condition could be that all RS's<a name="line.242"></a>
+<span class="sourceLineNo">243</span>   * globally have been quiesced, and procedures that require this precondition could be<a name="line.243"></a>
+<span class="sourceLineNo">244</span>   * implemented here.<a name="line.244"></a>
+<span class="sourceLineNo">245</span>   *<a name="line.245"></a>
+<span class="sourceLineNo">246</span>   * Users should override this method.  If quiescense is not required, this can be a no-op<a name="line.246"></a>
+<span class="sourceLineNo">247</span>   *<a name="line.247"></a>
+<span class="sourceLineNo">248</span>   * @throws ForeignException<a name="line.248"></a>
+<span class="sourceLineNo">249</span>   */<a name="line.249"></a>
+<span class="sourceLineNo">250</span>  abstract public void insideBarrier() throws ForeignException;<a name="line.250"></a>
+<span class="sourceLineNo">251</span><a name="line.251"></a>
+<span class="sourceLineNo">252</span>  /**<a name="line.252"></a>
+<span class="sourceLineNo">253</span>   * Users should override this method. This implementation of this method should rollback and<a name="line.253"></a>
+<span class="sourceLineNo">254</span>   * cleanup any temporary or partially completed state that the {@link #acquireBarrier()} may have<a name="line.254"></a>
+<span class="sourceLineNo">255</span>   * created.<a name="line.255"></a>
+<span class="sourceLineNo">256</span>   * @param e<a name="line.256"></a>
+<span class="sourceLineNo">257</span>   */<a name="line.257"></a>
+<span class="sourceLineNo">258</span>  abstract public void cleanup(Exception e);<a name="line.258"></a>
+<span class="sourceLineNo">259</span><a name="line.259"></a>
+<span class="sourceLineNo">260</span>  /**<a name="line.260"></a>
+<span class="sourceLineNo">261</span>   * Method to cancel the Subprocedure by injecting an exception from and external source.<a name="line.261"></a>
+<span class="sourceLineNo">262</span>   * @param cause<a name="line.262"></a>
+<span class="sourceLineNo">263</span>   */<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  public void cancel(String msg, Throwable cause) {<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    LOG.error(msg, cause);<a name="line.265"></a>
+<span class="sourceLineNo">266</span>    if (cause instanceof ForeignException) {<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      monitor.receive((ForeignException) cause);<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    } else {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      monitor.receive(new ForeignException(getMemberName(), cause));<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    }<a name="line.270"></a>
+<span class="sourceLineNo">271</span>  }<a name="line.271"></a>
+<span class="sourceLineNo">272</span><a name="line.272"></a>
+<span class="sourceLineNo">273</span>  /**<a name="line.273"></a>
+<span class="sourceLineNo">274</span>   * Callback for the member rpcs to call when the global barrier has been reached.  This<a name="line.274"></a>
+<span class="sourceLineNo">275</span>   * unblocks the main subprocedure exectuion thread so that the Subprocedure's<a name="line.275"></a>
+<span class="sourceLineNo">276</span>   * {@link #insideBarrier()} method can be run.<a name="line.276"></a>
+<span class="sourceLineNo">277</span>   */<a name="line.277"></a>
+<span class="sourceLineNo">278</span>  public void receiveReachedGlobalBarrier() {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    inGlobalBarrier.countDown();<a name="line.279"></a>
+<span class="sourceLineNo">280</span>  }<a name="line.280"></a>
+<span class="sourceLineNo">281</span><a name="line.281"></a>
+<span class="sourceLineNo">282</span>  //<a name="line.282"></a>
+<span class="sourceLineNo">283</span>  // Subprocedure Internal State interface<a name="line.283"></a>
+<span class="sourceLineNo">284</span>  //<a name="line.284"></a>
+<span class="sourceLineNo">285</span><a name="line.285"></a>
+<span class="sourceLineNo">286</span>  /**<a name="line.286"></a>
+<span class="sourceLineNo">287</span>   * Wait for the reached global barrier notification.<a name="line.287"></a>
+<span class="sourceLineNo">288</span>   *<a name="line.288"></a>
+<span class="sourceLineNo">289</span>   * Package visibility for testing<a name="line.289"></a>
+<span class="sourceLineNo">290</span>   *<a name="line.290"></a>
+<span class="sourceLineNo">291</span>   * @throws ForeignException<a name="line.291"></a>
+<span class="sourceLineNo">292</span>   * @throws InterruptedException<a name="line.292"></a>
+<span class="sourceLineNo">293</span>   */<a name="line.293"></a>
+<span class="sourceLineNo">294</span>  void waitForReachedGlobalBarrier() throws ForeignException, InterruptedException {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    Procedure.waitForLatch(inGlobalBarrier, monitor, wakeFrequency,<a name="line.295"></a>
+<span class="sourceLineNo">296</span>        barrierName + ":remote acquired");<a name="line.296"></a>
+<span class="sourceLineNo">297</span>  }<a name="line.297"></a>
+<span class="sourceLineNo">298</span><a name="line.298"></a>
+<span class="sourceLineNo">299</span>  /**<a name="line.299"></a>
+<span class="sourceLineNo">300</span>   * Waits until the entire procedure has globally completed, or has been aborted.<a name="line.300"></a>
+<span class="sourceLineNo">301</span>   * @throws ForeignException<a name="line.301"></a>
+<span class="sourceLineNo">302</span>   * @throws InterruptedException<a name="line.302"></a>
+<span class="sourceLineNo">303</span>   */<a name="line.303"></a>
+<span class="sourceLineNo">304</span>  public void waitForLocallyCompleted() throws ForeignException, InterruptedException {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    Procedure.waitForLatch(releasedLocalBarrier, monitor, wakeFrequency,<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        barrierName + ":completed");<a name="line.306"></a>
+<span class="sourceLineNo">307</span>  }<a name="line.307"></a>
+<span class="sourceLineNo">308</span><a name="line.308"></a>
+<span class="sourceLineNo">309</span>  /**<a name="line.309"></a>
+<span class="sourceLineNo">310</span>   * Empty Subprocedure for testing.<a name="line.310"></a>
+<span class="sourceLineNo">311</span>   *<a name="line.311"></a>
+<span class="sourceLineNo">312</span>   * Must be public for stubbing used in testing to work.<a name="line.312"></a>
+<span class="sourceLineNo">313</span>   */<a name="line.313"></a>
+<span class="sourceLineNo">314</span>  public static class SubprocedureImpl extends Subprocedure {<a name="line.314"></a>
+<span class="sourceLineNo">315</span><a name="line.315"></a>
+<span class="sourceLineNo">316</span>    public SubprocedureImpl(ProcedureMember member, String opName,<a name="line.316"></a>
+<span class="sourceLineNo">317</span>        ForeignExceptionDispatcher monitor, long wakeFrequency, long timeout) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>      super(member, opName, monitor, wakeFrequency, timeout);<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    }<a name="line.319"></a>
+<span class="sourceLineNo">320</span><a name="line.320"></a>
+<span class="sourceLineNo">321</span>    @Override<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    public void acquireBarrier() throws ForeignException {}<a name="line.322"></a>
+<span class="sourceLineNo">323</span><a name="line.323"></a>
+<span class="sourceLineNo">324</span>    @Override<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    public void insideBarrier() throws ForeignException {}<a name="line.325"></a>
+<span class="sourceLineNo">326</span><a name="line.326"></a>
+<span class="sourceLineNo">327</span>    @Override<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    public void cleanup(Exception e) {}<a name="line.328"></a>
+<span class="sourceLineNo">329</span>  };<a name="line.329"></a>
+<span class="sourceLineNo">330</span>}<a name="line.330"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
