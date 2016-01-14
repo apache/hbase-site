@@ -34,278 +34,280 @@
 <span class="sourceLineNo">026</span>import org.apache.commons.logging.LogFactory;<a name="line.26"></a>
 <span class="sourceLineNo">027</span>import org.apache.hadoop.conf.Configuration;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import org.apache.hadoop.fs.Path;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.Cell;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.KeyValueUtil;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.Tag;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.TagType;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.client.Scan;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.regionserver.HMobStore;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.regionserver.HStore;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.InternalScanner;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.MobCompactionStoreScanner;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.ScanType;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.regionserver.ScannerContext;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.regionserver.Store;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.StoreFile;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.StoreFile.Writer;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.regionserver.StoreFileScanner;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.regionserver.compactions.DefaultCompactor;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.49"></a>
-<span class="sourceLineNo">050</span><a name="line.50"></a>
-<span class="sourceLineNo">051</span>/**<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * Compact passed set of files in the mob-enabled column family.<a name="line.52"></a>
-<span class="sourceLineNo">053</span> */<a name="line.53"></a>
-<span class="sourceLineNo">054</span>@InterfaceAudience.Private<a name="line.54"></a>
-<span class="sourceLineNo">055</span>public class DefaultMobStoreCompactor extends DefaultCompactor {<a name="line.55"></a>
-<span class="sourceLineNo">056</span><a name="line.56"></a>
-<span class="sourceLineNo">057</span>  private static final Log LOG = LogFactory.getLog(DefaultMobStoreCompactor.class);<a name="line.57"></a>
-<span class="sourceLineNo">058</span>  private long mobSizeThreshold;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>  private HMobStore mobStore;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>  public DefaultMobStoreCompactor(Configuration conf, Store store) {<a name="line.60"></a>
-<span class="sourceLineNo">061</span>    super(conf, store);<a name="line.61"></a>
-<span class="sourceLineNo">062</span>    // The mob cells reside in the mob-enabled column family which is held by HMobStore.<a name="line.62"></a>
-<span class="sourceLineNo">063</span>    // During the compaction, the compactor reads the cells from the mob files and<a name="line.63"></a>
-<span class="sourceLineNo">064</span>    // probably creates new mob files. All of these operations are included in HMobStore,<a name="line.64"></a>
-<span class="sourceLineNo">065</span>    // so we need to cast the Store to HMobStore.<a name="line.65"></a>
-<span class="sourceLineNo">066</span>    if (!(store instanceof HMobStore)) {<a name="line.66"></a>
-<span class="sourceLineNo">067</span>      throw new IllegalArgumentException("The store " + store + " is not a HMobStore");<a name="line.67"></a>
-<span class="sourceLineNo">068</span>    }<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    mobStore = (HMobStore) store;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>    mobSizeThreshold = store.getFamily().getMobThreshold();<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  }<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  /**<a name="line.73"></a>
-<span class="sourceLineNo">074</span>   * Creates a writer for a new file in a temporary directory.<a name="line.74"></a>
-<span class="sourceLineNo">075</span>   * @param fd The file details.<a name="line.75"></a>
-<span class="sourceLineNo">076</span>   * @param shouldDropBehind Should the writer drop behind.<a name="line.76"></a>
-<span class="sourceLineNo">077</span>   * @return Writer for a new StoreFile in the tmp dir.<a name="line.77"></a>
-<span class="sourceLineNo">078</span>   * @throws IOException<a name="line.78"></a>
-<span class="sourceLineNo">079</span>   */<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  @Override<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  protected Writer createTmpWriter(FileDetails fd, boolean shouldDropBehind) throws IOException {<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    // make this writer with tags always because of possible new cells with tags.<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    StoreFile.Writer writer = store.createWriterInTmp(fd.maxKeyCount, this.compactionCompression,<a name="line.83"></a>
-<span class="sourceLineNo">084</span>      true, true, true, shouldDropBehind);<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    return writer;<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  }<a name="line.86"></a>
-<span class="sourceLineNo">087</span><a name="line.87"></a>
-<span class="sourceLineNo">088</span>  @Override<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  protected InternalScanner createScanner(Store store, List&lt;StoreFileScanner&gt; scanners,<a name="line.89"></a>
-<span class="sourceLineNo">090</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs) throws IOException {<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    Scan scan = new Scan();<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    scan.setMaxVersions(store.getFamily().getMaxVersions());<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    if (scanType == ScanType.COMPACT_DROP_DELETES) {<a name="line.93"></a>
-<span class="sourceLineNo">094</span>      // In major compaction, we need to write the delete markers to del files, so we have to<a name="line.94"></a>
-<span class="sourceLineNo">095</span>      // retain the them in scanning.<a name="line.95"></a>
-<span class="sourceLineNo">096</span>      scanType = ScanType.COMPACT_RETAIN_DELETES;<a name="line.96"></a>
-<span class="sourceLineNo">097</span>      return new MobCompactionStoreScanner(store, store.getScanInfo(), scan, scanners,<a name="line.97"></a>
-<span class="sourceLineNo">098</span>          scanType, smallestReadPoint, earliestPutTs, true);<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    } else {<a name="line.99"></a>
-<span class="sourceLineNo">100</span>      return new MobCompactionStoreScanner(store, store.getScanInfo(), scan, scanners,<a name="line.100"></a>
-<span class="sourceLineNo">101</span>          scanType, smallestReadPoint, earliestPutTs, false);<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    }<a name="line.102"></a>
-<span class="sourceLineNo">103</span>  }<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  // TODO refactor to take advantage of the throughput controller.<a name="line.105"></a>
-<span class="sourceLineNo">106</span><a name="line.106"></a>
-<span class="sourceLineNo">107</span>  /**<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   * Performs compaction on a column family with the mob flag enabled.<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   * This is for when the mob threshold size has changed or if the mob<a name="line.109"></a>
-<span class="sourceLineNo">110</span>   * column family mode has been toggled via an alter table statement.<a name="line.110"></a>
-<span class="sourceLineNo">111</span>   * Compacts the files by the following rules.<a name="line.111"></a>
-<span class="sourceLineNo">112</span>   * 1. If the cell has a mob reference tag, the cell's value is the path of the mob file.<a name="line.112"></a>
-<span class="sourceLineNo">113</span>   * &lt;ol&gt;<a name="line.113"></a>
-<span class="sourceLineNo">114</span>   * &lt;li&gt;<a name="line.114"></a>
-<span class="sourceLineNo">115</span>   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,<a name="line.115"></a>
-<span class="sourceLineNo">116</span>   * directly copy the (with mob tag) cell into the new store file.<a name="line.116"></a>
-<span class="sourceLineNo">117</span>   * &lt;/li&gt;<a name="line.117"></a>
-<span class="sourceLineNo">118</span>   * &lt;li&gt;<a name="line.118"></a>
-<span class="sourceLineNo">119</span>   * Otherwise, retrieve the mob cell from the mob file, and writes a copy of the cell into<a name="line.119"></a>
-<span class="sourceLineNo">120</span>   * the new store file.<a name="line.120"></a>
-<span class="sourceLineNo">121</span>   * &lt;/li&gt;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>   * &lt;/ol&gt;<a name="line.122"></a>
-<span class="sourceLineNo">123</span>   * 2. If the cell doesn't have a reference tag.<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   * &lt;ol&gt;<a name="line.124"></a>
-<span class="sourceLineNo">125</span>   * &lt;li&gt;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,<a name="line.126"></a>
-<span class="sourceLineNo">127</span>   * write this cell to a mob file, and write the path of this mob file to the store file.<a name="line.127"></a>
-<span class="sourceLineNo">128</span>   * &lt;/li&gt;<a name="line.128"></a>
-<span class="sourceLineNo">129</span>   * &lt;li&gt;<a name="line.129"></a>
-<span class="sourceLineNo">130</span>   * Otherwise, directly write this cell into the store file.<a name="line.130"></a>
-<span class="sourceLineNo">131</span>   * &lt;/li&gt;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>   * &lt;/ol&gt;<a name="line.132"></a>
-<span class="sourceLineNo">133</span>   * In the mob compaction, the {@link MobCompactionStoreScanner} is used as a scanner<a name="line.133"></a>
-<span class="sourceLineNo">134</span>   * which could output the normal cells and delete markers together when required.<a name="line.134"></a>
-<span class="sourceLineNo">135</span>   * After the major compaction on the normal hfiles, we have a guarantee that we have purged all<a name="line.135"></a>
-<span class="sourceLineNo">136</span>   * deleted or old version mob refs, and the delete markers are written to a del file with the<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * suffix _del. Because of this, it is safe to use the del file in the mob compaction.<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   * The mob compaction doesn't take place in the normal hfiles, it occurs directly in the<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   * mob files. When the small mob files are merged into bigger ones, the del file is added into<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * the scanner to filter the deleted cells.<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   * @param fd File details<a name="line.141"></a>
-<span class="sourceLineNo">142</span>   * @param scanner Where to read from.<a name="line.142"></a>
-<span class="sourceLineNo">143</span>   * @param writer Where to write to.<a name="line.143"></a>
-<span class="sourceLineNo">144</span>   * @param smallestReadPoint Smallest read point.<a name="line.144"></a>
-<span class="sourceLineNo">145</span>   * @param cleanSeqId When true, remove seqId(used to be mvcc) value which is &lt;= smallestReadPoint<a name="line.145"></a>
-<span class="sourceLineNo">146</span>   * @param throughputController The compaction throughput controller.<a name="line.146"></a>
-<span class="sourceLineNo">147</span>   * @param major Is a major compaction.<a name="line.147"></a>
-<span class="sourceLineNo">148</span>   * @return Whether compaction ended; false if it was interrupted for any reason.<a name="line.148"></a>
-<span class="sourceLineNo">149</span>   */<a name="line.149"></a>
-<span class="sourceLineNo">150</span>  @Override<a name="line.150"></a>
-<span class="sourceLineNo">151</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      long smallestReadPoint, boolean cleanSeqId,<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      CompactionThroughputController throughputController,  boolean major) throws IOException {<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    if (!(scanner instanceof MobCompactionStoreScanner)) {<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      throw new IllegalArgumentException(<a name="line.155"></a>
-<span class="sourceLineNo">156</span>        "The scanner should be an instance of MobCompactionStoreScanner");<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    }<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    MobCompactionStoreScanner compactionScanner = (MobCompactionStoreScanner) scanner;<a name="line.158"></a>
-<span class="sourceLineNo">159</span>    int bytesWritten = 0;<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.160"></a>
-<span class="sourceLineNo">161</span>    // we have to use a do/while loop.<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    List&lt;Cell&gt; cells = new ArrayList&lt;Cell&gt;();<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    int closeCheckInterval = HStore.getCloseCheckInterval();<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    boolean hasMore;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    Path path = MobUtils.getMobFamilyPath(conf, store.getTableName(), store.getColumnFamilyName());<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    byte[] fileName = null;<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    StoreFile.Writer mobFileWriter = null, delFileWriter = null;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    long mobCells = 0, deleteMarkersCount = 0;<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    Tag tableNameTag = new Tag(TagType.MOB_TABLE_NAME_TAG_TYPE, store.getTableName().getName());<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    long cellsCountCompactedToMob = 0, cellsCountCompactedFromMob = 0;<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    long cellsSizeCompactedToMob = 0, cellsSizeCompactedFromMob = 0;<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    try {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      try {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        // If the mob file writer could not be created, directly write the cell to the store file.<a name="line.175"></a>
-<span class="sourceLineNo">176</span>        mobFileWriter = mobStore.createWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.176"></a>
-<span class="sourceLineNo">177</span>            store.getFamily().getCompression(), store.getRegionInfo().getStartKey());<a name="line.177"></a>
-<span class="sourceLineNo">178</span>        fileName = Bytes.toBytes(mobFileWriter.getPath().getName());<a name="line.178"></a>
-<span class="sourceLineNo">179</span>      } catch (IOException e) {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>        LOG.error("Failed to create mob writer, "<a name="line.180"></a>
-<span class="sourceLineNo">181</span>               + "we will continue the compaction by writing MOB cells directly in store files", e);<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      }<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      delFileWriter = mobStore.createDelFileWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.183"></a>
-<span class="sourceLineNo">184</span>          store.getFamily().getCompression(), store.getRegionInfo().getStartKey());<a name="line.184"></a>
-<span class="sourceLineNo">185</span>      ScannerContext scannerContext =<a name="line.185"></a>
-<span class="sourceLineNo">186</span>              ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.186"></a>
-<span class="sourceLineNo">187</span>      do {<a name="line.187"></a>
-<span class="sourceLineNo">188</span>        hasMore = compactionScanner.next(cells, scannerContext);<a name="line.188"></a>
-<span class="sourceLineNo">189</span>        for (Cell c : cells) {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>          if (compactionScanner.isOutputDeleteMarkers() &amp;&amp; CellUtil.isDelete(c)) {<a name="line.190"></a>
-<span class="sourceLineNo">191</span>            delFileWriter.append(c);<a name="line.191"></a>
-<span class="sourceLineNo">192</span>            deleteMarkersCount++;<a name="line.192"></a>
-<span class="sourceLineNo">193</span>          } else if (mobFileWriter == null || c.getTypeByte() != KeyValue.Type.Put.getCode()) {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>            // If the mob file writer is null or the kv type is not put, directly write the cell<a name="line.194"></a>
-<span class="sourceLineNo">195</span>            // to the store file.<a name="line.195"></a>
-<span class="sourceLineNo">196</span>            writer.append(c);<a name="line.196"></a>
-<span class="sourceLineNo">197</span>          } else if (MobUtils.isMobReferenceCell(c)) {<a name="line.197"></a>
-<span class="sourceLineNo">198</span>            if (MobUtils.hasValidMobRefCellValue(c)) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>              int size = MobUtils.getMobValueLength(c);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>              if (size &gt; mobSizeThreshold) {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>                // If the value size is larger than the threshold, it's regarded as a mob. Since<a name="line.201"></a>
-<span class="sourceLineNo">202</span>                // its value is already in the mob file, directly write this cell to the store file<a name="line.202"></a>
-<span class="sourceLineNo">203</span>                writer.append(c);<a name="line.203"></a>
-<span class="sourceLineNo">204</span>              } else {<a name="line.204"></a>
-<span class="sourceLineNo">205</span>                // If the value is not larger than the threshold, it's not regarded a mob. Retrieve<a name="line.205"></a>
-<span class="sourceLineNo">206</span>                // the mob cell from the mob file, and write it back to the store file.<a name="line.206"></a>
-<span class="sourceLineNo">207</span>                Cell mobCell = mobStore.resolve(c, false);<a name="line.207"></a>
-<span class="sourceLineNo">208</span>                if (mobCell.getValueLength() != 0) {<a name="line.208"></a>
-<span class="sourceLineNo">209</span>                  // put the mob data back to the store file<a name="line.209"></a>
-<span class="sourceLineNo">210</span>                  CellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.210"></a>
-<span class="sourceLineNo">211</span>                  writer.append(mobCell);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>                  cellsCountCompactedFromMob++;<a name="line.212"></a>
-<span class="sourceLineNo">213</span>                  cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.213"></a>
-<span class="sourceLineNo">214</span>                } else {<a name="line.214"></a>
-<span class="sourceLineNo">215</span>                  // If the value of a file is empty, there might be issues when retrieving,<a name="line.215"></a>
-<span class="sourceLineNo">216</span>                  // directly write the cell to the store file, and leave it to be handled by the<a name="line.216"></a>
-<span class="sourceLineNo">217</span>                  // next compaction.<a name="line.217"></a>
-<span class="sourceLineNo">218</span>                  writer.append(c);<a name="line.218"></a>
-<span class="sourceLineNo">219</span>                }<a name="line.219"></a>
-<span class="sourceLineNo">220</span>              }<a name="line.220"></a>
-<span class="sourceLineNo">221</span>            } else {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>              LOG.warn("The value format of the KeyValue " + c<a name="line.222"></a>
-<span class="sourceLineNo">223</span>                  + " is wrong, its length is less than " + Bytes.SIZEOF_INT);<a name="line.223"></a>
-<span class="sourceLineNo">224</span>              writer.append(c);<a name="line.224"></a>
-<span class="sourceLineNo">225</span>            }<a name="line.225"></a>
-<span class="sourceLineNo">226</span>          } else if (c.getValueLength() &lt;= mobSizeThreshold) {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>            //If value size of a cell is not larger than the threshold, directly write to store file<a name="line.227"></a>
-<span class="sourceLineNo">228</span>            writer.append(c);<a name="line.228"></a>
-<span class="sourceLineNo">229</span>          } else {<a name="line.229"></a>
-<span class="sourceLineNo">230</span>            // If the value size of a cell is larger than the threshold, it's regarded as a mob,<a name="line.230"></a>
-<span class="sourceLineNo">231</span>            // write this cell to a mob file, and write the path to the store file.<a name="line.231"></a>
-<span class="sourceLineNo">232</span>            mobCells++;<a name="line.232"></a>
-<span class="sourceLineNo">233</span>            // append the original keyValue in the mob file.<a name="line.233"></a>
-<span class="sourceLineNo">234</span>            mobFileWriter.append(c);<a name="line.234"></a>
-<span class="sourceLineNo">235</span>            KeyValue reference = MobUtils.createMobRefKeyValue(c, fileName, tableNameTag);<a name="line.235"></a>
-<span class="sourceLineNo">236</span>            // write the cell whose value is the path of a mob file to the store file.<a name="line.236"></a>
-<span class="sourceLineNo">237</span>            writer.append(reference);<a name="line.237"></a>
-<span class="sourceLineNo">238</span>            cellsCountCompactedToMob++;<a name="line.238"></a>
-<span class="sourceLineNo">239</span>            cellsSizeCompactedToMob += c.getValueLength();<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          }<a name="line.240"></a>
-<span class="sourceLineNo">241</span>          ++progress.currentCompactedKVs;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>          // check periodically to see if a system stop is requested<a name="line.242"></a>
-<span class="sourceLineNo">243</span>          if (closeCheckInterval &gt; 0) {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>            bytesWritten += KeyValueUtil.length(c);<a name="line.244"></a>
-<span class="sourceLineNo">245</span>            if (bytesWritten &gt; closeCheckInterval) {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>              bytesWritten = 0;<a name="line.246"></a>
-<span class="sourceLineNo">247</span>              if (!store.areWritesEnabled()) {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>                progress.cancel();<a name="line.248"></a>
-<span class="sourceLineNo">249</span>                return false;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>              }<a name="line.250"></a>
-<span class="sourceLineNo">251</span>            }<a name="line.251"></a>
-<span class="sourceLineNo">252</span>          }<a name="line.252"></a>
-<span class="sourceLineNo">253</span>        }<a name="line.253"></a>
-<span class="sourceLineNo">254</span>        cells.clear();<a name="line.254"></a>
-<span class="sourceLineNo">255</span>      } while (hasMore);<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    } finally {<a name="line.256"></a>
-<span class="sourceLineNo">257</span>      if (mobFileWriter != null) {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>        mobFileWriter.appendMetadata(fd.maxSeqId, major, mobCells);<a name="line.258"></a>
-<span class="sourceLineNo">259</span>        mobFileWriter.close();<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      }<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      if (delFileWriter != null) {<a name="line.261"></a>
-<span class="sourceLineNo">262</span>        delFileWriter.appendMetadata(fd.maxSeqId, major, deleteMarkersCount);<a name="line.262"></a>
-<span class="sourceLineNo">263</span>        delFileWriter.close();<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      }<a name="line.264"></a>
-<span class="sourceLineNo">265</span>    }<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    if (mobFileWriter != null) {<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      if (mobCells &gt; 0) {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>        // If the mob file is not empty, commit it.<a name="line.268"></a>
-<span class="sourceLineNo">269</span>        mobStore.commitFile(mobFileWriter.getPath(), path);<a name="line.269"></a>
-<span class="sourceLineNo">270</span>      } else {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>        try {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>          // If the mob file is empty, delete it instead of committing.<a name="line.272"></a>
-<span class="sourceLineNo">273</span>          store.getFileSystem().delete(mobFileWriter.getPath(), true);<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        } catch (IOException e) {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>          LOG.error("Failed to delete the temp mob file", e);<a name="line.275"></a>
-<span class="sourceLineNo">276</span>        }<a name="line.276"></a>
-<span class="sourceLineNo">277</span>      }<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    }<a name="line.278"></a>
-<span class="sourceLineNo">279</span>    if (delFileWriter != null) {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      if (deleteMarkersCount &gt; 0) {<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        // If the del file is not empty, commit it.<a name="line.281"></a>
-<span class="sourceLineNo">282</span>        // If the commit fails, the compaction is re-performed again.<a name="line.282"></a>
-<span class="sourceLineNo">283</span>        mobStore.commitFile(delFileWriter.getPath(), path);<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      } else {<a name="line.284"></a>
-<span class="sourceLineNo">285</span>        try {<a name="line.285"></a>
-<span class="sourceLineNo">286</span>          // If the del file is empty, delete it instead of committing.<a name="line.286"></a>
-<span class="sourceLineNo">287</span>          store.getFileSystem().delete(delFileWriter.getPath(), true);<a name="line.287"></a>
-<span class="sourceLineNo">288</span>        } catch (IOException e) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>          LOG.error("Failed to delete the temp del file", e);<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      }<a name="line.291"></a>
-<span class="sourceLineNo">292</span>    }<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    mobStore.updateCellsCountCompactedFromMob(cellsCountCompactedFromMob);<a name="line.293"></a>
-<span class="sourceLineNo">294</span>    mobStore.updateCellsCountCompactedToMob(cellsCountCompactedToMob);<a name="line.294"></a>
-<span class="sourceLineNo">295</span>    mobStore.updateCellsSizeCompactedFromMob(cellsSizeCompactedFromMob);<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    mobStore.updateCellsSizeCompactedToMob(cellsSizeCompactedToMob);<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    progress.complete();<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    return true;<a name="line.298"></a>
-<span class="sourceLineNo">299</span>  }<a name="line.299"></a>
-<span class="sourceLineNo">300</span>}<a name="line.300"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.ArrayBackedTag;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.Cell;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.KeyValueUtil;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.Tag;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.TagType;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.client.Scan;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.regionserver.HMobStore;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.HStore;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.InternalScanner;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.MobCompactionStoreScanner;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.regionserver.ScanType;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.regionserver.ScannerContext;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.Store;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.StoreFile;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.regionserver.StoreFile.Writer;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.regionserver.StoreFileScanner;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.regionserver.compactions.DefaultCompactor;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>/**<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * Compact passed set of files in the mob-enabled column family.<a name="line.53"></a>
+<span class="sourceLineNo">054</span> */<a name="line.54"></a>
+<span class="sourceLineNo">055</span>@InterfaceAudience.Private<a name="line.55"></a>
+<span class="sourceLineNo">056</span>public class DefaultMobStoreCompactor extends DefaultCompactor {<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private static final Log LOG = LogFactory.getLog(DefaultMobStoreCompactor.class);<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  private long mobSizeThreshold;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private HMobStore mobStore;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>  public DefaultMobStoreCompactor(Configuration conf, Store store) {<a name="line.61"></a>
+<span class="sourceLineNo">062</span>    super(conf, store);<a name="line.62"></a>
+<span class="sourceLineNo">063</span>    // The mob cells reside in the mob-enabled column family which is held by HMobStore.<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    // During the compaction, the compactor reads the cells from the mob files and<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    // probably creates new mob files. All of these operations are included in HMobStore,<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    // so we need to cast the Store to HMobStore.<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    if (!(store instanceof HMobStore)) {<a name="line.67"></a>
+<span class="sourceLineNo">068</span>      throw new IllegalArgumentException("The store " + store + " is not a HMobStore");<a name="line.68"></a>
+<span class="sourceLineNo">069</span>    }<a name="line.69"></a>
+<span class="sourceLineNo">070</span>    mobStore = (HMobStore) store;<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    mobSizeThreshold = store.getFamily().getMobThreshold();<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  }<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  /**<a name="line.74"></a>
+<span class="sourceLineNo">075</span>   * Creates a writer for a new file in a temporary directory.<a name="line.75"></a>
+<span class="sourceLineNo">076</span>   * @param fd The file details.<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   * @param shouldDropBehind Should the writer drop behind.<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   * @return Writer for a new StoreFile in the tmp dir.<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   * @throws IOException<a name="line.79"></a>
+<span class="sourceLineNo">080</span>   */<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  @Override<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  protected Writer createTmpWriter(FileDetails fd, boolean shouldDropBehind) throws IOException {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    // make this writer with tags always because of possible new cells with tags.<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    StoreFile.Writer writer = store.createWriterInTmp(fd.maxKeyCount, this.compactionCompression,<a name="line.84"></a>
+<span class="sourceLineNo">085</span>      true, true, true, shouldDropBehind);<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    return writer;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  }<a name="line.87"></a>
+<span class="sourceLineNo">088</span><a name="line.88"></a>
+<span class="sourceLineNo">089</span>  @Override<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  protected InternalScanner createScanner(Store store, List&lt;StoreFileScanner&gt; scanners,<a name="line.90"></a>
+<span class="sourceLineNo">091</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs) throws IOException {<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    Scan scan = new Scan();<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    scan.setMaxVersions(store.getFamily().getMaxVersions());<a name="line.93"></a>
+<span class="sourceLineNo">094</span>    if (scanType == ScanType.COMPACT_DROP_DELETES) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      // In major compaction, we need to write the delete markers to del files, so we have to<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      // retain the them in scanning.<a name="line.96"></a>
+<span class="sourceLineNo">097</span>      scanType = ScanType.COMPACT_RETAIN_DELETES;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      return new MobCompactionStoreScanner(store, store.getScanInfo(), scan, scanners,<a name="line.98"></a>
+<span class="sourceLineNo">099</span>          scanType, smallestReadPoint, earliestPutTs, true);<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    } else {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      return new MobCompactionStoreScanner(store, store.getScanInfo(), scan, scanners,<a name="line.101"></a>
+<span class="sourceLineNo">102</span>          scanType, smallestReadPoint, earliestPutTs, false);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    }<a name="line.103"></a>
+<span class="sourceLineNo">104</span>  }<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  // TODO refactor to take advantage of the throughput controller.<a name="line.106"></a>
+<span class="sourceLineNo">107</span><a name="line.107"></a>
+<span class="sourceLineNo">108</span>  /**<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   * Performs compaction on a column family with the mob flag enabled.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   * This is for when the mob threshold size has changed or if the mob<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   * column family mode has been toggled via an alter table statement.<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   * Compacts the files by the following rules.<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   * 1. If the cell has a mob reference tag, the cell's value is the path of the mob file.<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   * &lt;ol&gt;<a name="line.114"></a>
+<span class="sourceLineNo">115</span>   * &lt;li&gt;<a name="line.115"></a>
+<span class="sourceLineNo">116</span>   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,<a name="line.116"></a>
+<span class="sourceLineNo">117</span>   * directly copy the (with mob tag) cell into the new store file.<a name="line.117"></a>
+<span class="sourceLineNo">118</span>   * &lt;/li&gt;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>   * &lt;li&gt;<a name="line.119"></a>
+<span class="sourceLineNo">120</span>   * Otherwise, retrieve the mob cell from the mob file, and writes a copy of the cell into<a name="line.120"></a>
+<span class="sourceLineNo">121</span>   * the new store file.<a name="line.121"></a>
+<span class="sourceLineNo">122</span>   * &lt;/li&gt;<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   * &lt;/ol&gt;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * 2. If the cell doesn't have a reference tag.<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   * &lt;ol&gt;<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   * &lt;li&gt;<a name="line.126"></a>
+<span class="sourceLineNo">127</span>   * If the value size of a cell is larger than the threshold, this cell is regarded as a mob,<a name="line.127"></a>
+<span class="sourceLineNo">128</span>   * write this cell to a mob file, and write the path of this mob file to the store file.<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   * &lt;/li&gt;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>   * &lt;li&gt;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>   * Otherwise, directly write this cell into the store file.<a name="line.131"></a>
+<span class="sourceLineNo">132</span>   * &lt;/li&gt;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>   * &lt;/ol&gt;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>   * In the mob compaction, the {@link MobCompactionStoreScanner} is used as a scanner<a name="line.134"></a>
+<span class="sourceLineNo">135</span>   * which could output the normal cells and delete markers together when required.<a name="line.135"></a>
+<span class="sourceLineNo">136</span>   * After the major compaction on the normal hfiles, we have a guarantee that we have purged all<a name="line.136"></a>
+<span class="sourceLineNo">137</span>   * deleted or old version mob refs, and the delete markers are written to a del file with the<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   * suffix _del. Because of this, it is safe to use the del file in the mob compaction.<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   * The mob compaction doesn't take place in the normal hfiles, it occurs directly in the<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   * mob files. When the small mob files are merged into bigger ones, the del file is added into<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   * the scanner to filter the deleted cells.<a name="line.141"></a>
+<span class="sourceLineNo">142</span>   * @param fd File details<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   * @param scanner Where to read from.<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   * @param writer Where to write to.<a name="line.144"></a>
+<span class="sourceLineNo">145</span>   * @param smallestReadPoint Smallest read point.<a name="line.145"></a>
+<span class="sourceLineNo">146</span>   * @param cleanSeqId When true, remove seqId(used to be mvcc) value which is &lt;= smallestReadPoint<a name="line.146"></a>
+<span class="sourceLineNo">147</span>   * @param throughputController The compaction throughput controller.<a name="line.147"></a>
+<span class="sourceLineNo">148</span>   * @param major Is a major compaction.<a name="line.148"></a>
+<span class="sourceLineNo">149</span>   * @return Whether compaction ended; false if it was interrupted for any reason.<a name="line.149"></a>
+<span class="sourceLineNo">150</span>   */<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  @Override<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      long smallestReadPoint, boolean cleanSeqId,<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      CompactionThroughputController throughputController,  boolean major) throws IOException {<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    if (!(scanner instanceof MobCompactionStoreScanner)) {<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      throw new IllegalArgumentException(<a name="line.156"></a>
+<span class="sourceLineNo">157</span>        "The scanner should be an instance of MobCompactionStoreScanner");<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    }<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    MobCompactionStoreScanner compactionScanner = (MobCompactionStoreScanner) scanner;<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    int bytesWritten = 0;<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    // we have to use a do/while loop.<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    List&lt;Cell&gt; cells = new ArrayList&lt;Cell&gt;();<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    int closeCheckInterval = HStore.getCloseCheckInterval();<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    boolean hasMore;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    Path path = MobUtils.getMobFamilyPath(conf, store.getTableName(), store.getColumnFamilyName());<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    byte[] fileName = null;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    StoreFile.Writer mobFileWriter = null, delFileWriter = null;<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    long mobCells = 0, deleteMarkersCount = 0;<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    Tag tableNameTag = new ArrayBackedTag(TagType.MOB_TABLE_NAME_TAG_TYPE,<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        store.getTableName().getName());<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    long cellsCountCompactedToMob = 0, cellsCountCompactedFromMob = 0;<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    long cellsSizeCompactedToMob = 0, cellsSizeCompactedFromMob = 0;<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    try {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      try {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        // If the mob file writer could not be created, directly write the cell to the store file.<a name="line.177"></a>
+<span class="sourceLineNo">178</span>        mobFileWriter = mobStore.createWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.178"></a>
+<span class="sourceLineNo">179</span>            store.getFamily().getCompression(), store.getRegionInfo().getStartKey());<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        fileName = Bytes.toBytes(mobFileWriter.getPath().getName());<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      } catch (IOException e) {<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        LOG.error("Failed to create mob writer, "<a name="line.182"></a>
+<span class="sourceLineNo">183</span>               + "we will continue the compaction by writing MOB cells directly in store files", e);<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      }<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      delFileWriter = mobStore.createDelFileWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.185"></a>
+<span class="sourceLineNo">186</span>          store.getFamily().getCompression(), store.getRegionInfo().getStartKey());<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      ScannerContext scannerContext =<a name="line.187"></a>
+<span class="sourceLineNo">188</span>              ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      do {<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        hasMore = compactionScanner.next(cells, scannerContext);<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        for (Cell c : cells) {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>          if (compactionScanner.isOutputDeleteMarkers() &amp;&amp; CellUtil.isDelete(c)) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>            delFileWriter.append(c);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>            deleteMarkersCount++;<a name="line.194"></a>
+<span class="sourceLineNo">195</span>          } else if (mobFileWriter == null || c.getTypeByte() != KeyValue.Type.Put.getCode()) {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>            // If the mob file writer is null or the kv type is not put, directly write the cell<a name="line.196"></a>
+<span class="sourceLineNo">197</span>            // to the store file.<a name="line.197"></a>
+<span class="sourceLineNo">198</span>            writer.append(c);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          } else if (MobUtils.isMobReferenceCell(c)) {<a name="line.199"></a>
+<span class="sourceLineNo">200</span>            if (MobUtils.hasValidMobRefCellValue(c)) {<a name="line.200"></a>
+<span class="sourceLineNo">201</span>              int size = MobUtils.getMobValueLength(c);<a name="line.201"></a>
+<span class="sourceLineNo">202</span>              if (size &gt; mobSizeThreshold) {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>                // If the value size is larger than the threshold, it's regarded as a mob. Since<a name="line.203"></a>
+<span class="sourceLineNo">204</span>                // its value is already in the mob file, directly write this cell to the store file<a name="line.204"></a>
+<span class="sourceLineNo">205</span>                writer.append(c);<a name="line.205"></a>
+<span class="sourceLineNo">206</span>              } else {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>                // If the value is not larger than the threshold, it's not regarded a mob. Retrieve<a name="line.207"></a>
+<span class="sourceLineNo">208</span>                // the mob cell from the mob file, and write it back to the store file.<a name="line.208"></a>
+<span class="sourceLineNo">209</span>                Cell mobCell = mobStore.resolve(c, false);<a name="line.209"></a>
+<span class="sourceLineNo">210</span>                if (mobCell.getValueLength() != 0) {<a name="line.210"></a>
+<span class="sourceLineNo">211</span>                  // put the mob data back to the store file<a name="line.211"></a>
+<span class="sourceLineNo">212</span>                  CellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.212"></a>
+<span class="sourceLineNo">213</span>                  writer.append(mobCell);<a name="line.213"></a>
+<span class="sourceLineNo">214</span>                  cellsCountCompactedFromMob++;<a name="line.214"></a>
+<span class="sourceLineNo">215</span>                  cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.215"></a>
+<span class="sourceLineNo">216</span>                } else {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>                  // If the value of a file is empty, there might be issues when retrieving,<a name="line.217"></a>
+<span class="sourceLineNo">218</span>                  // directly write the cell to the store file, and leave it to be handled by the<a name="line.218"></a>
+<span class="sourceLineNo">219</span>                  // next compaction.<a name="line.219"></a>
+<span class="sourceLineNo">220</span>                  writer.append(c);<a name="line.220"></a>
+<span class="sourceLineNo">221</span>                }<a name="line.221"></a>
+<span class="sourceLineNo">222</span>              }<a name="line.222"></a>
+<span class="sourceLineNo">223</span>            } else {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>              LOG.warn("The value format of the KeyValue " + c<a name="line.224"></a>
+<span class="sourceLineNo">225</span>                  + " is wrong, its length is less than " + Bytes.SIZEOF_INT);<a name="line.225"></a>
+<span class="sourceLineNo">226</span>              writer.append(c);<a name="line.226"></a>
+<span class="sourceLineNo">227</span>            }<a name="line.227"></a>
+<span class="sourceLineNo">228</span>          } else if (c.getValueLength() &lt;= mobSizeThreshold) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>            //If value size of a cell is not larger than the threshold, directly write to store file<a name="line.229"></a>
+<span class="sourceLineNo">230</span>            writer.append(c);<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          } else {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>            // If the value size of a cell is larger than the threshold, it's regarded as a mob,<a name="line.232"></a>
+<span class="sourceLineNo">233</span>            // write this cell to a mob file, and write the path to the store file.<a name="line.233"></a>
+<span class="sourceLineNo">234</span>            mobCells++;<a name="line.234"></a>
+<span class="sourceLineNo">235</span>            // append the original keyValue in the mob file.<a name="line.235"></a>
+<span class="sourceLineNo">236</span>            mobFileWriter.append(c);<a name="line.236"></a>
+<span class="sourceLineNo">237</span>            KeyValue reference = MobUtils.createMobRefKeyValue(c, fileName, tableNameTag);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>            // write the cell whose value is the path of a mob file to the store file.<a name="line.238"></a>
+<span class="sourceLineNo">239</span>            writer.append(reference);<a name="line.239"></a>
+<span class="sourceLineNo">240</span>            cellsCountCompactedToMob++;<a name="line.240"></a>
+<span class="sourceLineNo">241</span>            cellsSizeCompactedToMob += c.getValueLength();<a name="line.241"></a>
+<span class="sourceLineNo">242</span>          }<a name="line.242"></a>
+<span class="sourceLineNo">243</span>          ++progress.currentCompactedKVs;<a name="line.243"></a>
+<span class="sourceLineNo">244</span>          // check periodically to see if a system stop is requested<a name="line.244"></a>
+<span class="sourceLineNo">245</span>          if (closeCheckInterval &gt; 0) {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>            bytesWritten += KeyValueUtil.length(c);<a name="line.246"></a>
+<span class="sourceLineNo">247</span>            if (bytesWritten &gt; closeCheckInterval) {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>              bytesWritten = 0;<a name="line.248"></a>
+<span class="sourceLineNo">249</span>              if (!store.areWritesEnabled()) {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>                progress.cancel();<a name="line.250"></a>
+<span class="sourceLineNo">251</span>                return false;<a name="line.251"></a>
+<span class="sourceLineNo">252</span>              }<a name="line.252"></a>
+<span class="sourceLineNo">253</span>            }<a name="line.253"></a>
+<span class="sourceLineNo">254</span>          }<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        }<a name="line.255"></a>
+<span class="sourceLineNo">256</span>        cells.clear();<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      } while (hasMore);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    } finally {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>      if (mobFileWriter != null) {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>        mobFileWriter.appendMetadata(fd.maxSeqId, major, mobCells);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        mobFileWriter.close();<a name="line.261"></a>
+<span class="sourceLineNo">262</span>      }<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      if (delFileWriter != null) {<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        delFileWriter.appendMetadata(fd.maxSeqId, major, deleteMarkersCount);<a name="line.264"></a>
+<span class="sourceLineNo">265</span>        delFileWriter.close();<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      }<a name="line.266"></a>
+<span class="sourceLineNo">267</span>    }<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    if (mobFileWriter != null) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      if (mobCells &gt; 0) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>        // If the mob file is not empty, commit it.<a name="line.270"></a>
+<span class="sourceLineNo">271</span>        mobStore.commitFile(mobFileWriter.getPath(), path);<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      } else {<a name="line.272"></a>
+<span class="sourceLineNo">273</span>        try {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>          // If the mob file is empty, delete it instead of committing.<a name="line.274"></a>
+<span class="sourceLineNo">275</span>          store.getFileSystem().delete(mobFileWriter.getPath(), true);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>        } catch (IOException e) {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>          LOG.error("Failed to delete the temp mob file", e);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>        }<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      }<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    }<a name="line.280"></a>
+<span class="sourceLineNo">281</span>    if (delFileWriter != null) {<a name="line.281"></a>
+<span class="sourceLineNo">282</span>      if (deleteMarkersCount &gt; 0) {<a name="line.282"></a>
+<span class="sourceLineNo">283</span>        // If the del file is not empty, commit it.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>        // If the commit fails, the compaction is re-performed again.<a name="line.284"></a>
+<span class="sourceLineNo">285</span>        mobStore.commitFile(delFileWriter.getPath(), path);<a name="line.285"></a>
+<span class="sourceLineNo">286</span>      } else {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>        try {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>          // If the del file is empty, delete it instead of committing.<a name="line.288"></a>
+<span class="sourceLineNo">289</span>          store.getFileSystem().delete(delFileWriter.getPath(), true);<a name="line.289"></a>
+<span class="sourceLineNo">290</span>        } catch (IOException e) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>          LOG.error("Failed to delete the temp del file", e);<a name="line.291"></a>
+<span class="sourceLineNo">292</span>        }<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      }<a name="line.293"></a>
+<span class="sourceLineNo">294</span>    }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    mobStore.updateCellsCountCompactedFromMob(cellsCountCompactedFromMob);<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    mobStore.updateCellsCountCompactedToMob(cellsCountCompactedToMob);<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    mobStore.updateCellsSizeCompactedFromMob(cellsSizeCompactedFromMob);<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    mobStore.updateCellsSizeCompactedToMob(cellsSizeCompactedToMob);<a name="line.298"></a>
+<span class="sourceLineNo">299</span>    progress.complete();<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    return true;<a name="line.300"></a>
+<span class="sourceLineNo">301</span>  }<a name="line.301"></a>
+<span class="sourceLineNo">302</span>}<a name="line.302"></a>
 
 
 
