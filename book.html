@@ -3521,7 +3521,7 @@ Configuration that it is thought rare anyone would change can exist only in code
 <dd>
 <div class="paragraph">
 <div class="title">Description</div>
-<p>Where to store the contents of the bucketcache. One of: heap, offheap, or file. If a file, set it to file:PATH_TO_FILE. See <a href="https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/io/hfile/CacheConfig.html" class="bare">https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/io/hfile/CacheConfig.html</a> for more information.</p>
+<p>Where to store the contents of the bucketcache. One of: heap, offheap, or file. If a file, set it to file:PATH_TO_FILE. See <a href="http://hbase.apache.org/book.html#offheap.blockcache" class="bare">http://hbase.apache.org/book.html#offheap.blockcache</a> for more information.</p>
 </div>
 <div class="paragraph">
 <div class="title">Default</div>
@@ -18258,20 +18258,29 @@ to the HBase Connections in the executors
 <h2 id="_bulk_load"><a class="anchor" href="#_bulk_load"></a>83. Bulk Load</h2>
 <div class="sectionbody">
 <div class="paragraph">
-<p>Spark bulk load follows very closely to the MapReduce implementation of bulk
-load. In short, a partitioner partitions based on region splits and
-the row keys are sent to the reducers in order, so that HFiles can be written
-out. In Spark terms, the bulk load will be focused around a
-<code>repartitionAndSortWithinPartitions</code> followed by a <code>foreachPartition</code>.</p>
+<p>There are two options for bulk loading data into HBase with Spark.  There is the
+basic bulk load functionality that will work for cases where your rows have
+millions of columns and cases where your columns are not consolidated and
+partitions before the on the map side of the Spark bulk load process.</p>
 </div>
 <div class="paragraph">
-<p>The only major difference with the Spark implementation compared to the
-MapReduce implementation is that the column qualifier is included in the shuffle
-ordering process. This was done because the MapReduce bulk load implementation
-would have memory issues with loading rows with a large numbers of columns, as a
-result of the sorting of those columns being done in the memory of the reducer JVM.
-Instead, that ordering is done in the Spark Shuffle, so there should no longer
-be a limit to the number of columns in a row for bulk loading.</p>
+<p>There is also a thin record bulk load option with Spark, this second option is
+designed for tables that have less then 10k columns per row.  The advantage
+of this second option is higher throughput and less over all load on the Spark
+shuffle operation.</p>
+</div>
+<div class="paragraph">
+<p>Both implementations work more or less like the MapReduce bulk load process in
+that a partitioner partitions the rowkeys based on region splits and
+the row keys are sent to the reducers in order, so that HFiles can be written
+out directly from the reduce phase.</p>
+</div>
+<div class="paragraph">
+<p>In Spark terms, the bulk load will be implemented around a the Spark
+<code>repartitionAndSortWithinPartitions</code> followed by a Spark <code>foreachPartition</code>.</p>
+</div>
+<div class="paragraph">
+<p>First lets look at an example of using the basic bulk load functionality</p>
 </div>
 <div class="exampleblock">
 <div class="title">Example 49. Bulk Loading Example</div>
@@ -18287,6 +18296,11 @@ val config = new HBaseConfiguration()
 val hbaseContext = new HBaseContext(sc, config)
 
 val stagingFolder = ...
+val rdd = sc.parallelize(Array(
+      (Bytes.toBytes(&quot;1&quot;),
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;a&quot;), Bytes.toBytes(&quot;foo1&quot;))),
+      (Bytes.toBytes(&quot;3&quot;),
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;b&quot;), Bytes.toBytes(&quot;foo2.b&quot;))), ...
 
 rdd.hbaseBulkLoad(TableName.valueOf(tableName),
   t =&gt; {
@@ -18359,6 +18373,11 @@ val config = new HBaseConfiguration()
 val hbaseContext = new HBaseContext(sc, config)
 
 val stagingFolder = ...
+val rdd = sc.parallelize(Array(
+      (Bytes.toBytes(&quot;1&quot;),
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;a&quot;), Bytes.toBytes(&quot;foo1&quot;))),
+      (Bytes.toBytes(&quot;3&quot;),
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;b&quot;), Bytes.toBytes(&quot;foo2.b&quot;))), ...
 
 val familyHBaseWriterOptions = new java.util.HashMap[Array[Byte], FamilyHFileWriteOptions]
 val f1Options = new FamilyHFileWriteOptions(&quot;GZ&quot;, &quot;ROW&quot;, 128, &quot;PREFIX&quot;)
@@ -18387,6 +18406,59 @@ load.doBulkLoad(new Path(stagingFolder.getPath),
 </div>
 </div>
 </div>
+</div>
+<div class="paragraph">
+<p>Now lets look at how you would call the thin record bulk load implementation</p>
+</div>
+<div class="exampleblock">
+<div class="title">Example 51. Using thin record bulk load</div>
+<div class="content">
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="scala">val sc = new SparkContext(&quot;local&quot;, &quot;test&quot;)
+val config = new HBaseConfiguration()
+
+val hbaseContext = new HBaseContext(sc, config)
+
+val stagingFolder = ...
+val rdd = sc.parallelize(Array(
+      (&quot;1&quot;,
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;a&quot;), Bytes.toBytes(&quot;foo1&quot;))),
+      (&quot;3&quot;,
+        (Bytes.toBytes(columnFamily1), Bytes.toBytes(&quot;b&quot;), Bytes.toBytes(&quot;foo2.b&quot;))), ...
+
+rdd.hbaseBulkLoadThinRows(hbaseContext,
+      TableName.valueOf(tableName),
+      t =&gt; {
+        val rowKey = t._1
+
+        val familyQualifiersValues = new FamiliesQualifiersValues
+        t._2.foreach(f =&gt; {
+          val family:Array[Byte] = f._1
+          val qualifier = f._2
+          val value:Array[Byte] = f._3
+
+          familyQualifiersValues +=(family, qualifier, value)
+        })
+        (new ByteArrayWrapper(Bytes.toBytes(rowKey)), familyQualifiersValues)
+      },
+      stagingFolder.getPath,
+      new java.util.HashMap[Array[Byte], FamilyHFileWriteOptions],
+      compactionExclude = false,
+      20)
+
+val load = new LoadIncrementalHFiles(config)
+load.doBulkLoad(new Path(stagingFolder.getPath),
+  conn.getAdmin, table, conn.getRegionLocator(TableName.valueOf(tableName)))</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div class="paragraph">
+<p>Note that the big difference in using bulk load for thin rows is the function
+returns a tuple with the first value being the row key and the second value
+being an object of FamiliesQualifiersValues, which will contain all the
+values for this row for all column families.</p>
 </div>
 </div>
 </div>
@@ -18480,7 +18552,7 @@ of range checks and equal checks by sending a Filter object along with the Scan
 with information about consolidated push down predicates</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 51. SparkSQL Code Example</div>
+<div class="title">Example 52. SparkSQL Code Example</div>
 <div class="content">
 <div class="paragraph">
 <p>This example shows how we can interact with HBase with SQL.</p>
@@ -18753,7 +18825,7 @@ operation, such as starting, stopping, or performing merges, commits, or rollbac
 See
 <a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/RegionServerObserver.html">RegionServerObserver</a>.
 Consider overriding the convenience class
-<a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/BaseMasterRegionServerObserver.html">BaseMasterRegionServerObserver</a>
+<a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/BaseMasterAndRegionObserver.html">BaseMasterAndRegionObserver</a>
 which implements both <code>MasterObserver</code> and <code>RegionServerObserver</code> interfaces and
 will not break if new methods are added.</p>
 </dd>
@@ -18763,7 +18835,7 @@ will not break if new methods are added.</p>
 as table creation, deletion, or schema modification. See
 <a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/MasterObserver.html">MasterObserver</a>.
 Consider overriding the convenience class
-<a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/BaseMasterRegionServerObserver.html">BaseMasterRegionServerObserver</a>,
+<a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/coprocessor/BaseMasterAndRegionObserver.html">BaseMasterAndRegionObserver</a>,
 which implements both <code>MasterObserver</code> and <code>RegionServerObserver</code> interfaces and
 will not break if new methods are added.</p>
 </dd>
@@ -19833,7 +19905,7 @@ It is useful for tuning the IO impact of prefetching versus the time before all 
 <p>To enable prefetching on a given column family, you can use HBase Shell or use the API.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 52. Enable Prefetch Using HBase Shell</div>
+<div class="title">Example 53. Enable Prefetch Using HBase Shell</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -19843,7 +19915,7 @@ It is useful for tuning the IO impact of prefetching versus the time before all 
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 53. Enable Prefetch Using the API</div>
+<div class="title">Example 54. Enable Prefetch Using the API</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -20568,7 +20640,7 @@ If this is set to 0 (the default), hedged reads are disabled.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 54. Hedged Reads Configuration Example</div>
+<div class="title">Example 55. Hedged Reads Configuration Example</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -23035,7 +23107,7 @@ try to put data to these regions to check the write availability of each region 
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 55. Canary in a Kerberos-Enabled Cluster</div>
+<div class="title">Example 56. Canary in a Kerberos-Enabled Cluster</div>
 <div class="content">
 <div class="paragraph">
 <p>This example shows each of the properties with valid values.</p>
@@ -23886,7 +23958,7 @@ The script requires you to set some environment variables before running it.
 Examine the script and modify it to suit your needs.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 56. <em>rolling-restart.sh</em> General Usage</div>
+<div class="title">Example 57. <em>rolling-restart.sh</em> General Usage</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -25884,7 +25956,7 @@ If it&#8217;s either a new feature request, enhancement, or a bug, file a ticket
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 57. Code Blocks in Jira Comments</div>
+<div class="title">Example 58. Code Blocks in Jira Comments</div>
 <div class="content">
 <div class="paragraph">
 <p>A commonly used macro in Jira is {code}. Everything inside the tags is preformatted, as in this example.</p>
@@ -26400,7 +26472,7 @@ For now, just be aware of the difference between HBase 1.x builds and those of H
 This difference is important to the build instructions.</p>
 </div>
 <div id="maven.settings.xml" class="exampleblock">
-<div class="title">Example 58. Example <em>~/.m2/settings.xml</em> File</div>
+<div class="title">Example 59. Example <em>~/.m2/settings.xml</em> File</div>
 <div class="content">
 <div class="paragraph">
 <p>Publishing to maven requires you sign the artifacts you want to upload.
@@ -28342,7 +28414,7 @@ This is the indication that the patch was not created with <code>--no-prefix</co
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 59. Example of Committing a Patch</div>
+<div class="title">Example 60. Example of Committing a Patch</div>
 <div class="content">
 <div class="paragraph">
 <p>One thing you will notice with these examples is that there are a lot of git pull commands.
@@ -31528,7 +31600,7 @@ You do not need to re-create the table or copy data.
 If you are changing codecs, be sure the old codec is still available until all the old StoreFiles have been compacted.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 60. Enabling Compression on a ColumnFamily of an Existing Table using HBaseShell</div>
+<div class="title">Example 61. Enabling Compression on a ColumnFamily of an Existing Table using HBaseShell</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31540,7 +31612,7 @@ hbase&gt; enable 'test'</pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 61. Creating a New Table with Compression On a ColumnFamily</div>
+<div class="title">Example 62. Creating a New Table with Compression On a ColumnFamily</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31550,7 +31622,7 @@ hbase&gt; enable 'test'</pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 62. Verifying a ColumnFamily&#8217;s Compression Settings</div>
+<div class="title">Example 63. Verifying a ColumnFamily&#8217;s Compression Settings</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31575,7 +31647,7 @@ DESCRIPTION                                          ENABLED
 You must specify either <code>-write</code> or <code>-update-read</code> as your first parameter, and if you do not specify another parameter, usage advice is printed for each option.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 63. LoadTestTool Usage</div>
+<div class="title">Example 64. LoadTestTool Usage</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31635,7 +31707,7 @@ Options:
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 64. Example Usage of LoadTestTool</div>
+<div class="title">Example 65. Example Usage of LoadTestTool</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31659,7 +31731,7 @@ Disable the table before altering its DATA_BLOCK_ENCODING setting.
 Following is an example using HBase Shell:</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 65. Enable Data Block Encoding On a Table</div>
+<div class="title">Example 66. Enable Data Block Encoding On a Table</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -31677,7 +31749,7 @@ hbase&gt; enable 'test'
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 66. Verifying a ColumnFamily&#8217;s Data Block Encoding</div>
+<div class="title">Example 67. Verifying a ColumnFamily&#8217;s Data Block Encoding</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -32933,7 +33005,7 @@ The server will return cellblocks compressed using this same compressor as long 
 <div id="footer">
 <div id="footer-text">
 Version 2.0.0-SNAPSHOT<br>
-Last updated 2016-01-26 14:51:48 UTC
+Last updated 2016-01-27 14:45:17 UTC
 </div>
 </div>
 </body>
