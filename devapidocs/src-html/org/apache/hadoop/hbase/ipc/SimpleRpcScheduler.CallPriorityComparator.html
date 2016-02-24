@@ -36,203 +36,219 @@
 <span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.HConstants;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.29"></a>
 <span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.classification.InterfaceStability;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.util.BoundedPriorityBlockingQueue;<a name="line.31"></a>
-<span class="sourceLineNo">032</span><a name="line.32"></a>
-<span class="sourceLineNo">033</span>/**<a name="line.33"></a>
-<span class="sourceLineNo">034</span> * A scheduler that maintains isolated handler pools for general,<a name="line.34"></a>
-<span class="sourceLineNo">035</span> * high-priority, and replication requests.<a name="line.35"></a>
-<span class="sourceLineNo">036</span> */<a name="line.36"></a>
-<span class="sourceLineNo">037</span>@InterfaceAudience.LimitedPrivate({HBaseInterfaceAudience.COPROC, HBaseInterfaceAudience.PHOENIX})<a name="line.37"></a>
-<span class="sourceLineNo">038</span>@InterfaceStability.Evolving<a name="line.38"></a>
-<span class="sourceLineNo">039</span>public class SimpleRpcScheduler extends RpcScheduler {<a name="line.39"></a>
-<span class="sourceLineNo">040</span>  private static final Log LOG = LogFactory.getLog(SimpleRpcScheduler.class);<a name="line.40"></a>
-<span class="sourceLineNo">041</span><a name="line.41"></a>
-<span class="sourceLineNo">042</span>  public static final String CALL_QUEUE_READ_SHARE_CONF_KEY =<a name="line.42"></a>
-<span class="sourceLineNo">043</span>      "hbase.ipc.server.callqueue.read.ratio";<a name="line.43"></a>
-<span class="sourceLineNo">044</span>  public static final String CALL_QUEUE_SCAN_SHARE_CONF_KEY =<a name="line.44"></a>
-<span class="sourceLineNo">045</span>      "hbase.ipc.server.callqueue.scan.ratio";<a name="line.45"></a>
-<span class="sourceLineNo">046</span>  public static final String CALL_QUEUE_HANDLER_FACTOR_CONF_KEY =<a name="line.46"></a>
-<span class="sourceLineNo">047</span>      "hbase.ipc.server.callqueue.handler.factor";<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>  /** If set to 'deadline', uses a priority queue and deprioritize long-running scans */<a name="line.49"></a>
-<span class="sourceLineNo">050</span>  public static final String CALL_QUEUE_TYPE_CONF_KEY = "hbase.ipc.server.callqueue.type";<a name="line.50"></a>
-<span class="sourceLineNo">051</span>  public static final String CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE = "deadline";<a name="line.51"></a>
-<span class="sourceLineNo">052</span>  public static final String CALL_QUEUE_TYPE_FIFO_CONF_VALUE = "fifo";<a name="line.52"></a>
-<span class="sourceLineNo">053</span><a name="line.53"></a>
-<span class="sourceLineNo">054</span>  /** max delay in msec used to bound the deprioritized requests */<a name="line.54"></a>
-<span class="sourceLineNo">055</span>  public static final String QUEUE_MAX_CALL_DELAY_CONF_KEY<a name="line.55"></a>
-<span class="sourceLineNo">056</span>      = "hbase.ipc.server.queue.max.call.delay";<a name="line.56"></a>
-<span class="sourceLineNo">057</span><a name="line.57"></a>
-<span class="sourceLineNo">058</span>  /**<a name="line.58"></a>
-<span class="sourceLineNo">059</span>   * Comparator used by the "normal callQueue" if DEADLINE_CALL_QUEUE_CONF_KEY is set to true.<a name="line.59"></a>
-<span class="sourceLineNo">060</span>   * It uses the calculated "deadline" e.g. to deprioritize long-running job<a name="line.60"></a>
-<span class="sourceLineNo">061</span>   *<a name="line.61"></a>
-<span class="sourceLineNo">062</span>   * If multiple requests have the same deadline BoundedPriorityBlockingQueue will order them in<a name="line.62"></a>
-<span class="sourceLineNo">063</span>   * FIFO (first-in-first-out) manner.<a name="line.63"></a>
-<span class="sourceLineNo">064</span>   */<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  private static class CallPriorityComparator implements Comparator&lt;CallRunner&gt; {<a name="line.65"></a>
-<span class="sourceLineNo">066</span>    private final static int DEFAULT_MAX_CALL_DELAY = 5000;<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>    private final PriorityFunction priority;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    private final int maxDelay;<a name="line.69"></a>
-<span class="sourceLineNo">070</span><a name="line.70"></a>
-<span class="sourceLineNo">071</span>    public CallPriorityComparator(final Configuration conf, final PriorityFunction priority) {<a name="line.71"></a>
-<span class="sourceLineNo">072</span>      this.priority = priority;<a name="line.72"></a>
-<span class="sourceLineNo">073</span>      this.maxDelay = conf.getInt(QUEUE_MAX_CALL_DELAY_CONF_KEY, DEFAULT_MAX_CALL_DELAY);<a name="line.73"></a>
-<span class="sourceLineNo">074</span>    }<a name="line.74"></a>
-<span class="sourceLineNo">075</span><a name="line.75"></a>
-<span class="sourceLineNo">076</span>    @Override<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    public int compare(CallRunner a, CallRunner b) {<a name="line.77"></a>
-<span class="sourceLineNo">078</span>      RpcServer.Call callA = a.getCall();<a name="line.78"></a>
-<span class="sourceLineNo">079</span>      RpcServer.Call callB = b.getCall();<a name="line.79"></a>
-<span class="sourceLineNo">080</span>      long deadlineA = priority.getDeadline(callA.getHeader(), callA.param);<a name="line.80"></a>
-<span class="sourceLineNo">081</span>      long deadlineB = priority.getDeadline(callB.getHeader(), callB.param);<a name="line.81"></a>
-<span class="sourceLineNo">082</span>      deadlineA = callA.timestamp + Math.min(deadlineA, maxDelay);<a name="line.82"></a>
-<span class="sourceLineNo">083</span>      deadlineB = callB.timestamp + Math.min(deadlineB, maxDelay);<a name="line.83"></a>
-<span class="sourceLineNo">084</span>      return (int)(deadlineA - deadlineB);<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    }<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  }<a name="line.86"></a>
-<span class="sourceLineNo">087</span><a name="line.87"></a>
-<span class="sourceLineNo">088</span>  private int port;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private final PriorityFunction priority;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  private final RpcExecutor callExecutor;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  private final RpcExecutor priorityExecutor;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  private final RpcExecutor replicationExecutor;<a name="line.92"></a>
-<span class="sourceLineNo">093</span><a name="line.93"></a>
-<span class="sourceLineNo">094</span>  /** What level a high priority call is at. */<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  private final int highPriorityLevel;<a name="line.95"></a>
-<span class="sourceLineNo">096</span><a name="line.96"></a>
-<span class="sourceLineNo">097</span>  private Abortable abortable = null;<a name="line.97"></a>
-<span class="sourceLineNo">098</span><a name="line.98"></a>
-<span class="sourceLineNo">099</span>  /**<a name="line.99"></a>
-<span class="sourceLineNo">100</span>   * @param conf<a name="line.100"></a>
-<span class="sourceLineNo">101</span>   * @param handlerCount the number of handler threads that will be used to process calls<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   * @param priorityHandlerCount How many threads for priority handling.<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * @param replicationHandlerCount How many threads for replication handling.<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * @param highPriorityLevel<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * @param priority Function to extract request priority.<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   */<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  public SimpleRpcScheduler(<a name="line.107"></a>
-<span class="sourceLineNo">108</span>      Configuration conf,<a name="line.108"></a>
-<span class="sourceLineNo">109</span>      int handlerCount,<a name="line.109"></a>
-<span class="sourceLineNo">110</span>      int priorityHandlerCount,<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      int replicationHandlerCount,<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      PriorityFunction priority,<a name="line.112"></a>
-<span class="sourceLineNo">113</span>      Abortable server,<a name="line.113"></a>
-<span class="sourceLineNo">114</span>      int highPriorityLevel) {<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    int maxQueueLength = conf.getInt("hbase.ipc.server.max.callqueue.length",<a name="line.115"></a>
-<span class="sourceLineNo">116</span>        handlerCount * RpcServer.DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    this.priority = priority;<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    this.highPriorityLevel = highPriorityLevel;<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    this.abortable = server;<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>    String callQueueType = conf.get(CALL_QUEUE_TYPE_CONF_KEY, CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE);<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    float callqReadShare = conf.getFloat(CALL_QUEUE_READ_SHARE_CONF_KEY, 0);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    float callqScanShare = conf.getFloat(CALL_QUEUE_SCAN_SHARE_CONF_KEY, 0);<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>    float callQueuesHandlersFactor = conf.getFloat(CALL_QUEUE_HANDLER_FACTOR_CONF_KEY, 0);<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    int numCallQueues = Math.max(1, (int)Math.round(handlerCount * callQueuesHandlersFactor));<a name="line.126"></a>
-<span class="sourceLineNo">127</span><a name="line.127"></a>
-<span class="sourceLineNo">128</span>    LOG.info("Using " + callQueueType + " as user call queue, count=" + numCallQueues);<a name="line.128"></a>
-<span class="sourceLineNo">129</span><a name="line.129"></a>
-<span class="sourceLineNo">130</span>    if (numCallQueues &gt; 1 &amp;&amp; callqReadShare &gt; 0) {<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      // multiple read/write queues<a name="line.131"></a>
-<span class="sourceLineNo">132</span>      if (callQueueType.equals(CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE)) {<a name="line.132"></a>
-<span class="sourceLineNo">133</span>        CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);<a name="line.133"></a>
-<span class="sourceLineNo">134</span>        callExecutor = new RWQueueRpcExecutor("RW.default", handlerCount, numCallQueues,<a name="line.134"></a>
-<span class="sourceLineNo">135</span>            callqReadShare, callqScanShare, maxQueueLength, conf, abortable,<a name="line.135"></a>
-<span class="sourceLineNo">136</span>            BoundedPriorityBlockingQueue.class, callPriority);<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      } else {<a name="line.137"></a>
-<span class="sourceLineNo">138</span>        callExecutor = new RWQueueRpcExecutor("RW.default", handlerCount, numCallQueues,<a name="line.138"></a>
-<span class="sourceLineNo">139</span>          callqReadShare, callqScanShare, maxQueueLength, conf, abortable);<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      }<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    } else {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      // multiple queues<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      if (callQueueType.equals(CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE)) {<a name="line.143"></a>
-<span class="sourceLineNo">144</span>        CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        callExecutor = new BalancedQueueRpcExecutor("B.default", handlerCount, numCallQueues,<a name="line.145"></a>
-<span class="sourceLineNo">146</span>          conf, abortable, BoundedPriorityBlockingQueue.class, maxQueueLength, callPriority);<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      } else {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>        callExecutor = new BalancedQueueRpcExecutor("B.default", handlerCount,<a name="line.148"></a>
-<span class="sourceLineNo">149</span>            numCallQueues, maxQueueLength, conf, abortable);<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      }<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    }<a name="line.151"></a>
-<span class="sourceLineNo">152</span><a name="line.152"></a>
-<span class="sourceLineNo">153</span>    // Create 2 queues to help priorityExecutor be more scalable.<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    this.priorityExecutor = priorityHandlerCount &gt; 0 ?<a name="line.154"></a>
-<span class="sourceLineNo">155</span>        new BalancedQueueRpcExecutor("Priority", priorityHandlerCount, 2, maxQueueLength) : null;<a name="line.155"></a>
-<span class="sourceLineNo">156</span><a name="line.156"></a>
-<span class="sourceLineNo">157</span>   this.replicationExecutor =<a name="line.157"></a>
-<span class="sourceLineNo">158</span>     replicationHandlerCount &gt; 0 ? new BalancedQueueRpcExecutor("Replication",<a name="line.158"></a>
-<span class="sourceLineNo">159</span>       replicationHandlerCount, 1, maxQueueLength, conf, abortable) : null;<a name="line.159"></a>
-<span class="sourceLineNo">160</span>  }<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>  public SimpleRpcScheduler(<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        Configuration conf,<a name="line.163"></a>
-<span class="sourceLineNo">164</span>        int handlerCount,<a name="line.164"></a>
-<span class="sourceLineNo">165</span>        int priorityHandlerCount,<a name="line.165"></a>
-<span class="sourceLineNo">166</span>        int replicationHandlerCount,<a name="line.166"></a>
-<span class="sourceLineNo">167</span>        PriorityFunction priority,<a name="line.167"></a>
-<span class="sourceLineNo">168</span>        int highPriorityLevel) {<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    this(conf, handlerCount, priorityHandlerCount, replicationHandlerCount, priority,<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      null, highPriorityLevel);<a name="line.170"></a>
-<span class="sourceLineNo">171</span>  }<a name="line.171"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.conf.ConfigurationObserver;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.util.BoundedPriorityBlockingQueue;<a name="line.32"></a>
+<span class="sourceLineNo">033</span><a name="line.33"></a>
+<span class="sourceLineNo">034</span>/**<a name="line.34"></a>
+<span class="sourceLineNo">035</span> * A scheduler that maintains isolated handler pools for general,<a name="line.35"></a>
+<span class="sourceLineNo">036</span> * high-priority, and replication requests.<a name="line.36"></a>
+<span class="sourceLineNo">037</span> */<a name="line.37"></a>
+<span class="sourceLineNo">038</span>@InterfaceAudience.LimitedPrivate({HBaseInterfaceAudience.COPROC, HBaseInterfaceAudience.PHOENIX})<a name="line.38"></a>
+<span class="sourceLineNo">039</span>@InterfaceStability.Evolving<a name="line.39"></a>
+<span class="sourceLineNo">040</span>public class SimpleRpcScheduler extends RpcScheduler implements ConfigurationObserver {<a name="line.40"></a>
+<span class="sourceLineNo">041</span>  private static final Log LOG = LogFactory.getLog(SimpleRpcScheduler.class);<a name="line.41"></a>
+<span class="sourceLineNo">042</span><a name="line.42"></a>
+<span class="sourceLineNo">043</span>  public static final String CALL_QUEUE_READ_SHARE_CONF_KEY =<a name="line.43"></a>
+<span class="sourceLineNo">044</span>      "hbase.ipc.server.callqueue.read.ratio";<a name="line.44"></a>
+<span class="sourceLineNo">045</span>  public static final String CALL_QUEUE_SCAN_SHARE_CONF_KEY =<a name="line.45"></a>
+<span class="sourceLineNo">046</span>      "hbase.ipc.server.callqueue.scan.ratio";<a name="line.46"></a>
+<span class="sourceLineNo">047</span>  public static final String CALL_QUEUE_HANDLER_FACTOR_CONF_KEY =<a name="line.47"></a>
+<span class="sourceLineNo">048</span>      "hbase.ipc.server.callqueue.handler.factor";<a name="line.48"></a>
+<span class="sourceLineNo">049</span><a name="line.49"></a>
+<span class="sourceLineNo">050</span>  /** If set to 'deadline', uses a priority queue and deprioritize long-running scans */<a name="line.50"></a>
+<span class="sourceLineNo">051</span>  public static final String CALL_QUEUE_TYPE_CONF_KEY = "hbase.ipc.server.callqueue.type";<a name="line.51"></a>
+<span class="sourceLineNo">052</span>  public static final String CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE = "deadline";<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  public static final String CALL_QUEUE_TYPE_FIFO_CONF_VALUE = "fifo";<a name="line.53"></a>
+<span class="sourceLineNo">054</span><a name="line.54"></a>
+<span class="sourceLineNo">055</span>  /** max delay in msec used to bound the deprioritized requests */<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  public static final String QUEUE_MAX_CALL_DELAY_CONF_KEY<a name="line.56"></a>
+<span class="sourceLineNo">057</span>      = "hbase.ipc.server.queue.max.call.delay";<a name="line.57"></a>
+<span class="sourceLineNo">058</span><a name="line.58"></a>
+<span class="sourceLineNo">059</span>  /**<a name="line.59"></a>
+<span class="sourceLineNo">060</span>   * Resize call queues;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>   * @param conf new configuration<a name="line.61"></a>
+<span class="sourceLineNo">062</span>   */<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  @Override<a name="line.63"></a>
+<span class="sourceLineNo">064</span>  public void onConfigurationChange(Configuration conf) {<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    callExecutor.resizeQueues(conf);<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    if (priorityExecutor != null) {<a name="line.66"></a>
+<span class="sourceLineNo">067</span>      priorityExecutor.resizeQueues(conf);<a name="line.67"></a>
+<span class="sourceLineNo">068</span>    }<a name="line.68"></a>
+<span class="sourceLineNo">069</span>    if (replicationExecutor != null) {<a name="line.69"></a>
+<span class="sourceLineNo">070</span>      replicationExecutor.resizeQueues(conf);<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    }<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  }<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  /**<a name="line.74"></a>
+<span class="sourceLineNo">075</span>   * Comparator used by the "normal callQueue" if DEADLINE_CALL_QUEUE_CONF_KEY is set to true.<a name="line.75"></a>
+<span class="sourceLineNo">076</span>   * It uses the calculated "deadline" e.g. to deprioritize long-running job<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   *<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   * If multiple requests have the same deadline BoundedPriorityBlockingQueue will order them in<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   * FIFO (first-in-first-out) manner.<a name="line.79"></a>
+<span class="sourceLineNo">080</span>   */<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  private static class CallPriorityComparator implements Comparator&lt;CallRunner&gt; {<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    private final static int DEFAULT_MAX_CALL_DELAY = 5000;<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>    private final PriorityFunction priority;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    private final int maxDelay;<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>    public CallPriorityComparator(final Configuration conf, final PriorityFunction priority) {<a name="line.87"></a>
+<span class="sourceLineNo">088</span>      this.priority = priority;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      this.maxDelay = conf.getInt(QUEUE_MAX_CALL_DELAY_CONF_KEY, DEFAULT_MAX_CALL_DELAY);<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    }<a name="line.90"></a>
+<span class="sourceLineNo">091</span><a name="line.91"></a>
+<span class="sourceLineNo">092</span>    @Override<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    public int compare(CallRunner a, CallRunner b) {<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      RpcServer.Call callA = a.getCall();<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      RpcServer.Call callB = b.getCall();<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      long deadlineA = priority.getDeadline(callA.getHeader(), callA.param);<a name="line.96"></a>
+<span class="sourceLineNo">097</span>      long deadlineB = priority.getDeadline(callB.getHeader(), callB.param);<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      deadlineA = callA.timestamp + Math.min(deadlineA, maxDelay);<a name="line.98"></a>
+<span class="sourceLineNo">099</span>      deadlineB = callB.timestamp + Math.min(deadlineB, maxDelay);<a name="line.99"></a>
+<span class="sourceLineNo">100</span>      return (int)(deadlineA - deadlineB);<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    }<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  }<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  private int port;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  private final PriorityFunction priority;<a name="line.105"></a>
+<span class="sourceLineNo">106</span>  private final RpcExecutor callExecutor;<a name="line.106"></a>
+<span class="sourceLineNo">107</span>  private final RpcExecutor priorityExecutor;<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private final RpcExecutor replicationExecutor;<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  /** What level a high priority call is at. */<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  private final int highPriorityLevel;<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private Abortable abortable = null;<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>  /**<a name="line.115"></a>
+<span class="sourceLineNo">116</span>   * @param conf<a name="line.116"></a>
+<span class="sourceLineNo">117</span>   * @param handlerCount the number of handler threads that will be used to process calls<a name="line.117"></a>
+<span class="sourceLineNo">118</span>   * @param priorityHandlerCount How many threads for priority handling.<a name="line.118"></a>
+<span class="sourceLineNo">119</span>   * @param replicationHandlerCount How many threads for replication handling.<a name="line.119"></a>
+<span class="sourceLineNo">120</span>   * @param highPriorityLevel<a name="line.120"></a>
+<span class="sourceLineNo">121</span>   * @param priority Function to extract request priority.<a name="line.121"></a>
+<span class="sourceLineNo">122</span>   */<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  public SimpleRpcScheduler(<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      Configuration conf,<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      int handlerCount,<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      int priorityHandlerCount,<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      int replicationHandlerCount,<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      PriorityFunction priority,<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      Abortable server,<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      int highPriorityLevel) {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    int maxQueueLength = conf.getInt("hbase.ipc.server.max.callqueue.length",<a name="line.131"></a>
+<span class="sourceLineNo">132</span>        handlerCount * RpcServer.DEFAULT_MAX_CALLQUEUE_LENGTH_PER_HANDLER);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    this.priority = priority;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    this.highPriorityLevel = highPriorityLevel;<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    this.abortable = server;<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>    String callQueueType = conf.get(CALL_QUEUE_TYPE_CONF_KEY, CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE);<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    float callqReadShare = conf.getFloat(CALL_QUEUE_READ_SHARE_CONF_KEY, 0);<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    float callqScanShare = conf.getFloat(CALL_QUEUE_SCAN_SHARE_CONF_KEY, 0);<a name="line.139"></a>
+<span class="sourceLineNo">140</span><a name="line.140"></a>
+<span class="sourceLineNo">141</span>    float callQueuesHandlersFactor = conf.getFloat(CALL_QUEUE_HANDLER_FACTOR_CONF_KEY, 0);<a name="line.141"></a>
+<span class="sourceLineNo">142</span>    int numCallQueues = Math.max(1, (int)Math.round(handlerCount * callQueuesHandlersFactor));<a name="line.142"></a>
+<span class="sourceLineNo">143</span><a name="line.143"></a>
+<span class="sourceLineNo">144</span>    LOG.info("Using " + callQueueType + " as user call queue, count=" + numCallQueues);<a name="line.144"></a>
+<span class="sourceLineNo">145</span><a name="line.145"></a>
+<span class="sourceLineNo">146</span>    if (numCallQueues &gt; 1 &amp;&amp; callqReadShare &gt; 0) {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>      // multiple read/write queues<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      if (callQueueType.equals(CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE)) {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);<a name="line.149"></a>
+<span class="sourceLineNo">150</span>        callExecutor = new RWQueueRpcExecutor("RW.default", handlerCount, numCallQueues,<a name="line.150"></a>
+<span class="sourceLineNo">151</span>            callqReadShare, callqScanShare, maxQueueLength, conf, abortable,<a name="line.151"></a>
+<span class="sourceLineNo">152</span>            BoundedPriorityBlockingQueue.class, callPriority);<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      } else {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>        callExecutor = new RWQueueRpcExecutor("RW.default", handlerCount, numCallQueues,<a name="line.154"></a>
+<span class="sourceLineNo">155</span>          callqReadShare, callqScanShare, maxQueueLength, conf, abortable);<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      }<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    } else {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      // multiple queues<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      if (callQueueType.equals(CALL_QUEUE_TYPE_DEADLINE_CONF_VALUE)) {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        CallPriorityComparator callPriority = new CallPriorityComparator(conf, this.priority);<a name="line.160"></a>
+<span class="sourceLineNo">161</span>        callExecutor = new BalancedQueueRpcExecutor("B.default", handlerCount, numCallQueues,<a name="line.161"></a>
+<span class="sourceLineNo">162</span>          conf, abortable, BoundedPriorityBlockingQueue.class, maxQueueLength, callPriority);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      } else {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>        callExecutor = new BalancedQueueRpcExecutor("B.default", handlerCount,<a name="line.164"></a>
+<span class="sourceLineNo">165</span>            numCallQueues, maxQueueLength, conf, abortable);<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      }<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    }<a name="line.167"></a>
+<span class="sourceLineNo">168</span><a name="line.168"></a>
+<span class="sourceLineNo">169</span>    // Create 2 queues to help priorityExecutor be more scalable.<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    this.priorityExecutor = priorityHandlerCount &gt; 0 ?<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        new BalancedQueueRpcExecutor("Priority", priorityHandlerCount, 2, maxQueueLength) : null;<a name="line.171"></a>
 <span class="sourceLineNo">172</span><a name="line.172"></a>
-<span class="sourceLineNo">173</span>  @Override<a name="line.173"></a>
-<span class="sourceLineNo">174</span>  public void init(Context context) {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    this.port = context.getListenerAddress().getPort();<a name="line.175"></a>
+<span class="sourceLineNo">173</span>   this.replicationExecutor =<a name="line.173"></a>
+<span class="sourceLineNo">174</span>     replicationHandlerCount &gt; 0 ? new BalancedQueueRpcExecutor("Replication",<a name="line.174"></a>
+<span class="sourceLineNo">175</span>       replicationHandlerCount, 1, maxQueueLength, conf, abortable) : null;<a name="line.175"></a>
 <span class="sourceLineNo">176</span>  }<a name="line.176"></a>
 <span class="sourceLineNo">177</span><a name="line.177"></a>
-<span class="sourceLineNo">178</span>  @Override<a name="line.178"></a>
-<span class="sourceLineNo">179</span>  public void start() {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    callExecutor.start(port);<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    if (priorityExecutor != null) priorityExecutor.start(port);<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    if (replicationExecutor != null) replicationExecutor.start(port);<a name="line.182"></a>
-<span class="sourceLineNo">183</span>  }<a name="line.183"></a>
-<span class="sourceLineNo">184</span><a name="line.184"></a>
-<span class="sourceLineNo">185</span>  @Override<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  public void stop() {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    callExecutor.stop();<a name="line.187"></a>
-<span class="sourceLineNo">188</span>    if (priorityExecutor != null) priorityExecutor.stop();<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    if (replicationExecutor != null) replicationExecutor.stop();<a name="line.189"></a>
-<span class="sourceLineNo">190</span>  }<a name="line.190"></a>
-<span class="sourceLineNo">191</span><a name="line.191"></a>
-<span class="sourceLineNo">192</span>  @Override<a name="line.192"></a>
-<span class="sourceLineNo">193</span>  public boolean dispatch(CallRunner callTask) throws InterruptedException {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>    RpcServer.Call call = callTask.getCall();<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    int level = priority.getPriority(call.getHeader(), call.param, call.getRequestUser());<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    if (priorityExecutor != null &amp;&amp; level &gt; highPriorityLevel) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      return priorityExecutor.dispatch(callTask);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    } else if (replicationExecutor != null &amp;&amp; level == HConstants.REPLICATION_QOS) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      return replicationExecutor.dispatch(callTask);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    } else {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      return callExecutor.dispatch(callTask);<a name="line.201"></a>
-<span class="sourceLineNo">202</span>    }<a name="line.202"></a>
-<span class="sourceLineNo">203</span>  }<a name="line.203"></a>
-<span class="sourceLineNo">204</span><a name="line.204"></a>
-<span class="sourceLineNo">205</span>  @Override<a name="line.205"></a>
-<span class="sourceLineNo">206</span>  public int getGeneralQueueLength() {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>    return callExecutor.getQueueLength();<a name="line.207"></a>
-<span class="sourceLineNo">208</span>  }<a name="line.208"></a>
-<span class="sourceLineNo">209</span><a name="line.209"></a>
-<span class="sourceLineNo">210</span>  @Override<a name="line.210"></a>
-<span class="sourceLineNo">211</span>  public int getPriorityQueueLength() {<a name="line.211"></a>
-<span class="sourceLineNo">212</span>    return priorityExecutor == null ? 0 : priorityExecutor.getQueueLength();<a name="line.212"></a>
-<span class="sourceLineNo">213</span>  }<a name="line.213"></a>
-<span class="sourceLineNo">214</span><a name="line.214"></a>
-<span class="sourceLineNo">215</span>  @Override<a name="line.215"></a>
-<span class="sourceLineNo">216</span>  public int getReplicationQueueLength() {<a name="line.216"></a>
-<span class="sourceLineNo">217</span>    return replicationExecutor == null ? 0 : replicationExecutor.getQueueLength();<a name="line.217"></a>
-<span class="sourceLineNo">218</span>  }<a name="line.218"></a>
-<span class="sourceLineNo">219</span><a name="line.219"></a>
-<span class="sourceLineNo">220</span>  @Override<a name="line.220"></a>
-<span class="sourceLineNo">221</span>  public int getActiveRpcHandlerCount() {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    return callExecutor.getActiveHandlerCount() +<a name="line.222"></a>
-<span class="sourceLineNo">223</span>           (priorityExecutor == null ? 0 : priorityExecutor.getActiveHandlerCount()) +<a name="line.223"></a>
-<span class="sourceLineNo">224</span>           (replicationExecutor == null ? 0 : replicationExecutor.getActiveHandlerCount());<a name="line.224"></a>
-<span class="sourceLineNo">225</span>  }<a name="line.225"></a>
-<span class="sourceLineNo">226</span>}<a name="line.226"></a>
-<span class="sourceLineNo">227</span><a name="line.227"></a>
+<span class="sourceLineNo">178</span>  public SimpleRpcScheduler(<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        Configuration conf,<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        int handlerCount,<a name="line.180"></a>
+<span class="sourceLineNo">181</span>        int priorityHandlerCount,<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        int replicationHandlerCount,<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        PriorityFunction priority,<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        int highPriorityLevel) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    this(conf, handlerCount, priorityHandlerCount, replicationHandlerCount, priority,<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      null, highPriorityLevel);<a name="line.186"></a>
+<span class="sourceLineNo">187</span>  }<a name="line.187"></a>
+<span class="sourceLineNo">188</span><a name="line.188"></a>
+<span class="sourceLineNo">189</span>  @Override<a name="line.189"></a>
+<span class="sourceLineNo">190</span>  public void init(Context context) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    this.port = context.getListenerAddress().getPort();<a name="line.191"></a>
+<span class="sourceLineNo">192</span>  }<a name="line.192"></a>
+<span class="sourceLineNo">193</span><a name="line.193"></a>
+<span class="sourceLineNo">194</span>  @Override<a name="line.194"></a>
+<span class="sourceLineNo">195</span>  public void start() {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    callExecutor.start(port);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    if (priorityExecutor != null) priorityExecutor.start(port);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    if (replicationExecutor != null) replicationExecutor.start(port);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>  }<a name="line.199"></a>
+<span class="sourceLineNo">200</span><a name="line.200"></a>
+<span class="sourceLineNo">201</span>  @Override<a name="line.201"></a>
+<span class="sourceLineNo">202</span>  public void stop() {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    callExecutor.stop();<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    if (priorityExecutor != null) priorityExecutor.stop();<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    if (replicationExecutor != null) replicationExecutor.stop();<a name="line.205"></a>
+<span class="sourceLineNo">206</span>  }<a name="line.206"></a>
+<span class="sourceLineNo">207</span><a name="line.207"></a>
+<span class="sourceLineNo">208</span>  @Override<a name="line.208"></a>
+<span class="sourceLineNo">209</span>  public boolean dispatch(CallRunner callTask) throws InterruptedException {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    RpcServer.Call call = callTask.getCall();<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    int level = priority.getPriority(call.getHeader(), call.param, call.getRequestUser());<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    if (priorityExecutor != null &amp;&amp; level &gt; highPriorityLevel) {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      return priorityExecutor.dispatch(callTask);<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    } else if (replicationExecutor != null &amp;&amp; level == HConstants.REPLICATION_QOS) {<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      return replicationExecutor.dispatch(callTask);<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    } else {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      return callExecutor.dispatch(callTask);<a name="line.217"></a>
+<span class="sourceLineNo">218</span>    }<a name="line.218"></a>
+<span class="sourceLineNo">219</span>  }<a name="line.219"></a>
+<span class="sourceLineNo">220</span><a name="line.220"></a>
+<span class="sourceLineNo">221</span>  @Override<a name="line.221"></a>
+<span class="sourceLineNo">222</span>  public int getGeneralQueueLength() {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    return callExecutor.getQueueLength();<a name="line.223"></a>
+<span class="sourceLineNo">224</span>  }<a name="line.224"></a>
+<span class="sourceLineNo">225</span><a name="line.225"></a>
+<span class="sourceLineNo">226</span>  @Override<a name="line.226"></a>
+<span class="sourceLineNo">227</span>  public int getPriorityQueueLength() {<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    return priorityExecutor == null ? 0 : priorityExecutor.getQueueLength();<a name="line.228"></a>
+<span class="sourceLineNo">229</span>  }<a name="line.229"></a>
+<span class="sourceLineNo">230</span><a name="line.230"></a>
+<span class="sourceLineNo">231</span>  @Override<a name="line.231"></a>
+<span class="sourceLineNo">232</span>  public int getReplicationQueueLength() {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    return replicationExecutor == null ? 0 : replicationExecutor.getQueueLength();<a name="line.233"></a>
+<span class="sourceLineNo">234</span>  }<a name="line.234"></a>
+<span class="sourceLineNo">235</span><a name="line.235"></a>
+<span class="sourceLineNo">236</span>  @Override<a name="line.236"></a>
+<span class="sourceLineNo">237</span>  public int getActiveRpcHandlerCount() {<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    return callExecutor.getActiveHandlerCount() +<a name="line.238"></a>
+<span class="sourceLineNo">239</span>           (priorityExecutor == null ? 0 : priorityExecutor.getActiveHandlerCount()) +<a name="line.239"></a>
+<span class="sourceLineNo">240</span>           (replicationExecutor == null ? 0 : replicationExecutor.getActiveHandlerCount());<a name="line.240"></a>
+<span class="sourceLineNo">241</span>  }<a name="line.241"></a>
+<span class="sourceLineNo">242</span>}<a name="line.242"></a>
+<span class="sourceLineNo">243</span><a name="line.243"></a>
 
 
 
