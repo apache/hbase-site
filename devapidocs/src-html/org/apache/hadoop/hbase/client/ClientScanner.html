@@ -30,768 +30,846 @@
 <span class="sourceLineNo">022</span>import org.apache.commons.logging.LogFactory;<a name="line.22"></a>
 <span class="sourceLineNo">023</span>import org.apache.hadoop.conf.Configuration;<a name="line.23"></a>
 <span class="sourceLineNo">024</span>import org.apache.hadoop.hbase.Cell;<a name="line.24"></a>
-<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.DoNotRetryIOException;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.HBaseConfiguration;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.HConstants;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.NotServingRegionException;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.TableName;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.UnknownScannerException;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.exceptions.OutOfOrderScannerNextException;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.ipc.RpcControllerFactory;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.protobuf.ProtobufUtil;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.protobuf.generated.MapReduceProtos;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.39"></a>
-<span class="sourceLineNo">040</span><a name="line.40"></a>
-<span class="sourceLineNo">041</span>import java.io.IOException;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import java.io.InterruptedIOException;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import java.util.ArrayList;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import java.util.Arrays;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import java.util.LinkedList;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import java.util.List;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import java.util.Queue;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import java.util.concurrent.ExecutorService;<a name="line.48"></a>
-<span class="sourceLineNo">049</span><a name="line.49"></a>
-<span class="sourceLineNo">050</span>/**<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * Implements the scanner interface for the HBase client.<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * If there are multiple regions in a table, this scanner will iterate<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * through them all.<a name="line.53"></a>
-<span class="sourceLineNo">054</span> */<a name="line.54"></a>
-<span class="sourceLineNo">055</span>@InterfaceAudience.Private<a name="line.55"></a>
-<span class="sourceLineNo">056</span>public abstract class ClientScanner extends AbstractClientScanner {<a name="line.56"></a>
-<span class="sourceLineNo">057</span>    private static final Log LOG = LogFactory.getLog(ClientScanner.class);<a name="line.57"></a>
-<span class="sourceLineNo">058</span>    // A byte array in which all elements are the max byte, and it is used to<a name="line.58"></a>
-<span class="sourceLineNo">059</span>    // construct closest front row<a name="line.59"></a>
-<span class="sourceLineNo">060</span>    static byte[] MAX_BYTE_ARRAY = Bytes.createMaxByteArray(9);<a name="line.60"></a>
-<span class="sourceLineNo">061</span>    protected Scan scan;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>    protected boolean closed = false;<a name="line.62"></a>
-<span class="sourceLineNo">063</span>    // Current region scanner is against.  Gets cleared if current region goes<a name="line.63"></a>
-<span class="sourceLineNo">064</span>    // wonky: e.g. if it splits on us.<a name="line.64"></a>
-<span class="sourceLineNo">065</span>    protected HRegionInfo currentRegion = null;<a name="line.65"></a>
-<span class="sourceLineNo">066</span>    protected ScannerCallableWithReplicas callable = null;<a name="line.66"></a>
-<span class="sourceLineNo">067</span>    protected Queue&lt;Result&gt; cache;<a name="line.67"></a>
-<span class="sourceLineNo">068</span>    /**<a name="line.68"></a>
-<span class="sourceLineNo">069</span>     * A list of partial results that have been returned from the server. This list should only<a name="line.69"></a>
-<span class="sourceLineNo">070</span>     * contain results if this scanner does not have enough partial results to form the complete<a name="line.70"></a>
-<span class="sourceLineNo">071</span>     * result.<a name="line.71"></a>
-<span class="sourceLineNo">072</span>     */<a name="line.72"></a>
-<span class="sourceLineNo">073</span>    protected final LinkedList&lt;Result&gt; partialResults = new LinkedList&lt;Result&gt;();<a name="line.73"></a>
-<span class="sourceLineNo">074</span>    /**<a name="line.74"></a>
-<span class="sourceLineNo">075</span>     * The row for which we are accumulating partial Results (i.e. the row of the Results stored<a name="line.75"></a>
-<span class="sourceLineNo">076</span>     * inside partialResults). Changes to partialResultsRow and partialResults are kept in sync<a name="line.76"></a>
-<span class="sourceLineNo">077</span>     * via the methods {@link #addToPartialResults(Result)} and {@link #clearPartialResults()}<a name="line.77"></a>
-<span class="sourceLineNo">078</span>     */<a name="line.78"></a>
-<span class="sourceLineNo">079</span>    protected byte[] partialResultsRow = null;<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    protected final int caching;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    protected long lastNext;<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    // Keep lastResult returned successfully in case we have to reset scanner.<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    protected Result lastResult = null;<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    protected final long maxScannerResultSize;<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    private final ClusterConnection connection;<a name="line.85"></a>
-<span class="sourceLineNo">086</span>    private final TableName tableName;<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    protected final int scannerTimeout;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    protected boolean scanMetricsPublished = false;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    protected RpcRetryingCaller&lt;Result []&gt; caller;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    protected RpcControllerFactory rpcControllerFactory;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    protected Configuration conf;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    //The timeout on the primary. Applicable if there are multiple replicas for a region<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    //In that case, we will only wait for this much timeout on the primary before going<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    //to the replicas and trying the same scan. Note that the retries will still happen<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    //on each replica and the first successful results will be taken. A timeout of 0 is<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    //disallowed.<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    protected final int primaryOperationTimeout;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    private int retries;<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    protected final ExecutorService pool;<a name="line.99"></a>
-<span class="sourceLineNo">100</span><a name="line.100"></a>
-<span class="sourceLineNo">101</span>  /**<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   * Create a new ClientScanner for the specified table Note that the passed {@link Scan}'s start<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * row maybe changed changed.<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * @param conf The {@link Configuration} to use.<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * @param scan {@link Scan} to use in this scanner<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   * @param tableName The table that we wish to scan<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * @param connection Connection identifying the cluster<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   * @throws IOException<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   */<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  public ClientScanner(final Configuration conf, final Scan scan, final TableName tableName,<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      ClusterConnection connection, RpcRetryingCallerFactory rpcFactory,<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      RpcControllerFactory controllerFactory, ExecutorService pool, int primaryOperationTimeout)<a name="line.112"></a>
-<span class="sourceLineNo">113</span>      throws IOException {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>      if (LOG.isTraceEnabled()) {<a name="line.114"></a>
-<span class="sourceLineNo">115</span>        LOG.trace("Scan table=" + tableName<a name="line.115"></a>
-<span class="sourceLineNo">116</span>            + ", startRow=" + Bytes.toStringBinary(scan.getStartRow()));<a name="line.116"></a>
-<span class="sourceLineNo">117</span>      }<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      this.scan = scan;<a name="line.118"></a>
-<span class="sourceLineNo">119</span>      this.tableName = tableName;<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      this.lastNext = System.currentTimeMillis();<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      this.connection = connection;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      this.pool = pool;<a name="line.122"></a>
-<span class="sourceLineNo">123</span>      this.primaryOperationTimeout = primaryOperationTimeout;<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      this.retries = conf.getInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,<a name="line.124"></a>
-<span class="sourceLineNo">125</span>          HConstants.DEFAULT_HBASE_CLIENT_RETRIES_NUMBER);<a name="line.125"></a>
-<span class="sourceLineNo">126</span>      if (scan.getMaxResultSize() &gt; 0) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        this.maxScannerResultSize = scan.getMaxResultSize();<a name="line.127"></a>
-<span class="sourceLineNo">128</span>      } else {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>        this.maxScannerResultSize = conf.getLong(<a name="line.129"></a>
-<span class="sourceLineNo">130</span>          HConstants.HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE_KEY,<a name="line.130"></a>
-<span class="sourceLineNo">131</span>          HConstants.DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE);<a name="line.131"></a>
-<span class="sourceLineNo">132</span>      }<a name="line.132"></a>
-<span class="sourceLineNo">133</span>      this.scannerTimeout = HBaseConfiguration.getInt(conf,<a name="line.133"></a>
-<span class="sourceLineNo">134</span>        HConstants.HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD,<a name="line.134"></a>
-<span class="sourceLineNo">135</span>        HConstants.HBASE_REGIONSERVER_LEASE_PERIOD_KEY,<a name="line.135"></a>
-<span class="sourceLineNo">136</span>        HConstants.DEFAULT_HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD);<a name="line.136"></a>
-<span class="sourceLineNo">137</span><a name="line.137"></a>
-<span class="sourceLineNo">138</span>      // check if application wants to collect scan metrics<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      initScanMetrics(scan);<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>      // Use the caching from the Scan.  If not set, use the default cache setting for this table.<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      if (this.scan.getCaching() &gt; 0) {<a name="line.142"></a>
-<span class="sourceLineNo">143</span>        this.caching = this.scan.getCaching();<a name="line.143"></a>
-<span class="sourceLineNo">144</span>      } else {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        this.caching = conf.getInt(<a name="line.145"></a>
-<span class="sourceLineNo">146</span>            HConstants.HBASE_CLIENT_SCANNER_CACHING,<a name="line.146"></a>
-<span class="sourceLineNo">147</span>            HConstants.DEFAULT_HBASE_CLIENT_SCANNER_CACHING);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      }<a name="line.148"></a>
-<span class="sourceLineNo">149</span><a name="line.149"></a>
-<span class="sourceLineNo">150</span>      this.caller = rpcFactory.&lt;Result[]&gt; newCaller();<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      this.rpcControllerFactory = controllerFactory;<a name="line.151"></a>
-<span class="sourceLineNo">152</span><a name="line.152"></a>
-<span class="sourceLineNo">153</span>      this.conf = conf;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      initCache();<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      initializeScannerInConstruction();<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
+<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.CellComparator;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.DoNotRetryIOException;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.HBaseConfiguration;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.HConstants;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.NotServingRegionException;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.TableName;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.UnknownScannerException;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.exceptions.OutOfOrderScannerNextException;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.ipc.RpcControllerFactory;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.protobuf.ProtobufUtil;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.protobuf.generated.MapReduceProtos;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.40"></a>
+<span class="sourceLineNo">041</span><a name="line.41"></a>
+<span class="sourceLineNo">042</span>import java.io.IOException;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import java.io.InterruptedIOException;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import java.util.ArrayList;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import java.util.Arrays;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import java.util.LinkedList;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import java.util.List;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import java.util.Queue;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import java.util.concurrent.ExecutorService;<a name="line.49"></a>
+<span class="sourceLineNo">050</span><a name="line.50"></a>
+<span class="sourceLineNo">051</span>/**<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * Implements the scanner interface for the HBase client.<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * If there are multiple regions in a table, this scanner will iterate<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * through them all.<a name="line.54"></a>
+<span class="sourceLineNo">055</span> */<a name="line.55"></a>
+<span class="sourceLineNo">056</span>@InterfaceAudience.Private<a name="line.56"></a>
+<span class="sourceLineNo">057</span>public abstract class ClientScanner extends AbstractClientScanner {<a name="line.57"></a>
+<span class="sourceLineNo">058</span>    private static final Log LOG = LogFactory.getLog(ClientScanner.class);<a name="line.58"></a>
+<span class="sourceLineNo">059</span>    // A byte array in which all elements are the max byte, and it is used to<a name="line.59"></a>
+<span class="sourceLineNo">060</span>    // construct closest front row<a name="line.60"></a>
+<span class="sourceLineNo">061</span>    static byte[] MAX_BYTE_ARRAY = Bytes.createMaxByteArray(9);<a name="line.61"></a>
+<span class="sourceLineNo">062</span>    protected Scan scan;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>    protected boolean closed = false;<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    // Current region scanner is against.  Gets cleared if current region goes<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    // wonky: e.g. if it splits on us.<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    protected HRegionInfo currentRegion = null;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    protected ScannerCallableWithReplicas callable = null;<a name="line.67"></a>
+<span class="sourceLineNo">068</span>    protected Queue&lt;Result&gt; cache;<a name="line.68"></a>
+<span class="sourceLineNo">069</span>    /**<a name="line.69"></a>
+<span class="sourceLineNo">070</span>     * A list of partial results that have been returned from the server. This list should only<a name="line.70"></a>
+<span class="sourceLineNo">071</span>     * contain results if this scanner does not have enough partial results to form the complete<a name="line.71"></a>
+<span class="sourceLineNo">072</span>     * result.<a name="line.72"></a>
+<span class="sourceLineNo">073</span>     */<a name="line.73"></a>
+<span class="sourceLineNo">074</span>    protected final LinkedList&lt;Result&gt; partialResults = new LinkedList&lt;Result&gt;();<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    /**<a name="line.75"></a>
+<span class="sourceLineNo">076</span>     * The row for which we are accumulating partial Results (i.e. the row of the Results stored<a name="line.76"></a>
+<span class="sourceLineNo">077</span>     * inside partialResults). Changes to partialResultsRow and partialResults are kept in sync<a name="line.77"></a>
+<span class="sourceLineNo">078</span>     * via the methods {@link #addToPartialResults(Result)} and {@link #clearPartialResults()}<a name="line.78"></a>
+<span class="sourceLineNo">079</span>     */<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    protected byte[] partialResultsRow = null;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    /**<a name="line.81"></a>
+<span class="sourceLineNo">082</span>     * The last cell from a not full Row which is added to cache<a name="line.82"></a>
+<span class="sourceLineNo">083</span>     */<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    protected Cell lastCellLoadedToCache = null;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    protected final int caching;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    protected long lastNext;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    // Keep lastResult returned successfully in case we have to reset scanner.<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    protected Result lastResult = null;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    protected final long maxScannerResultSize;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    private final ClusterConnection connection;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    private final TableName tableName;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    protected final int scannerTimeout;<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    protected boolean scanMetricsPublished = false;<a name="line.93"></a>
+<span class="sourceLineNo">094</span>    protected RpcRetryingCaller&lt;Result []&gt; caller;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    protected RpcControllerFactory rpcControllerFactory;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    protected Configuration conf;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    //The timeout on the primary. Applicable if there are multiple replicas for a region<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    //In that case, we will only wait for this much timeout on the primary before going<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    //to the replicas and trying the same scan. Note that the retries will still happen<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    //on each replica and the first successful results will be taken. A timeout of 0 is<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    //disallowed.<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    protected final int primaryOperationTimeout;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    private int retries;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    protected final ExecutorService pool;<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  /**<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   * Create a new ClientScanner for the specified table Note that the passed {@link Scan}'s start<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   * row maybe changed changed.<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   * @param conf The {@link Configuration} to use.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   * @param scan {@link Scan} to use in this scanner<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   * @param tableName The table that we wish to scan<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   * @param connection Connection identifying the cluster<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   * @throws IOException<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   */<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  public ClientScanner(final Configuration conf, final Scan scan, final TableName tableName,<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      ClusterConnection connection, RpcRetryingCallerFactory rpcFactory,<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      RpcControllerFactory controllerFactory, ExecutorService pool, int primaryOperationTimeout)<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      throws IOException {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      if (LOG.isTraceEnabled()) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>        LOG.trace("Scan table=" + tableName<a name="line.120"></a>
+<span class="sourceLineNo">121</span>            + ", startRow=" + Bytes.toStringBinary(scan.getStartRow()));<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      }<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      this.scan = scan;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      this.tableName = tableName;<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      this.lastNext = System.currentTimeMillis();<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      this.connection = connection;<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      this.pool = pool;<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      this.primaryOperationTimeout = primaryOperationTimeout;<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      this.retries = conf.getInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,<a name="line.129"></a>
+<span class="sourceLineNo">130</span>          HConstants.DEFAULT_HBASE_CLIENT_RETRIES_NUMBER);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      if (scan.getMaxResultSize() &gt; 0) {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>        this.maxScannerResultSize = scan.getMaxResultSize();<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      } else {<a name="line.133"></a>
+<span class="sourceLineNo">134</span>        this.maxScannerResultSize = conf.getLong(<a name="line.134"></a>
+<span class="sourceLineNo">135</span>          HConstants.HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE_KEY,<a name="line.135"></a>
+<span class="sourceLineNo">136</span>          HConstants.DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE);<a name="line.136"></a>
+<span class="sourceLineNo">137</span>      }<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      this.scannerTimeout = HBaseConfiguration.getInt(conf,<a name="line.138"></a>
+<span class="sourceLineNo">139</span>        HConstants.HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD,<a name="line.139"></a>
+<span class="sourceLineNo">140</span>        HConstants.HBASE_REGIONSERVER_LEASE_PERIOD_KEY,<a name="line.140"></a>
+<span class="sourceLineNo">141</span>        HConstants.DEFAULT_HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD);<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>      // check if application wants to collect scan metrics<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      initScanMetrics(scan);<a name="line.144"></a>
+<span class="sourceLineNo">145</span><a name="line.145"></a>
+<span class="sourceLineNo">146</span>      // Use the caching from the Scan.  If not set, use the default cache setting for this table.<a name="line.146"></a>
+<span class="sourceLineNo">147</span>      if (this.scan.getCaching() &gt; 0) {<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        this.caching = this.scan.getCaching();<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      } else {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>        this.caching = conf.getInt(<a name="line.150"></a>
+<span class="sourceLineNo">151</span>            HConstants.HBASE_CLIENT_SCANNER_CACHING,<a name="line.151"></a>
+<span class="sourceLineNo">152</span>            HConstants.DEFAULT_HBASE_CLIENT_SCANNER_CACHING);<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      }<a name="line.153"></a>
+<span class="sourceLineNo">154</span><a name="line.154"></a>
+<span class="sourceLineNo">155</span>      this.caller = rpcFactory.&lt;Result[]&gt; newCaller();<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      this.rpcControllerFactory = controllerFactory;<a name="line.156"></a>
 <span class="sourceLineNo">157</span><a name="line.157"></a>
-<span class="sourceLineNo">158</span>    protected abstract void initCache();<a name="line.158"></a>
-<span class="sourceLineNo">159</span><a name="line.159"></a>
-<span class="sourceLineNo">160</span>    protected void initializeScannerInConstruction() throws IOException{<a name="line.160"></a>
-<span class="sourceLineNo">161</span>      // initialize the scanner<a name="line.161"></a>
-<span class="sourceLineNo">162</span>      nextScanner(this.caching, false);<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    }<a name="line.163"></a>
+<span class="sourceLineNo">158</span>      this.conf = conf;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      initCache();<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      initializeScannerInConstruction();<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    }<a name="line.161"></a>
+<span class="sourceLineNo">162</span><a name="line.162"></a>
+<span class="sourceLineNo">163</span>    protected abstract void initCache();<a name="line.163"></a>
 <span class="sourceLineNo">164</span><a name="line.164"></a>
-<span class="sourceLineNo">165</span>    protected ClusterConnection getConnection() {<a name="line.165"></a>
-<span class="sourceLineNo">166</span>      return this.connection;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    }<a name="line.167"></a>
-<span class="sourceLineNo">168</span><a name="line.168"></a>
-<span class="sourceLineNo">169</span>    protected TableName getTable() {<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      return this.tableName;<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
-<span class="sourceLineNo">172</span><a name="line.172"></a>
-<span class="sourceLineNo">173</span>    protected int getRetries() {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      return this.retries;<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    }<a name="line.175"></a>
-<span class="sourceLineNo">176</span><a name="line.176"></a>
-<span class="sourceLineNo">177</span>    protected int getScannerTimeout() {<a name="line.177"></a>
-<span class="sourceLineNo">178</span>      return this.scannerTimeout;<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    }<a name="line.179"></a>
-<span class="sourceLineNo">180</span><a name="line.180"></a>
-<span class="sourceLineNo">181</span>    protected Configuration getConf() {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      return this.conf;<a name="line.182"></a>
-<span class="sourceLineNo">183</span>    }<a name="line.183"></a>
-<span class="sourceLineNo">184</span><a name="line.184"></a>
-<span class="sourceLineNo">185</span>    protected Scan getScan() {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>      return scan;<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    }<a name="line.187"></a>
-<span class="sourceLineNo">188</span><a name="line.188"></a>
-<span class="sourceLineNo">189</span>    protected ExecutorService getPool() {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>      return pool;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    }<a name="line.191"></a>
-<span class="sourceLineNo">192</span><a name="line.192"></a>
-<span class="sourceLineNo">193</span>    protected int getPrimaryOperationTimeout() {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      return primaryOperationTimeout;<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
-<span class="sourceLineNo">196</span><a name="line.196"></a>
-<span class="sourceLineNo">197</span>    protected int getCaching() {<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      return caching;<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
-<span class="sourceLineNo">200</span><a name="line.200"></a>
-<span class="sourceLineNo">201</span>    protected long getTimestamp() {<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      return lastNext;<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    }<a name="line.203"></a>
-<span class="sourceLineNo">204</span><a name="line.204"></a>
-<span class="sourceLineNo">205</span>    @VisibleForTesting<a name="line.205"></a>
-<span class="sourceLineNo">206</span>    protected long getMaxResultSize() {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      return maxScannerResultSize;<a name="line.207"></a>
+<span class="sourceLineNo">165</span>    protected void initializeScannerInConstruction() throws IOException{<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      // initialize the scanner<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      nextScanner(this.caching, false);<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    }<a name="line.168"></a>
+<span class="sourceLineNo">169</span><a name="line.169"></a>
+<span class="sourceLineNo">170</span>    protected ClusterConnection getConnection() {<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      return this.connection;<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
+<span class="sourceLineNo">173</span><a name="line.173"></a>
+<span class="sourceLineNo">174</span>    protected TableName getTable() {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      return this.tableName;<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    }<a name="line.176"></a>
+<span class="sourceLineNo">177</span><a name="line.177"></a>
+<span class="sourceLineNo">178</span>    protected int getRetries() {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      return this.retries;<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
+<span class="sourceLineNo">181</span><a name="line.181"></a>
+<span class="sourceLineNo">182</span>    protected int getScannerTimeout() {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      return this.scannerTimeout;<a name="line.183"></a>
+<span class="sourceLineNo">184</span>    }<a name="line.184"></a>
+<span class="sourceLineNo">185</span><a name="line.185"></a>
+<span class="sourceLineNo">186</span>    protected Configuration getConf() {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      return this.conf;<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    }<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>    protected Scan getScan() {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      return scan;<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    }<a name="line.192"></a>
+<span class="sourceLineNo">193</span><a name="line.193"></a>
+<span class="sourceLineNo">194</span>    protected ExecutorService getPool() {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>      return pool;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    }<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>    protected int getPrimaryOperationTimeout() {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      return primaryOperationTimeout;<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
+<span class="sourceLineNo">201</span><a name="line.201"></a>
+<span class="sourceLineNo">202</span>    protected int getCaching() {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      return caching;<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    }<a name="line.204"></a>
+<span class="sourceLineNo">205</span><a name="line.205"></a>
+<span class="sourceLineNo">206</span>    protected long getTimestamp() {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      return lastNext;<a name="line.207"></a>
 <span class="sourceLineNo">208</span>    }<a name="line.208"></a>
 <span class="sourceLineNo">209</span><a name="line.209"></a>
-<span class="sourceLineNo">210</span>    // returns true if the passed region endKey<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    protected boolean checkScanStopRow(final byte [] endKey) {<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      if (this.scan.getStopRow().length &gt; 0) {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>        // there is a stop row, check to see if we are past it.<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        byte [] stopRow = scan.getStopRow();<a name="line.214"></a>
-<span class="sourceLineNo">215</span>        int cmp = Bytes.compareTo(stopRow, 0, stopRow.length,<a name="line.215"></a>
-<span class="sourceLineNo">216</span>          endKey, 0, endKey.length);<a name="line.216"></a>
-<span class="sourceLineNo">217</span>        if (cmp &lt;= 0) {<a name="line.217"></a>
-<span class="sourceLineNo">218</span>          // stopRow &lt;= endKey (endKey is equals to or larger than stopRow)<a name="line.218"></a>
-<span class="sourceLineNo">219</span>          // This is a stop.<a name="line.219"></a>
-<span class="sourceLineNo">220</span>          return true;<a name="line.220"></a>
-<span class="sourceLineNo">221</span>        }<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>      return false; //unlikely.<a name="line.223"></a>
-<span class="sourceLineNo">224</span>    }<a name="line.224"></a>
-<span class="sourceLineNo">225</span><a name="line.225"></a>
-<span class="sourceLineNo">226</span>    private boolean possiblyNextScanner(int nbRows, final boolean done) throws IOException {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>      // If we have just switched replica, don't go to the next scanner yet. Rather, try<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      // the scanner operations on the new replica, from the right point in the scan<a name="line.228"></a>
-<span class="sourceLineNo">229</span>      // Note that when we switched to a different replica we left it at a point<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      // where we just did the "openScanner" with the appropriate startrow<a name="line.230"></a>
-<span class="sourceLineNo">231</span>      if (callable != null &amp;&amp; callable.switchedToADifferentReplica()) return true;<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      return nextScanner(nbRows, done);<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
-<span class="sourceLineNo">234</span><a name="line.234"></a>
-<span class="sourceLineNo">235</span>    /*<a name="line.235"></a>
-<span class="sourceLineNo">236</span>     * Gets a scanner for the next region.  If this.currentRegion != null, then<a name="line.236"></a>
-<span class="sourceLineNo">237</span>     * we will move to the endrow of this.currentRegion.  Else we will get<a name="line.237"></a>
-<span class="sourceLineNo">238</span>     * scanner at the scan.getStartRow().  We will go no further, just tidy<a name="line.238"></a>
-<span class="sourceLineNo">239</span>     * up outstanding scanners, if &lt;code&gt;currentRegion != null&lt;/code&gt; and<a name="line.239"></a>
-<span class="sourceLineNo">240</span>     * &lt;code&gt;done&lt;/code&gt; is true.<a name="line.240"></a>
-<span class="sourceLineNo">241</span>     * @param nbRows<a name="line.241"></a>
-<span class="sourceLineNo">242</span>     * @param done Server-side says we're done scanning.<a name="line.242"></a>
-<span class="sourceLineNo">243</span>     */<a name="line.243"></a>
-<span class="sourceLineNo">244</span>  protected boolean nextScanner(int nbRows, final boolean done)<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    throws IOException {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>      // Close the previous scanner if it's open<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      if (this.callable != null) {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>        this.callable.setClose();<a name="line.248"></a>
-<span class="sourceLineNo">249</span>        call(callable, caller, scannerTimeout);<a name="line.249"></a>
-<span class="sourceLineNo">250</span>        this.callable = null;<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      }<a name="line.251"></a>
-<span class="sourceLineNo">252</span><a name="line.252"></a>
-<span class="sourceLineNo">253</span>      // Where to start the next scanner<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      byte [] localStartKey;<a name="line.254"></a>
-<span class="sourceLineNo">255</span><a name="line.255"></a>
-<span class="sourceLineNo">256</span>      // if we're at end of table, close and return false to stop iterating<a name="line.256"></a>
-<span class="sourceLineNo">257</span>      if (this.currentRegion != null) {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>        byte [] endKey = this.currentRegion.getEndKey();<a name="line.258"></a>
-<span class="sourceLineNo">259</span>        if (endKey == null ||<a name="line.259"></a>
-<span class="sourceLineNo">260</span>            Bytes.equals(endKey, HConstants.EMPTY_BYTE_ARRAY) ||<a name="line.260"></a>
-<span class="sourceLineNo">261</span>            checkScanStopRow(endKey) ||<a name="line.261"></a>
-<span class="sourceLineNo">262</span>            done) {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>          close();<a name="line.263"></a>
-<span class="sourceLineNo">264</span>          if (LOG.isTraceEnabled()) {<a name="line.264"></a>
-<span class="sourceLineNo">265</span>            LOG.trace("Finished " + this.currentRegion);<a name="line.265"></a>
-<span class="sourceLineNo">266</span>          }<a name="line.266"></a>
-<span class="sourceLineNo">267</span>          return false;<a name="line.267"></a>
-<span class="sourceLineNo">268</span>        }<a name="line.268"></a>
-<span class="sourceLineNo">269</span>        localStartKey = endKey;<a name="line.269"></a>
-<span class="sourceLineNo">270</span>        if (LOG.isTraceEnabled()) {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>          LOG.trace("Finished " + this.currentRegion);<a name="line.271"></a>
-<span class="sourceLineNo">272</span>        }<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      } else {<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        localStartKey = this.scan.getStartRow();<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      }<a name="line.275"></a>
-<span class="sourceLineNo">276</span><a name="line.276"></a>
-<span class="sourceLineNo">277</span>      if (LOG.isDebugEnabled() &amp;&amp; this.currentRegion != null) {<a name="line.277"></a>
-<span class="sourceLineNo">278</span>        // Only worth logging if NOT first region in scan.<a name="line.278"></a>
-<span class="sourceLineNo">279</span>        LOG.debug("Advancing internal scanner to startKey at '" +<a name="line.279"></a>
-<span class="sourceLineNo">280</span>          Bytes.toStringBinary(localStartKey) + "'");<a name="line.280"></a>
-<span class="sourceLineNo">281</span>      }<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      try {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>        callable = getScannerCallable(localStartKey, nbRows);<a name="line.283"></a>
-<span class="sourceLineNo">284</span>        // Open a scanner on the region server starting at the<a name="line.284"></a>
-<span class="sourceLineNo">285</span>        // beginning of the region<a name="line.285"></a>
-<span class="sourceLineNo">286</span>        call(callable, caller, scannerTimeout);<a name="line.286"></a>
-<span class="sourceLineNo">287</span>        this.currentRegion = callable.getHRegionInfo();<a name="line.287"></a>
-<span class="sourceLineNo">288</span>        if (this.scanMetrics != null) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>          this.scanMetrics.countOfRegions.incrementAndGet();<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      } catch (IOException e) {<a name="line.291"></a>
-<span class="sourceLineNo">292</span>        close();<a name="line.292"></a>
-<span class="sourceLineNo">293</span>        throw e;<a name="line.293"></a>
-<span class="sourceLineNo">294</span>      }<a name="line.294"></a>
-<span class="sourceLineNo">295</span>      return true;<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    }<a name="line.296"></a>
-<span class="sourceLineNo">297</span><a name="line.297"></a>
-<span class="sourceLineNo">298</span>  @VisibleForTesting<a name="line.298"></a>
-<span class="sourceLineNo">299</span>  boolean isAnyRPCcancelled() {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    return callable.isAnyRPCcancelled();<a name="line.300"></a>
-<span class="sourceLineNo">301</span>  }<a name="line.301"></a>
+<span class="sourceLineNo">210</span>    @VisibleForTesting<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    protected long getMaxResultSize() {<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      return maxScannerResultSize;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>    }<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>    // returns true if the passed region endKey<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    protected boolean checkScanStopRow(final byte [] endKey) {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      if (this.scan.getStopRow().length &gt; 0) {<a name="line.217"></a>
+<span class="sourceLineNo">218</span>        // there is a stop row, check to see if we are past it.<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        byte [] stopRow = scan.getStopRow();<a name="line.219"></a>
+<span class="sourceLineNo">220</span>        int cmp = Bytes.compareTo(stopRow, 0, stopRow.length,<a name="line.220"></a>
+<span class="sourceLineNo">221</span>          endKey, 0, endKey.length);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>        if (cmp &lt;= 0) {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>          // stopRow &lt;= endKey (endKey is equals to or larger than stopRow)<a name="line.223"></a>
+<span class="sourceLineNo">224</span>          // This is a stop.<a name="line.224"></a>
+<span class="sourceLineNo">225</span>          return true;<a name="line.225"></a>
+<span class="sourceLineNo">226</span>        }<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      }<a name="line.227"></a>
+<span class="sourceLineNo">228</span>      return false; //unlikely.<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    }<a name="line.229"></a>
+<span class="sourceLineNo">230</span><a name="line.230"></a>
+<span class="sourceLineNo">231</span>    private boolean possiblyNextScanner(int nbRows, final boolean done) throws IOException {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      // If we have just switched replica, don't go to the next scanner yet. Rather, try<a name="line.232"></a>
+<span class="sourceLineNo">233</span>      // the scanner operations on the new replica, from the right point in the scan<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      // Note that when we switched to a different replica we left it at a point<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      // where we just did the "openScanner" with the appropriate startrow<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      if (callable != null &amp;&amp; callable.switchedToADifferentReplica()) return true;<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      return nextScanner(nbRows, done);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    }<a name="line.238"></a>
+<span class="sourceLineNo">239</span><a name="line.239"></a>
+<span class="sourceLineNo">240</span>    /*<a name="line.240"></a>
+<span class="sourceLineNo">241</span>     * Gets a scanner for the next region.  If this.currentRegion != null, then<a name="line.241"></a>
+<span class="sourceLineNo">242</span>     * we will move to the endrow of this.currentRegion.  Else we will get<a name="line.242"></a>
+<span class="sourceLineNo">243</span>     * scanner at the scan.getStartRow().  We will go no further, just tidy<a name="line.243"></a>
+<span class="sourceLineNo">244</span>     * up outstanding scanners, if &lt;code&gt;currentRegion != null&lt;/code&gt; and<a name="line.244"></a>
+<span class="sourceLineNo">245</span>     * &lt;code&gt;done&lt;/code&gt; is true.<a name="line.245"></a>
+<span class="sourceLineNo">246</span>     * @param nbRows<a name="line.246"></a>
+<span class="sourceLineNo">247</span>     * @param done Server-side says we're done scanning.<a name="line.247"></a>
+<span class="sourceLineNo">248</span>     */<a name="line.248"></a>
+<span class="sourceLineNo">249</span>  protected boolean nextScanner(int nbRows, final boolean done)<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    throws IOException {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      // Close the previous scanner if it's open<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      if (this.callable != null) {<a name="line.252"></a>
+<span class="sourceLineNo">253</span>        this.callable.setClose();<a name="line.253"></a>
+<span class="sourceLineNo">254</span>        call(callable, caller, scannerTimeout);<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        this.callable = null;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      }<a name="line.256"></a>
+<span class="sourceLineNo">257</span><a name="line.257"></a>
+<span class="sourceLineNo">258</span>      // Where to start the next scanner<a name="line.258"></a>
+<span class="sourceLineNo">259</span>      byte [] localStartKey;<a name="line.259"></a>
+<span class="sourceLineNo">260</span><a name="line.260"></a>
+<span class="sourceLineNo">261</span>      // if we're at end of table, close and return false to stop iterating<a name="line.261"></a>
+<span class="sourceLineNo">262</span>      if (this.currentRegion != null) {<a name="line.262"></a>
+<span class="sourceLineNo">263</span>        byte [] endKey = this.currentRegion.getEndKey();<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        if (endKey == null ||<a name="line.264"></a>
+<span class="sourceLineNo">265</span>            Bytes.equals(endKey, HConstants.EMPTY_BYTE_ARRAY) ||<a name="line.265"></a>
+<span class="sourceLineNo">266</span>            checkScanStopRow(endKey) ||<a name="line.266"></a>
+<span class="sourceLineNo">267</span>            done) {<a name="line.267"></a>
+<span class="sourceLineNo">268</span>          close();<a name="line.268"></a>
+<span class="sourceLineNo">269</span>          if (LOG.isTraceEnabled()) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>            LOG.trace("Finished " + this.currentRegion);<a name="line.270"></a>
+<span class="sourceLineNo">271</span>          }<a name="line.271"></a>
+<span class="sourceLineNo">272</span>          return false;<a name="line.272"></a>
+<span class="sourceLineNo">273</span>        }<a name="line.273"></a>
+<span class="sourceLineNo">274</span>        localStartKey = endKey;<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        if (LOG.isTraceEnabled()) {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>          LOG.trace("Finished " + this.currentRegion);<a name="line.276"></a>
+<span class="sourceLineNo">277</span>        }<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      } else {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>        localStartKey = this.scan.getStartRow();<a name="line.279"></a>
+<span class="sourceLineNo">280</span>      }<a name="line.280"></a>
+<span class="sourceLineNo">281</span><a name="line.281"></a>
+<span class="sourceLineNo">282</span>      if (LOG.isDebugEnabled() &amp;&amp; this.currentRegion != null) {<a name="line.282"></a>
+<span class="sourceLineNo">283</span>        // Only worth logging if NOT first region in scan.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>        LOG.debug("Advancing internal scanner to startKey at '" +<a name="line.284"></a>
+<span class="sourceLineNo">285</span>          Bytes.toStringBinary(localStartKey) + "'");<a name="line.285"></a>
+<span class="sourceLineNo">286</span>      }<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      try {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        callable = getScannerCallable(localStartKey, nbRows);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>        // Open a scanner on the region server starting at the<a name="line.289"></a>
+<span class="sourceLineNo">290</span>        // beginning of the region<a name="line.290"></a>
+<span class="sourceLineNo">291</span>        call(callable, caller, scannerTimeout);<a name="line.291"></a>
+<span class="sourceLineNo">292</span>        this.currentRegion = callable.getHRegionInfo();<a name="line.292"></a>
+<span class="sourceLineNo">293</span>        if (this.scanMetrics != null) {<a name="line.293"></a>
+<span class="sourceLineNo">294</span>          this.scanMetrics.countOfRegions.incrementAndGet();<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        }<a name="line.295"></a>
+<span class="sourceLineNo">296</span>      } catch (IOException e) {<a name="line.296"></a>
+<span class="sourceLineNo">297</span>        close();<a name="line.297"></a>
+<span class="sourceLineNo">298</span>        throw e;<a name="line.298"></a>
+<span class="sourceLineNo">299</span>      }<a name="line.299"></a>
+<span class="sourceLineNo">300</span>      return true;<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    }<a name="line.301"></a>
 <span class="sourceLineNo">302</span><a name="line.302"></a>
-<span class="sourceLineNo">303</span>  Result[] call(ScannerCallableWithReplicas callable,<a name="line.303"></a>
-<span class="sourceLineNo">304</span>      RpcRetryingCaller&lt;Result[]&gt; caller, int scannerTimeout)<a name="line.304"></a>
-<span class="sourceLineNo">305</span>      throws IOException, RuntimeException {<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    if (Thread.interrupted()) {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      throw new InterruptedIOException();<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    }<a name="line.308"></a>
-<span class="sourceLineNo">309</span>    // callWithoutRetries is at this layer. Within the ScannerCallableWithReplicas,<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    // we do a callWithRetries<a name="line.310"></a>
-<span class="sourceLineNo">311</span>    return caller.callWithoutRetries(callable, scannerTimeout);<a name="line.311"></a>
-<span class="sourceLineNo">312</span>  }<a name="line.312"></a>
-<span class="sourceLineNo">313</span><a name="line.313"></a>
-<span class="sourceLineNo">314</span>    @InterfaceAudience.Private<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    protected ScannerCallableWithReplicas getScannerCallable(byte [] localStartKey,<a name="line.315"></a>
-<span class="sourceLineNo">316</span>        int nbRows) {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>      scan.setStartRow(localStartKey);<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      ScannerCallable s =<a name="line.318"></a>
-<span class="sourceLineNo">319</span>          new ScannerCallable(getConnection(), getTable(), scan, this.scanMetrics,<a name="line.319"></a>
-<span class="sourceLineNo">320</span>              this.rpcControllerFactory);<a name="line.320"></a>
-<span class="sourceLineNo">321</span>      s.setCaching(nbRows);<a name="line.321"></a>
-<span class="sourceLineNo">322</span>      ScannerCallableWithReplicas sr = new ScannerCallableWithReplicas(tableName, getConnection(),<a name="line.322"></a>
-<span class="sourceLineNo">323</span>       s, pool, primaryOperationTimeout, scan,<a name="line.323"></a>
-<span class="sourceLineNo">324</span>       retries, scannerTimeout, caching, conf, caller);<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      return sr;<a name="line.325"></a>
-<span class="sourceLineNo">326</span>    }<a name="line.326"></a>
-<span class="sourceLineNo">327</span><a name="line.327"></a>
-<span class="sourceLineNo">328</span>    /**<a name="line.328"></a>
-<span class="sourceLineNo">329</span>     * Publish the scan metrics. For now, we use scan.setAttribute to pass the metrics back to the<a name="line.329"></a>
-<span class="sourceLineNo">330</span>     * application or TableInputFormat.Later, we could push it to other systems. We don't use<a name="line.330"></a>
-<span class="sourceLineNo">331</span>     * metrics framework because it doesn't support multi-instances of the same metrics on the same<a name="line.331"></a>
-<span class="sourceLineNo">332</span>     * machine; for scan/map reduce scenarios, we will have multiple scans running at the same time.<a name="line.332"></a>
-<span class="sourceLineNo">333</span>     *<a name="line.333"></a>
-<span class="sourceLineNo">334</span>     * By default, scan metrics are disabled; if the application wants to collect them, this<a name="line.334"></a>
-<span class="sourceLineNo">335</span>     * behavior can be turned on by calling calling {@link Scan#setScanMetricsEnabled(boolean)}<a name="line.335"></a>
-<span class="sourceLineNo">336</span>     *<a name="line.336"></a>
-<span class="sourceLineNo">337</span>     * &lt;p&gt;This invocation clears the scan metrics. Metrics are aggregated in the Scan instance.<a name="line.337"></a>
-<span class="sourceLineNo">338</span>     */<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    protected void writeScanMetrics() {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>      if (this.scanMetrics == null || scanMetricsPublished) {<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        return;<a name="line.341"></a>
-<span class="sourceLineNo">342</span>      }<a name="line.342"></a>
-<span class="sourceLineNo">343</span>      MapReduceProtos.ScanMetrics pScanMetrics = ProtobufUtil.toScanMetrics(scanMetrics);<a name="line.343"></a>
-<span class="sourceLineNo">344</span>      scan.setAttribute(Scan.SCAN_ATTRIBUTES_METRICS_DATA, pScanMetrics.toByteArray());<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      scanMetricsPublished = true;<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    }<a name="line.346"></a>
-<span class="sourceLineNo">347</span><a name="line.347"></a>
-<span class="sourceLineNo">348</span>    protected void initSyncCache() {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    cache = new LinkedList&lt;Result&gt;();<a name="line.349"></a>
-<span class="sourceLineNo">350</span>  }<a name="line.350"></a>
-<span class="sourceLineNo">351</span><a name="line.351"></a>
-<span class="sourceLineNo">352</span>    protected Result nextWithSyncCache() throws IOException {<a name="line.352"></a>
-<span class="sourceLineNo">353</span>      // If the scanner is closed and there's nothing left in the cache, next is a no-op.<a name="line.353"></a>
-<span class="sourceLineNo">354</span>      if (cache.size() == 0 &amp;&amp; this.closed) {<a name="line.354"></a>
-<span class="sourceLineNo">355</span>        return null;<a name="line.355"></a>
-<span class="sourceLineNo">356</span>      }<a name="line.356"></a>
-<span class="sourceLineNo">357</span>      if (cache.size() == 0) {<a name="line.357"></a>
-<span class="sourceLineNo">358</span>        loadCache();<a name="line.358"></a>
-<span class="sourceLineNo">359</span>      }<a name="line.359"></a>
-<span class="sourceLineNo">360</span><a name="line.360"></a>
-<span class="sourceLineNo">361</span>      if (cache.size() &gt; 0) {<a name="line.361"></a>
-<span class="sourceLineNo">362</span>        return cache.poll();<a name="line.362"></a>
-<span class="sourceLineNo">363</span>      }<a name="line.363"></a>
-<span class="sourceLineNo">364</span><a name="line.364"></a>
-<span class="sourceLineNo">365</span>      // if we exhausted this scanner before calling close, write out the scan metrics<a name="line.365"></a>
-<span class="sourceLineNo">366</span>      writeScanMetrics();<a name="line.366"></a>
-<span class="sourceLineNo">367</span>      return null;<a name="line.367"></a>
-<span class="sourceLineNo">368</span>    }<a name="line.368"></a>
+<span class="sourceLineNo">303</span>  @VisibleForTesting<a name="line.303"></a>
+<span class="sourceLineNo">304</span>  boolean isAnyRPCcancelled() {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    return callable.isAnyRPCcancelled();<a name="line.305"></a>
+<span class="sourceLineNo">306</span>  }<a name="line.306"></a>
+<span class="sourceLineNo">307</span><a name="line.307"></a>
+<span class="sourceLineNo">308</span>  Result[] call(ScannerCallableWithReplicas callable,<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      RpcRetryingCaller&lt;Result[]&gt; caller, int scannerTimeout)<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      throws IOException, RuntimeException {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    if (Thread.interrupted()) {<a name="line.311"></a>
+<span class="sourceLineNo">312</span>      throw new InterruptedIOException();<a name="line.312"></a>
+<span class="sourceLineNo">313</span>    }<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    // callWithoutRetries is at this layer. Within the ScannerCallableWithReplicas,<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    // we do a callWithRetries<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    return caller.callWithoutRetries(callable, scannerTimeout);<a name="line.316"></a>
+<span class="sourceLineNo">317</span>  }<a name="line.317"></a>
+<span class="sourceLineNo">318</span><a name="line.318"></a>
+<span class="sourceLineNo">319</span>    @InterfaceAudience.Private<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    protected ScannerCallableWithReplicas getScannerCallable(byte [] localStartKey,<a name="line.320"></a>
+<span class="sourceLineNo">321</span>        int nbRows) {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>      scan.setStartRow(localStartKey);<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      ScannerCallable s =<a name="line.323"></a>
+<span class="sourceLineNo">324</span>          new ScannerCallable(getConnection(), getTable(), scan, this.scanMetrics,<a name="line.324"></a>
+<span class="sourceLineNo">325</span>              this.rpcControllerFactory);<a name="line.325"></a>
+<span class="sourceLineNo">326</span>      s.setCaching(nbRows);<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      ScannerCallableWithReplicas sr = new ScannerCallableWithReplicas(tableName, getConnection(),<a name="line.327"></a>
+<span class="sourceLineNo">328</span>       s, pool, primaryOperationTimeout, scan,<a name="line.328"></a>
+<span class="sourceLineNo">329</span>       retries, scannerTimeout, caching, conf, caller);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      return sr;<a name="line.330"></a>
+<span class="sourceLineNo">331</span>    }<a name="line.331"></a>
+<span class="sourceLineNo">332</span><a name="line.332"></a>
+<span class="sourceLineNo">333</span>    /**<a name="line.333"></a>
+<span class="sourceLineNo">334</span>     * Publish the scan metrics. For now, we use scan.setAttribute to pass the metrics back to the<a name="line.334"></a>
+<span class="sourceLineNo">335</span>     * application or TableInputFormat.Later, we could push it to other systems. We don't use<a name="line.335"></a>
+<span class="sourceLineNo">336</span>     * metrics framework because it doesn't support multi-instances of the same metrics on the same<a name="line.336"></a>
+<span class="sourceLineNo">337</span>     * machine; for scan/map reduce scenarios, we will have multiple scans running at the same time.<a name="line.337"></a>
+<span class="sourceLineNo">338</span>     *<a name="line.338"></a>
+<span class="sourceLineNo">339</span>     * By default, scan metrics are disabled; if the application wants to collect them, this<a name="line.339"></a>
+<span class="sourceLineNo">340</span>     * behavior can be turned on by calling calling {@link Scan#setScanMetricsEnabled(boolean)}<a name="line.340"></a>
+<span class="sourceLineNo">341</span>     *<a name="line.341"></a>
+<span class="sourceLineNo">342</span>     * &lt;p&gt;This invocation clears the scan metrics. Metrics are aggregated in the Scan instance.<a name="line.342"></a>
+<span class="sourceLineNo">343</span>     */<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    protected void writeScanMetrics() {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      if (this.scanMetrics == null || scanMetricsPublished) {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        return;<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      }<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      MapReduceProtos.ScanMetrics pScanMetrics = ProtobufUtil.toScanMetrics(scanMetrics);<a name="line.348"></a>
+<span class="sourceLineNo">349</span>      scan.setAttribute(Scan.SCAN_ATTRIBUTES_METRICS_DATA, pScanMetrics.toByteArray());<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      scanMetricsPublished = true;<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    }<a name="line.351"></a>
+<span class="sourceLineNo">352</span><a name="line.352"></a>
+<span class="sourceLineNo">353</span>    protected void initSyncCache() {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>    cache = new LinkedList&lt;Result&gt;();<a name="line.354"></a>
+<span class="sourceLineNo">355</span>  }<a name="line.355"></a>
+<span class="sourceLineNo">356</span><a name="line.356"></a>
+<span class="sourceLineNo">357</span>    protected Result nextWithSyncCache() throws IOException {<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      // If the scanner is closed and there's nothing left in the cache, next is a no-op.<a name="line.358"></a>
+<span class="sourceLineNo">359</span>      if (cache.size() == 0 &amp;&amp; this.closed) {<a name="line.359"></a>
+<span class="sourceLineNo">360</span>        return null;<a name="line.360"></a>
+<span class="sourceLineNo">361</span>      }<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      if (cache.size() == 0) {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>        loadCache();<a name="line.363"></a>
+<span class="sourceLineNo">364</span>      }<a name="line.364"></a>
+<span class="sourceLineNo">365</span><a name="line.365"></a>
+<span class="sourceLineNo">366</span>      if (cache.size() &gt; 0) {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>        return cache.poll();<a name="line.367"></a>
+<span class="sourceLineNo">368</span>      }<a name="line.368"></a>
 <span class="sourceLineNo">369</span><a name="line.369"></a>
-<span class="sourceLineNo">370</span>  @VisibleForTesting<a name="line.370"></a>
-<span class="sourceLineNo">371</span>  public int getCacheSize() {<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    return cache != null ? cache.size() : 0;<a name="line.372"></a>
-<span class="sourceLineNo">373</span>  }<a name="line.373"></a>
+<span class="sourceLineNo">370</span>      // if we exhausted this scanner before calling close, write out the scan metrics<a name="line.370"></a>
+<span class="sourceLineNo">371</span>      writeScanMetrics();<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      return null;<a name="line.372"></a>
+<span class="sourceLineNo">373</span>    }<a name="line.373"></a>
 <span class="sourceLineNo">374</span><a name="line.374"></a>
-<span class="sourceLineNo">375</span>  /**<a name="line.375"></a>
-<span class="sourceLineNo">376</span>   * Contact the servers to load more {@link Result}s in the cache.<a name="line.376"></a>
-<span class="sourceLineNo">377</span>   */<a name="line.377"></a>
-<span class="sourceLineNo">378</span>  protected void loadCache() throws IOException {<a name="line.378"></a>
-<span class="sourceLineNo">379</span>    // check if scanner was closed during previous prefetch<a name="line.379"></a>
-<span class="sourceLineNo">380</span>    if (closed) return;<a name="line.380"></a>
-<span class="sourceLineNo">381</span>    Result[] values = null;<a name="line.381"></a>
-<span class="sourceLineNo">382</span>    long remainingResultSize = maxScannerResultSize;<a name="line.382"></a>
-<span class="sourceLineNo">383</span>    int countdown = this.caching;<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    // We need to reset it if it's a new callable that was created with a countdown in nextScanner<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    callable.setCaching(this.caching);<a name="line.385"></a>
-<span class="sourceLineNo">386</span>    // This flag is set when we want to skip the result returned. We do<a name="line.386"></a>
-<span class="sourceLineNo">387</span>    // this when we reset scanner because it split under us.<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    boolean retryAfterOutOfOrderException = true;<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    // We don't expect that the server will have more results for us if<a name="line.389"></a>
-<span class="sourceLineNo">390</span>    // it doesn't tell us otherwise. We rely on the size or count of results<a name="line.390"></a>
-<span class="sourceLineNo">391</span>    boolean serverHasMoreResults = false;<a name="line.391"></a>
-<span class="sourceLineNo">392</span>    do {<a name="line.392"></a>
-<span class="sourceLineNo">393</span>      try {<a name="line.393"></a>
-<span class="sourceLineNo">394</span>        // Server returns a null values if scanning is to stop. Else,<a name="line.394"></a>
-<span class="sourceLineNo">395</span>        // returns an empty array if scanning is to go on and we've just<a name="line.395"></a>
-<span class="sourceLineNo">396</span>        // exhausted current region.<a name="line.396"></a>
-<span class="sourceLineNo">397</span>        values = call(callable, caller, scannerTimeout);<a name="line.397"></a>
-<span class="sourceLineNo">398</span>        // When the replica switch happens, we need to do certain operations again.<a name="line.398"></a>
-<span class="sourceLineNo">399</span>        // The callable will openScanner with the right startkey but we need to pick up<a name="line.399"></a>
-<span class="sourceLineNo">400</span>        // from there. Bypass the rest of the loop and let the catch-up happen in the beginning<a name="line.400"></a>
-<span class="sourceLineNo">401</span>        // of the loop as it happens for the cases where we see exceptions.<a name="line.401"></a>
-<span class="sourceLineNo">402</span>        // Since only openScanner would have happened, values would be null<a name="line.402"></a>
-<span class="sourceLineNo">403</span>        if (values == null &amp;&amp; callable.switchedToADifferentReplica()) {<a name="line.403"></a>
-<span class="sourceLineNo">404</span>          // Any accumulated partial results are no longer valid since the callable will<a name="line.404"></a>
-<span class="sourceLineNo">405</span>          // openScanner with the correct startkey and we must pick up from there<a name="line.405"></a>
-<span class="sourceLineNo">406</span>          clearPartialResults();<a name="line.406"></a>
-<span class="sourceLineNo">407</span>          this.currentRegion = callable.getHRegionInfo();<a name="line.407"></a>
-<span class="sourceLineNo">408</span>          continue;<a name="line.408"></a>
-<span class="sourceLineNo">409</span>        }<a name="line.409"></a>
-<span class="sourceLineNo">410</span>        retryAfterOutOfOrderException = true;<a name="line.410"></a>
-<span class="sourceLineNo">411</span>      } catch (DoNotRetryIOException e) {<a name="line.411"></a>
-<span class="sourceLineNo">412</span>        // An exception was thrown which makes any partial results that we were collecting<a name="line.412"></a>
-<span class="sourceLineNo">413</span>        // invalid. The scanner will need to be reset to the beginning of a row.<a name="line.413"></a>
-<span class="sourceLineNo">414</span>        clearPartialResults();<a name="line.414"></a>
-<span class="sourceLineNo">415</span>        // DNRIOEs are thrown to make us break out of retries. Some types of DNRIOEs want us<a name="line.415"></a>
-<span class="sourceLineNo">416</span>        // to reset the scanner and come back in again.<a name="line.416"></a>
-<span class="sourceLineNo">417</span>        if (e instanceof UnknownScannerException) {<a name="line.417"></a>
-<span class="sourceLineNo">418</span>          long timeout = lastNext + scannerTimeout;<a name="line.418"></a>
-<span class="sourceLineNo">419</span>          // If we are over the timeout, throw this exception to the client wrapped in<a name="line.419"></a>
-<span class="sourceLineNo">420</span>          // a ScannerTimeoutException. Else, it's because the region moved and we used the old<a name="line.420"></a>
-<span class="sourceLineNo">421</span>          // id against the new region server; reset the scanner.<a name="line.421"></a>
-<span class="sourceLineNo">422</span>          if (timeout &lt; System.currentTimeMillis()) {<a name="line.422"></a>
-<span class="sourceLineNo">423</span>            LOG.info("For hints related to the following exception, please try taking a look at: "<a name="line.423"></a>
-<span class="sourceLineNo">424</span>                    + "https://hbase.apache.org/book.html#trouble.client.scantimeout");<a name="line.424"></a>
-<span class="sourceLineNo">425</span>            long elapsed = System.currentTimeMillis() - lastNext;<a name="line.425"></a>
-<span class="sourceLineNo">426</span>            ScannerTimeoutException ex =<a name="line.426"></a>
-<span class="sourceLineNo">427</span>                new ScannerTimeoutException(elapsed + "ms passed since the last invocation, "<a name="line.427"></a>
-<span class="sourceLineNo">428</span>                    + "timeout is currently set to " + scannerTimeout);<a name="line.428"></a>
-<span class="sourceLineNo">429</span>            ex.initCause(e);<a name="line.429"></a>
-<span class="sourceLineNo">430</span>            throw ex;<a name="line.430"></a>
-<span class="sourceLineNo">431</span>          }<a name="line.431"></a>
-<span class="sourceLineNo">432</span>        } else {<a name="line.432"></a>
-<span class="sourceLineNo">433</span>          // If exception is any but the list below throw it back to the client; else setup<a name="line.433"></a>
-<span class="sourceLineNo">434</span>          // the scanner and retry.<a name="line.434"></a>
-<span class="sourceLineNo">435</span>          Throwable cause = e.getCause();<a name="line.435"></a>
-<span class="sourceLineNo">436</span>          if ((cause != null &amp;&amp; cause instanceof NotServingRegionException) ||<a name="line.436"></a>
-<span class="sourceLineNo">437</span>              (cause != null &amp;&amp; cause instanceof RegionServerStoppedException) ||<a name="line.437"></a>
-<span class="sourceLineNo">438</span>              e instanceof OutOfOrderScannerNextException) {<a name="line.438"></a>
-<span class="sourceLineNo">439</span>            // Pass. It is easier writing the if loop test as list of what is allowed rather than<a name="line.439"></a>
-<span class="sourceLineNo">440</span>            // as a list of what is not allowed... so if in here, it means we do not throw.<a name="line.440"></a>
-<span class="sourceLineNo">441</span>          } else {<a name="line.441"></a>
-<span class="sourceLineNo">442</span>            throw e;<a name="line.442"></a>
-<span class="sourceLineNo">443</span>          }<a name="line.443"></a>
-<span class="sourceLineNo">444</span>        }<a name="line.444"></a>
-<span class="sourceLineNo">445</span>        // Else, its signal from depths of ScannerCallable that we need to reset the scanner.<a name="line.445"></a>
-<span class="sourceLineNo">446</span>        if (this.lastResult != null) {<a name="line.446"></a>
-<span class="sourceLineNo">447</span>          // The region has moved. We need to open a brand new scanner at the new location.<a name="line.447"></a>
-<span class="sourceLineNo">448</span>          // Reset the startRow to the row we've seen last so that the new scanner starts at<a name="line.448"></a>
-<span class="sourceLineNo">449</span>          // the correct row. Otherwise we may see previously returned rows again.<a name="line.449"></a>
-<span class="sourceLineNo">450</span>          // (ScannerCallable by now has "relocated" the correct region)<a name="line.450"></a>
-<span class="sourceLineNo">451</span>          if (scan.isReversed()) {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>            scan.setStartRow(createClosestRowBefore(lastResult.getRow()));<a name="line.452"></a>
-<span class="sourceLineNo">453</span>          } else {<a name="line.453"></a>
-<span class="sourceLineNo">454</span>            scan.setStartRow(Bytes.add(lastResult.getRow(), new byte[1]));<a name="line.454"></a>
-<span class="sourceLineNo">455</span>          }<a name="line.455"></a>
-<span class="sourceLineNo">456</span>        }<a name="line.456"></a>
-<span class="sourceLineNo">457</span>        if (e instanceof OutOfOrderScannerNextException) {<a name="line.457"></a>
-<span class="sourceLineNo">458</span>          if (retryAfterOutOfOrderException) {<a name="line.458"></a>
-<span class="sourceLineNo">459</span>            retryAfterOutOfOrderException = false;<a name="line.459"></a>
-<span class="sourceLineNo">460</span>          } else {<a name="line.460"></a>
-<span class="sourceLineNo">461</span>            // TODO: Why wrap this in a DNRIOE when it already is a DNRIOE?<a name="line.461"></a>
-<span class="sourceLineNo">462</span>            throw new DoNotRetryIOException("Failed after retry of " +<a name="line.462"></a>
-<span class="sourceLineNo">463</span>                "OutOfOrderScannerNextException: was there a rpc timeout?", e);<a name="line.463"></a>
-<span class="sourceLineNo">464</span>          }<a name="line.464"></a>
-<span class="sourceLineNo">465</span>        }<a name="line.465"></a>
-<span class="sourceLineNo">466</span>        // Clear region.<a name="line.466"></a>
-<span class="sourceLineNo">467</span>        this.currentRegion = null;<a name="line.467"></a>
-<span class="sourceLineNo">468</span>        // Set this to zero so we don't try and do an rpc and close on remote server when<a name="line.468"></a>
-<span class="sourceLineNo">469</span>        // the exception we got was UnknownScanner or the Server is going down.<a name="line.469"></a>
-<span class="sourceLineNo">470</span>        callable = null;<a name="line.470"></a>
-<span class="sourceLineNo">471</span>        // This continue will take us to while at end of loop where we will set up new scanner.<a name="line.471"></a>
-<span class="sourceLineNo">472</span>        continue;<a name="line.472"></a>
-<span class="sourceLineNo">473</span>      }<a name="line.473"></a>
-<span class="sourceLineNo">474</span>      long currentTime = System.currentTimeMillis();<a name="line.474"></a>
-<span class="sourceLineNo">475</span>      if (this.scanMetrics != null) {<a name="line.475"></a>
-<span class="sourceLineNo">476</span>        this.scanMetrics.sumOfMillisSecBetweenNexts.addAndGet(currentTime - lastNext);<a name="line.476"></a>
-<span class="sourceLineNo">477</span>      }<a name="line.477"></a>
-<span class="sourceLineNo">478</span>      lastNext = currentTime;<a name="line.478"></a>
-<span class="sourceLineNo">479</span>      // Groom the array of Results that we received back from the server before adding that<a name="line.479"></a>
-<span class="sourceLineNo">480</span>      // Results to the scanner's cache. If partial results are not allowed to be seen by the<a name="line.480"></a>
-<span class="sourceLineNo">481</span>      // caller, all book keeping will be performed within this method.<a name="line.481"></a>
-<span class="sourceLineNo">482</span>      List&lt;Result&gt; resultsToAddToCache =<a name="line.482"></a>
-<span class="sourceLineNo">483</span>          getResultsToAddToCache(values, callable.isHeartbeatMessage());<a name="line.483"></a>
-<span class="sourceLineNo">484</span>      if (!resultsToAddToCache.isEmpty()) {<a name="line.484"></a>
-<span class="sourceLineNo">485</span>        for (Result rs : resultsToAddToCache) {<a name="line.485"></a>
-<span class="sourceLineNo">486</span>          cache.add(rs);<a name="line.486"></a>
-<span class="sourceLineNo">487</span>          long estimatedHeapSizeOfResult = calcEstimatedSize(rs);<a name="line.487"></a>
-<span class="sourceLineNo">488</span>          countdown--;<a name="line.488"></a>
-<span class="sourceLineNo">489</span>          remainingResultSize -= estimatedHeapSizeOfResult;<a name="line.489"></a>
-<span class="sourceLineNo">490</span>          addEstimatedSize(estimatedHeapSizeOfResult);<a name="line.490"></a>
-<span class="sourceLineNo">491</span>          this.lastResult = rs;<a name="line.491"></a>
-<span class="sourceLineNo">492</span>        }<a name="line.492"></a>
-<span class="sourceLineNo">493</span>      }<a name="line.493"></a>
-<span class="sourceLineNo">494</span>      if (callable.isHeartbeatMessage()) {<a name="line.494"></a>
-<span class="sourceLineNo">495</span>        if (cache.size() &gt; 0) {<a name="line.495"></a>
-<span class="sourceLineNo">496</span>          // Caller of this method just wants a Result. If we see a heartbeat message, it means<a name="line.496"></a>
-<span class="sourceLineNo">497</span>          // processing of the scan is taking a long time server side. Rather than continue to<a name="line.497"></a>
-<span class="sourceLineNo">498</span>          // loop until a limit (e.g. size or caching) is reached, break out early to avoid causing<a name="line.498"></a>
-<span class="sourceLineNo">499</span>          // unnecesary delays to the caller<a name="line.499"></a>
-<span class="sourceLineNo">500</span>          if (LOG.isTraceEnabled()) {<a name="line.500"></a>
-<span class="sourceLineNo">501</span>            LOG.trace("Heartbeat message received and cache contains Results."<a name="line.501"></a>
-<span class="sourceLineNo">502</span>                    + " Breaking out of scan loop");<a name="line.502"></a>
-<span class="sourceLineNo">503</span>          }<a name="line.503"></a>
-<span class="sourceLineNo">504</span>          break;<a name="line.504"></a>
-<span class="sourceLineNo">505</span>        }<a name="line.505"></a>
-<span class="sourceLineNo">506</span>        continue;<a name="line.506"></a>
-<span class="sourceLineNo">507</span>      }<a name="line.507"></a>
-<span class="sourceLineNo">508</span><a name="line.508"></a>
-<span class="sourceLineNo">509</span>      // We expect that the server won't have more results for us when we exhaust<a name="line.509"></a>
-<span class="sourceLineNo">510</span>      // the size (bytes or count) of the results returned. If the server *does* inform us that<a name="line.510"></a>
-<span class="sourceLineNo">511</span>      // there are more results, we want to avoid possiblyNextScanner(...). Only when we actually<a name="line.511"></a>
-<span class="sourceLineNo">512</span>      // get results is the moreResults context valid.<a name="line.512"></a>
-<span class="sourceLineNo">513</span>      if (null != values &amp;&amp; values.length &gt; 0 &amp;&amp; callable.hasMoreResultsContext()) {<a name="line.513"></a>
-<span class="sourceLineNo">514</span>        // Only adhere to more server results when we don't have any partialResults<a name="line.514"></a>
-<span class="sourceLineNo">515</span>        // as it keeps the outer loop logic the same.<a name="line.515"></a>
-<span class="sourceLineNo">516</span>        serverHasMoreResults = callable.getServerHasMoreResults() &amp;&amp; partialResults.isEmpty();<a name="line.516"></a>
-<span class="sourceLineNo">517</span>      }<a name="line.517"></a>
-<span class="sourceLineNo">518</span>      // Values == null means server-side filter has determined we must STOP<a name="line.518"></a>
-<span class="sourceLineNo">519</span>      // !partialResults.isEmpty() means that we are still accumulating partial Results for a<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      // row. We should not change scanners before we receive all the partial Results for that<a name="line.520"></a>
-<span class="sourceLineNo">521</span>      // row.<a name="line.521"></a>
-<span class="sourceLineNo">522</span>    } while ((callable != null &amp;&amp; callable.isHeartbeatMessage())<a name="line.522"></a>
-<span class="sourceLineNo">523</span>        || (doneWithRegion(remainingResultSize, countdown, serverHasMoreResults)<a name="line.523"></a>
-<span class="sourceLineNo">524</span>        &amp;&amp; (!partialResults.isEmpty() || possiblyNextScanner(countdown, values == null))));<a name="line.524"></a>
-<span class="sourceLineNo">525</span>  }<a name="line.525"></a>
-<span class="sourceLineNo">526</span><a name="line.526"></a>
-<span class="sourceLineNo">527</span>  /**<a name="line.527"></a>
-<span class="sourceLineNo">528</span>   * @param remainingResultSize<a name="line.528"></a>
-<span class="sourceLineNo">529</span>   * @param remainingRows<a name="line.529"></a>
-<span class="sourceLineNo">530</span>   * @param regionHasMoreResults<a name="line.530"></a>
-<span class="sourceLineNo">531</span>   * @return true when the current region has been exhausted. When the current region has been<a name="line.531"></a>
-<span class="sourceLineNo">532</span>   *         exhausted, the region must be changed before scanning can continue<a name="line.532"></a>
-<span class="sourceLineNo">533</span>   */<a name="line.533"></a>
-<span class="sourceLineNo">534</span>  private boolean doneWithRegion(long remainingResultSize, int remainingRows,<a name="line.534"></a>
-<span class="sourceLineNo">535</span>      boolean regionHasMoreResults) {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    return remainingResultSize &gt; 0 &amp;&amp; remainingRows &gt; 0 &amp;&amp; !regionHasMoreResults;<a name="line.536"></a>
-<span class="sourceLineNo">537</span>  }<a name="line.537"></a>
-<span class="sourceLineNo">538</span><a name="line.538"></a>
-<span class="sourceLineNo">539</span>  protected long calcEstimatedSize(Result rs) {<a name="line.539"></a>
-<span class="sourceLineNo">540</span>    long estimatedHeapSizeOfResult = 0;<a name="line.540"></a>
-<span class="sourceLineNo">541</span>    // We don't make Iterator here<a name="line.541"></a>
-<span class="sourceLineNo">542</span>    for (Cell cell : rs.rawCells()) {<a name="line.542"></a>
-<span class="sourceLineNo">543</span>      estimatedHeapSizeOfResult += CellUtil.estimatedHeapSizeOf(cell);<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    }<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    return estimatedHeapSizeOfResult;<a name="line.545"></a>
-<span class="sourceLineNo">546</span>  }<a name="line.546"></a>
-<span class="sourceLineNo">547</span><a name="line.547"></a>
-<span class="sourceLineNo">548</span>  protected void addEstimatedSize(long estimatedHeapSizeOfResult) {<a name="line.548"></a>
-<span class="sourceLineNo">549</span>    return;<a name="line.549"></a>
-<span class="sourceLineNo">550</span>  }<a name="line.550"></a>
-<span class="sourceLineNo">551</span><a name="line.551"></a>
-<span class="sourceLineNo">552</span>  @VisibleForTesting<a name="line.552"></a>
-<span class="sourceLineNo">553</span>  public int getCacheCount() {<a name="line.553"></a>
-<span class="sourceLineNo">554</span>    return cache != null ? cache.size() : 0;<a name="line.554"></a>
-<span class="sourceLineNo">555</span>  }<a name="line.555"></a>
-<span class="sourceLineNo">556</span><a name="line.556"></a>
-<span class="sourceLineNo">557</span>  /**<a name="line.557"></a>
-<span class="sourceLineNo">558</span>   * This method ensures all of our book keeping regarding partial results is kept up to date. This<a name="line.558"></a>
-<span class="sourceLineNo">559</span>   * method should be called once we know that the results we received back from the RPC request do<a name="line.559"></a>
-<span class="sourceLineNo">560</span>   * not contain errors. We return a list of results that should be added to the cache. In general,<a name="line.560"></a>
-<span class="sourceLineNo">561</span>   * this list will contain all NON-partial results from the input array (unless the client has<a name="line.561"></a>
-<span class="sourceLineNo">562</span>   * specified that they are okay with receiving partial results)<a name="line.562"></a>
-<span class="sourceLineNo">563</span>   * @param resultsFromServer The array of {@link Result}s returned from the server<a name="line.563"></a>
-<span class="sourceLineNo">564</span>   * @param heartbeatMessage Flag indicating whether or not the response received from the server<a name="line.564"></a>
-<span class="sourceLineNo">565</span>   *          represented a complete response, or a heartbeat message that was sent to keep the<a name="line.565"></a>
-<span class="sourceLineNo">566</span>   *          client-server connection alive<a name="line.566"></a>
-<span class="sourceLineNo">567</span>   * @return the list of results that should be added to the cache.<a name="line.567"></a>
-<span class="sourceLineNo">568</span>   * @throws IOException<a name="line.568"></a>
-<span class="sourceLineNo">569</span>   */<a name="line.569"></a>
-<span class="sourceLineNo">570</span>  protected List&lt;Result&gt;<a name="line.570"></a>
-<span class="sourceLineNo">571</span>      getResultsToAddToCache(Result[] resultsFromServer, boolean heartbeatMessage)<a name="line.571"></a>
-<span class="sourceLineNo">572</span>          throws IOException {<a name="line.572"></a>
-<span class="sourceLineNo">573</span>    int resultSize = resultsFromServer != null ? resultsFromServer.length : 0;<a name="line.573"></a>
-<span class="sourceLineNo">574</span>    List&lt;Result&gt; resultsToAddToCache = new ArrayList&lt;Result&gt;(resultSize);<a name="line.574"></a>
-<span class="sourceLineNo">575</span><a name="line.575"></a>
-<span class="sourceLineNo">576</span>    final boolean isBatchSet = scan != null &amp;&amp; scan.getBatch() &gt; 0;<a name="line.576"></a>
-<span class="sourceLineNo">577</span>    final boolean allowPartials = scan != null &amp;&amp; scan.getAllowPartialResults();<a name="line.577"></a>
+<span class="sourceLineNo">375</span>  @VisibleForTesting<a name="line.375"></a>
+<span class="sourceLineNo">376</span>  public int getCacheSize() {<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    return cache != null ? cache.size() : 0;<a name="line.377"></a>
+<span class="sourceLineNo">378</span>  }<a name="line.378"></a>
+<span class="sourceLineNo">379</span><a name="line.379"></a>
+<span class="sourceLineNo">380</span>  /**<a name="line.380"></a>
+<span class="sourceLineNo">381</span>   * Contact the servers to load more {@link Result}s in the cache.<a name="line.381"></a>
+<span class="sourceLineNo">382</span>   */<a name="line.382"></a>
+<span class="sourceLineNo">383</span>  protected void loadCache() throws IOException {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>    // check if scanner was closed during previous prefetch<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    if (closed) return;<a name="line.385"></a>
+<span class="sourceLineNo">386</span>    Result[] values = null;<a name="line.386"></a>
+<span class="sourceLineNo">387</span>    long remainingResultSize = maxScannerResultSize;<a name="line.387"></a>
+<span class="sourceLineNo">388</span>    int countdown = this.caching;<a name="line.388"></a>
+<span class="sourceLineNo">389</span>    // We need to reset it if it's a new callable that was created with a countdown in nextScanner<a name="line.389"></a>
+<span class="sourceLineNo">390</span>    callable.setCaching(this.caching);<a name="line.390"></a>
+<span class="sourceLineNo">391</span>    // This flag is set when we want to skip the result returned. We do<a name="line.391"></a>
+<span class="sourceLineNo">392</span>    // this when we reset scanner because it split under us.<a name="line.392"></a>
+<span class="sourceLineNo">393</span>    boolean retryAfterOutOfOrderException = true;<a name="line.393"></a>
+<span class="sourceLineNo">394</span>    // We don't expect that the server will have more results for us if<a name="line.394"></a>
+<span class="sourceLineNo">395</span>    // it doesn't tell us otherwise. We rely on the size or count of results<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    boolean serverHasMoreResults = false;<a name="line.396"></a>
+<span class="sourceLineNo">397</span>    boolean allResultsSkipped = false;<a name="line.397"></a>
+<span class="sourceLineNo">398</span>    do {<a name="line.398"></a>
+<span class="sourceLineNo">399</span>      allResultsSkipped = false;<a name="line.399"></a>
+<span class="sourceLineNo">400</span>      try {<a name="line.400"></a>
+<span class="sourceLineNo">401</span>        // Server returns a null values if scanning is to stop. Else,<a name="line.401"></a>
+<span class="sourceLineNo">402</span>        // returns an empty array if scanning is to go on and we've just<a name="line.402"></a>
+<span class="sourceLineNo">403</span>        // exhausted current region.<a name="line.403"></a>
+<span class="sourceLineNo">404</span>        values = call(callable, caller, scannerTimeout);<a name="line.404"></a>
+<span class="sourceLineNo">405</span>        // When the replica switch happens, we need to do certain operations again.<a name="line.405"></a>
+<span class="sourceLineNo">406</span>        // The callable will openScanner with the right startkey but we need to pick up<a name="line.406"></a>
+<span class="sourceLineNo">407</span>        // from there. Bypass the rest of the loop and let the catch-up happen in the beginning<a name="line.407"></a>
+<span class="sourceLineNo">408</span>        // of the loop as it happens for the cases where we see exceptions.<a name="line.408"></a>
+<span class="sourceLineNo">409</span>        // Since only openScanner would have happened, values would be null<a name="line.409"></a>
+<span class="sourceLineNo">410</span>        if (values == null &amp;&amp; callable.switchedToADifferentReplica()) {<a name="line.410"></a>
+<span class="sourceLineNo">411</span>          // Any accumulated partial results are no longer valid since the callable will<a name="line.411"></a>
+<span class="sourceLineNo">412</span>          // openScanner with the correct startkey and we must pick up from there<a name="line.412"></a>
+<span class="sourceLineNo">413</span>          clearPartialResults();<a name="line.413"></a>
+<span class="sourceLineNo">414</span>          this.currentRegion = callable.getHRegionInfo();<a name="line.414"></a>
+<span class="sourceLineNo">415</span>          continue;<a name="line.415"></a>
+<span class="sourceLineNo">416</span>        }<a name="line.416"></a>
+<span class="sourceLineNo">417</span>        retryAfterOutOfOrderException = true;<a name="line.417"></a>
+<span class="sourceLineNo">418</span>      } catch (DoNotRetryIOException e) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        // An exception was thrown which makes any partial results that we were collecting<a name="line.419"></a>
+<span class="sourceLineNo">420</span>        // invalid. The scanner will need to be reset to the beginning of a row.<a name="line.420"></a>
+<span class="sourceLineNo">421</span>        clearPartialResults();<a name="line.421"></a>
+<span class="sourceLineNo">422</span>        // DNRIOEs are thrown to make us break out of retries. Some types of DNRIOEs want us<a name="line.422"></a>
+<span class="sourceLineNo">423</span>        // to reset the scanner and come back in again.<a name="line.423"></a>
+<span class="sourceLineNo">424</span>        if (e instanceof UnknownScannerException) {<a name="line.424"></a>
+<span class="sourceLineNo">425</span>          long timeout = lastNext + scannerTimeout;<a name="line.425"></a>
+<span class="sourceLineNo">426</span>          // If we are over the timeout, throw this exception to the client wrapped in<a name="line.426"></a>
+<span class="sourceLineNo">427</span>          // a ScannerTimeoutException. Else, it's because the region moved and we used the old<a name="line.427"></a>
+<span class="sourceLineNo">428</span>          // id against the new region server; reset the scanner.<a name="line.428"></a>
+<span class="sourceLineNo">429</span>          if (timeout &lt; System.currentTimeMillis()) {<a name="line.429"></a>
+<span class="sourceLineNo">430</span>            LOG.info("For hints related to the following exception, please try taking a look at: "<a name="line.430"></a>
+<span class="sourceLineNo">431</span>                    + "https://hbase.apache.org/book.html#trouble.client.scantimeout");<a name="line.431"></a>
+<span class="sourceLineNo">432</span>            long elapsed = System.currentTimeMillis() - lastNext;<a name="line.432"></a>
+<span class="sourceLineNo">433</span>            ScannerTimeoutException ex =<a name="line.433"></a>
+<span class="sourceLineNo">434</span>                new ScannerTimeoutException(elapsed + "ms passed since the last invocation, "<a name="line.434"></a>
+<span class="sourceLineNo">435</span>                    + "timeout is currently set to " + scannerTimeout);<a name="line.435"></a>
+<span class="sourceLineNo">436</span>            ex.initCause(e);<a name="line.436"></a>
+<span class="sourceLineNo">437</span>            throw ex;<a name="line.437"></a>
+<span class="sourceLineNo">438</span>          }<a name="line.438"></a>
+<span class="sourceLineNo">439</span>        } else {<a name="line.439"></a>
+<span class="sourceLineNo">440</span>          // If exception is any but the list below throw it back to the client; else setup<a name="line.440"></a>
+<span class="sourceLineNo">441</span>          // the scanner and retry.<a name="line.441"></a>
+<span class="sourceLineNo">442</span>          Throwable cause = e.getCause();<a name="line.442"></a>
+<span class="sourceLineNo">443</span>          if ((cause != null &amp;&amp; cause instanceof NotServingRegionException) ||<a name="line.443"></a>
+<span class="sourceLineNo">444</span>              (cause != null &amp;&amp; cause instanceof RegionServerStoppedException) ||<a name="line.444"></a>
+<span class="sourceLineNo">445</span>              e instanceof OutOfOrderScannerNextException) {<a name="line.445"></a>
+<span class="sourceLineNo">446</span>            // Pass. It is easier writing the if loop test as list of what is allowed rather than<a name="line.446"></a>
+<span class="sourceLineNo">447</span>            // as a list of what is not allowed... so if in here, it means we do not throw.<a name="line.447"></a>
+<span class="sourceLineNo">448</span>          } else {<a name="line.448"></a>
+<span class="sourceLineNo">449</span>            throw e;<a name="line.449"></a>
+<span class="sourceLineNo">450</span>          }<a name="line.450"></a>
+<span class="sourceLineNo">451</span>        }<a name="line.451"></a>
+<span class="sourceLineNo">452</span>        // Else, its signal from depths of ScannerCallable that we need to reset the scanner.<a name="line.452"></a>
+<span class="sourceLineNo">453</span>        if (this.lastResult != null) {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>          // The region has moved. We need to open a brand new scanner at the new location.<a name="line.454"></a>
+<span class="sourceLineNo">455</span>          // Reset the startRow to the row we've seen last so that the new scanner starts at<a name="line.455"></a>
+<span class="sourceLineNo">456</span>          // the correct row. Otherwise we may see previously returned rows again.<a name="line.456"></a>
+<span class="sourceLineNo">457</span>          // (ScannerCallable by now has "relocated" the correct region)<a name="line.457"></a>
+<span class="sourceLineNo">458</span>          if (!this.lastResult.isPartial() &amp;&amp; scan.getBatch() &lt; 0 ) {<a name="line.458"></a>
+<span class="sourceLineNo">459</span>            if (scan.isReversed()) {<a name="line.459"></a>
+<span class="sourceLineNo">460</span>              scan.setStartRow(createClosestRowBefore(lastResult.getRow()));<a name="line.460"></a>
+<span class="sourceLineNo">461</span>            } else {<a name="line.461"></a>
+<span class="sourceLineNo">462</span>              scan.setStartRow(Bytes.add(lastResult.getRow(), new byte[1]));<a name="line.462"></a>
+<span class="sourceLineNo">463</span>            }<a name="line.463"></a>
+<span class="sourceLineNo">464</span>          } else {<a name="line.464"></a>
+<span class="sourceLineNo">465</span>            // we need rescan this row because we only loaded partial row before<a name="line.465"></a>
+<span class="sourceLineNo">466</span>            scan.setStartRow(lastResult.getRow());<a name="line.466"></a>
+<span class="sourceLineNo">467</span>          }<a name="line.467"></a>
+<span class="sourceLineNo">468</span>        }<a name="line.468"></a>
+<span class="sourceLineNo">469</span>        if (e instanceof OutOfOrderScannerNextException) {<a name="line.469"></a>
+<span class="sourceLineNo">470</span>          if (retryAfterOutOfOrderException) {<a name="line.470"></a>
+<span class="sourceLineNo">471</span>            retryAfterOutOfOrderException = false;<a name="line.471"></a>
+<span class="sourceLineNo">472</span>          } else {<a name="line.472"></a>
+<span class="sourceLineNo">473</span>            // TODO: Why wrap this in a DNRIOE when it already is a DNRIOE?<a name="line.473"></a>
+<span class="sourceLineNo">474</span>            throw new DoNotRetryIOException("Failed after retry of " +<a name="line.474"></a>
+<span class="sourceLineNo">475</span>                "OutOfOrderScannerNextException: was there a rpc timeout?", e);<a name="line.475"></a>
+<span class="sourceLineNo">476</span>          }<a name="line.476"></a>
+<span class="sourceLineNo">477</span>        }<a name="line.477"></a>
+<span class="sourceLineNo">478</span>        // Clear region.<a name="line.478"></a>
+<span class="sourceLineNo">479</span>        this.currentRegion = null;<a name="line.479"></a>
+<span class="sourceLineNo">480</span>        // Set this to zero so we don't try and do an rpc and close on remote server when<a name="line.480"></a>
+<span class="sourceLineNo">481</span>        // the exception we got was UnknownScanner or the Server is going down.<a name="line.481"></a>
+<span class="sourceLineNo">482</span>        callable = null;<a name="line.482"></a>
+<span class="sourceLineNo">483</span>        // This continue will take us to while at end of loop where we will set up new scanner.<a name="line.483"></a>
+<span class="sourceLineNo">484</span>        continue;<a name="line.484"></a>
+<span class="sourceLineNo">485</span>      }<a name="line.485"></a>
+<span class="sourceLineNo">486</span>      long currentTime = System.currentTimeMillis();<a name="line.486"></a>
+<span class="sourceLineNo">487</span>      if (this.scanMetrics != null) {<a name="line.487"></a>
+<span class="sourceLineNo">488</span>        this.scanMetrics.sumOfMillisSecBetweenNexts.addAndGet(currentTime - lastNext);<a name="line.488"></a>
+<span class="sourceLineNo">489</span>      }<a name="line.489"></a>
+<span class="sourceLineNo">490</span>      lastNext = currentTime;<a name="line.490"></a>
+<span class="sourceLineNo">491</span>      // Groom the array of Results that we received back from the server before adding that<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      // Results to the scanner's cache. If partial results are not allowed to be seen by the<a name="line.492"></a>
+<span class="sourceLineNo">493</span>      // caller, all book keeping will be performed within this method.<a name="line.493"></a>
+<span class="sourceLineNo">494</span>      List&lt;Result&gt; resultsToAddToCache =<a name="line.494"></a>
+<span class="sourceLineNo">495</span>          getResultsToAddToCache(values, callable.isHeartbeatMessage());<a name="line.495"></a>
+<span class="sourceLineNo">496</span>      if (!resultsToAddToCache.isEmpty()) {<a name="line.496"></a>
+<span class="sourceLineNo">497</span>        for (Result rs : resultsToAddToCache) {<a name="line.497"></a>
+<span class="sourceLineNo">498</span>          rs = filterLoadedCell(rs);<a name="line.498"></a>
+<span class="sourceLineNo">499</span>          if (rs == null) {<a name="line.499"></a>
+<span class="sourceLineNo">500</span>            continue;<a name="line.500"></a>
+<span class="sourceLineNo">501</span>          }<a name="line.501"></a>
+<span class="sourceLineNo">502</span><a name="line.502"></a>
+<span class="sourceLineNo">503</span>          cache.add(rs);<a name="line.503"></a>
+<span class="sourceLineNo">504</span>          long estimatedHeapSizeOfResult = calcEstimatedSize(rs);<a name="line.504"></a>
+<span class="sourceLineNo">505</span>          countdown--;<a name="line.505"></a>
+<span class="sourceLineNo">506</span>          remainingResultSize -= estimatedHeapSizeOfResult;<a name="line.506"></a>
+<span class="sourceLineNo">507</span>          addEstimatedSize(estimatedHeapSizeOfResult);<a name="line.507"></a>
+<span class="sourceLineNo">508</span>          this.lastResult = rs;<a name="line.508"></a>
+<span class="sourceLineNo">509</span>          if (this.lastResult.isPartial() || scan.getBatch() &gt; 0 ) {<a name="line.509"></a>
+<span class="sourceLineNo">510</span>            updateLastCellLoadedToCache(this.lastResult);<a name="line.510"></a>
+<span class="sourceLineNo">511</span>          } else {<a name="line.511"></a>
+<span class="sourceLineNo">512</span>            this.lastCellLoadedToCache = null;<a name="line.512"></a>
+<span class="sourceLineNo">513</span>          }<a name="line.513"></a>
+<span class="sourceLineNo">514</span>        }<a name="line.514"></a>
+<span class="sourceLineNo">515</span>        if (cache.isEmpty()) {<a name="line.515"></a>
+<span class="sourceLineNo">516</span>          // all result has been seen before, we need scan more.<a name="line.516"></a>
+<span class="sourceLineNo">517</span>          allResultsSkipped = true;<a name="line.517"></a>
+<span class="sourceLineNo">518</span>          continue;<a name="line.518"></a>
+<span class="sourceLineNo">519</span>        }<a name="line.519"></a>
+<span class="sourceLineNo">520</span>      }<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      if (callable.isHeartbeatMessage()) {<a name="line.521"></a>
+<span class="sourceLineNo">522</span>        if (cache.size() &gt; 0) {<a name="line.522"></a>
+<span class="sourceLineNo">523</span>          // Caller of this method just wants a Result. If we see a heartbeat message, it means<a name="line.523"></a>
+<span class="sourceLineNo">524</span>          // processing of the scan is taking a long time server side. Rather than continue to<a name="line.524"></a>
+<span class="sourceLineNo">525</span>          // loop until a limit (e.g. size or caching) is reached, break out early to avoid causing<a name="line.525"></a>
+<span class="sourceLineNo">526</span>          // unnecesary delays to the caller<a name="line.526"></a>
+<span class="sourceLineNo">527</span>          if (LOG.isTraceEnabled()) {<a name="line.527"></a>
+<span class="sourceLineNo">528</span>            LOG.trace("Heartbeat message received and cache contains Results."<a name="line.528"></a>
+<span class="sourceLineNo">529</span>                    + " Breaking out of scan loop");<a name="line.529"></a>
+<span class="sourceLineNo">530</span>          }<a name="line.530"></a>
+<span class="sourceLineNo">531</span>          break;<a name="line.531"></a>
+<span class="sourceLineNo">532</span>        }<a name="line.532"></a>
+<span class="sourceLineNo">533</span>        continue;<a name="line.533"></a>
+<span class="sourceLineNo">534</span>      }<a name="line.534"></a>
+<span class="sourceLineNo">535</span><a name="line.535"></a>
+<span class="sourceLineNo">536</span>      // We expect that the server won't have more results for us when we exhaust<a name="line.536"></a>
+<span class="sourceLineNo">537</span>      // the size (bytes or count) of the results returned. If the server *does* inform us that<a name="line.537"></a>
+<span class="sourceLineNo">538</span>      // there are more results, we want to avoid possiblyNextScanner(...). Only when we actually<a name="line.538"></a>
+<span class="sourceLineNo">539</span>      // get results is the moreResults context valid.<a name="line.539"></a>
+<span class="sourceLineNo">540</span>      if (null != values &amp;&amp; values.length &gt; 0 &amp;&amp; callable.hasMoreResultsContext()) {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>        // Only adhere to more server results when we don't have any partialResults<a name="line.541"></a>
+<span class="sourceLineNo">542</span>        // as it keeps the outer loop logic the same.<a name="line.542"></a>
+<span class="sourceLineNo">543</span>        serverHasMoreResults = callable.getServerHasMoreResults() &amp;&amp; partialResults.isEmpty();<a name="line.543"></a>
+<span class="sourceLineNo">544</span>      }<a name="line.544"></a>
+<span class="sourceLineNo">545</span>      // Values == null means server-side filter has determined we must STOP<a name="line.545"></a>
+<span class="sourceLineNo">546</span>      // !partialResults.isEmpty() means that we are still accumulating partial Results for a<a name="line.546"></a>
+<span class="sourceLineNo">547</span>      // row. We should not change scanners before we receive all the partial Results for that<a name="line.547"></a>
+<span class="sourceLineNo">548</span>      // row.<a name="line.548"></a>
+<span class="sourceLineNo">549</span>    } while (allResultsSkipped || (callable != null &amp;&amp; callable.isHeartbeatMessage())<a name="line.549"></a>
+<span class="sourceLineNo">550</span>        || (doneWithRegion(remainingResultSize, countdown, serverHasMoreResults)<a name="line.550"></a>
+<span class="sourceLineNo">551</span>        &amp;&amp; (!partialResults.isEmpty() || possiblyNextScanner(countdown, values == null))));<a name="line.551"></a>
+<span class="sourceLineNo">552</span>  }<a name="line.552"></a>
+<span class="sourceLineNo">553</span><a name="line.553"></a>
+<span class="sourceLineNo">554</span>  /**<a name="line.554"></a>
+<span class="sourceLineNo">555</span>   * @param remainingResultSize<a name="line.555"></a>
+<span class="sourceLineNo">556</span>   * @param remainingRows<a name="line.556"></a>
+<span class="sourceLineNo">557</span>   * @param regionHasMoreResults<a name="line.557"></a>
+<span class="sourceLineNo">558</span>   * @return true when the current region has been exhausted. When the current region has been<a name="line.558"></a>
+<span class="sourceLineNo">559</span>   *         exhausted, the region must be changed before scanning can continue<a name="line.559"></a>
+<span class="sourceLineNo">560</span>   */<a name="line.560"></a>
+<span class="sourceLineNo">561</span>  private boolean doneWithRegion(long remainingResultSize, int remainingRows,<a name="line.561"></a>
+<span class="sourceLineNo">562</span>      boolean regionHasMoreResults) {<a name="line.562"></a>
+<span class="sourceLineNo">563</span>    return remainingResultSize &gt; 0 &amp;&amp; remainingRows &gt; 0 &amp;&amp; !regionHasMoreResults;<a name="line.563"></a>
+<span class="sourceLineNo">564</span>  }<a name="line.564"></a>
+<span class="sourceLineNo">565</span><a name="line.565"></a>
+<span class="sourceLineNo">566</span>  protected long calcEstimatedSize(Result rs) {<a name="line.566"></a>
+<span class="sourceLineNo">567</span>    long estimatedHeapSizeOfResult = 0;<a name="line.567"></a>
+<span class="sourceLineNo">568</span>    // We don't make Iterator here<a name="line.568"></a>
+<span class="sourceLineNo">569</span>    for (Cell cell : rs.rawCells()) {<a name="line.569"></a>
+<span class="sourceLineNo">570</span>      estimatedHeapSizeOfResult += CellUtil.estimatedHeapSizeOf(cell);<a name="line.570"></a>
+<span class="sourceLineNo">571</span>    }<a name="line.571"></a>
+<span class="sourceLineNo">572</span>    return estimatedHeapSizeOfResult;<a name="line.572"></a>
+<span class="sourceLineNo">573</span>  }<a name="line.573"></a>
+<span class="sourceLineNo">574</span><a name="line.574"></a>
+<span class="sourceLineNo">575</span>  protected void addEstimatedSize(long estimatedHeapSizeOfResult) {<a name="line.575"></a>
+<span class="sourceLineNo">576</span>    return;<a name="line.576"></a>
+<span class="sourceLineNo">577</span>  }<a name="line.577"></a>
 <span class="sourceLineNo">578</span><a name="line.578"></a>
-<span class="sourceLineNo">579</span>    // If the caller has indicated in their scan that they are okay with seeing partial results,<a name="line.579"></a>
-<span class="sourceLineNo">580</span>    // then simply add all results to the list. Note that since scan batching also returns results<a name="line.580"></a>
-<span class="sourceLineNo">581</span>    // for a row in pieces we treat batch being set as equivalent to allowing partials. The<a name="line.581"></a>
-<span class="sourceLineNo">582</span>    // implication of treating batching as equivalent to partial results is that it is possible<a name="line.582"></a>
-<span class="sourceLineNo">583</span>    // the caller will receive a result back where the number of cells in the result is less than<a name="line.583"></a>
-<span class="sourceLineNo">584</span>    // the batch size even though it may not be the last group of cells for that row.<a name="line.584"></a>
-<span class="sourceLineNo">585</span>    if (allowPartials || isBatchSet) {<a name="line.585"></a>
-<span class="sourceLineNo">586</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0,<a name="line.586"></a>
-<span class="sourceLineNo">587</span>          (null == resultsFromServer ? 0 : resultsFromServer.length));<a name="line.587"></a>
-<span class="sourceLineNo">588</span>      return resultsToAddToCache;<a name="line.588"></a>
-<span class="sourceLineNo">589</span>    }<a name="line.589"></a>
-<span class="sourceLineNo">590</span><a name="line.590"></a>
-<span class="sourceLineNo">591</span>    // If no results were returned it indicates that either we have the all the partial results<a name="line.591"></a>
-<span class="sourceLineNo">592</span>    // necessary to construct the complete result or the server had to send a heartbeat message<a name="line.592"></a>
-<span class="sourceLineNo">593</span>    // to the client to keep the client-server connection alive<a name="line.593"></a>
-<span class="sourceLineNo">594</span>    if (resultsFromServer == null || resultsFromServer.length == 0) {<a name="line.594"></a>
-<span class="sourceLineNo">595</span>      // If this response was an empty heartbeat message, then we have not exhausted the region<a name="line.595"></a>
-<span class="sourceLineNo">596</span>      // and thus there may be more partials server side that still need to be added to the partial<a name="line.596"></a>
-<span class="sourceLineNo">597</span>      // list before we form the complete Result<a name="line.597"></a>
-<span class="sourceLineNo">598</span>      if (!partialResults.isEmpty() &amp;&amp; !heartbeatMessage) {<a name="line.598"></a>
-<span class="sourceLineNo">599</span>        resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.599"></a>
-<span class="sourceLineNo">600</span>        clearPartialResults();<a name="line.600"></a>
-<span class="sourceLineNo">601</span>      }<a name="line.601"></a>
+<span class="sourceLineNo">579</span>  @VisibleForTesting<a name="line.579"></a>
+<span class="sourceLineNo">580</span>  public int getCacheCount() {<a name="line.580"></a>
+<span class="sourceLineNo">581</span>    return cache != null ? cache.size() : 0;<a name="line.581"></a>
+<span class="sourceLineNo">582</span>  }<a name="line.582"></a>
+<span class="sourceLineNo">583</span><a name="line.583"></a>
+<span class="sourceLineNo">584</span>  /**<a name="line.584"></a>
+<span class="sourceLineNo">585</span>   * This method ensures all of our book keeping regarding partial results is kept up to date. This<a name="line.585"></a>
+<span class="sourceLineNo">586</span>   * method should be called once we know that the results we received back from the RPC request do<a name="line.586"></a>
+<span class="sourceLineNo">587</span>   * not contain errors. We return a list of results that should be added to the cache. In general,<a name="line.587"></a>
+<span class="sourceLineNo">588</span>   * this list will contain all NON-partial results from the input array (unless the client has<a name="line.588"></a>
+<span class="sourceLineNo">589</span>   * specified that they are okay with receiving partial results)<a name="line.589"></a>
+<span class="sourceLineNo">590</span>   * @param resultsFromServer The array of {@link Result}s returned from the server<a name="line.590"></a>
+<span class="sourceLineNo">591</span>   * @param heartbeatMessage Flag indicating whether or not the response received from the server<a name="line.591"></a>
+<span class="sourceLineNo">592</span>   *          represented a complete response, or a heartbeat message that was sent to keep the<a name="line.592"></a>
+<span class="sourceLineNo">593</span>   *          client-server connection alive<a name="line.593"></a>
+<span class="sourceLineNo">594</span>   * @return the list of results that should be added to the cache.<a name="line.594"></a>
+<span class="sourceLineNo">595</span>   * @throws IOException<a name="line.595"></a>
+<span class="sourceLineNo">596</span>   */<a name="line.596"></a>
+<span class="sourceLineNo">597</span>  protected List&lt;Result&gt;<a name="line.597"></a>
+<span class="sourceLineNo">598</span>      getResultsToAddToCache(Result[] resultsFromServer, boolean heartbeatMessage)<a name="line.598"></a>
+<span class="sourceLineNo">599</span>          throws IOException {<a name="line.599"></a>
+<span class="sourceLineNo">600</span>    int resultSize = resultsFromServer != null ? resultsFromServer.length : 0;<a name="line.600"></a>
+<span class="sourceLineNo">601</span>    List&lt;Result&gt; resultsToAddToCache = new ArrayList&lt;Result&gt;(resultSize);<a name="line.601"></a>
 <span class="sourceLineNo">602</span><a name="line.602"></a>
-<span class="sourceLineNo">603</span>      return resultsToAddToCache;<a name="line.603"></a>
-<span class="sourceLineNo">604</span>    }<a name="line.604"></a>
+<span class="sourceLineNo">603</span>    final boolean isBatchSet = scan != null &amp;&amp; scan.getBatch() &gt; 0;<a name="line.603"></a>
+<span class="sourceLineNo">604</span>    final boolean allowPartials = scan != null &amp;&amp; scan.getAllowPartialResults();<a name="line.604"></a>
 <span class="sourceLineNo">605</span><a name="line.605"></a>
-<span class="sourceLineNo">606</span>    // In every RPC response there should be at most a single partial result. Furthermore, if<a name="line.606"></a>
-<span class="sourceLineNo">607</span>    // there is a partial result, it is guaranteed to be in the last position of the array.<a name="line.607"></a>
-<span class="sourceLineNo">608</span>    Result last = resultsFromServer[resultsFromServer.length - 1];<a name="line.608"></a>
-<span class="sourceLineNo">609</span>    Result partial = last.isPartial() ? last : null;<a name="line.609"></a>
-<span class="sourceLineNo">610</span><a name="line.610"></a>
-<span class="sourceLineNo">611</span>    if (LOG.isTraceEnabled()) {<a name="line.611"></a>
-<span class="sourceLineNo">612</span>      StringBuilder sb = new StringBuilder();<a name="line.612"></a>
-<span class="sourceLineNo">613</span>      sb.append("number results from RPC: ").append(resultsFromServer.length).append(",");<a name="line.613"></a>
-<span class="sourceLineNo">614</span>      sb.append("partial != null: ").append(partial != null).append(",");<a name="line.614"></a>
-<span class="sourceLineNo">615</span>      sb.append("number of partials so far: ").append(partialResults.size());<a name="line.615"></a>
-<span class="sourceLineNo">616</span>      LOG.trace(sb.toString());<a name="line.616"></a>
-<span class="sourceLineNo">617</span>    }<a name="line.617"></a>
-<span class="sourceLineNo">618</span><a name="line.618"></a>
-<span class="sourceLineNo">619</span>    // There are three possibilities cases that can occur while handling partial results<a name="line.619"></a>
-<span class="sourceLineNo">620</span>    //<a name="line.620"></a>
-<span class="sourceLineNo">621</span>    // 1. (partial != null &amp;&amp; partialResults.isEmpty())<a name="line.621"></a>
-<span class="sourceLineNo">622</span>    // This is the first partial result that we have received. It should be added to<a name="line.622"></a>
-<span class="sourceLineNo">623</span>    // the list of partialResults and await the next RPC request at which point another<a name="line.623"></a>
-<span class="sourceLineNo">624</span>    // portion of the complete result will be received<a name="line.624"></a>
-<span class="sourceLineNo">625</span>    //<a name="line.625"></a>
-<span class="sourceLineNo">626</span>    // 2. !partialResults.isEmpty()<a name="line.626"></a>
-<span class="sourceLineNo">627</span>    // Since our partialResults list is not empty it means that we have been accumulating partial<a name="line.627"></a>
-<span class="sourceLineNo">628</span>    // Results for a particular row. We cannot form the complete/whole Result for that row until<a name="line.628"></a>
-<span class="sourceLineNo">629</span>    // all partials for the row have been received. Thus we loop through all of the Results<a name="line.629"></a>
-<span class="sourceLineNo">630</span>    // returned from the server and determine whether or not all partial Results for the row have<a name="line.630"></a>
-<span class="sourceLineNo">631</span>    // been received. We know that we have received all of the partial Results for the row when:<a name="line.631"></a>
-<span class="sourceLineNo">632</span>    // i) We notice a row change in the Results<a name="line.632"></a>
-<span class="sourceLineNo">633</span>    // ii) We see a Result for the partial row that is NOT marked as a partial Result<a name="line.633"></a>
-<span class="sourceLineNo">634</span>    //<a name="line.634"></a>
-<span class="sourceLineNo">635</span>    // 3. (partial == null &amp;&amp; partialResults.isEmpty())<a name="line.635"></a>
-<span class="sourceLineNo">636</span>    // Business as usual. We are not accumulating partial results and there wasn't a partial result<a name="line.636"></a>
-<span class="sourceLineNo">637</span>    // in the RPC response. This means that all of the results we received from the server are<a name="line.637"></a>
-<span class="sourceLineNo">638</span>    // complete and can be added directly to the cache<a name="line.638"></a>
-<span class="sourceLineNo">639</span>    if (partial != null &amp;&amp; partialResults.isEmpty()) {<a name="line.639"></a>
-<span class="sourceLineNo">640</span>      addToPartialResults(partial);<a name="line.640"></a>
-<span class="sourceLineNo">641</span><a name="line.641"></a>
-<span class="sourceLineNo">642</span>      // Exclude the last result, it's a partial<a name="line.642"></a>
-<span class="sourceLineNo">643</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0, resultsFromServer.length - 1);<a name="line.643"></a>
-<span class="sourceLineNo">644</span>    } else if (!partialResults.isEmpty()) {<a name="line.644"></a>
-<span class="sourceLineNo">645</span>      for (int i = 0; i &lt; resultsFromServer.length; i++) {<a name="line.645"></a>
-<span class="sourceLineNo">646</span>        Result result = resultsFromServer[i];<a name="line.646"></a>
-<span class="sourceLineNo">647</span><a name="line.647"></a>
-<span class="sourceLineNo">648</span>        // This result is from the same row as the partial Results. Add it to the list of partials<a name="line.648"></a>
-<span class="sourceLineNo">649</span>        // and check if it was the last partial Result for that row<a name="line.649"></a>
-<span class="sourceLineNo">650</span>        if (Bytes.equals(partialResultsRow, result.getRow())) {<a name="line.650"></a>
-<span class="sourceLineNo">651</span>          addToPartialResults(result);<a name="line.651"></a>
-<span class="sourceLineNo">652</span><a name="line.652"></a>
-<span class="sourceLineNo">653</span>          // If the result is not a partial, it is a signal to us that it is the last Result we<a name="line.653"></a>
-<span class="sourceLineNo">654</span>          // need to form the complete Result client-side<a name="line.654"></a>
-<span class="sourceLineNo">655</span>          if (!result.isPartial()) {<a name="line.655"></a>
-<span class="sourceLineNo">656</span>            resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.656"></a>
-<span class="sourceLineNo">657</span>            clearPartialResults();<a name="line.657"></a>
-<span class="sourceLineNo">658</span>          }<a name="line.658"></a>
-<span class="sourceLineNo">659</span>        } else {<a name="line.659"></a>
-<span class="sourceLineNo">660</span>          // The row of this result differs from the row of the partial results we have received so<a name="line.660"></a>
-<span class="sourceLineNo">661</span>          // far. If our list of partials isn't empty, this is a signal to form the complete Result<a name="line.661"></a>
-<span class="sourceLineNo">662</span>          // since the row has now changed<a name="line.662"></a>
-<span class="sourceLineNo">663</span>          if (!partialResults.isEmpty()) {<a name="line.663"></a>
-<span class="sourceLineNo">664</span>            resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.664"></a>
-<span class="sourceLineNo">665</span>            clearPartialResults();<a name="line.665"></a>
-<span class="sourceLineNo">666</span>          }<a name="line.666"></a>
-<span class="sourceLineNo">667</span><a name="line.667"></a>
-<span class="sourceLineNo">668</span>          // It's possible that in one response from the server we receive the final partial for<a name="line.668"></a>
-<span class="sourceLineNo">669</span>          // one row and receive a partial for a different row. Thus, make sure that all Results<a name="line.669"></a>
-<span class="sourceLineNo">670</span>          // are added to the proper list<a name="line.670"></a>
-<span class="sourceLineNo">671</span>          if (result.isPartial()) {<a name="line.671"></a>
-<span class="sourceLineNo">672</span>            addToPartialResults(result);<a name="line.672"></a>
-<span class="sourceLineNo">673</span>          } else {<a name="line.673"></a>
-<span class="sourceLineNo">674</span>            resultsToAddToCache.add(result);<a name="line.674"></a>
-<span class="sourceLineNo">675</span>          }<a name="line.675"></a>
-<span class="sourceLineNo">676</span>        }<a name="line.676"></a>
-<span class="sourceLineNo">677</span>      }<a name="line.677"></a>
-<span class="sourceLineNo">678</span>    } else { // partial == null &amp;&amp; partialResults.isEmpty() -- business as usual<a name="line.678"></a>
-<span class="sourceLineNo">679</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0, resultsFromServer.length);<a name="line.679"></a>
-<span class="sourceLineNo">680</span>    }<a name="line.680"></a>
-<span class="sourceLineNo">681</span><a name="line.681"></a>
-<span class="sourceLineNo">682</span>    return resultsToAddToCache;<a name="line.682"></a>
-<span class="sourceLineNo">683</span>  }<a name="line.683"></a>
-<span class="sourceLineNo">684</span><a name="line.684"></a>
-<span class="sourceLineNo">685</span>  /**<a name="line.685"></a>
-<span class="sourceLineNo">686</span>   * A convenience method for adding a Result to our list of partials. This method ensure that only<a name="line.686"></a>
-<span class="sourceLineNo">687</span>   * Results that belong to the same row as the other partials can be added to the list.<a name="line.687"></a>
-<span class="sourceLineNo">688</span>   * @param result The result that we want to add to our list of partial Results<a name="line.688"></a>
-<span class="sourceLineNo">689</span>   * @throws IOException<a name="line.689"></a>
-<span class="sourceLineNo">690</span>   */<a name="line.690"></a>
-<span class="sourceLineNo">691</span>  private void addToPartialResults(final Result result) throws IOException {<a name="line.691"></a>
-<span class="sourceLineNo">692</span>    final byte[] row = result.getRow();<a name="line.692"></a>
-<span class="sourceLineNo">693</span>    if (partialResultsRow != null &amp;&amp; !Bytes.equals(row, partialResultsRow)) {<a name="line.693"></a>
-<span class="sourceLineNo">694</span>      throw new IOException("Partial result row does not match. All partial results must come "<a name="line.694"></a>
-<span class="sourceLineNo">695</span>          + "from the same row. partialResultsRow: " + Bytes.toString(partialResultsRow) + "row: "<a name="line.695"></a>
-<span class="sourceLineNo">696</span>          + Bytes.toString(row));<a name="line.696"></a>
-<span class="sourceLineNo">697</span>    }<a name="line.697"></a>
-<span class="sourceLineNo">698</span>    partialResultsRow = row;<a name="line.698"></a>
-<span class="sourceLineNo">699</span>    partialResults.add(result);<a name="line.699"></a>
-<span class="sourceLineNo">700</span>  }<a name="line.700"></a>
-<span class="sourceLineNo">701</span><a name="line.701"></a>
-<span class="sourceLineNo">702</span>  /**<a name="line.702"></a>
-<span class="sourceLineNo">703</span>   * Convenience method for clearing the list of partials and resetting the partialResultsRow.<a name="line.703"></a>
-<span class="sourceLineNo">704</span>   */<a name="line.704"></a>
-<span class="sourceLineNo">705</span>  private void clearPartialResults() {<a name="line.705"></a>
-<span class="sourceLineNo">706</span>    partialResults.clear();<a name="line.706"></a>
-<span class="sourceLineNo">707</span>    partialResultsRow = null;<a name="line.707"></a>
-<span class="sourceLineNo">708</span>  }<a name="line.708"></a>
-<span class="sourceLineNo">709</span><a name="line.709"></a>
-<span class="sourceLineNo">710</span>  /**<a name="line.710"></a>
-<span class="sourceLineNo">711</span>   * Helper method for adding results between the indices [start, end) to the outputList<a name="line.711"></a>
-<span class="sourceLineNo">712</span>   * @param outputList the list that results will be added to<a name="line.712"></a>
-<span class="sourceLineNo">713</span>   * @param inputArray the array that results are taken from<a name="line.713"></a>
-<span class="sourceLineNo">714</span>   * @param start beginning index (inclusive)<a name="line.714"></a>
-<span class="sourceLineNo">715</span>   * @param end ending index (exclusive)<a name="line.715"></a>
-<span class="sourceLineNo">716</span>   */<a name="line.716"></a>
-<span class="sourceLineNo">717</span>  private void addResultsToList(List&lt;Result&gt; outputList, Result[] inputArray, int start, int end) {<a name="line.717"></a>
-<span class="sourceLineNo">718</span>    if (inputArray == null || start &lt; 0 || end &gt; inputArray.length) return;<a name="line.718"></a>
-<span class="sourceLineNo">719</span><a name="line.719"></a>
-<span class="sourceLineNo">720</span>    for (int i = start; i &lt; end; i++) {<a name="line.720"></a>
-<span class="sourceLineNo">721</span>      outputList.add(inputArray[i]);<a name="line.721"></a>
-<span class="sourceLineNo">722</span>    }<a name="line.722"></a>
-<span class="sourceLineNo">723</span>  }<a name="line.723"></a>
-<span class="sourceLineNo">724</span><a name="line.724"></a>
-<span class="sourceLineNo">725</span>    @Override<a name="line.725"></a>
-<span class="sourceLineNo">726</span>    public void close() {<a name="line.726"></a>
-<span class="sourceLineNo">727</span>      if (!scanMetricsPublished) writeScanMetrics();<a name="line.727"></a>
-<span class="sourceLineNo">728</span>      if (callable != null) {<a name="line.728"></a>
-<span class="sourceLineNo">729</span>        callable.setClose();<a name="line.729"></a>
-<span class="sourceLineNo">730</span>        try {<a name="line.730"></a>
-<span class="sourceLineNo">731</span>          call(callable, caller, scannerTimeout);<a name="line.731"></a>
-<span class="sourceLineNo">732</span>        } catch (UnknownScannerException e) {<a name="line.732"></a>
-<span class="sourceLineNo">733</span>           // We used to catch this error, interpret, and rethrow. However, we<a name="line.733"></a>
-<span class="sourceLineNo">734</span>           // have since decided that it's not nice for a scanner's close to<a name="line.734"></a>
-<span class="sourceLineNo">735</span>           // throw exceptions. Chances are it was just due to lease time out.<a name="line.735"></a>
-<span class="sourceLineNo">736</span>          if (LOG.isDebugEnabled()) {<a name="line.736"></a>
-<span class="sourceLineNo">737</span>            LOG.debug("scanner failed to close", e);<a name="line.737"></a>
-<span class="sourceLineNo">738</span>          }<a name="line.738"></a>
-<span class="sourceLineNo">739</span>        } catch (IOException e) {<a name="line.739"></a>
-<span class="sourceLineNo">740</span>          /* An exception other than UnknownScanner is unexpected. */<a name="line.740"></a>
-<span class="sourceLineNo">741</span>          LOG.warn("scanner failed to close.", e);<a name="line.741"></a>
-<span class="sourceLineNo">742</span>        }<a name="line.742"></a>
-<span class="sourceLineNo">743</span>        callable = null;<a name="line.743"></a>
-<span class="sourceLineNo">744</span>      }<a name="line.744"></a>
-<span class="sourceLineNo">745</span>      closed = true;<a name="line.745"></a>
-<span class="sourceLineNo">746</span>    }<a name="line.746"></a>
-<span class="sourceLineNo">747</span><a name="line.747"></a>
-<span class="sourceLineNo">748</span>  /**<a name="line.748"></a>
-<span class="sourceLineNo">749</span>   * Create the closest row before the specified row<a name="line.749"></a>
-<span class="sourceLineNo">750</span>   * @param row<a name="line.750"></a>
-<span class="sourceLineNo">751</span>   * @return a new byte array which is the closest front row of the specified one<a name="line.751"></a>
-<span class="sourceLineNo">752</span>   */<a name="line.752"></a>
-<span class="sourceLineNo">753</span>  protected static byte[] createClosestRowBefore(byte[] row) {<a name="line.753"></a>
-<span class="sourceLineNo">754</span>    if (row == null) {<a name="line.754"></a>
-<span class="sourceLineNo">755</span>      throw new IllegalArgumentException("The passed row is empty");<a name="line.755"></a>
-<span class="sourceLineNo">756</span>    }<a name="line.756"></a>
-<span class="sourceLineNo">757</span>    if (Bytes.equals(row, HConstants.EMPTY_BYTE_ARRAY)) {<a name="line.757"></a>
-<span class="sourceLineNo">758</span>      return MAX_BYTE_ARRAY;<a name="line.758"></a>
-<span class="sourceLineNo">759</span>    }<a name="line.759"></a>
-<span class="sourceLineNo">760</span>    if (row[row.length - 1] == 0) {<a name="line.760"></a>
-<span class="sourceLineNo">761</span>      return Arrays.copyOf(row, row.length - 1);<a name="line.761"></a>
-<span class="sourceLineNo">762</span>    } else {<a name="line.762"></a>
-<span class="sourceLineNo">763</span>      byte[] closestFrontRow = Arrays.copyOf(row, row.length);<a name="line.763"></a>
-<span class="sourceLineNo">764</span>      closestFrontRow[row.length - 1] = (byte) ((closestFrontRow[row.length - 1] &amp; 0xff) - 1);<a name="line.764"></a>
-<span class="sourceLineNo">765</span>      closestFrontRow = Bytes.add(closestFrontRow, MAX_BYTE_ARRAY);<a name="line.765"></a>
-<span class="sourceLineNo">766</span>      return closestFrontRow;<a name="line.766"></a>
-<span class="sourceLineNo">767</span>    }<a name="line.767"></a>
-<span class="sourceLineNo">768</span>  }<a name="line.768"></a>
-<span class="sourceLineNo">769</span><a name="line.769"></a>
-<span class="sourceLineNo">770</span>  @Override<a name="line.770"></a>
-<span class="sourceLineNo">771</span>  public boolean renewLease() {<a name="line.771"></a>
-<span class="sourceLineNo">772</span>    if (callable != null) {<a name="line.772"></a>
-<span class="sourceLineNo">773</span>      // do not return any rows, do not advance the scanner<a name="line.773"></a>
-<span class="sourceLineNo">774</span>      callable.setRenew(true);<a name="line.774"></a>
-<span class="sourceLineNo">775</span>      try {<a name="line.775"></a>
-<span class="sourceLineNo">776</span>        this.caller.callWithoutRetries(callable, this.scannerTimeout);<a name="line.776"></a>
-<span class="sourceLineNo">777</span>      } catch (Exception e) {<a name="line.777"></a>
-<span class="sourceLineNo">778</span>        return false;<a name="line.778"></a>
-<span class="sourceLineNo">779</span>      } finally {<a name="line.779"></a>
-<span class="sourceLineNo">780</span>        callable.setRenew(false);<a name="line.780"></a>
-<span class="sourceLineNo">781</span>      }<a name="line.781"></a>
-<span class="sourceLineNo">782</span>      return true;<a name="line.782"></a>
+<span class="sourceLineNo">606</span>    // If the caller has indicated in their scan that they are okay with seeing partial results,<a name="line.606"></a>
+<span class="sourceLineNo">607</span>    // then simply add all results to the list. Note that since scan batching also returns results<a name="line.607"></a>
+<span class="sourceLineNo">608</span>    // for a row in pieces we treat batch being set as equivalent to allowing partials. The<a name="line.608"></a>
+<span class="sourceLineNo">609</span>    // implication of treating batching as equivalent to partial results is that it is possible<a name="line.609"></a>
+<span class="sourceLineNo">610</span>    // the caller will receive a result back where the number of cells in the result is less than<a name="line.610"></a>
+<span class="sourceLineNo">611</span>    // the batch size even though it may not be the last group of cells for that row.<a name="line.611"></a>
+<span class="sourceLineNo">612</span>    if (allowPartials || isBatchSet) {<a name="line.612"></a>
+<span class="sourceLineNo">613</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0,<a name="line.613"></a>
+<span class="sourceLineNo">614</span>          (null == resultsFromServer ? 0 : resultsFromServer.length));<a name="line.614"></a>
+<span class="sourceLineNo">615</span>      return resultsToAddToCache;<a name="line.615"></a>
+<span class="sourceLineNo">616</span>    }<a name="line.616"></a>
+<span class="sourceLineNo">617</span><a name="line.617"></a>
+<span class="sourceLineNo">618</span>    // If no results were returned it indicates that either we have the all the partial results<a name="line.618"></a>
+<span class="sourceLineNo">619</span>    // necessary to construct the complete result or the server had to send a heartbeat message<a name="line.619"></a>
+<span class="sourceLineNo">620</span>    // to the client to keep the client-server connection alive<a name="line.620"></a>
+<span class="sourceLineNo">621</span>    if (resultsFromServer == null || resultsFromServer.length == 0) {<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      // If this response was an empty heartbeat message, then we have not exhausted the region<a name="line.622"></a>
+<span class="sourceLineNo">623</span>      // and thus there may be more partials server side that still need to be added to the partial<a name="line.623"></a>
+<span class="sourceLineNo">624</span>      // list before we form the complete Result<a name="line.624"></a>
+<span class="sourceLineNo">625</span>      if (!partialResults.isEmpty() &amp;&amp; !heartbeatMessage) {<a name="line.625"></a>
+<span class="sourceLineNo">626</span>        resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.626"></a>
+<span class="sourceLineNo">627</span>        clearPartialResults();<a name="line.627"></a>
+<span class="sourceLineNo">628</span>      }<a name="line.628"></a>
+<span class="sourceLineNo">629</span><a name="line.629"></a>
+<span class="sourceLineNo">630</span>      return resultsToAddToCache;<a name="line.630"></a>
+<span class="sourceLineNo">631</span>    }<a name="line.631"></a>
+<span class="sourceLineNo">632</span><a name="line.632"></a>
+<span class="sourceLineNo">633</span>    // In every RPC response there should be at most a single partial result. Furthermore, if<a name="line.633"></a>
+<span class="sourceLineNo">634</span>    // there is a partial result, it is guaranteed to be in the last position of the array.<a name="line.634"></a>
+<span class="sourceLineNo">635</span>    Result last = resultsFromServer[resultsFromServer.length - 1];<a name="line.635"></a>
+<span class="sourceLineNo">636</span>    Result partial = last.isPartial() ? last : null;<a name="line.636"></a>
+<span class="sourceLineNo">637</span><a name="line.637"></a>
+<span class="sourceLineNo">638</span>    if (LOG.isTraceEnabled()) {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>      StringBuilder sb = new StringBuilder();<a name="line.639"></a>
+<span class="sourceLineNo">640</span>      sb.append("number results from RPC: ").append(resultsFromServer.length).append(",");<a name="line.640"></a>
+<span class="sourceLineNo">641</span>      sb.append("partial != null: ").append(partial != null).append(",");<a name="line.641"></a>
+<span class="sourceLineNo">642</span>      sb.append("number of partials so far: ").append(partialResults.size());<a name="line.642"></a>
+<span class="sourceLineNo">643</span>      LOG.trace(sb.toString());<a name="line.643"></a>
+<span class="sourceLineNo">644</span>    }<a name="line.644"></a>
+<span class="sourceLineNo">645</span><a name="line.645"></a>
+<span class="sourceLineNo">646</span>    // There are three possibilities cases that can occur while handling partial results<a name="line.646"></a>
+<span class="sourceLineNo">647</span>    //<a name="line.647"></a>
+<span class="sourceLineNo">648</span>    // 1. (partial != null &amp;&amp; partialResults.isEmpty())<a name="line.648"></a>
+<span class="sourceLineNo">649</span>    // This is the first partial result that we have received. It should be added to<a name="line.649"></a>
+<span class="sourceLineNo">650</span>    // the list of partialResults and await the next RPC request at which point another<a name="line.650"></a>
+<span class="sourceLineNo">651</span>    // portion of the complete result will be received<a name="line.651"></a>
+<span class="sourceLineNo">652</span>    //<a name="line.652"></a>
+<span class="sourceLineNo">653</span>    // 2. !partialResults.isEmpty()<a name="line.653"></a>
+<span class="sourceLineNo">654</span>    // Since our partialResults list is not empty it means that we have been accumulating partial<a name="line.654"></a>
+<span class="sourceLineNo">655</span>    // Results for a particular row. We cannot form the complete/whole Result for that row until<a name="line.655"></a>
+<span class="sourceLineNo">656</span>    // all partials for the row have been received. Thus we loop through all of the Results<a name="line.656"></a>
+<span class="sourceLineNo">657</span>    // returned from the server and determine whether or not all partial Results for the row have<a name="line.657"></a>
+<span class="sourceLineNo">658</span>    // been received. We know that we have received all of the partial Results for the row when:<a name="line.658"></a>
+<span class="sourceLineNo">659</span>    // i) We notice a row change in the Results<a name="line.659"></a>
+<span class="sourceLineNo">660</span>    // ii) We see a Result for the partial row that is NOT marked as a partial Result<a name="line.660"></a>
+<span class="sourceLineNo">661</span>    //<a name="line.661"></a>
+<span class="sourceLineNo">662</span>    // 3. (partial == null &amp;&amp; partialResults.isEmpty())<a name="line.662"></a>
+<span class="sourceLineNo">663</span>    // Business as usual. We are not accumulating partial results and there wasn't a partial result<a name="line.663"></a>
+<span class="sourceLineNo">664</span>    // in the RPC response. This means that all of the results we received from the server are<a name="line.664"></a>
+<span class="sourceLineNo">665</span>    // complete and can be added directly to the cache<a name="line.665"></a>
+<span class="sourceLineNo">666</span>    if (partial != null &amp;&amp; partialResults.isEmpty()) {<a name="line.666"></a>
+<span class="sourceLineNo">667</span>      addToPartialResults(partial);<a name="line.667"></a>
+<span class="sourceLineNo">668</span><a name="line.668"></a>
+<span class="sourceLineNo">669</span>      // Exclude the last result, it's a partial<a name="line.669"></a>
+<span class="sourceLineNo">670</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0, resultsFromServer.length - 1);<a name="line.670"></a>
+<span class="sourceLineNo">671</span>    } else if (!partialResults.isEmpty()) {<a name="line.671"></a>
+<span class="sourceLineNo">672</span>      for (int i = 0; i &lt; resultsFromServer.length; i++) {<a name="line.672"></a>
+<span class="sourceLineNo">673</span>        Result result = resultsFromServer[i];<a name="line.673"></a>
+<span class="sourceLineNo">674</span><a name="line.674"></a>
+<span class="sourceLineNo">675</span>        // This result is from the same row as the partial Results. Add it to the list of partials<a name="line.675"></a>
+<span class="sourceLineNo">676</span>        // and check if it was the last partial Result for that row<a name="line.676"></a>
+<span class="sourceLineNo">677</span>        if (Bytes.equals(partialResultsRow, result.getRow())) {<a name="line.677"></a>
+<span class="sourceLineNo">678</span>          addToPartialResults(result);<a name="line.678"></a>
+<span class="sourceLineNo">679</span><a name="line.679"></a>
+<span class="sourceLineNo">680</span>          // If the result is not a partial, it is a signal to us that it is the last Result we<a name="line.680"></a>
+<span class="sourceLineNo">681</span>          // need to form the complete Result client-side<a name="line.681"></a>
+<span class="sourceLineNo">682</span>          if (!result.isPartial()) {<a name="line.682"></a>
+<span class="sourceLineNo">683</span>            resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.683"></a>
+<span class="sourceLineNo">684</span>            clearPartialResults();<a name="line.684"></a>
+<span class="sourceLineNo">685</span>          }<a name="line.685"></a>
+<span class="sourceLineNo">686</span>        } else {<a name="line.686"></a>
+<span class="sourceLineNo">687</span>          // The row of this result differs from the row of the partial results we have received so<a name="line.687"></a>
+<span class="sourceLineNo">688</span>          // far. If our list of partials isn't empty, this is a signal to form the complete Result<a name="line.688"></a>
+<span class="sourceLineNo">689</span>          // since the row has now changed<a name="line.689"></a>
+<span class="sourceLineNo">690</span>          if (!partialResults.isEmpty()) {<a name="line.690"></a>
+<span class="sourceLineNo">691</span>            resultsToAddToCache.add(Result.createCompleteResult(partialResults));<a name="line.691"></a>
+<span class="sourceLineNo">692</span>            clearPartialResults();<a name="line.692"></a>
+<span class="sourceLineNo">693</span>          }<a name="line.693"></a>
+<span class="sourceLineNo">694</span><a name="line.694"></a>
+<span class="sourceLineNo">695</span>          // It's possible that in one response from the server we receive the final partial for<a name="line.695"></a>
+<span class="sourceLineNo">696</span>          // one row and receive a partial for a different row. Thus, make sure that all Results<a name="line.696"></a>
+<span class="sourceLineNo">697</span>          // are added to the proper list<a name="line.697"></a>
+<span class="sourceLineNo">698</span>          if (result.isPartial()) {<a name="line.698"></a>
+<span class="sourceLineNo">699</span>            addToPartialResults(result);<a name="line.699"></a>
+<span class="sourceLineNo">700</span>          } else {<a name="line.700"></a>
+<span class="sourceLineNo">701</span>            resultsToAddToCache.add(result);<a name="line.701"></a>
+<span class="sourceLineNo">702</span>          }<a name="line.702"></a>
+<span class="sourceLineNo">703</span>        }<a name="line.703"></a>
+<span class="sourceLineNo">704</span>      }<a name="line.704"></a>
+<span class="sourceLineNo">705</span>    } else { // partial == null &amp;&amp; partialResults.isEmpty() -- business as usual<a name="line.705"></a>
+<span class="sourceLineNo">706</span>      addResultsToList(resultsToAddToCache, resultsFromServer, 0, resultsFromServer.length);<a name="line.706"></a>
+<span class="sourceLineNo">707</span>    }<a name="line.707"></a>
+<span class="sourceLineNo">708</span><a name="line.708"></a>
+<span class="sourceLineNo">709</span>    return resultsToAddToCache;<a name="line.709"></a>
+<span class="sourceLineNo">710</span>  }<a name="line.710"></a>
+<span class="sourceLineNo">711</span><a name="line.711"></a>
+<span class="sourceLineNo">712</span>  /**<a name="line.712"></a>
+<span class="sourceLineNo">713</span>   * A convenience method for adding a Result to our list of partials. This method ensure that only<a name="line.713"></a>
+<span class="sourceLineNo">714</span>   * Results that belong to the same row as the other partials can be added to the list.<a name="line.714"></a>
+<span class="sourceLineNo">715</span>   * @param result The result that we want to add to our list of partial Results<a name="line.715"></a>
+<span class="sourceLineNo">716</span>   * @throws IOException<a name="line.716"></a>
+<span class="sourceLineNo">717</span>   */<a name="line.717"></a>
+<span class="sourceLineNo">718</span>  private void addToPartialResults(final Result result) throws IOException {<a name="line.718"></a>
+<span class="sourceLineNo">719</span>    final byte[] row = result.getRow();<a name="line.719"></a>
+<span class="sourceLineNo">720</span>    if (partialResultsRow != null &amp;&amp; !Bytes.equals(row, partialResultsRow)) {<a name="line.720"></a>
+<span class="sourceLineNo">721</span>      throw new IOException("Partial result row does not match. All partial results must come "<a name="line.721"></a>
+<span class="sourceLineNo">722</span>          + "from the same row. partialResultsRow: " + Bytes.toString(partialResultsRow) + "row: "<a name="line.722"></a>
+<span class="sourceLineNo">723</span>          + Bytes.toString(row));<a name="line.723"></a>
+<span class="sourceLineNo">724</span>    }<a name="line.724"></a>
+<span class="sourceLineNo">725</span>    partialResultsRow = row;<a name="line.725"></a>
+<span class="sourceLineNo">726</span>    partialResults.add(result);<a name="line.726"></a>
+<span class="sourceLineNo">727</span>  }<a name="line.727"></a>
+<span class="sourceLineNo">728</span><a name="line.728"></a>
+<span class="sourceLineNo">729</span>  /**<a name="line.729"></a>
+<span class="sourceLineNo">730</span>   * Convenience method for clearing the list of partials and resetting the partialResultsRow.<a name="line.730"></a>
+<span class="sourceLineNo">731</span>   */<a name="line.731"></a>
+<span class="sourceLineNo">732</span>  private void clearPartialResults() {<a name="line.732"></a>
+<span class="sourceLineNo">733</span>    partialResults.clear();<a name="line.733"></a>
+<span class="sourceLineNo">734</span>    partialResultsRow = null;<a name="line.734"></a>
+<span class="sourceLineNo">735</span>  }<a name="line.735"></a>
+<span class="sourceLineNo">736</span><a name="line.736"></a>
+<span class="sourceLineNo">737</span>  /**<a name="line.737"></a>
+<span class="sourceLineNo">738</span>   * Helper method for adding results between the indices [start, end) to the outputList<a name="line.738"></a>
+<span class="sourceLineNo">739</span>   * @param outputList the list that results will be added to<a name="line.739"></a>
+<span class="sourceLineNo">740</span>   * @param inputArray the array that results are taken from<a name="line.740"></a>
+<span class="sourceLineNo">741</span>   * @param start beginning index (inclusive)<a name="line.741"></a>
+<span class="sourceLineNo">742</span>   * @param end ending index (exclusive)<a name="line.742"></a>
+<span class="sourceLineNo">743</span>   */<a name="line.743"></a>
+<span class="sourceLineNo">744</span>  private void addResultsToList(List&lt;Result&gt; outputList, Result[] inputArray, int start, int end) {<a name="line.744"></a>
+<span class="sourceLineNo">745</span>    if (inputArray == null || start &lt; 0 || end &gt; inputArray.length) return;<a name="line.745"></a>
+<span class="sourceLineNo">746</span><a name="line.746"></a>
+<span class="sourceLineNo">747</span>    for (int i = start; i &lt; end; i++) {<a name="line.747"></a>
+<span class="sourceLineNo">748</span>      outputList.add(inputArray[i]);<a name="line.748"></a>
+<span class="sourceLineNo">749</span>    }<a name="line.749"></a>
+<span class="sourceLineNo">750</span>  }<a name="line.750"></a>
+<span class="sourceLineNo">751</span><a name="line.751"></a>
+<span class="sourceLineNo">752</span>    @Override<a name="line.752"></a>
+<span class="sourceLineNo">753</span>    public void close() {<a name="line.753"></a>
+<span class="sourceLineNo">754</span>      if (!scanMetricsPublished) writeScanMetrics();<a name="line.754"></a>
+<span class="sourceLineNo">755</span>      if (callable != null) {<a name="line.755"></a>
+<span class="sourceLineNo">756</span>        callable.setClose();<a name="line.756"></a>
+<span class="sourceLineNo">757</span>        try {<a name="line.757"></a>
+<span class="sourceLineNo">758</span>          call(callable, caller, scannerTimeout);<a name="line.758"></a>
+<span class="sourceLineNo">759</span>        } catch (UnknownScannerException e) {<a name="line.759"></a>
+<span class="sourceLineNo">760</span>           // We used to catch this error, interpret, and rethrow. However, we<a name="line.760"></a>
+<span class="sourceLineNo">761</span>           // have since decided that it's not nice for a scanner's close to<a name="line.761"></a>
+<span class="sourceLineNo">762</span>           // throw exceptions. Chances are it was just due to lease time out.<a name="line.762"></a>
+<span class="sourceLineNo">763</span>          if (LOG.isDebugEnabled()) {<a name="line.763"></a>
+<span class="sourceLineNo">764</span>            LOG.debug("scanner failed to close", e);<a name="line.764"></a>
+<span class="sourceLineNo">765</span>          }<a name="line.765"></a>
+<span class="sourceLineNo">766</span>        } catch (IOException e) {<a name="line.766"></a>
+<span class="sourceLineNo">767</span>          /* An exception other than UnknownScanner is unexpected. */<a name="line.767"></a>
+<span class="sourceLineNo">768</span>          LOG.warn("scanner failed to close.", e);<a name="line.768"></a>
+<span class="sourceLineNo">769</span>        }<a name="line.769"></a>
+<span class="sourceLineNo">770</span>        callable = null;<a name="line.770"></a>
+<span class="sourceLineNo">771</span>      }<a name="line.771"></a>
+<span class="sourceLineNo">772</span>      closed = true;<a name="line.772"></a>
+<span class="sourceLineNo">773</span>    }<a name="line.773"></a>
+<span class="sourceLineNo">774</span><a name="line.774"></a>
+<span class="sourceLineNo">775</span>  /**<a name="line.775"></a>
+<span class="sourceLineNo">776</span>   * Create the closest row before the specified row<a name="line.776"></a>
+<span class="sourceLineNo">777</span>   * @param row<a name="line.777"></a>
+<span class="sourceLineNo">778</span>   * @return a new byte array which is the closest front row of the specified one<a name="line.778"></a>
+<span class="sourceLineNo">779</span>   */<a name="line.779"></a>
+<span class="sourceLineNo">780</span>  protected static byte[] createClosestRowBefore(byte[] row) {<a name="line.780"></a>
+<span class="sourceLineNo">781</span>    if (row == null) {<a name="line.781"></a>
+<span class="sourceLineNo">782</span>      throw new IllegalArgumentException("The passed row is empty");<a name="line.782"></a>
 <span class="sourceLineNo">783</span>    }<a name="line.783"></a>
-<span class="sourceLineNo">784</span>    return false;<a name="line.784"></a>
-<span class="sourceLineNo">785</span>  }<a name="line.785"></a>
-<span class="sourceLineNo">786</span>}<a name="line.786"></a>
+<span class="sourceLineNo">784</span>    if (Bytes.equals(row, HConstants.EMPTY_BYTE_ARRAY)) {<a name="line.784"></a>
+<span class="sourceLineNo">785</span>      return MAX_BYTE_ARRAY;<a name="line.785"></a>
+<span class="sourceLineNo">786</span>    }<a name="line.786"></a>
+<span class="sourceLineNo">787</span>    if (row[row.length - 1] == 0) {<a name="line.787"></a>
+<span class="sourceLineNo">788</span>      return Arrays.copyOf(row, row.length - 1);<a name="line.788"></a>
+<span class="sourceLineNo">789</span>    } else {<a name="line.789"></a>
+<span class="sourceLineNo">790</span>      byte[] closestFrontRow = Arrays.copyOf(row, row.length);<a name="line.790"></a>
+<span class="sourceLineNo">791</span>      closestFrontRow[row.length - 1] = (byte) ((closestFrontRow[row.length - 1] &amp; 0xff) - 1);<a name="line.791"></a>
+<span class="sourceLineNo">792</span>      closestFrontRow = Bytes.add(closestFrontRow, MAX_BYTE_ARRAY);<a name="line.792"></a>
+<span class="sourceLineNo">793</span>      return closestFrontRow;<a name="line.793"></a>
+<span class="sourceLineNo">794</span>    }<a name="line.794"></a>
+<span class="sourceLineNo">795</span>  }<a name="line.795"></a>
+<span class="sourceLineNo">796</span><a name="line.796"></a>
+<span class="sourceLineNo">797</span>  @Override<a name="line.797"></a>
+<span class="sourceLineNo">798</span>  public boolean renewLease() {<a name="line.798"></a>
+<span class="sourceLineNo">799</span>    if (callable != null) {<a name="line.799"></a>
+<span class="sourceLineNo">800</span>      // do not return any rows, do not advance the scanner<a name="line.800"></a>
+<span class="sourceLineNo">801</span>      callable.setRenew(true);<a name="line.801"></a>
+<span class="sourceLineNo">802</span>      try {<a name="line.802"></a>
+<span class="sourceLineNo">803</span>        this.caller.callWithoutRetries(callable, this.scannerTimeout);<a name="line.803"></a>
+<span class="sourceLineNo">804</span>      } catch (Exception e) {<a name="line.804"></a>
+<span class="sourceLineNo">805</span>        return false;<a name="line.805"></a>
+<span class="sourceLineNo">806</span>      } finally {<a name="line.806"></a>
+<span class="sourceLineNo">807</span>        callable.setRenew(false);<a name="line.807"></a>
+<span class="sourceLineNo">808</span>      }<a name="line.808"></a>
+<span class="sourceLineNo">809</span>      return true;<a name="line.809"></a>
+<span class="sourceLineNo">810</span>    }<a name="line.810"></a>
+<span class="sourceLineNo">811</span>    return false;<a name="line.811"></a>
+<span class="sourceLineNo">812</span>  }<a name="line.812"></a>
+<span class="sourceLineNo">813</span><a name="line.813"></a>
+<span class="sourceLineNo">814</span>  protected void updateLastCellLoadedToCache(Result result) {<a name="line.814"></a>
+<span class="sourceLineNo">815</span>    if (result.rawCells().length == 0) {<a name="line.815"></a>
+<span class="sourceLineNo">816</span>      return;<a name="line.816"></a>
+<span class="sourceLineNo">817</span>    }<a name="line.817"></a>
+<span class="sourceLineNo">818</span>    this.lastCellLoadedToCache = result.rawCells()[result.rawCells().length - 1];<a name="line.818"></a>
+<span class="sourceLineNo">819</span>  }<a name="line.819"></a>
+<span class="sourceLineNo">820</span><a name="line.820"></a>
+<span class="sourceLineNo">821</span>  /**<a name="line.821"></a>
+<span class="sourceLineNo">822</span>   * Compare two Cells considering reversed scanner.<a name="line.822"></a>
+<span class="sourceLineNo">823</span>   * ReversedScanner only reverses rows, not columns.<a name="line.823"></a>
+<span class="sourceLineNo">824</span>   */<a name="line.824"></a>
+<span class="sourceLineNo">825</span>  private int compare(Cell a, Cell b) {<a name="line.825"></a>
+<span class="sourceLineNo">826</span>    CellComparator comparator = currentRegion != null &amp;&amp; currentRegion.isMetaRegion() ?<a name="line.826"></a>
+<span class="sourceLineNo">827</span>        CellComparator.META_COMPARATOR : CellComparator.COMPARATOR;<a name="line.827"></a>
+<span class="sourceLineNo">828</span>    int r = comparator.compareRows(a, b);<a name="line.828"></a>
+<span class="sourceLineNo">829</span>    if (r != 0) {<a name="line.829"></a>
+<span class="sourceLineNo">830</span>      return this.scan.isReversed() ? -r : r;<a name="line.830"></a>
+<span class="sourceLineNo">831</span>    }<a name="line.831"></a>
+<span class="sourceLineNo">832</span>    return CellComparator.compareWithoutRow(a, b);<a name="line.832"></a>
+<span class="sourceLineNo">833</span>  }<a name="line.833"></a>
+<span class="sourceLineNo">834</span><a name="line.834"></a>
+<span class="sourceLineNo">835</span>  private Result filterLoadedCell(Result result) {<a name="line.835"></a>
+<span class="sourceLineNo">836</span>    // we only filter result when last result is partial<a name="line.836"></a>
+<span class="sourceLineNo">837</span>    // so lastCellLoadedToCache and result should have same row key.<a name="line.837"></a>
+<span class="sourceLineNo">838</span>    // However, if 1) read some cells; 1.1) delete this row at the same time 2) move region;<a name="line.838"></a>
+<span class="sourceLineNo">839</span>    // 3) read more cell. lastCellLoadedToCache and result will be not at same row.<a name="line.839"></a>
+<span class="sourceLineNo">840</span>    if (lastCellLoadedToCache == null || result.rawCells().length == 0) {<a name="line.840"></a>
+<span class="sourceLineNo">841</span>      return result;<a name="line.841"></a>
+<span class="sourceLineNo">842</span>    }<a name="line.842"></a>
+<span class="sourceLineNo">843</span>    if (compare(this.lastCellLoadedToCache, result.rawCells()[0]) &lt; 0) {<a name="line.843"></a>
+<span class="sourceLineNo">844</span>      // The first cell of this result is larger than the last cell of loadcache.<a name="line.844"></a>
+<span class="sourceLineNo">845</span>      // If user do not allow partial result, it must be true.<a name="line.845"></a>
+<span class="sourceLineNo">846</span>      return result;<a name="line.846"></a>
+<span class="sourceLineNo">847</span>    }<a name="line.847"></a>
+<span class="sourceLineNo">848</span>    if (compare(this.lastCellLoadedToCache, result.rawCells()[result.rawCells().length - 1]) &gt;= 0) {<a name="line.848"></a>
+<span class="sourceLineNo">849</span>      // The last cell of this result is smaller than the last cell of loadcache, skip all.<a name="line.849"></a>
+<span class="sourceLineNo">850</span>      return null;<a name="line.850"></a>
+<span class="sourceLineNo">851</span>    }<a name="line.851"></a>
+<span class="sourceLineNo">852</span><a name="line.852"></a>
+<span class="sourceLineNo">853</span>    // The first one must not in filtered result, we start at the second.<a name="line.853"></a>
+<span class="sourceLineNo">854</span>    int index = 1;<a name="line.854"></a>
+<span class="sourceLineNo">855</span>    while (index &lt; result.rawCells().length) {<a name="line.855"></a>
+<span class="sourceLineNo">856</span>      if (compare(this.lastCellLoadedToCache, result.rawCells()[index]) &lt; 0) {<a name="line.856"></a>
+<span class="sourceLineNo">857</span>        break;<a name="line.857"></a>
+<span class="sourceLineNo">858</span>      }<a name="line.858"></a>
+<span class="sourceLineNo">859</span>      index++;<a name="line.859"></a>
+<span class="sourceLineNo">860</span>    }<a name="line.860"></a>
+<span class="sourceLineNo">861</span>    Cell[] list = Arrays.copyOfRange(result.rawCells(), index, result.rawCells().length);<a name="line.861"></a>
+<span class="sourceLineNo">862</span>    return Result.create(list, result.getExists(), result.isStale(), result.isPartial());<a name="line.862"></a>
+<span class="sourceLineNo">863</span>  }<a name="line.863"></a>
+<span class="sourceLineNo">864</span>}<a name="line.864"></a>
 
 
 
