@@ -514,9 +514,11 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 </td>
 </tr>
 <tr class="rowColor">
-<td class="colFirst"><code>private <a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a></code></td>
+<td class="colFirst"><code>protected <a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a></code></td>
 <td class="colLast"><code><strong><a href="../../../../../org/apache/hadoop/hbase/regionserver/StoreScanner.html#optimize(org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode,%20org.apache.hadoop.hbase.Cell)">optimize</a></strong>(<a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a>&nbsp;qcode,
-                <a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;cell)</code>&nbsp;</td>
+                <a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;cell)</code>
+<div class="block">See if we should actually SEEK or rather just SKIP to the next Cell (see HBASE-13109).</div>
+</td>
 </tr>
 <tr class="altColor">
 <td class="colFirst"><code>private void</code></td>
@@ -1324,8 +1326,58 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>optimize</h4>
-<pre>private&nbsp;<a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a>&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.656">optimize</a>(<a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a>&nbsp;qcode,
+<pre>protected&nbsp;<a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a>&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.711">optimize</a>(<a href="../../../../../org/apache/hadoop/hbase/regionserver/ScanQueryMatcher.MatchCode.html" title="enum in org.apache.hadoop.hbase.regionserver">ScanQueryMatcher.MatchCode</a>&nbsp;qcode,
                                   <a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;cell)</pre>
+<div class="block">See if we should actually SEEK or rather just SKIP to the next Cell (see HBASE-13109).
+ This method works together with ColumnTrackers and Filters. ColumnTrackers may issue SEEK
+ hints, such as seek to next column, next row, or seek to an arbitrary seek key.
+ This method intercepts these qcodes and decides whether a seek is the most efficient _actual_
+ way to get us to the requested cell (SEEKs are more expensive than SKIP, SKIP, SKIP inside the
+ current, loaded block).
+ It does this by looking at the next indexed key of the current HFile. This key
+ is then compared with the _SEEK_ key, where a SEEK key is an artificial 'last possible key
+ on the row' (only in here, we avoid actually creating a SEEK key; in the compare we work with
+ the current Cell but compare as though it were a seek key; see down in
+ matcher.compareKeyForNextRow, etc). If the compare gets us onto the
+ next block we *_SEEK, otherwise we just INCLUDE or SKIP, and let the ColumnTrackers or Filters
+ go through the next Cell, and so on)
+
+ <p>The ColumnTrackers and Filters must behave correctly in all cases, i.e. if they are past the
+ Cells they care about they must issues a SKIP or SEEK.
+
+ <p>Other notes:
+ <ul>
+ <li>Rows can straddle block boundaries</li>
+ <li>Versions of columns can straddle block boundaries (i.e. column C1 at T1 might be in a
+ different block than column C1 at T2)</li>
+ <li>We want to SKIP and INCLUDE if the chance is high that we'll find the desired Cell after a
+ few SKIPs...</li>
+ <li>We want to INCLUDE_AND_SEEK and SEEK when the chance is high that we'll be able to seek
+ past many Cells, especially if we know we need to go to the next block.</li>
+ </ul>
+ <p>A good proxy (best effort) to determine whether INCLUDE/SKIP is better than SEEK is whether
+ we'll likely end up seeking to the next block (or past the next block) to get our next column.
+ Example:
+ <pre>
+ |    BLOCK 1              |     BLOCK 2                   |
+ |  r1/c1, r1/c2, r1/c3    |    r1/c4, r1/c5, r2/c1        |
+                                   ^         ^
+                                   |         |
+                           Next Index Key   SEEK_NEXT_ROW (before r2/c1)
+
+
+ |    BLOCK 1                       |     BLOCK 2                      |
+ |  r1/c1/t5, r1/c1/t4, r1/c1/t3    |    r1/c1/t2, r1/c1/T1, r1/c2/T3  |
+                                            ^              ^
+                                            |              |
+                                    Next Index Key        SEEK_NEXT_COL
+ </pre>
+ Now imagine we want columns c1 and c3 (see first diagram above), the 'Next Index Key' of r1/c4
+ is > r1/c3 so we should seek to get to the c1 on the next row, r2. In second case, say we only
+ want one version of c1, after we have it, a SEEK_COL will be issued to get to c2. Looking at
+ the 'Next Index Key', it would land us in the next block, so we should SEEK. In other scenarios
+ where the SEEK will not land us in the next block, it is very likely better to issues a series
+ of SKIPs.</div>
 </li>
 </ul>
 <a name="updateReaders(java.util.List)">
@@ -1334,7 +1386,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>updateReaders</h4>
-<pre>public&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.686">updateReaders</a>(<a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;<a href="../../../../../org/apache/hadoop/hbase/regionserver/StoreFile.html" title="class in org.apache.hadoop.hbase.regionserver">StoreFile</a>&gt;&nbsp;sfs)
+<pre>public&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.747">updateReaders</a>(<a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;<a href="../../../../../org/apache/hadoop/hbase/regionserver/StoreFile.html" title="class in org.apache.hadoop.hbase.regionserver">StoreFile</a>&gt;&nbsp;sfs)
                    throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <div class="block"><strong>Description copied from interface:&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/ChangedReadersObserver.html#updateReaders(java.util.List)">ChangedReadersObserver</a></code></strong></div>
 <div class="block">Notify observers.</div>
@@ -1351,7 +1403,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>checkReseek</h4>
-<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.703">checkReseek</a>(boolean&nbsp;flushed)
+<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.764">checkReseek</a>(boolean&nbsp;flushed)
                        throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <dl><dt><span class="strong">Parameters:</span></dt><dd><code>flushed</code> - indicates if there was a flush</dd>
 <dt><span class="strong">Returns:</span></dt><dd>true if top of heap has changed (and KeyValueHeap has to try the
@@ -1366,7 +1418,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>resetScannerStack</h4>
-<pre>protected&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.719">resetScannerStack</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;lastTopKey)
+<pre>protected&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.780">resetScannerStack</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;lastTopKey)
                           throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <dl><dt><span class="strong">Throws:</span></dt>
 <dd><code><a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd></dl>
@@ -1378,7 +1430,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>checkScanOrder</h4>
-<pre>protected&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.772">checkScanOrder</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;prevKV,
+<pre>protected&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.833">checkScanOrder</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;prevKV,
                   <a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv,
                   <a href="../../../../../org/apache/hadoop/hbase/CellComparator.html" title="class in org.apache.hadoop.hbase">CellComparator</a>&nbsp;comparator)
                        throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
@@ -1394,7 +1446,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>seekToNextRow</h4>
-<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.780">seekToNextRow</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;c)
+<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.841">seekToNextRow</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;c)
                          throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <dl><dt><span class="strong">Throws:</span></dt>
 <dd><code><a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></code></dd></dl>
@@ -1406,7 +1458,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>seekAsDirection</h4>
-<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.790">seekAsDirection</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv)
+<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.851">seekAsDirection</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv)
                            throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <div class="block">Do a reseek in a normal StoreScanner(scan forward)</div>
 <dl><dt><span class="strong">Parameters:</span></dt><dd><code>kv</code> - </dd>
@@ -1421,7 +1473,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>reseek</h4>
-<pre>public&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.796">reseek</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv)
+<pre>public&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.857">reseek</a>(<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv)
                throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <div class="block"><strong>Description copied from interface:&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html#reseek(org.apache.hadoop.hbase.Cell)">KeyValueScanner</a></code></strong></div>
 <div class="block">Reseek the scanner at or after the specified KeyValue.
@@ -1443,7 +1495,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>checkFlushed</h4>
-<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.808">checkFlushed</a>()</pre>
+<pre>protected&nbsp;boolean&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.869">checkFlushed</a>()</pre>
 </li>
 </ul>
 <a name="getSequenceID()">
@@ -1452,7 +1504,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>getSequenceID</h4>
-<pre>public&nbsp;long&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.830">getSequenceID</a>()</pre>
+<pre>public&nbsp;long&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.891">getSequenceID</a>()</pre>
 <div class="block"><strong>Description copied from interface:&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html#getSequenceID()">KeyValueScanner</a></code></strong></div>
 <div class="block">Get the sequence id associated with this KeyValueScanner. This is required
  for comparing multiple files to find out which one has the latest data.
@@ -1470,7 +1522,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>parallelSeek</h4>
-<pre>private&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.840">parallelSeek</a>(<a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;? extends <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html" title="interface in org.apache.hadoop.hbase.regionserver">KeyValueScanner</a>&gt;&nbsp;scanners,
+<pre>private&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.901">parallelSeek</a>(<a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;? extends <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html" title="interface in org.apache.hadoop.hbase.regionserver">KeyValueScanner</a>&gt;&nbsp;scanners,
                 <a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;kv)
                    throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <div class="block">Seek storefiles in parallel to optimize IO latency as much as possible</div>
@@ -1485,7 +1537,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>getAllScannersForTesting</h4>
-<pre><a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;<a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html" title="interface in org.apache.hadoop.hbase.regionserver">KeyValueScanner</a>&gt;&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.876">getAllScannersForTesting</a>()</pre>
+<pre><a href="http://docs.oracle.com/javase/7/docs/api/java/util/List.html?is-external=true" title="class or interface in java.util">List</a>&lt;<a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html" title="interface in org.apache.hadoop.hbase.regionserver">KeyValueScanner</a>&gt;&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.937">getAllScannersForTesting</a>()</pre>
 <div class="block">Used in testing.</div>
 <dl><dt><span class="strong">Returns:</span></dt><dd>all scanners in no particular order</dd></dl>
 </li>
@@ -1496,7 +1548,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>enableLazySeekGlobally</h4>
-<pre>static&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.886">enableLazySeekGlobally</a>(boolean&nbsp;enable)</pre>
+<pre>static&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.947">enableLazySeekGlobally</a>(boolean&nbsp;enable)</pre>
 </li>
 </ul>
 <a name="getEstimatedNumberOfKvsScanned()">
@@ -1505,7 +1557,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>getEstimatedNumberOfKvsScanned</h4>
-<pre>public&nbsp;long&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.893">getEstimatedNumberOfKvsScanned</a>()</pre>
+<pre>public&nbsp;long&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.954">getEstimatedNumberOfKvsScanned</a>()</pre>
 <dl><dt><span class="strong">Returns:</span></dt><dd>The estimated number of KVs seen by this scanner (includes some skipped KVs).</dd></dl>
 </li>
 </ul>
@@ -1515,14 +1567,15 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockList">
 <li class="blockList">
 <h4>getNextIndexedKey</h4>
-<pre>public&nbsp;<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.898">getNextIndexedKey</a>()</pre>
+<pre>public&nbsp;<a href="../../../../../org/apache/hadoop/hbase/Cell.html" title="interface in org.apache.hadoop.hbase">Cell</a>&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.959">getNextIndexedKey</a>()</pre>
 <dl>
 <dt><strong>Specified by:</strong></dt>
 <dd><code><a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html#getNextIndexedKey()">getNextIndexedKey</a></code>&nbsp;in interface&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValueScanner.html" title="interface in org.apache.hadoop.hbase.regionserver">KeyValueScanner</a></code></dd>
 <dt><strong>Overrides:</strong></dt>
 <dd><code><a href="../../../../../org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.html#getNextIndexedKey()">getNextIndexedKey</a></code>&nbsp;in class&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/NonLazyKeyValueScanner.html" title="class in org.apache.hadoop.hbase.regionserver">NonLazyKeyValueScanner</a></code></dd>
-<dt><span class="strong">Returns:</span></dt><dd>the next key in the index (the key to seek to the next block)
- if known, or null otherwise</dd></dl>
+<dt><span class="strong">Returns:</span></dt><dd>the next key in the index, usually the first key of next block OR a key that falls
+ between last key of current block and first key of next block..
+ see HFileWriterImpl#getMidpoint, or null if not known.</dd></dl>
 </li>
 </ul>
 <a name="shipped()">
@@ -1531,7 +1584,7 @@ implements <a href="../../../../../org/apache/hadoop/hbase/regionserver/KeyValue
 <ul class="blockListLast">
 <li class="blockList">
 <h4>shipped</h4>
-<pre>public&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.903">shipped</a>()
+<pre>public&nbsp;void&nbsp;<a href="../../../../../src-html/org/apache/hadoop/hbase/regionserver/StoreScanner.html#line.964">shipped</a>()
              throws <a href="http://docs.oracle.com/javase/7/docs/api/java/io/IOException.html?is-external=true" title="class or interface in java.io">IOException</a></pre>
 <div class="block"><strong>Description copied from interface:&nbsp;<code><a href="../../../../../org/apache/hadoop/hbase/regionserver/Shipper.html#shipped()">Shipper</a></code></strong></div>
 <div class="block">Called after a batch of rows scanned and set to be returned to client. Any in between cleanup
