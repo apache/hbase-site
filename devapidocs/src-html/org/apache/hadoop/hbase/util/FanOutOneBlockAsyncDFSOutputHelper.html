@@ -80,352 +80,352 @@
 <span class="sourceLineNo">072</span>import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;<a name="line.72"></a>
 <span class="sourceLineNo">073</span>import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;<a name="line.73"></a>
 <span class="sourceLineNo">074</span>import org.apache.hadoop.io.EnumSetWritable;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>import org.apache.hadoop.net.NetUtils;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>import org.apache.hadoop.util.DataChecksum;<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>import com.google.common.base.Throwables;<a name="line.78"></a>
-<span class="sourceLineNo">079</span>import com.google.common.collect.ImmutableMap;<a name="line.79"></a>
-<span class="sourceLineNo">080</span>import com.google.protobuf.CodedOutputStream;<a name="line.80"></a>
-<span class="sourceLineNo">081</span><a name="line.81"></a>
-<span class="sourceLineNo">082</span>import io.netty.bootstrap.Bootstrap;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>import io.netty.buffer.ByteBuf;<a name="line.83"></a>
-<span class="sourceLineNo">084</span>import io.netty.buffer.ByteBufAllocator;<a name="line.84"></a>
-<span class="sourceLineNo">085</span>import io.netty.buffer.ByteBufOutputStream;<a name="line.85"></a>
-<span class="sourceLineNo">086</span>import io.netty.buffer.PooledByteBufAllocator;<a name="line.86"></a>
-<span class="sourceLineNo">087</span>import io.netty.channel.Channel;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>import io.netty.channel.ChannelFuture;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>import io.netty.channel.ChannelFutureListener;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>import io.netty.channel.ChannelHandlerContext;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>import io.netty.channel.ChannelInitializer;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>import io.netty.channel.ChannelPipeline;<a name="line.92"></a>
-<span class="sourceLineNo">093</span>import io.netty.channel.EventLoop;<a name="line.93"></a>
-<span class="sourceLineNo">094</span>import io.netty.channel.SimpleChannelInboundHandler;<a name="line.94"></a>
-<span class="sourceLineNo">095</span>import io.netty.channel.socket.nio.NioSocketChannel;<a name="line.95"></a>
-<span class="sourceLineNo">096</span>import io.netty.handler.codec.protobuf.ProtobufDecoder;<a name="line.96"></a>
-<span class="sourceLineNo">097</span>import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>import io.netty.handler.timeout.IdleState;<a name="line.98"></a>
-<span class="sourceLineNo">099</span>import io.netty.handler.timeout.IdleStateEvent;<a name="line.99"></a>
-<span class="sourceLineNo">100</span>import io.netty.handler.timeout.IdleStateHandler;<a name="line.100"></a>
-<span class="sourceLineNo">101</span>import io.netty.util.concurrent.Future;<a name="line.101"></a>
-<span class="sourceLineNo">102</span>import io.netty.util.concurrent.FutureListener;<a name="line.102"></a>
-<span class="sourceLineNo">103</span>import io.netty.util.concurrent.Promise;<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>/**<a name="line.105"></a>
-<span class="sourceLineNo">106</span> * Helper class for implementing {@link FanOutOneBlockAsyncDFSOutput}.<a name="line.106"></a>
-<span class="sourceLineNo">107</span> */<a name="line.107"></a>
-<span class="sourceLineNo">108</span>@InterfaceAudience.Private<a name="line.108"></a>
-<span class="sourceLineNo">109</span>public class FanOutOneBlockAsyncDFSOutputHelper {<a name="line.109"></a>
-<span class="sourceLineNo">110</span><a name="line.110"></a>
-<span class="sourceLineNo">111</span>  private static final Log LOG = LogFactory.getLog(FanOutOneBlockAsyncDFSOutputHelper.class);<a name="line.111"></a>
-<span class="sourceLineNo">112</span><a name="line.112"></a>
-<span class="sourceLineNo">113</span>  private FanOutOneBlockAsyncDFSOutputHelper() {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  }<a name="line.114"></a>
-<span class="sourceLineNo">115</span><a name="line.115"></a>
-<span class="sourceLineNo">116</span>  // use pooled allocator for performance.<a name="line.116"></a>
-<span class="sourceLineNo">117</span>  private static final ByteBufAllocator ALLOC = PooledByteBufAllocator.DEFAULT;<a name="line.117"></a>
-<span class="sourceLineNo">118</span><a name="line.118"></a>
-<span class="sourceLineNo">119</span>  // copied from DFSPacket since it is package private.<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  public static final long HEART_BEAT_SEQNO = -1L;<a name="line.120"></a>
-<span class="sourceLineNo">121</span><a name="line.121"></a>
-<span class="sourceLineNo">122</span>  // helper class for creating DataChecksum object.<a name="line.122"></a>
-<span class="sourceLineNo">123</span>  private static final Method CREATE_CHECKSUM;<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>  // helper class for getting Status from PipelineAckProto. In hadoop 2.6 or before, there is a<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  // getStatus method, and for hadoop 2.7 or after, the status is retrieved from flag. The flag may<a name="line.126"></a>
-<span class="sourceLineNo">127</span>  // get from proto directly, or combined by the reply field of the proto and a ECN object. See<a name="line.127"></a>
-<span class="sourceLineNo">128</span>  // createPipelineAckStatusGetter for more details.<a name="line.128"></a>
-<span class="sourceLineNo">129</span>  private interface PipelineAckStatusGetter {<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    Status get(PipelineAckProto ack);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>  }<a name="line.131"></a>
-<span class="sourceLineNo">132</span><a name="line.132"></a>
-<span class="sourceLineNo">133</span>  private static final PipelineAckStatusGetter PIPELINE_ACK_STATUS_GETTER;<a name="line.133"></a>
-<span class="sourceLineNo">134</span><a name="line.134"></a>
-<span class="sourceLineNo">135</span>  // StorageType enum is added in hadoop 2.4, but it is moved to another package in hadoop 2.6 and<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  // the setter method in OpWriteBlockProto is also added in hadoop 2.6. So we need to skip the<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  // setStorageType call if it is hadoop 2.5 or before. See createStorageTypeSetter for more<a name="line.137"></a>
-<span class="sourceLineNo">138</span>  // details.<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  private interface StorageTypeSetter {<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    OpWriteBlockProto.Builder set(OpWriteBlockProto.Builder builder, Enum&lt;?&gt; storageType);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>  }<a name="line.141"></a>
-<span class="sourceLineNo">142</span><a name="line.142"></a>
-<span class="sourceLineNo">143</span>  private static final StorageTypeSetter STORAGE_TYPE_SETTER;<a name="line.143"></a>
-<span class="sourceLineNo">144</span><a name="line.144"></a>
-<span class="sourceLineNo">145</span>  // helper class for calling create method on namenode. There is a supportedVersions parameter for<a name="line.145"></a>
-<span class="sourceLineNo">146</span>  // hadoop 2.6 or after. See createFileCreater for more details.<a name="line.146"></a>
-<span class="sourceLineNo">147</span>  private interface FileCreater {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.148"></a>
-<span class="sourceLineNo">149</span>        String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.149"></a>
-<span class="sourceLineNo">150</span>        short replication, long blockSize) throws IOException;<a name="line.150"></a>
-<span class="sourceLineNo">151</span>  }<a name="line.151"></a>
-<span class="sourceLineNo">152</span><a name="line.152"></a>
-<span class="sourceLineNo">153</span>  private static final FileCreater FILE_CREATER;<a name="line.153"></a>
-<span class="sourceLineNo">154</span><a name="line.154"></a>
-<span class="sourceLineNo">155</span>  // helper class for add or remove lease from DFSClient. Hadoop 2.4 use src as the Map's key, and<a name="line.155"></a>
-<span class="sourceLineNo">156</span>  // hadoop 2.5 or after use inodeId. See createLeaseManager for more details.<a name="line.156"></a>
-<span class="sourceLineNo">157</span>  private interface LeaseManager {<a name="line.157"></a>
-<span class="sourceLineNo">158</span><a name="line.158"></a>
-<span class="sourceLineNo">159</span>    void begin(DFSClient client, String src, long inodeId);<a name="line.159"></a>
-<span class="sourceLineNo">160</span><a name="line.160"></a>
-<span class="sourceLineNo">161</span>    void end(DFSClient client, String src, long inodeId);<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  }<a name="line.162"></a>
-<span class="sourceLineNo">163</span><a name="line.163"></a>
-<span class="sourceLineNo">164</span>  private static final LeaseManager LEASE_MANAGER;<a name="line.164"></a>
-<span class="sourceLineNo">165</span><a name="line.165"></a>
-<span class="sourceLineNo">166</span>  // This is used to terminate a recoverFileLease call when FileSystem is already closed.<a name="line.166"></a>
-<span class="sourceLineNo">167</span>  // isClientRunning is not public so we need to use reflection.<a name="line.167"></a>
-<span class="sourceLineNo">168</span>  private interface DFSClientAdaptor {<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    boolean isClientRunning(DFSClient client);<a name="line.169"></a>
-<span class="sourceLineNo">170</span>  }<a name="line.170"></a>
-<span class="sourceLineNo">171</span><a name="line.171"></a>
-<span class="sourceLineNo">172</span>  private static final DFSClientAdaptor DFS_CLIENT_ADAPTOR;<a name="line.172"></a>
-<span class="sourceLineNo">173</span><a name="line.173"></a>
-<span class="sourceLineNo">174</span>  private static DFSClientAdaptor createDFSClientAdaptor() {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    try {<a name="line.175"></a>
-<span class="sourceLineNo">176</span>      final Method method = DFSClient.class.getDeclaredMethod("isClientRunning");<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      method.setAccessible(true);<a name="line.177"></a>
-<span class="sourceLineNo">178</span>      return new DFSClientAdaptor() {<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>        @Override<a name="line.180"></a>
-<span class="sourceLineNo">181</span>        public boolean isClientRunning(DFSClient client) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>          try {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>            return (Boolean) method.invoke(client);<a name="line.183"></a>
-<span class="sourceLineNo">184</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>            throw new RuntimeException(e);<a name="line.185"></a>
-<span class="sourceLineNo">186</span>          }<a name="line.186"></a>
-<span class="sourceLineNo">187</span>        }<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      };<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    } catch (NoSuchMethodException e) {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>      throw new Error(e);<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    }<a name="line.191"></a>
-<span class="sourceLineNo">192</span>  }<a name="line.192"></a>
-<span class="sourceLineNo">193</span><a name="line.193"></a>
-<span class="sourceLineNo">194</span>  private static LeaseManager createLeaseManager() {<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    try {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      final Method beginFileLeaseMethod = DFSClient.class.getDeclaredMethod("beginFileLease",<a name="line.196"></a>
-<span class="sourceLineNo">197</span>        long.class, DFSOutputStream.class);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      beginFileLeaseMethod.setAccessible(true);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      final Method endFileLeaseMethod = DFSClient.class.getDeclaredMethod("endFileLease",<a name="line.199"></a>
-<span class="sourceLineNo">200</span>        long.class);<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      endFileLeaseMethod.setAccessible(true);<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      return new LeaseManager() {<a name="line.202"></a>
-<span class="sourceLineNo">203</span><a name="line.203"></a>
-<span class="sourceLineNo">204</span>        @Override<a name="line.204"></a>
-<span class="sourceLineNo">205</span>        public void begin(DFSClient client, String src, long inodeId) {<a name="line.205"></a>
-<span class="sourceLineNo">206</span>          try {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>            beginFileLeaseMethod.invoke(client, inodeId, null);<a name="line.207"></a>
-<span class="sourceLineNo">208</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.208"></a>
-<span class="sourceLineNo">209</span>            throw new RuntimeException(e);<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          }<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        }<a name="line.211"></a>
-<span class="sourceLineNo">212</span><a name="line.212"></a>
-<span class="sourceLineNo">213</span>        @Override<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        public void end(DFSClient client, String src, long inodeId) {<a name="line.214"></a>
-<span class="sourceLineNo">215</span>          try {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>            endFileLeaseMethod.invoke(client, inodeId);<a name="line.216"></a>
-<span class="sourceLineNo">217</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.217"></a>
-<span class="sourceLineNo">218</span>            throw new RuntimeException(e);<a name="line.218"></a>
-<span class="sourceLineNo">219</span>          }<a name="line.219"></a>
-<span class="sourceLineNo">220</span>        }<a name="line.220"></a>
-<span class="sourceLineNo">221</span>      };<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    } catch (NoSuchMethodException e) {<a name="line.222"></a>
-<span class="sourceLineNo">223</span>      LOG.warn("No inodeId related lease methods found, should be hadoop 2.4-", e);<a name="line.223"></a>
-<span class="sourceLineNo">224</span>    }<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    try {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      final Method beginFileLeaseMethod = DFSClient.class.getDeclaredMethod("beginFileLease",<a name="line.226"></a>
-<span class="sourceLineNo">227</span>        String.class, DFSOutputStream.class);<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      beginFileLeaseMethod.setAccessible(true);<a name="line.228"></a>
-<span class="sourceLineNo">229</span>      final Method endFileLeaseMethod = DFSClient.class.getDeclaredMethod("endFileLease",<a name="line.229"></a>
-<span class="sourceLineNo">230</span>        String.class);<a name="line.230"></a>
-<span class="sourceLineNo">231</span>      endFileLeaseMethod.setAccessible(true);<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      return new LeaseManager() {<a name="line.232"></a>
-<span class="sourceLineNo">233</span><a name="line.233"></a>
-<span class="sourceLineNo">234</span>        @Override<a name="line.234"></a>
-<span class="sourceLineNo">235</span>        public void begin(DFSClient client, String src, long inodeId) {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>          try {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>            beginFileLeaseMethod.invoke(client, src, null);<a name="line.237"></a>
-<span class="sourceLineNo">238</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>            throw new RuntimeException(e);<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          }<a name="line.240"></a>
-<span class="sourceLineNo">241</span>        }<a name="line.241"></a>
-<span class="sourceLineNo">242</span><a name="line.242"></a>
-<span class="sourceLineNo">243</span>        @Override<a name="line.243"></a>
-<span class="sourceLineNo">244</span>        public void end(DFSClient client, String src, long inodeId) {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>          try {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>            endFileLeaseMethod.invoke(client, src);<a name="line.246"></a>
-<span class="sourceLineNo">247</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>            throw new RuntimeException(e);<a name="line.248"></a>
-<span class="sourceLineNo">249</span>          }<a name="line.249"></a>
-<span class="sourceLineNo">250</span>        }<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      };<a name="line.251"></a>
-<span class="sourceLineNo">252</span>    } catch (NoSuchMethodException e) {<a name="line.252"></a>
-<span class="sourceLineNo">253</span>      throw new Error(e);<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    }<a name="line.254"></a>
-<span class="sourceLineNo">255</span>  }<a name="line.255"></a>
-<span class="sourceLineNo">256</span><a name="line.256"></a>
-<span class="sourceLineNo">257</span>  private static PipelineAckStatusGetter createPipelineAckStatusGetter() {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    try {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      final Method getFlagListMethod = PipelineAckProto.class.getMethod("getFlagList");<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      @SuppressWarnings("rawtypes")<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      Class&lt;? extends Enum&gt; ecnClass;<a name="line.261"></a>
-<span class="sourceLineNo">262</span>      try {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>        ecnClass = Class.forName("org.apache.hadoop.hdfs.protocol.datatransfer.PipelineAck$ECN")<a name="line.263"></a>
-<span class="sourceLineNo">264</span>            .asSubclass(Enum.class);<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      } catch (ClassNotFoundException e) {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>        throw new Error(e);<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      }<a name="line.267"></a>
-<span class="sourceLineNo">268</span>      @SuppressWarnings("unchecked")<a name="line.268"></a>
-<span class="sourceLineNo">269</span>      final Enum&lt;?&gt; disabledECN = Enum.valueOf(ecnClass, "DISABLED");<a name="line.269"></a>
-<span class="sourceLineNo">270</span>      final Method getReplyMethod = PipelineAckProto.class.getMethod("getReply", int.class);<a name="line.270"></a>
-<span class="sourceLineNo">271</span>      final Method combineHeaderMethod = PipelineAck.class.getMethod("combineHeader", ecnClass,<a name="line.271"></a>
-<span class="sourceLineNo">272</span>        Status.class);<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      final Method getStatusFromHeaderMethod = PipelineAck.class.getMethod("getStatusFromHeader",<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        int.class);<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      return new PipelineAckStatusGetter() {<a name="line.275"></a>
-<span class="sourceLineNo">276</span><a name="line.276"></a>
-<span class="sourceLineNo">277</span>        @Override<a name="line.277"></a>
-<span class="sourceLineNo">278</span>        public Status get(PipelineAckProto ack) {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>          try {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>            @SuppressWarnings("unchecked")<a name="line.280"></a>
-<span class="sourceLineNo">281</span>            List&lt;Integer&gt; flagList = (List&lt;Integer&gt;) getFlagListMethod.invoke(ack);<a name="line.281"></a>
-<span class="sourceLineNo">282</span>            Integer headerFlag;<a name="line.282"></a>
-<span class="sourceLineNo">283</span>            if (flagList.isEmpty()) {<a name="line.283"></a>
-<span class="sourceLineNo">284</span>              Status reply = (Status) getReplyMethod.invoke(ack, 0);<a name="line.284"></a>
-<span class="sourceLineNo">285</span>              headerFlag = (Integer) combineHeaderMethod.invoke(null, disabledECN, reply);<a name="line.285"></a>
-<span class="sourceLineNo">286</span>            } else {<a name="line.286"></a>
-<span class="sourceLineNo">287</span>              headerFlag = flagList.get(0);<a name="line.287"></a>
-<span class="sourceLineNo">288</span>            }<a name="line.288"></a>
-<span class="sourceLineNo">289</span>            return (Status) getStatusFromHeaderMethod.invoke(null, headerFlag);<a name="line.289"></a>
-<span class="sourceLineNo">290</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.290"></a>
-<span class="sourceLineNo">291</span>            throw new RuntimeException(e);<a name="line.291"></a>
-<span class="sourceLineNo">292</span>          }<a name="line.292"></a>
-<span class="sourceLineNo">293</span>        }<a name="line.293"></a>
-<span class="sourceLineNo">294</span>      };<a name="line.294"></a>
-<span class="sourceLineNo">295</span>    } catch (NoSuchMethodException e) {<a name="line.295"></a>
-<span class="sourceLineNo">296</span>      LOG.warn("Can not get expected methods, should be hadoop 2.6-", e);<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    }<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    try {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      final Method getStatusMethod = PipelineAckProto.class.getMethod("getStatus", int.class);<a name="line.299"></a>
-<span class="sourceLineNo">300</span>      return new PipelineAckStatusGetter() {<a name="line.300"></a>
-<span class="sourceLineNo">301</span><a name="line.301"></a>
-<span class="sourceLineNo">302</span>        @Override<a name="line.302"></a>
-<span class="sourceLineNo">303</span>        public Status get(PipelineAckProto ack) {<a name="line.303"></a>
-<span class="sourceLineNo">304</span>          try {<a name="line.304"></a>
-<span class="sourceLineNo">305</span>            return (Status) getStatusMethod.invoke(ack, 0);<a name="line.305"></a>
-<span class="sourceLineNo">306</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>            throw new RuntimeException(e);<a name="line.307"></a>
-<span class="sourceLineNo">308</span>          }<a name="line.308"></a>
-<span class="sourceLineNo">309</span>        }<a name="line.309"></a>
-<span class="sourceLineNo">310</span>      };<a name="line.310"></a>
-<span class="sourceLineNo">311</span>    } catch (NoSuchMethodException e) {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>      throw new Error(e);<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    }<a name="line.313"></a>
-<span class="sourceLineNo">314</span>  }<a name="line.314"></a>
-<span class="sourceLineNo">315</span><a name="line.315"></a>
-<span class="sourceLineNo">316</span>  private static StorageTypeSetter createStorageTypeSetter() {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>    final Method setStorageTypeMethod;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>    try {<a name="line.318"></a>
-<span class="sourceLineNo">319</span>      setStorageTypeMethod = OpWriteBlockProto.Builder.class.getMethod("setStorageType",<a name="line.319"></a>
-<span class="sourceLineNo">320</span>        StorageTypeProto.class);<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    } catch (NoSuchMethodException e) {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>      LOG.warn("noSetStorageType method found, should be hadoop 2.5-", e);<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      return new StorageTypeSetter() {<a name="line.323"></a>
-<span class="sourceLineNo">324</span><a name="line.324"></a>
-<span class="sourceLineNo">325</span>        @Override<a name="line.325"></a>
-<span class="sourceLineNo">326</span>        public Builder set(Builder builder, Enum&lt;?&gt; storageType) {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>          return builder;<a name="line.327"></a>
-<span class="sourceLineNo">328</span>        }<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      };<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    ImmutableMap.Builder&lt;String, StorageTypeProto&gt; builder = ImmutableMap.builder();<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    for (StorageTypeProto storageTypeProto : StorageTypeProto.values()) {<a name="line.332"></a>
-<span class="sourceLineNo">333</span>      builder.put(storageTypeProto.name(), storageTypeProto);<a name="line.333"></a>
-<span class="sourceLineNo">334</span>    }<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    final ImmutableMap&lt;String, StorageTypeProto&gt; name2ProtoEnum = builder.build();<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    return new StorageTypeSetter() {<a name="line.336"></a>
-<span class="sourceLineNo">337</span><a name="line.337"></a>
-<span class="sourceLineNo">338</span>      @Override<a name="line.338"></a>
-<span class="sourceLineNo">339</span>      public Builder set(Builder builder, Enum&lt;?&gt; storageType) {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>        Object protoEnum = name2ProtoEnum.get(storageType.name());<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        try {<a name="line.341"></a>
-<span class="sourceLineNo">342</span>          setStorageTypeMethod.invoke(builder, protoEnum);<a name="line.342"></a>
-<span class="sourceLineNo">343</span>        } catch (IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {<a name="line.343"></a>
-<span class="sourceLineNo">344</span>          throw new RuntimeException(e);<a name="line.344"></a>
-<span class="sourceLineNo">345</span>        }<a name="line.345"></a>
-<span class="sourceLineNo">346</span>        return builder;<a name="line.346"></a>
-<span class="sourceLineNo">347</span>      }<a name="line.347"></a>
-<span class="sourceLineNo">348</span>    };<a name="line.348"></a>
-<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
-<span class="sourceLineNo">350</span><a name="line.350"></a>
-<span class="sourceLineNo">351</span>  private static FileCreater createFileCreater() {<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    for (Method method : ClientProtocol.class.getMethods()) {<a name="line.352"></a>
-<span class="sourceLineNo">353</span>      if (method.getName().equals("create")) {<a name="line.353"></a>
-<span class="sourceLineNo">354</span>        final Method createMethod = method;<a name="line.354"></a>
-<span class="sourceLineNo">355</span>        Class&lt;?&gt;[] paramTypes = createMethod.getParameterTypes();<a name="line.355"></a>
-<span class="sourceLineNo">356</span>        if (paramTypes[paramTypes.length - 1] == long.class) {<a name="line.356"></a>
-<span class="sourceLineNo">357</span>          return new FileCreater() {<a name="line.357"></a>
-<span class="sourceLineNo">358</span><a name="line.358"></a>
-<span class="sourceLineNo">359</span>            @Override<a name="line.359"></a>
-<span class="sourceLineNo">360</span>            public HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.360"></a>
-<span class="sourceLineNo">361</span>                String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.361"></a>
-<span class="sourceLineNo">362</span>                short replication, long blockSize) throws IOException {<a name="line.362"></a>
-<span class="sourceLineNo">363</span>              try {<a name="line.363"></a>
-<span class="sourceLineNo">364</span>                return (HdfsFileStatus) createMethod.invoke(namenode, src, masked, clientName, flag,<a name="line.364"></a>
-<span class="sourceLineNo">365</span>                  createParent, replication, blockSize);<a name="line.365"></a>
-<span class="sourceLineNo">366</span>              } catch (IllegalAccessException e) {<a name="line.366"></a>
-<span class="sourceLineNo">367</span>                throw new RuntimeException(e);<a name="line.367"></a>
-<span class="sourceLineNo">368</span>              } catch (InvocationTargetException e) {<a name="line.368"></a>
-<span class="sourceLineNo">369</span>                Throwables.propagateIfPossible(e.getTargetException(), IOException.class);<a name="line.369"></a>
-<span class="sourceLineNo">370</span>                throw new RuntimeException(e);<a name="line.370"></a>
-<span class="sourceLineNo">371</span>              }<a name="line.371"></a>
-<span class="sourceLineNo">372</span>            }<a name="line.372"></a>
-<span class="sourceLineNo">373</span>          };<a name="line.373"></a>
-<span class="sourceLineNo">374</span>        } else {<a name="line.374"></a>
-<span class="sourceLineNo">375</span>          try {<a name="line.375"></a>
-<span class="sourceLineNo">376</span>            Class&lt;?&gt; cryptoProtocolVersionClass = Class<a name="line.376"></a>
-<span class="sourceLineNo">377</span>                .forName("org.apache.hadoop.crypto.CryptoProtocolVersion");<a name="line.377"></a>
-<span class="sourceLineNo">378</span>            Method supportedMethod = cryptoProtocolVersionClass.getMethod("supported");<a name="line.378"></a>
-<span class="sourceLineNo">379</span>            final Object supported = supportedMethod.invoke(null);<a name="line.379"></a>
-<span class="sourceLineNo">380</span>            return new FileCreater() {<a name="line.380"></a>
-<span class="sourceLineNo">381</span><a name="line.381"></a>
-<span class="sourceLineNo">382</span>              @Override<a name="line.382"></a>
-<span class="sourceLineNo">383</span>              public HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.383"></a>
-<span class="sourceLineNo">384</span>                  String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.384"></a>
-<span class="sourceLineNo">385</span>                  short replication, long blockSize) throws IOException {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>                try {<a name="line.386"></a>
-<span class="sourceLineNo">387</span>                  return (HdfsFileStatus) createMethod.invoke(namenode, src, masked, clientName,<a name="line.387"></a>
-<span class="sourceLineNo">388</span>                    flag, createParent, replication, blockSize, supported);<a name="line.388"></a>
-<span class="sourceLineNo">389</span>                } catch (IllegalAccessException e) {<a name="line.389"></a>
-<span class="sourceLineNo">390</span>                  throw new RuntimeException(e);<a name="line.390"></a>
-<span class="sourceLineNo">391</span>                } catch (InvocationTargetException e) {<a name="line.391"></a>
-<span class="sourceLineNo">392</span>                  Throwables.propagateIfPossible(e.getTargetException(), IOException.class);<a name="line.392"></a>
-<span class="sourceLineNo">393</span>                  throw new RuntimeException(e);<a name="line.393"></a>
-<span class="sourceLineNo">394</span>                }<a name="line.394"></a>
-<span class="sourceLineNo">395</span>              }<a name="line.395"></a>
-<span class="sourceLineNo">396</span>            };<a name="line.396"></a>
-<span class="sourceLineNo">397</span>          } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException<a name="line.397"></a>
-<span class="sourceLineNo">398</span>              | InvocationTargetException e) {<a name="line.398"></a>
-<span class="sourceLineNo">399</span>            throw new Error(e);<a name="line.399"></a>
-<span class="sourceLineNo">400</span>          }<a name="line.400"></a>
-<span class="sourceLineNo">401</span>        }<a name="line.401"></a>
-<span class="sourceLineNo">402</span>      }<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    }<a name="line.403"></a>
-<span class="sourceLineNo">404</span>    throw new Error("No create method found for " + ClientProtocol.class.getName());<a name="line.404"></a>
-<span class="sourceLineNo">405</span>  }<a name="line.405"></a>
-<span class="sourceLineNo">406</span><a name="line.406"></a>
-<span class="sourceLineNo">407</span>  // cancel the processing if DFSClient is already closed.<a name="line.407"></a>
-<span class="sourceLineNo">408</span>  static final class CancelOnClose implements CancelableProgressable {<a name="line.408"></a>
-<span class="sourceLineNo">409</span><a name="line.409"></a>
-<span class="sourceLineNo">410</span>    private final DFSClient client;<a name="line.410"></a>
-<span class="sourceLineNo">411</span><a name="line.411"></a>
-<span class="sourceLineNo">412</span>    public CancelOnClose(DFSClient client) {<a name="line.412"></a>
-<span class="sourceLineNo">413</span>      this.client = client;<a name="line.413"></a>
-<span class="sourceLineNo">414</span>    }<a name="line.414"></a>
-<span class="sourceLineNo">415</span><a name="line.415"></a>
-<span class="sourceLineNo">416</span>    @Override<a name="line.416"></a>
-<span class="sourceLineNo">417</span>    public boolean progress() {<a name="line.417"></a>
-<span class="sourceLineNo">418</span>      return DFS_CLIENT_ADAPTOR.isClientRunning(client);<a name="line.418"></a>
-<span class="sourceLineNo">419</span>    }<a name="line.419"></a>
-<span class="sourceLineNo">420</span><a name="line.420"></a>
+<span class="sourceLineNo">075</span>import org.apache.hadoop.ipc.RemoteException;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>import org.apache.hadoop.net.NetUtils;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>import org.apache.hadoop.util.DataChecksum;<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>import com.google.common.base.Throwables;<a name="line.79"></a>
+<span class="sourceLineNo">080</span>import com.google.common.collect.ImmutableMap;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>import com.google.protobuf.CodedOutputStream;<a name="line.81"></a>
+<span class="sourceLineNo">082</span><a name="line.82"></a>
+<span class="sourceLineNo">083</span>import io.netty.bootstrap.Bootstrap;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>import io.netty.buffer.ByteBuf;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>import io.netty.buffer.ByteBufAllocator;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>import io.netty.buffer.ByteBufOutputStream;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>import io.netty.buffer.PooledByteBufAllocator;<a name="line.87"></a>
+<span class="sourceLineNo">088</span>import io.netty.channel.Channel;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>import io.netty.channel.ChannelFuture;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>import io.netty.channel.ChannelFutureListener;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>import io.netty.channel.ChannelHandlerContext;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>import io.netty.channel.ChannelInitializer;<a name="line.92"></a>
+<span class="sourceLineNo">093</span>import io.netty.channel.ChannelPipeline;<a name="line.93"></a>
+<span class="sourceLineNo">094</span>import io.netty.channel.EventLoop;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>import io.netty.channel.SimpleChannelInboundHandler;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>import io.netty.channel.socket.nio.NioSocketChannel;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>import io.netty.handler.codec.protobuf.ProtobufDecoder;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>import io.netty.handler.codec.protobuf.ProtobufVarint32FrameDecoder;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>import io.netty.handler.timeout.IdleState;<a name="line.99"></a>
+<span class="sourceLineNo">100</span>import io.netty.handler.timeout.IdleStateEvent;<a name="line.100"></a>
+<span class="sourceLineNo">101</span>import io.netty.handler.timeout.IdleStateHandler;<a name="line.101"></a>
+<span class="sourceLineNo">102</span>import io.netty.util.concurrent.Future;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>import io.netty.util.concurrent.FutureListener;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>import io.netty.util.concurrent.Promise;<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>/**<a name="line.106"></a>
+<span class="sourceLineNo">107</span> * Helper class for implementing {@link FanOutOneBlockAsyncDFSOutput}.<a name="line.107"></a>
+<span class="sourceLineNo">108</span> */<a name="line.108"></a>
+<span class="sourceLineNo">109</span>@InterfaceAudience.Private<a name="line.109"></a>
+<span class="sourceLineNo">110</span>public class FanOutOneBlockAsyncDFSOutputHelper {<a name="line.110"></a>
+<span class="sourceLineNo">111</span><a name="line.111"></a>
+<span class="sourceLineNo">112</span>  private static final Log LOG = LogFactory.getLog(FanOutOneBlockAsyncDFSOutputHelper.class);<a name="line.112"></a>
+<span class="sourceLineNo">113</span><a name="line.113"></a>
+<span class="sourceLineNo">114</span>  private FanOutOneBlockAsyncDFSOutputHelper() {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  }<a name="line.115"></a>
+<span class="sourceLineNo">116</span><a name="line.116"></a>
+<span class="sourceLineNo">117</span>  // use pooled allocator for performance.<a name="line.117"></a>
+<span class="sourceLineNo">118</span>  private static final ByteBufAllocator ALLOC = PooledByteBufAllocator.DEFAULT;<a name="line.118"></a>
+<span class="sourceLineNo">119</span><a name="line.119"></a>
+<span class="sourceLineNo">120</span>  // copied from DFSPacket since it is package private.<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  public static final long HEART_BEAT_SEQNO = -1L;<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  // helper class for creating DataChecksum object.<a name="line.123"></a>
+<span class="sourceLineNo">124</span>  private static final Method CREATE_CHECKSUM;<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>  // helper class for getting Status from PipelineAckProto. In hadoop 2.6 or before, there is a<a name="line.126"></a>
+<span class="sourceLineNo">127</span>  // getStatus method, and for hadoop 2.7 or after, the status is retrieved from flag. The flag may<a name="line.127"></a>
+<span class="sourceLineNo">128</span>  // get from proto directly, or combined by the reply field of the proto and a ECN object. See<a name="line.128"></a>
+<span class="sourceLineNo">129</span>  // createPipelineAckStatusGetter for more details.<a name="line.129"></a>
+<span class="sourceLineNo">130</span>  private interface PipelineAckStatusGetter {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    Status get(PipelineAckProto ack);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  }<a name="line.132"></a>
+<span class="sourceLineNo">133</span><a name="line.133"></a>
+<span class="sourceLineNo">134</span>  private static final PipelineAckStatusGetter PIPELINE_ACK_STATUS_GETTER;<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  // StorageType enum is added in hadoop 2.4, but it is moved to another package in hadoop 2.6 and<a name="line.136"></a>
+<span class="sourceLineNo">137</span>  // the setter method in OpWriteBlockProto is also added in hadoop 2.6. So we need to skip the<a name="line.137"></a>
+<span class="sourceLineNo">138</span>  // setStorageType call if it is hadoop 2.5 or before. See createStorageTypeSetter for more<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  // details.<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  private interface StorageTypeSetter {<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    OpWriteBlockProto.Builder set(OpWriteBlockProto.Builder builder, Enum&lt;?&gt; storageType);<a name="line.141"></a>
+<span class="sourceLineNo">142</span>  }<a name="line.142"></a>
+<span class="sourceLineNo">143</span><a name="line.143"></a>
+<span class="sourceLineNo">144</span>  private static final StorageTypeSetter STORAGE_TYPE_SETTER;<a name="line.144"></a>
+<span class="sourceLineNo">145</span><a name="line.145"></a>
+<span class="sourceLineNo">146</span>  // helper class for calling create method on namenode. There is a supportedVersions parameter for<a name="line.146"></a>
+<span class="sourceLineNo">147</span>  // hadoop 2.6 or after. See createFileCreater for more details.<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  private interface FileCreater {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.149"></a>
+<span class="sourceLineNo">150</span>        String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.150"></a>
+<span class="sourceLineNo">151</span>        short replication, long blockSize) throws IOException;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  }<a name="line.152"></a>
+<span class="sourceLineNo">153</span><a name="line.153"></a>
+<span class="sourceLineNo">154</span>  private static final FileCreater FILE_CREATER;<a name="line.154"></a>
+<span class="sourceLineNo">155</span><a name="line.155"></a>
+<span class="sourceLineNo">156</span>  // helper class for add or remove lease from DFSClient. Hadoop 2.4 use src as the Map's key, and<a name="line.156"></a>
+<span class="sourceLineNo">157</span>  // hadoop 2.5 or after use inodeId. See createLeaseManager for more details.<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  private interface LeaseManager {<a name="line.158"></a>
+<span class="sourceLineNo">159</span><a name="line.159"></a>
+<span class="sourceLineNo">160</span>    void begin(DFSClient client, String src, long inodeId);<a name="line.160"></a>
+<span class="sourceLineNo">161</span><a name="line.161"></a>
+<span class="sourceLineNo">162</span>    void end(DFSClient client, String src, long inodeId);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>  }<a name="line.163"></a>
+<span class="sourceLineNo">164</span><a name="line.164"></a>
+<span class="sourceLineNo">165</span>  private static final LeaseManager LEASE_MANAGER;<a name="line.165"></a>
+<span class="sourceLineNo">166</span><a name="line.166"></a>
+<span class="sourceLineNo">167</span>  // This is used to terminate a recoverFileLease call when FileSystem is already closed.<a name="line.167"></a>
+<span class="sourceLineNo">168</span>  // isClientRunning is not public so we need to use reflection.<a name="line.168"></a>
+<span class="sourceLineNo">169</span>  private interface DFSClientAdaptor {<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    boolean isClientRunning(DFSClient client);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  }<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>  private static final DFSClientAdaptor DFS_CLIENT_ADAPTOR;<a name="line.173"></a>
+<span class="sourceLineNo">174</span><a name="line.174"></a>
+<span class="sourceLineNo">175</span>  private static DFSClientAdaptor createDFSClientAdaptor() {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    try {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      final Method method = DFSClient.class.getDeclaredMethod("isClientRunning");<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      method.setAccessible(true);<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      return new DFSClientAdaptor() {<a name="line.179"></a>
+<span class="sourceLineNo">180</span><a name="line.180"></a>
+<span class="sourceLineNo">181</span>        @Override<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        public boolean isClientRunning(DFSClient client) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>          try {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>            return (Boolean) method.invoke(client);<a name="line.184"></a>
+<span class="sourceLineNo">185</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>            throw new RuntimeException(e);<a name="line.186"></a>
+<span class="sourceLineNo">187</span>          }<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        }<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      };<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    } catch (NoSuchMethodException e) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      throw new Error(e);<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    }<a name="line.192"></a>
+<span class="sourceLineNo">193</span>  }<a name="line.193"></a>
+<span class="sourceLineNo">194</span><a name="line.194"></a>
+<span class="sourceLineNo">195</span>  private static LeaseManager createLeaseManager() {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    try {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      final Method beginFileLeaseMethod = DFSClient.class.getDeclaredMethod("beginFileLease",<a name="line.197"></a>
+<span class="sourceLineNo">198</span>        long.class, DFSOutputStream.class);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      beginFileLeaseMethod.setAccessible(true);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      final Method endFileLeaseMethod = DFSClient.class.getDeclaredMethod("endFileLease",<a name="line.200"></a>
+<span class="sourceLineNo">201</span>        long.class);<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      endFileLeaseMethod.setAccessible(true);<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      return new LeaseManager() {<a name="line.203"></a>
+<span class="sourceLineNo">204</span><a name="line.204"></a>
+<span class="sourceLineNo">205</span>        @Override<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        public void begin(DFSClient client, String src, long inodeId) {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>          try {<a name="line.207"></a>
+<span class="sourceLineNo">208</span>            beginFileLeaseMethod.invoke(client, inodeId, null);<a name="line.208"></a>
+<span class="sourceLineNo">209</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>            throw new RuntimeException(e);<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          }<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        }<a name="line.212"></a>
+<span class="sourceLineNo">213</span><a name="line.213"></a>
+<span class="sourceLineNo">214</span>        @Override<a name="line.214"></a>
+<span class="sourceLineNo">215</span>        public void end(DFSClient client, String src, long inodeId) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>          try {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>            endFileLeaseMethod.invoke(client, inodeId);<a name="line.217"></a>
+<span class="sourceLineNo">218</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>            throw new RuntimeException(e);<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          }<a name="line.220"></a>
+<span class="sourceLineNo">221</span>        }<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      };<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    } catch (NoSuchMethodException e) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>      LOG.warn("No inodeId related lease methods found, should be hadoop 2.4-", e);<a name="line.224"></a>
+<span class="sourceLineNo">225</span>    }<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    try {<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      final Method beginFileLeaseMethod = DFSClient.class.getDeclaredMethod("beginFileLease",<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        String.class, DFSOutputStream.class);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>      beginFileLeaseMethod.setAccessible(true);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>      final Method endFileLeaseMethod = DFSClient.class.getDeclaredMethod("endFileLease",<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        String.class);<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      endFileLeaseMethod.setAccessible(true);<a name="line.232"></a>
+<span class="sourceLineNo">233</span>      return new LeaseManager() {<a name="line.233"></a>
+<span class="sourceLineNo">234</span><a name="line.234"></a>
+<span class="sourceLineNo">235</span>        @Override<a name="line.235"></a>
+<span class="sourceLineNo">236</span>        public void begin(DFSClient client, String src, long inodeId) {<a name="line.236"></a>
+<span class="sourceLineNo">237</span>          try {<a name="line.237"></a>
+<span class="sourceLineNo">238</span>            beginFileLeaseMethod.invoke(client, src, null);<a name="line.238"></a>
+<span class="sourceLineNo">239</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>            throw new RuntimeException(e);<a name="line.240"></a>
+<span class="sourceLineNo">241</span>          }<a name="line.241"></a>
+<span class="sourceLineNo">242</span>        }<a name="line.242"></a>
+<span class="sourceLineNo">243</span><a name="line.243"></a>
+<span class="sourceLineNo">244</span>        @Override<a name="line.244"></a>
+<span class="sourceLineNo">245</span>        public void end(DFSClient client, String src, long inodeId) {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>          try {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>            endFileLeaseMethod.invoke(client, src);<a name="line.247"></a>
+<span class="sourceLineNo">248</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>            throw new RuntimeException(e);<a name="line.249"></a>
+<span class="sourceLineNo">250</span>          }<a name="line.250"></a>
+<span class="sourceLineNo">251</span>        }<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      };<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    } catch (NoSuchMethodException e) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>      throw new Error(e);<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
+<span class="sourceLineNo">256</span>  }<a name="line.256"></a>
+<span class="sourceLineNo">257</span><a name="line.257"></a>
+<span class="sourceLineNo">258</span>  private static PipelineAckStatusGetter createPipelineAckStatusGetter() {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    try {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      final Method getFlagListMethod = PipelineAckProto.class.getMethod("getFlagList");<a name="line.260"></a>
+<span class="sourceLineNo">261</span>      @SuppressWarnings("rawtypes")<a name="line.261"></a>
+<span class="sourceLineNo">262</span>      Class&lt;? extends Enum&gt; ecnClass;<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      try {<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        ecnClass = Class.forName("org.apache.hadoop.hdfs.protocol.datatransfer.PipelineAck$ECN")<a name="line.264"></a>
+<span class="sourceLineNo">265</span>            .asSubclass(Enum.class);<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      } catch (ClassNotFoundException e) {<a name="line.266"></a>
+<span class="sourceLineNo">267</span>        throw new Error(e);<a name="line.267"></a>
+<span class="sourceLineNo">268</span>      }<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      @SuppressWarnings("unchecked")<a name="line.269"></a>
+<span class="sourceLineNo">270</span>      final Enum&lt;?&gt; disabledECN = Enum.valueOf(ecnClass, "DISABLED");<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      final Method getReplyMethod = PipelineAckProto.class.getMethod("getReply", int.class);<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      final Method combineHeaderMethod = PipelineAck.class.getMethod("combineHeader", ecnClass,<a name="line.272"></a>
+<span class="sourceLineNo">273</span>        Status.class);<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      final Method getStatusFromHeaderMethod = PipelineAck.class.getMethod("getStatusFromHeader",<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        int.class);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>      return new PipelineAckStatusGetter() {<a name="line.276"></a>
+<span class="sourceLineNo">277</span><a name="line.277"></a>
+<span class="sourceLineNo">278</span>        @Override<a name="line.278"></a>
+<span class="sourceLineNo">279</span>        public Status get(PipelineAckProto ack) {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>          try {<a name="line.280"></a>
+<span class="sourceLineNo">281</span>            @SuppressWarnings("unchecked")<a name="line.281"></a>
+<span class="sourceLineNo">282</span>            List&lt;Integer&gt; flagList = (List&lt;Integer&gt;) getFlagListMethod.invoke(ack);<a name="line.282"></a>
+<span class="sourceLineNo">283</span>            Integer headerFlag;<a name="line.283"></a>
+<span class="sourceLineNo">284</span>            if (flagList.isEmpty()) {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>              Status reply = (Status) getReplyMethod.invoke(ack, 0);<a name="line.285"></a>
+<span class="sourceLineNo">286</span>              headerFlag = (Integer) combineHeaderMethod.invoke(null, disabledECN, reply);<a name="line.286"></a>
+<span class="sourceLineNo">287</span>            } else {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>              headerFlag = flagList.get(0);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>            }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>            return (Status) getStatusFromHeaderMethod.invoke(null, headerFlag);<a name="line.290"></a>
+<span class="sourceLineNo">291</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.291"></a>
+<span class="sourceLineNo">292</span>            throw new RuntimeException(e);<a name="line.292"></a>
+<span class="sourceLineNo">293</span>          }<a name="line.293"></a>
+<span class="sourceLineNo">294</span>        }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>      };<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    } catch (NoSuchMethodException e) {<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      LOG.warn("Can not get expected methods, should be hadoop 2.6-", e);<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    }<a name="line.298"></a>
+<span class="sourceLineNo">299</span>    try {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>      final Method getStatusMethod = PipelineAckProto.class.getMethod("getStatus", int.class);<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      return new PipelineAckStatusGetter() {<a name="line.301"></a>
+<span class="sourceLineNo">302</span><a name="line.302"></a>
+<span class="sourceLineNo">303</span>        @Override<a name="line.303"></a>
+<span class="sourceLineNo">304</span>        public Status get(PipelineAckProto ack) {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>          try {<a name="line.305"></a>
+<span class="sourceLineNo">306</span>            return (Status) getStatusMethod.invoke(ack, 0);<a name="line.306"></a>
+<span class="sourceLineNo">307</span>          } catch (IllegalAccessException | InvocationTargetException e) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>            throw new RuntimeException(e);<a name="line.308"></a>
+<span class="sourceLineNo">309</span>          }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>        }<a name="line.310"></a>
+<span class="sourceLineNo">311</span>      };<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    } catch (NoSuchMethodException e) {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      throw new Error(e);<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    }<a name="line.314"></a>
+<span class="sourceLineNo">315</span>  }<a name="line.315"></a>
+<span class="sourceLineNo">316</span><a name="line.316"></a>
+<span class="sourceLineNo">317</span>  private static StorageTypeSetter createStorageTypeSetter() {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    final Method setStorageTypeMethod;<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    try {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>      setStorageTypeMethod = OpWriteBlockProto.Builder.class.getMethod("setStorageType",<a name="line.320"></a>
+<span class="sourceLineNo">321</span>        StorageTypeProto.class);<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    } catch (NoSuchMethodException e) {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      LOG.warn("noSetStorageType method found, should be hadoop 2.5-", e);<a name="line.323"></a>
+<span class="sourceLineNo">324</span>      return new StorageTypeSetter() {<a name="line.324"></a>
+<span class="sourceLineNo">325</span><a name="line.325"></a>
+<span class="sourceLineNo">326</span>        @Override<a name="line.326"></a>
+<span class="sourceLineNo">327</span>        public Builder set(Builder builder, Enum&lt;?&gt; storageType) {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>          return builder;<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        }<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      };<a name="line.330"></a>
+<span class="sourceLineNo">331</span>    }<a name="line.331"></a>
+<span class="sourceLineNo">332</span>    ImmutableMap.Builder&lt;String, StorageTypeProto&gt; builder = ImmutableMap.builder();<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    for (StorageTypeProto storageTypeProto : StorageTypeProto.values()) {<a name="line.333"></a>
+<span class="sourceLineNo">334</span>      builder.put(storageTypeProto.name(), storageTypeProto);<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    }<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    final ImmutableMap&lt;String, StorageTypeProto&gt; name2ProtoEnum = builder.build();<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    return new StorageTypeSetter() {<a name="line.337"></a>
+<span class="sourceLineNo">338</span><a name="line.338"></a>
+<span class="sourceLineNo">339</span>      @Override<a name="line.339"></a>
+<span class="sourceLineNo">340</span>      public Builder set(Builder builder, Enum&lt;?&gt; storageType) {<a name="line.340"></a>
+<span class="sourceLineNo">341</span>        Object protoEnum = name2ProtoEnum.get(storageType.name());<a name="line.341"></a>
+<span class="sourceLineNo">342</span>        try {<a name="line.342"></a>
+<span class="sourceLineNo">343</span>          setStorageTypeMethod.invoke(builder, protoEnum);<a name="line.343"></a>
+<span class="sourceLineNo">344</span>        } catch (IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>          throw new RuntimeException(e);<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        }<a name="line.346"></a>
+<span class="sourceLineNo">347</span>        return builder;<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      }<a name="line.348"></a>
+<span class="sourceLineNo">349</span>    };<a name="line.349"></a>
+<span class="sourceLineNo">350</span>  }<a name="line.350"></a>
+<span class="sourceLineNo">351</span><a name="line.351"></a>
+<span class="sourceLineNo">352</span>  private static FileCreater createFileCreater() {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    for (Method method : ClientProtocol.class.getMethods()) {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      if (method.getName().equals("create")) {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>        final Method createMethod = method;<a name="line.355"></a>
+<span class="sourceLineNo">356</span>        Class&lt;?&gt;[] paramTypes = createMethod.getParameterTypes();<a name="line.356"></a>
+<span class="sourceLineNo">357</span>        if (paramTypes[paramTypes.length - 1] == long.class) {<a name="line.357"></a>
+<span class="sourceLineNo">358</span>          return new FileCreater() {<a name="line.358"></a>
+<span class="sourceLineNo">359</span><a name="line.359"></a>
+<span class="sourceLineNo">360</span>            @Override<a name="line.360"></a>
+<span class="sourceLineNo">361</span>            public HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.361"></a>
+<span class="sourceLineNo">362</span>                String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.362"></a>
+<span class="sourceLineNo">363</span>                short replication, long blockSize) throws IOException {<a name="line.363"></a>
+<span class="sourceLineNo">364</span>              try {<a name="line.364"></a>
+<span class="sourceLineNo">365</span>                return (HdfsFileStatus) createMethod.invoke(namenode, src, masked, clientName, flag,<a name="line.365"></a>
+<span class="sourceLineNo">366</span>                  createParent, replication, blockSize);<a name="line.366"></a>
+<span class="sourceLineNo">367</span>              } catch (IllegalAccessException e) {<a name="line.367"></a>
+<span class="sourceLineNo">368</span>                throw new RuntimeException(e);<a name="line.368"></a>
+<span class="sourceLineNo">369</span>              } catch (InvocationTargetException e) {<a name="line.369"></a>
+<span class="sourceLineNo">370</span>                Throwables.propagateIfPossible(e.getTargetException(), IOException.class);<a name="line.370"></a>
+<span class="sourceLineNo">371</span>                throw new RuntimeException(e);<a name="line.371"></a>
+<span class="sourceLineNo">372</span>              }<a name="line.372"></a>
+<span class="sourceLineNo">373</span>            }<a name="line.373"></a>
+<span class="sourceLineNo">374</span>          };<a name="line.374"></a>
+<span class="sourceLineNo">375</span>        } else {<a name="line.375"></a>
+<span class="sourceLineNo">376</span>          try {<a name="line.376"></a>
+<span class="sourceLineNo">377</span>            Class&lt;?&gt; cryptoProtocolVersionClass = Class<a name="line.377"></a>
+<span class="sourceLineNo">378</span>                .forName("org.apache.hadoop.crypto.CryptoProtocolVersion");<a name="line.378"></a>
+<span class="sourceLineNo">379</span>            Method supportedMethod = cryptoProtocolVersionClass.getMethod("supported");<a name="line.379"></a>
+<span class="sourceLineNo">380</span>            final Object supported = supportedMethod.invoke(null);<a name="line.380"></a>
+<span class="sourceLineNo">381</span>            return new FileCreater() {<a name="line.381"></a>
+<span class="sourceLineNo">382</span><a name="line.382"></a>
+<span class="sourceLineNo">383</span>              @Override<a name="line.383"></a>
+<span class="sourceLineNo">384</span>              public HdfsFileStatus create(ClientProtocol namenode, String src, FsPermission masked,<a name="line.384"></a>
+<span class="sourceLineNo">385</span>                  String clientName, EnumSetWritable&lt;CreateFlag&gt; flag, boolean createParent,<a name="line.385"></a>
+<span class="sourceLineNo">386</span>                  short replication, long blockSize) throws IOException {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>                try {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>                  return (HdfsFileStatus) createMethod.invoke(namenode, src, masked, clientName,<a name="line.388"></a>
+<span class="sourceLineNo">389</span>                    flag, createParent, replication, blockSize, supported);<a name="line.389"></a>
+<span class="sourceLineNo">390</span>                } catch (IllegalAccessException e) {<a name="line.390"></a>
+<span class="sourceLineNo">391</span>                  throw new RuntimeException(e);<a name="line.391"></a>
+<span class="sourceLineNo">392</span>                } catch (InvocationTargetException e) {<a name="line.392"></a>
+<span class="sourceLineNo">393</span>                  Throwables.propagateIfPossible(e.getTargetException(), IOException.class);<a name="line.393"></a>
+<span class="sourceLineNo">394</span>                  throw new RuntimeException(e);<a name="line.394"></a>
+<span class="sourceLineNo">395</span>                }<a name="line.395"></a>
+<span class="sourceLineNo">396</span>              }<a name="line.396"></a>
+<span class="sourceLineNo">397</span>            };<a name="line.397"></a>
+<span class="sourceLineNo">398</span>          } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException<a name="line.398"></a>
+<span class="sourceLineNo">399</span>              | InvocationTargetException e) {<a name="line.399"></a>
+<span class="sourceLineNo">400</span>            throw new Error(e);<a name="line.400"></a>
+<span class="sourceLineNo">401</span>          }<a name="line.401"></a>
+<span class="sourceLineNo">402</span>        }<a name="line.402"></a>
+<span class="sourceLineNo">403</span>      }<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    }<a name="line.404"></a>
+<span class="sourceLineNo">405</span>    throw new Error("No create method found for " + ClientProtocol.class.getName());<a name="line.405"></a>
+<span class="sourceLineNo">406</span>  }<a name="line.406"></a>
+<span class="sourceLineNo">407</span><a name="line.407"></a>
+<span class="sourceLineNo">408</span>  // cancel the processing if DFSClient is already closed.<a name="line.408"></a>
+<span class="sourceLineNo">409</span>  static final class CancelOnClose implements CancelableProgressable {<a name="line.409"></a>
+<span class="sourceLineNo">410</span><a name="line.410"></a>
+<span class="sourceLineNo">411</span>    private final DFSClient client;<a name="line.411"></a>
+<span class="sourceLineNo">412</span><a name="line.412"></a>
+<span class="sourceLineNo">413</span>    public CancelOnClose(DFSClient client) {<a name="line.413"></a>
+<span class="sourceLineNo">414</span>      this.client = client;<a name="line.414"></a>
+<span class="sourceLineNo">415</span>    }<a name="line.415"></a>
+<span class="sourceLineNo">416</span><a name="line.416"></a>
+<span class="sourceLineNo">417</span>    @Override<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    public boolean progress() {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>      return DFS_CLIENT_ADAPTOR.isClientRunning(client);<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    }<a name="line.420"></a>
 <span class="sourceLineNo">421</span>  }<a name="line.421"></a>
 <span class="sourceLineNo">422</span><a name="line.422"></a>
 <span class="sourceLineNo">423</span>  static {<a name="line.423"></a>
@@ -587,110 +587,138 @@
 <span class="sourceLineNo">579</span>    return futureList;<a name="line.579"></a>
 <span class="sourceLineNo">580</span>  }<a name="line.580"></a>
 <span class="sourceLineNo">581</span><a name="line.581"></a>
-<span class="sourceLineNo">582</span>  private static FanOutOneBlockAsyncDFSOutput createOutput(DistributedFileSystem dfs, String src,<a name="line.582"></a>
-<span class="sourceLineNo">583</span>      boolean overwrite, boolean createParent, short replication, long blockSize,<a name="line.583"></a>
-<span class="sourceLineNo">584</span>      EventLoop eventLoop) throws IOException {<a name="line.584"></a>
-<span class="sourceLineNo">585</span>    Configuration conf = dfs.getConf();<a name="line.585"></a>
-<span class="sourceLineNo">586</span>    FSUtils fsUtils = FSUtils.getInstance(dfs, conf);<a name="line.586"></a>
-<span class="sourceLineNo">587</span>    DFSClient client = dfs.getClient();<a name="line.587"></a>
-<span class="sourceLineNo">588</span>    String clientName = client.getClientName();<a name="line.588"></a>
-<span class="sourceLineNo">589</span>    ClientProtocol namenode = client.getNamenode();<a name="line.589"></a>
-<span class="sourceLineNo">590</span>    HdfsFileStatus stat = FILE_CREATER.create(namenode, src,<a name="line.590"></a>
-<span class="sourceLineNo">591</span>      FsPermission.getFileDefault().applyUMask(FsPermission.getUMask(conf)), clientName,<a name="line.591"></a>
-<span class="sourceLineNo">592</span>      new EnumSetWritable&lt;CreateFlag&gt;(<a name="line.592"></a>
-<span class="sourceLineNo">593</span>          overwrite ? EnumSet.of(CREATE, OVERWRITE) : EnumSet.of(CREATE)),<a name="line.593"></a>
-<span class="sourceLineNo">594</span>      createParent, replication, blockSize);<a name="line.594"></a>
-<span class="sourceLineNo">595</span>    beginFileLease(client, src, stat.getFileId());<a name="line.595"></a>
-<span class="sourceLineNo">596</span>    boolean succ = false;<a name="line.596"></a>
-<span class="sourceLineNo">597</span>    LocatedBlock locatedBlock = null;<a name="line.597"></a>
-<span class="sourceLineNo">598</span>    List&lt;Future&lt;Channel&gt;&gt; futureList = null;<a name="line.598"></a>
-<span class="sourceLineNo">599</span>    try {<a name="line.599"></a>
-<span class="sourceLineNo">600</span>      DataChecksum summer = createChecksum(client);<a name="line.600"></a>
-<span class="sourceLineNo">601</span>      locatedBlock = namenode.addBlock(src, client.getClientName(), null, null, stat.getFileId(),<a name="line.601"></a>
-<span class="sourceLineNo">602</span>        null);<a name="line.602"></a>
-<span class="sourceLineNo">603</span>      List&lt;Channel&gt; datanodeList = new ArrayList&lt;&gt;();<a name="line.603"></a>
-<span class="sourceLineNo">604</span>      futureList = connectToDataNodes(conf, clientName, locatedBlock, 0L, 0L, PIPELINE_SETUP_CREATE,<a name="line.604"></a>
-<span class="sourceLineNo">605</span>        summer, eventLoop);<a name="line.605"></a>
-<span class="sourceLineNo">606</span>      for (Future&lt;Channel&gt; future : futureList) {<a name="line.606"></a>
-<span class="sourceLineNo">607</span>        // fail the creation if there are connection failures since we are fail-fast. The upper<a name="line.607"></a>
-<span class="sourceLineNo">608</span>        // layer should retry itself if needed.<a name="line.608"></a>
-<span class="sourceLineNo">609</span>        datanodeList.add(future.syncUninterruptibly().getNow());<a name="line.609"></a>
-<span class="sourceLineNo">610</span>      }<a name="line.610"></a>
-<span class="sourceLineNo">611</span>      succ = true;<a name="line.611"></a>
-<span class="sourceLineNo">612</span>      return new FanOutOneBlockAsyncDFSOutput(conf, fsUtils, dfs, client, namenode, clientName, src,<a name="line.612"></a>
-<span class="sourceLineNo">613</span>          stat.getFileId(), locatedBlock, eventLoop, datanodeList, summer, ALLOC);<a name="line.613"></a>
-<span class="sourceLineNo">614</span>    } finally {<a name="line.614"></a>
-<span class="sourceLineNo">615</span>      if (!succ) {<a name="line.615"></a>
-<span class="sourceLineNo">616</span>        if (futureList != null) {<a name="line.616"></a>
-<span class="sourceLineNo">617</span>          for (Future&lt;Channel&gt; f : futureList) {<a name="line.617"></a>
-<span class="sourceLineNo">618</span>            f.addListener(new FutureListener&lt;Channel&gt;() {<a name="line.618"></a>
-<span class="sourceLineNo">619</span><a name="line.619"></a>
-<span class="sourceLineNo">620</span>              @Override<a name="line.620"></a>
-<span class="sourceLineNo">621</span>              public void operationComplete(Future&lt;Channel&gt; future) throws Exception {<a name="line.621"></a>
-<span class="sourceLineNo">622</span>                if (future.isSuccess()) {<a name="line.622"></a>
-<span class="sourceLineNo">623</span>                  future.getNow().close();<a name="line.623"></a>
-<span class="sourceLineNo">624</span>                }<a name="line.624"></a>
-<span class="sourceLineNo">625</span>              }<a name="line.625"></a>
-<span class="sourceLineNo">626</span>            });<a name="line.626"></a>
-<span class="sourceLineNo">627</span>          }<a name="line.627"></a>
-<span class="sourceLineNo">628</span>        }<a name="line.628"></a>
-<span class="sourceLineNo">629</span>        endFileLease(client, src, stat.getFileId());<a name="line.629"></a>
-<span class="sourceLineNo">630</span>        fsUtils.recoverFileLease(dfs, new Path(src), conf, new CancelOnClose(client));<a name="line.630"></a>
+<span class="sourceLineNo">582</span>  /**<a name="line.582"></a>
+<span class="sourceLineNo">583</span>   * Exception other than RemoteException thrown when calling create on namenode<a name="line.583"></a>
+<span class="sourceLineNo">584</span>   */<a name="line.584"></a>
+<span class="sourceLineNo">585</span>  public static class NameNodeException extends IOException {<a name="line.585"></a>
+<span class="sourceLineNo">586</span><a name="line.586"></a>
+<span class="sourceLineNo">587</span>    private static final long serialVersionUID = 3143237406477095390L;<a name="line.587"></a>
+<span class="sourceLineNo">588</span><a name="line.588"></a>
+<span class="sourceLineNo">589</span>    public NameNodeException(Throwable cause) {<a name="line.589"></a>
+<span class="sourceLineNo">590</span>      super(cause);<a name="line.590"></a>
+<span class="sourceLineNo">591</span>    }<a name="line.591"></a>
+<span class="sourceLineNo">592</span>  }<a name="line.592"></a>
+<span class="sourceLineNo">593</span><a name="line.593"></a>
+<span class="sourceLineNo">594</span>  private static FanOutOneBlockAsyncDFSOutput createOutput(DistributedFileSystem dfs, String src,<a name="line.594"></a>
+<span class="sourceLineNo">595</span>      boolean overwrite, boolean createParent, short replication, long blockSize,<a name="line.595"></a>
+<span class="sourceLineNo">596</span>      EventLoop eventLoop) throws IOException {<a name="line.596"></a>
+<span class="sourceLineNo">597</span>    Configuration conf = dfs.getConf();<a name="line.597"></a>
+<span class="sourceLineNo">598</span>    FSUtils fsUtils = FSUtils.getInstance(dfs, conf);<a name="line.598"></a>
+<span class="sourceLineNo">599</span>    DFSClient client = dfs.getClient();<a name="line.599"></a>
+<span class="sourceLineNo">600</span>    String clientName = client.getClientName();<a name="line.600"></a>
+<span class="sourceLineNo">601</span>    ClientProtocol namenode = client.getNamenode();<a name="line.601"></a>
+<span class="sourceLineNo">602</span>    HdfsFileStatus stat;<a name="line.602"></a>
+<span class="sourceLineNo">603</span>    try {<a name="line.603"></a>
+<span class="sourceLineNo">604</span>      stat = FILE_CREATER.create(namenode, src,<a name="line.604"></a>
+<span class="sourceLineNo">605</span>        FsPermission.getFileDefault().applyUMask(FsPermission.getUMask(conf)), clientName,<a name="line.605"></a>
+<span class="sourceLineNo">606</span>        new EnumSetWritable&lt;CreateFlag&gt;(<a name="line.606"></a>
+<span class="sourceLineNo">607</span>            overwrite ? EnumSet.of(CREATE, OVERWRITE) : EnumSet.of(CREATE)),<a name="line.607"></a>
+<span class="sourceLineNo">608</span>        createParent, replication, blockSize);<a name="line.608"></a>
+<span class="sourceLineNo">609</span>    } catch (Exception e) {<a name="line.609"></a>
+<span class="sourceLineNo">610</span>      if (e instanceof RemoteException) {<a name="line.610"></a>
+<span class="sourceLineNo">611</span>        throw (RemoteException) e;<a name="line.611"></a>
+<span class="sourceLineNo">612</span>      } else {<a name="line.612"></a>
+<span class="sourceLineNo">613</span>        throw new NameNodeException(e);<a name="line.613"></a>
+<span class="sourceLineNo">614</span>      }<a name="line.614"></a>
+<span class="sourceLineNo">615</span>    }<a name="line.615"></a>
+<span class="sourceLineNo">616</span>    beginFileLease(client, src, stat.getFileId());<a name="line.616"></a>
+<span class="sourceLineNo">617</span>    boolean succ = false;<a name="line.617"></a>
+<span class="sourceLineNo">618</span>    LocatedBlock locatedBlock = null;<a name="line.618"></a>
+<span class="sourceLineNo">619</span>    List&lt;Future&lt;Channel&gt;&gt; futureList = null;<a name="line.619"></a>
+<span class="sourceLineNo">620</span>    try {<a name="line.620"></a>
+<span class="sourceLineNo">621</span>      DataChecksum summer = createChecksum(client);<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      locatedBlock = namenode.addBlock(src, client.getClientName(), null, null, stat.getFileId(),<a name="line.622"></a>
+<span class="sourceLineNo">623</span>        null);<a name="line.623"></a>
+<span class="sourceLineNo">624</span>      List&lt;Channel&gt; datanodeList = new ArrayList&lt;&gt;();<a name="line.624"></a>
+<span class="sourceLineNo">625</span>      futureList = connectToDataNodes(conf, clientName, locatedBlock, 0L, 0L, PIPELINE_SETUP_CREATE,<a name="line.625"></a>
+<span class="sourceLineNo">626</span>        summer, eventLoop);<a name="line.626"></a>
+<span class="sourceLineNo">627</span>      for (Future&lt;Channel&gt; future : futureList) {<a name="line.627"></a>
+<span class="sourceLineNo">628</span>        // fail the creation if there are connection failures since we are fail-fast. The upper<a name="line.628"></a>
+<span class="sourceLineNo">629</span>        // layer should retry itself if needed.<a name="line.629"></a>
+<span class="sourceLineNo">630</span>        datanodeList.add(future.syncUninterruptibly().getNow());<a name="line.630"></a>
 <span class="sourceLineNo">631</span>      }<a name="line.631"></a>
-<span class="sourceLineNo">632</span>    }<a name="line.632"></a>
-<span class="sourceLineNo">633</span>  }<a name="line.633"></a>
-<span class="sourceLineNo">634</span><a name="line.634"></a>
-<span class="sourceLineNo">635</span>  /**<a name="line.635"></a>
-<span class="sourceLineNo">636</span>   * Create a {@link FanOutOneBlockAsyncDFSOutput}. The method maybe blocked so do not call it<a name="line.636"></a>
-<span class="sourceLineNo">637</span>   * inside {@link EventLoop}.<a name="line.637"></a>
-<span class="sourceLineNo">638</span>   * @param eventLoop all connections to datanode will use the same event loop.<a name="line.638"></a>
-<span class="sourceLineNo">639</span>   */<a name="line.639"></a>
-<span class="sourceLineNo">640</span>  public static FanOutOneBlockAsyncDFSOutput createOutput(final DistributedFileSystem dfs, Path f,<a name="line.640"></a>
-<span class="sourceLineNo">641</span>      final boolean overwrite, final boolean createParent, final short replication,<a name="line.641"></a>
-<span class="sourceLineNo">642</span>      final long blockSize, final EventLoop eventLoop) throws IOException {<a name="line.642"></a>
-<span class="sourceLineNo">643</span>    return new FileSystemLinkResolver&lt;FanOutOneBlockAsyncDFSOutput&gt;() {<a name="line.643"></a>
-<span class="sourceLineNo">644</span><a name="line.644"></a>
-<span class="sourceLineNo">645</span>      @Override<a name="line.645"></a>
-<span class="sourceLineNo">646</span>      public FanOutOneBlockAsyncDFSOutput doCall(Path p)<a name="line.646"></a>
-<span class="sourceLineNo">647</span>          throws IOException, UnresolvedLinkException {<a name="line.647"></a>
-<span class="sourceLineNo">648</span>        return createOutput(dfs, p.toUri().getPath(), overwrite, createParent, replication,<a name="line.648"></a>
-<span class="sourceLineNo">649</span>          blockSize, eventLoop);<a name="line.649"></a>
-<span class="sourceLineNo">650</span>      }<a name="line.650"></a>
-<span class="sourceLineNo">651</span><a name="line.651"></a>
-<span class="sourceLineNo">652</span>      @Override<a name="line.652"></a>
-<span class="sourceLineNo">653</span>      public FanOutOneBlockAsyncDFSOutput next(FileSystem fs, Path p) throws IOException {<a name="line.653"></a>
-<span class="sourceLineNo">654</span>        throw new UnsupportedOperationException();<a name="line.654"></a>
-<span class="sourceLineNo">655</span>      }<a name="line.655"></a>
-<span class="sourceLineNo">656</span>    }.resolve(dfs, f);<a name="line.656"></a>
-<span class="sourceLineNo">657</span>  }<a name="line.657"></a>
-<span class="sourceLineNo">658</span><a name="line.658"></a>
-<span class="sourceLineNo">659</span>  static void completeFile(DFSClient client, ClientProtocol namenode, String src, String clientName,<a name="line.659"></a>
-<span class="sourceLineNo">660</span>      ExtendedBlock block, long fileId) {<a name="line.660"></a>
-<span class="sourceLineNo">661</span>    for (int retry = 0;; retry++) {<a name="line.661"></a>
-<span class="sourceLineNo">662</span>      try {<a name="line.662"></a>
-<span class="sourceLineNo">663</span>        if (namenode.complete(src, clientName, block, fileId)) {<a name="line.663"></a>
-<span class="sourceLineNo">664</span>          endFileLease(client, src, fileId);<a name="line.664"></a>
-<span class="sourceLineNo">665</span>          return;<a name="line.665"></a>
-<span class="sourceLineNo">666</span>        } else {<a name="line.666"></a>
-<span class="sourceLineNo">667</span>          LOG.warn("complete file " + src + " not finished, retry = " + retry);<a name="line.667"></a>
-<span class="sourceLineNo">668</span>        }<a name="line.668"></a>
-<span class="sourceLineNo">669</span>      } catch (LeaseExpiredException e) {<a name="line.669"></a>
-<span class="sourceLineNo">670</span>        LOG.warn("lease for file " + src + " is expired, give up", e);<a name="line.670"></a>
-<span class="sourceLineNo">671</span>        return;<a name="line.671"></a>
-<span class="sourceLineNo">672</span>      } catch (Exception e) {<a name="line.672"></a>
-<span class="sourceLineNo">673</span>        LOG.warn("complete file " + src + " failed, retry = " + retry, e);<a name="line.673"></a>
-<span class="sourceLineNo">674</span>      }<a name="line.674"></a>
-<span class="sourceLineNo">675</span>      sleepIgnoreInterrupt(retry);<a name="line.675"></a>
-<span class="sourceLineNo">676</span>    }<a name="line.676"></a>
-<span class="sourceLineNo">677</span>  }<a name="line.677"></a>
-<span class="sourceLineNo">678</span><a name="line.678"></a>
-<span class="sourceLineNo">679</span>  static void sleepIgnoreInterrupt(int retry) {<a name="line.679"></a>
-<span class="sourceLineNo">680</span>    try {<a name="line.680"></a>
-<span class="sourceLineNo">681</span>      Thread.sleep(ConnectionUtils.getPauseTime(100, retry));<a name="line.681"></a>
-<span class="sourceLineNo">682</span>    } catch (InterruptedException e) {<a name="line.682"></a>
-<span class="sourceLineNo">683</span>    }<a name="line.683"></a>
-<span class="sourceLineNo">684</span>  }<a name="line.684"></a>
-<span class="sourceLineNo">685</span>}<a name="line.685"></a>
+<span class="sourceLineNo">632</span>      succ = true;<a name="line.632"></a>
+<span class="sourceLineNo">633</span>      return new FanOutOneBlockAsyncDFSOutput(conf, fsUtils, dfs, client, namenode, clientName, src,<a name="line.633"></a>
+<span class="sourceLineNo">634</span>          stat.getFileId(), locatedBlock, eventLoop, datanodeList, summer, ALLOC);<a name="line.634"></a>
+<span class="sourceLineNo">635</span>    } finally {<a name="line.635"></a>
+<span class="sourceLineNo">636</span>      if (!succ) {<a name="line.636"></a>
+<span class="sourceLineNo">637</span>        if (futureList != null) {<a name="line.637"></a>
+<span class="sourceLineNo">638</span>          for (Future&lt;Channel&gt; f : futureList) {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>            f.addListener(new FutureListener&lt;Channel&gt;() {<a name="line.639"></a>
+<span class="sourceLineNo">640</span><a name="line.640"></a>
+<span class="sourceLineNo">641</span>              @Override<a name="line.641"></a>
+<span class="sourceLineNo">642</span>              public void operationComplete(Future&lt;Channel&gt; future) throws Exception {<a name="line.642"></a>
+<span class="sourceLineNo">643</span>                if (future.isSuccess()) {<a name="line.643"></a>
+<span class="sourceLineNo">644</span>                  future.getNow().close();<a name="line.644"></a>
+<span class="sourceLineNo">645</span>                }<a name="line.645"></a>
+<span class="sourceLineNo">646</span>              }<a name="line.646"></a>
+<span class="sourceLineNo">647</span>            });<a name="line.647"></a>
+<span class="sourceLineNo">648</span>          }<a name="line.648"></a>
+<span class="sourceLineNo">649</span>        }<a name="line.649"></a>
+<span class="sourceLineNo">650</span>        endFileLease(client, src, stat.getFileId());<a name="line.650"></a>
+<span class="sourceLineNo">651</span>        fsUtils.recoverFileLease(dfs, new Path(src), conf, new CancelOnClose(client));<a name="line.651"></a>
+<span class="sourceLineNo">652</span>      }<a name="line.652"></a>
+<span class="sourceLineNo">653</span>    }<a name="line.653"></a>
+<span class="sourceLineNo">654</span>  }<a name="line.654"></a>
+<span class="sourceLineNo">655</span><a name="line.655"></a>
+<span class="sourceLineNo">656</span>  /**<a name="line.656"></a>
+<span class="sourceLineNo">657</span>   * Create a {@link FanOutOneBlockAsyncDFSOutput}. The method maybe blocked so do not call it<a name="line.657"></a>
+<span class="sourceLineNo">658</span>   * inside {@link EventLoop}.<a name="line.658"></a>
+<span class="sourceLineNo">659</span>   * @param eventLoop all connections to datanode will use the same event loop.<a name="line.659"></a>
+<span class="sourceLineNo">660</span>   */<a name="line.660"></a>
+<span class="sourceLineNo">661</span>  public static FanOutOneBlockAsyncDFSOutput createOutput(final DistributedFileSystem dfs, Path f,<a name="line.661"></a>
+<span class="sourceLineNo">662</span>      final boolean overwrite, final boolean createParent, final short replication,<a name="line.662"></a>
+<span class="sourceLineNo">663</span>      final long blockSize, final EventLoop eventLoop) throws IOException {<a name="line.663"></a>
+<span class="sourceLineNo">664</span>    return new FileSystemLinkResolver&lt;FanOutOneBlockAsyncDFSOutput&gt;() {<a name="line.664"></a>
+<span class="sourceLineNo">665</span><a name="line.665"></a>
+<span class="sourceLineNo">666</span>      @Override<a name="line.666"></a>
+<span class="sourceLineNo">667</span>      public FanOutOneBlockAsyncDFSOutput doCall(Path p)<a name="line.667"></a>
+<span class="sourceLineNo">668</span>          throws IOException, UnresolvedLinkException {<a name="line.668"></a>
+<span class="sourceLineNo">669</span>        return createOutput(dfs, p.toUri().getPath(), overwrite, createParent, replication,<a name="line.669"></a>
+<span class="sourceLineNo">670</span>          blockSize, eventLoop);<a name="line.670"></a>
+<span class="sourceLineNo">671</span>      }<a name="line.671"></a>
+<span class="sourceLineNo">672</span><a name="line.672"></a>
+<span class="sourceLineNo">673</span>      @Override<a name="line.673"></a>
+<span class="sourceLineNo">674</span>      public FanOutOneBlockAsyncDFSOutput next(FileSystem fs, Path p) throws IOException {<a name="line.674"></a>
+<span class="sourceLineNo">675</span>        throw new UnsupportedOperationException();<a name="line.675"></a>
+<span class="sourceLineNo">676</span>      }<a name="line.676"></a>
+<span class="sourceLineNo">677</span>    }.resolve(dfs, f);<a name="line.677"></a>
+<span class="sourceLineNo">678</span>  }<a name="line.678"></a>
+<span class="sourceLineNo">679</span><a name="line.679"></a>
+<span class="sourceLineNo">680</span>  public static boolean shouldRetryCreate(RemoteException e) {<a name="line.680"></a>
+<span class="sourceLineNo">681</span>    // RetryStartFileException is introduced in HDFS 2.6+, so here we can only use the class name.<a name="line.681"></a>
+<span class="sourceLineNo">682</span>    // For exceptions other than this, we just throw it out. This is same with<a name="line.682"></a>
+<span class="sourceLineNo">683</span>    // DFSOutputStream.newStreamForCreate.<a name="line.683"></a>
+<span class="sourceLineNo">684</span>    return e.getClassName().endsWith("RetryStartFileException");<a name="line.684"></a>
+<span class="sourceLineNo">685</span>  }<a name="line.685"></a>
+<span class="sourceLineNo">686</span><a name="line.686"></a>
+<span class="sourceLineNo">687</span>  static void completeFile(DFSClient client, ClientProtocol namenode, String src, String clientName,<a name="line.687"></a>
+<span class="sourceLineNo">688</span>      ExtendedBlock block, long fileId) {<a name="line.688"></a>
+<span class="sourceLineNo">689</span>    for (int retry = 0;; retry++) {<a name="line.689"></a>
+<span class="sourceLineNo">690</span>      try {<a name="line.690"></a>
+<span class="sourceLineNo">691</span>        if (namenode.complete(src, clientName, block, fileId)) {<a name="line.691"></a>
+<span class="sourceLineNo">692</span>          endFileLease(client, src, fileId);<a name="line.692"></a>
+<span class="sourceLineNo">693</span>          return;<a name="line.693"></a>
+<span class="sourceLineNo">694</span>        } else {<a name="line.694"></a>
+<span class="sourceLineNo">695</span>          LOG.warn("complete file " + src + " not finished, retry = " + retry);<a name="line.695"></a>
+<span class="sourceLineNo">696</span>        }<a name="line.696"></a>
+<span class="sourceLineNo">697</span>      } catch (LeaseExpiredException e) {<a name="line.697"></a>
+<span class="sourceLineNo">698</span>        LOG.warn("lease for file " + src + " is expired, give up", e);<a name="line.698"></a>
+<span class="sourceLineNo">699</span>        return;<a name="line.699"></a>
+<span class="sourceLineNo">700</span>      } catch (Exception e) {<a name="line.700"></a>
+<span class="sourceLineNo">701</span>        LOG.warn("complete file " + src + " failed, retry = " + retry, e);<a name="line.701"></a>
+<span class="sourceLineNo">702</span>      }<a name="line.702"></a>
+<span class="sourceLineNo">703</span>      sleepIgnoreInterrupt(retry);<a name="line.703"></a>
+<span class="sourceLineNo">704</span>    }<a name="line.704"></a>
+<span class="sourceLineNo">705</span>  }<a name="line.705"></a>
+<span class="sourceLineNo">706</span><a name="line.706"></a>
+<span class="sourceLineNo">707</span>  static void sleepIgnoreInterrupt(int retry) {<a name="line.707"></a>
+<span class="sourceLineNo">708</span>    try {<a name="line.708"></a>
+<span class="sourceLineNo">709</span>      Thread.sleep(ConnectionUtils.getPauseTime(100, retry));<a name="line.709"></a>
+<span class="sourceLineNo">710</span>    } catch (InterruptedException e) {<a name="line.710"></a>
+<span class="sourceLineNo">711</span>    }<a name="line.711"></a>
+<span class="sourceLineNo">712</span>  }<a name="line.712"></a>
+<span class="sourceLineNo">713</span>}<a name="line.713"></a>
 
 
 
