@@ -126,969 +126,989 @@
 <span class="sourceLineNo">118</span>  private static final String ASSIGN_SEQ_IDS = "hbase.mapreduce.bulkload.assign.sequenceNumbers";<a name="line.118"></a>
 <span class="sourceLineNo">119</span>  public final static String CREATE_TABLE_CONF_KEY = "create.table";<a name="line.119"></a>
 <span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  private int maxFilesPerRegionPerFamily;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>  private boolean assignSeqIds;<a name="line.122"></a>
-<span class="sourceLineNo">123</span><a name="line.123"></a>
-<span class="sourceLineNo">124</span>  // Source filesystem<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  private FileSystem fs;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  // Source delegation token<a name="line.126"></a>
-<span class="sourceLineNo">127</span>  private FsDelegationToken fsDelegationToken;<a name="line.127"></a>
-<span class="sourceLineNo">128</span>  private String bulkToken;<a name="line.128"></a>
-<span class="sourceLineNo">129</span>  private UserProvider userProvider;<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  private int nrThreads;<a name="line.130"></a>
-<span class="sourceLineNo">131</span><a name="line.131"></a>
-<span class="sourceLineNo">132</span>  private LoadIncrementalHFiles() {}<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>  public LoadIncrementalHFiles(Configuration conf) throws Exception {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    super(conf);<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    initialize();<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  }<a name="line.137"></a>
-<span class="sourceLineNo">138</span><a name="line.138"></a>
-<span class="sourceLineNo">139</span>  private void initialize() throws Exception {<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    if (initalized) {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      return;<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    }<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    // make a copy, just to be sure we're not overriding someone else's config<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    setConf(HBaseConfiguration.create(getConf()));<a name="line.144"></a>
-<span class="sourceLineNo">145</span>    Configuration conf = getConf();<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    // disable blockcache for tool invocation, see HBASE-10500<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    conf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY, 0);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    this.userProvider = UserProvider.instantiate(conf);<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    this.fsDelegationToken = new FsDelegationToken(userProvider, "renewer");<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    assignSeqIds = conf.getBoolean(ASSIGN_SEQ_IDS, true);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    maxFilesPerRegionPerFamily = conf.getInt(MAX_FILES_PER_REGION_PER_FAMILY, 32);<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    nrThreads = conf.getInt("hbase.loadincremental.threads.max",<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      Runtime.getRuntime().availableProcessors());<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    initalized = true;<a name="line.154"></a>
-<span class="sourceLineNo">155</span>  }<a name="line.155"></a>
-<span class="sourceLineNo">156</span><a name="line.156"></a>
-<span class="sourceLineNo">157</span>  private void usage() {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    System.err.println("usage: " + NAME + " /path/to/hfileoutputformat-output tablename" + "\n -D"<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        + CREATE_TABLE_CONF_KEY + "=no - can be used to avoid creation of table by this tool\n"<a name="line.159"></a>
-<span class="sourceLineNo">160</span>        + "  Note: if you set this to 'no', then the target table must already exist in HBase\n"<a name="line.160"></a>
-<span class="sourceLineNo">161</span>        + "\n");<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  }<a name="line.162"></a>
-<span class="sourceLineNo">163</span><a name="line.163"></a>
-<span class="sourceLineNo">164</span>  private static interface BulkHFileVisitor&lt;TFamily&gt; {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    TFamily bulkFamily(final byte[] familyName)<a name="line.165"></a>
-<span class="sourceLineNo">166</span>      throws IOException;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    void bulkHFile(final TFamily family, final FileStatus hfileStatus)<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      throws IOException;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>  }<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>  /**<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   * Iterate over the bulkDir hfiles.<a name="line.172"></a>
-<span class="sourceLineNo">173</span>   * Skip reference, HFileLink, files starting with "_" and non-valid hfiles.<a name="line.173"></a>
-<span class="sourceLineNo">174</span>   */<a name="line.174"></a>
-<span class="sourceLineNo">175</span>  private static &lt;TFamily&gt; void visitBulkHFiles(final FileSystem fs, final Path bulkDir,<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    final BulkHFileVisitor&lt;TFamily&gt; visitor) throws IOException {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    visitBulkHFiles(fs, bulkDir, visitor, true);<a name="line.177"></a>
-<span class="sourceLineNo">178</span>  }<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>  /**<a name="line.180"></a>
-<span class="sourceLineNo">181</span>   * Iterate over the bulkDir hfiles.<a name="line.181"></a>
-<span class="sourceLineNo">182</span>   * Skip reference, HFileLink, files starting with "_".<a name="line.182"></a>
-<span class="sourceLineNo">183</span>   * Check and skip non-valid hfiles by default, or skip this validation by setting<a name="line.183"></a>
-<span class="sourceLineNo">184</span>   * 'hbase.loadincremental.validate.hfile' to false.<a name="line.184"></a>
-<span class="sourceLineNo">185</span>   */<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  private static &lt;TFamily&gt; void visitBulkHFiles(final FileSystem fs, final Path bulkDir,<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    final BulkHFileVisitor&lt;TFamily&gt; visitor, final boolean validateHFile) throws IOException {<a name="line.187"></a>
-<span class="sourceLineNo">188</span>    if (!fs.exists(bulkDir)) {<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      throw new FileNotFoundException("Bulkload dir " + bulkDir + " not found");<a name="line.189"></a>
-<span class="sourceLineNo">190</span>    }<a name="line.190"></a>
-<span class="sourceLineNo">191</span><a name="line.191"></a>
-<span class="sourceLineNo">192</span>    FileStatus[] familyDirStatuses = fs.listStatus(bulkDir);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    if (familyDirStatuses == null) {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      throw new FileNotFoundException("No families found in " + bulkDir);<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
-<span class="sourceLineNo">196</span><a name="line.196"></a>
-<span class="sourceLineNo">197</span>    for (FileStatus familyStat : familyDirStatuses) {<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      if (!familyStat.isDirectory()) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>        LOG.warn("Skipping non-directory " + familyStat.getPath());<a name="line.199"></a>
-<span class="sourceLineNo">200</span>        continue;<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      }<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      Path familyDir = familyStat.getPath();<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      byte[] familyName = familyDir.getName().getBytes();<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      TFamily family = visitor.bulkFamily(familyName);<a name="line.204"></a>
-<span class="sourceLineNo">205</span><a name="line.205"></a>
-<span class="sourceLineNo">206</span>      FileStatus[] hfileStatuses = fs.listStatus(familyDir);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      for (FileStatus hfileStatus : hfileStatuses) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        if (!fs.isFile(hfileStatus.getPath())) {<a name="line.208"></a>
-<span class="sourceLineNo">209</span>          LOG.warn("Skipping non-file " + hfileStatus);<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          continue;<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        }<a name="line.211"></a>
-<span class="sourceLineNo">212</span><a name="line.212"></a>
-<span class="sourceLineNo">213</span>        Path hfile = hfileStatus.getPath();<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        // Skip "_", reference, HFileLink<a name="line.214"></a>
-<span class="sourceLineNo">215</span>        String fileName = hfile.getName();<a name="line.215"></a>
-<span class="sourceLineNo">216</span>        if (fileName.startsWith("_")) {<a name="line.216"></a>
-<span class="sourceLineNo">217</span>          continue;<a name="line.217"></a>
-<span class="sourceLineNo">218</span>        }<a name="line.218"></a>
-<span class="sourceLineNo">219</span>        if (StoreFileInfo.isReference(fileName)) {<a name="line.219"></a>
-<span class="sourceLineNo">220</span>          LOG.warn("Skipping reference " + fileName);<a name="line.220"></a>
-<span class="sourceLineNo">221</span>          continue;<a name="line.221"></a>
-<span class="sourceLineNo">222</span>        }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        if (HFileLink.isHFileLink(fileName)) {<a name="line.223"></a>
-<span class="sourceLineNo">224</span>          LOG.warn("Skipping HFileLink " + fileName);<a name="line.224"></a>
-<span class="sourceLineNo">225</span>          continue;<a name="line.225"></a>
-<span class="sourceLineNo">226</span>        }<a name="line.226"></a>
-<span class="sourceLineNo">227</span><a name="line.227"></a>
-<span class="sourceLineNo">228</span>        // Validate HFile Format if needed<a name="line.228"></a>
-<span class="sourceLineNo">229</span>        if (validateHFile) {<a name="line.229"></a>
-<span class="sourceLineNo">230</span>          try {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>            if (!HFile.isHFileFormat(fs, hfile)) {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>              LOG.warn("the file " + hfile + " doesn't seems to be an hfile. skipping");<a name="line.232"></a>
-<span class="sourceLineNo">233</span>              continue;<a name="line.233"></a>
-<span class="sourceLineNo">234</span>            }<a name="line.234"></a>
-<span class="sourceLineNo">235</span>          } catch (FileNotFoundException e) {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>            LOG.warn("the file " + hfile + " was removed");<a name="line.236"></a>
-<span class="sourceLineNo">237</span>            continue;<a name="line.237"></a>
-<span class="sourceLineNo">238</span>          }<a name="line.238"></a>
-<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
-<span class="sourceLineNo">240</span><a name="line.240"></a>
-<span class="sourceLineNo">241</span>        visitor.bulkHFile(family, hfileStatus);<a name="line.241"></a>
-<span class="sourceLineNo">242</span>      }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>    }<a name="line.243"></a>
-<span class="sourceLineNo">244</span>  }<a name="line.244"></a>
-<span class="sourceLineNo">245</span><a name="line.245"></a>
-<span class="sourceLineNo">246</span>  /**<a name="line.246"></a>
-<span class="sourceLineNo">247</span>   * Represents an HFile waiting to be loaded. An queue is used<a name="line.247"></a>
-<span class="sourceLineNo">248</span>   * in this class in order to support the case where a region has<a name="line.248"></a>
-<span class="sourceLineNo">249</span>   * split during the process of the load. When this happens,<a name="line.249"></a>
-<span class="sourceLineNo">250</span>   * the HFile is split into two physical parts across the new<a name="line.250"></a>
-<span class="sourceLineNo">251</span>   * region boundary, and each part is added back into the queue.<a name="line.251"></a>
-<span class="sourceLineNo">252</span>   * The import process finishes when the queue is empty.<a name="line.252"></a>
-<span class="sourceLineNo">253</span>   */<a name="line.253"></a>
-<span class="sourceLineNo">254</span>  public static class LoadQueueItem {<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    final byte[] family;<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    final Path hfilePath;<a name="line.256"></a>
+<span class="sourceLineNo">121</span>  // We use a '.' prefix which is ignored when walking directory trees<a name="line.121"></a>
+<span class="sourceLineNo">122</span>  // above. It is invalid family name.<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  final static String TMP_DIR = ".tmp";<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>  private int maxFilesPerRegionPerFamily;<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  private boolean assignSeqIds;<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  // Source filesystem<a name="line.128"></a>
+<span class="sourceLineNo">129</span>  private FileSystem fs;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>  // Source delegation token<a name="line.130"></a>
+<span class="sourceLineNo">131</span>  private FsDelegationToken fsDelegationToken;<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  private String bulkToken;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  private UserProvider userProvider;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  private int nrThreads;<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  private LoadIncrementalHFiles() {}<a name="line.136"></a>
+<span class="sourceLineNo">137</span><a name="line.137"></a>
+<span class="sourceLineNo">138</span>  public LoadIncrementalHFiles(Configuration conf) throws Exception {<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    super(conf);<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    initialize();<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>  private void initialize() throws Exception {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    if (initalized) {<a name="line.144"></a>
+<span class="sourceLineNo">145</span>      return;<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    }<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    // make a copy, just to be sure we're not overriding someone else's config<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    setConf(HBaseConfiguration.create(getConf()));<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    Configuration conf = getConf();<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    // disable blockcache for tool invocation, see HBASE-10500<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    conf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY, 0);<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    this.userProvider = UserProvider.instantiate(conf);<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    this.fsDelegationToken = new FsDelegationToken(userProvider, "renewer");<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    assignSeqIds = conf.getBoolean(ASSIGN_SEQ_IDS, true);<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    maxFilesPerRegionPerFamily = conf.getInt(MAX_FILES_PER_REGION_PER_FAMILY, 32);<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    nrThreads = conf.getInt("hbase.loadincremental.threads.max",<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      Runtime.getRuntime().availableProcessors());<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    initalized = true;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>  }<a name="line.159"></a>
+<span class="sourceLineNo">160</span><a name="line.160"></a>
+<span class="sourceLineNo">161</span>  private void usage() {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    System.err.println("usage: " + NAME + " /path/to/hfileoutputformat-output tablename" + "\n -D"<a name="line.162"></a>
+<span class="sourceLineNo">163</span>        + CREATE_TABLE_CONF_KEY + "=no - can be used to avoid creation of table by this tool\n"<a name="line.163"></a>
+<span class="sourceLineNo">164</span>        + "  Note: if you set this to 'no', then the target table must already exist in HBase\n"<a name="line.164"></a>
+<span class="sourceLineNo">165</span>        + "\n");<a name="line.165"></a>
+<span class="sourceLineNo">166</span>  }<a name="line.166"></a>
+<span class="sourceLineNo">167</span><a name="line.167"></a>
+<span class="sourceLineNo">168</span>  private static interface BulkHFileVisitor&lt;TFamily&gt; {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    TFamily bulkFamily(final byte[] familyName)<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      throws IOException;<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    void bulkHFile(final TFamily family, final FileStatus hfileStatus)<a name="line.171"></a>
+<span class="sourceLineNo">172</span>      throws IOException;<a name="line.172"></a>
+<span class="sourceLineNo">173</span>  }<a name="line.173"></a>
+<span class="sourceLineNo">174</span><a name="line.174"></a>
+<span class="sourceLineNo">175</span>  /**<a name="line.175"></a>
+<span class="sourceLineNo">176</span>   * Iterate over the bulkDir hfiles.<a name="line.176"></a>
+<span class="sourceLineNo">177</span>   * Skip reference, HFileLink, files starting with "_" and non-valid hfiles.<a name="line.177"></a>
+<span class="sourceLineNo">178</span>   */<a name="line.178"></a>
+<span class="sourceLineNo">179</span>  private static &lt;TFamily&gt; void visitBulkHFiles(final FileSystem fs, final Path bulkDir,<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    final BulkHFileVisitor&lt;TFamily&gt; visitor) throws IOException {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    visitBulkHFiles(fs, bulkDir, visitor, true);<a name="line.181"></a>
+<span class="sourceLineNo">182</span>  }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>  /**<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   * Iterate over the bulkDir hfiles.<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   * Skip reference, HFileLink, files starting with "_".<a name="line.186"></a>
+<span class="sourceLineNo">187</span>   * Check and skip non-valid hfiles by default, or skip this validation by setting<a name="line.187"></a>
+<span class="sourceLineNo">188</span>   * 'hbase.loadincremental.validate.hfile' to false.<a name="line.188"></a>
+<span class="sourceLineNo">189</span>   */<a name="line.189"></a>
+<span class="sourceLineNo">190</span>  private static &lt;TFamily&gt; void visitBulkHFiles(final FileSystem fs, final Path bulkDir,<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    final BulkHFileVisitor&lt;TFamily&gt; visitor, final boolean validateHFile) throws IOException {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    if (!fs.exists(bulkDir)) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      throw new FileNotFoundException("Bulkload dir " + bulkDir + " not found");<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    }<a name="line.194"></a>
+<span class="sourceLineNo">195</span><a name="line.195"></a>
+<span class="sourceLineNo">196</span>    FileStatus[] familyDirStatuses = fs.listStatus(bulkDir);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    if (familyDirStatuses == null) {<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      throw new FileNotFoundException("No families found in " + bulkDir);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
+<span class="sourceLineNo">200</span><a name="line.200"></a>
+<span class="sourceLineNo">201</span>    for (FileStatus familyStat : familyDirStatuses) {<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      if (!familyStat.isDirectory()) {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>        LOG.warn("Skipping non-directory " + familyStat.getPath());<a name="line.203"></a>
+<span class="sourceLineNo">204</span>        continue;<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      }<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      Path familyDir = familyStat.getPath();<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      byte[] familyName = familyDir.getName().getBytes();<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      // Skip invalid family<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      try {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        HColumnDescriptor.isLegalFamilyName(familyName);<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      }<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      catch (IllegalArgumentException e) {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        LOG.warn("Skipping invalid " + familyStat.getPath());<a name="line.213"></a>
+<span class="sourceLineNo">214</span>        continue;<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      }<a name="line.215"></a>
+<span class="sourceLineNo">216</span>      TFamily family = visitor.bulkFamily(familyName);<a name="line.216"></a>
+<span class="sourceLineNo">217</span><a name="line.217"></a>
+<span class="sourceLineNo">218</span>      FileStatus[] hfileStatuses = fs.listStatus(familyDir);<a name="line.218"></a>
+<span class="sourceLineNo">219</span>      for (FileStatus hfileStatus : hfileStatuses) {<a name="line.219"></a>
+<span class="sourceLineNo">220</span>        if (!fs.isFile(hfileStatus.getPath())) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>          LOG.warn("Skipping non-file " + hfileStatus);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>          continue;<a name="line.222"></a>
+<span class="sourceLineNo">223</span>        }<a name="line.223"></a>
+<span class="sourceLineNo">224</span><a name="line.224"></a>
+<span class="sourceLineNo">225</span>        Path hfile = hfileStatus.getPath();<a name="line.225"></a>
+<span class="sourceLineNo">226</span>        // Skip "_", reference, HFileLink<a name="line.226"></a>
+<span class="sourceLineNo">227</span>        String fileName = hfile.getName();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        if (fileName.startsWith("_")) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          continue;<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        }<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        if (StoreFileInfo.isReference(fileName)) {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>          LOG.warn("Skipping reference " + fileName);<a name="line.232"></a>
+<span class="sourceLineNo">233</span>          continue;<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        }<a name="line.234"></a>
+<span class="sourceLineNo">235</span>        if (HFileLink.isHFileLink(fileName)) {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>          LOG.warn("Skipping HFileLink " + fileName);<a name="line.236"></a>
+<span class="sourceLineNo">237</span>          continue;<a name="line.237"></a>
+<span class="sourceLineNo">238</span>        }<a name="line.238"></a>
+<span class="sourceLineNo">239</span><a name="line.239"></a>
+<span class="sourceLineNo">240</span>        // Validate HFile Format if needed<a name="line.240"></a>
+<span class="sourceLineNo">241</span>        if (validateHFile) {<a name="line.241"></a>
+<span class="sourceLineNo">242</span>          try {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>            if (!HFile.isHFileFormat(fs, hfile)) {<a name="line.243"></a>
+<span class="sourceLineNo">244</span>              LOG.warn("the file " + hfile + " doesn't seems to be an hfile. skipping");<a name="line.244"></a>
+<span class="sourceLineNo">245</span>              continue;<a name="line.245"></a>
+<span class="sourceLineNo">246</span>            }<a name="line.246"></a>
+<span class="sourceLineNo">247</span>          } catch (FileNotFoundException e) {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>            LOG.warn("the file " + hfile + " was removed");<a name="line.248"></a>
+<span class="sourceLineNo">249</span>            continue;<a name="line.249"></a>
+<span class="sourceLineNo">250</span>          }<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  }<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>        visitor.bulkHFile(family, hfileStatus);<a name="line.253"></a>
+<span class="sourceLineNo">254</span>      }<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
+<span class="sourceLineNo">256</span>  }<a name="line.256"></a>
 <span class="sourceLineNo">257</span><a name="line.257"></a>
-<span class="sourceLineNo">258</span>    public LoadQueueItem(byte[] family, Path hfilePath) {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      this.family = family;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      this.hfilePath = hfilePath;<a name="line.260"></a>
-<span class="sourceLineNo">261</span>    }<a name="line.261"></a>
-<span class="sourceLineNo">262</span><a name="line.262"></a>
-<span class="sourceLineNo">263</span>    @Override<a name="line.263"></a>
-<span class="sourceLineNo">264</span>    public String toString() {<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      return "family:"+ Bytes.toString(family) + " path:" + hfilePath.toString();<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    }<a name="line.266"></a>
-<span class="sourceLineNo">267</span>  }<a name="line.267"></a>
-<span class="sourceLineNo">268</span><a name="line.268"></a>
-<span class="sourceLineNo">269</span>  /**<a name="line.269"></a>
-<span class="sourceLineNo">270</span>   * Walk the given directory for all HFiles, and return a Queue<a name="line.270"></a>
-<span class="sourceLineNo">271</span>   * containing all such files.<a name="line.271"></a>
-<span class="sourceLineNo">272</span>   */<a name="line.272"></a>
-<span class="sourceLineNo">273</span>  private void discoverLoadQueue(final Deque&lt;LoadQueueItem&gt; ret, final Path hfofDir,<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    final boolean validateHFile) throws IOException {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    fs = hfofDir.getFileSystem(getConf());<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor&lt;byte[]&gt;() {<a name="line.276"></a>
-<span class="sourceLineNo">277</span>      @Override<a name="line.277"></a>
-<span class="sourceLineNo">278</span>      public byte[] bulkFamily(final byte[] familyName) {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>        return familyName;<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      }<a name="line.280"></a>
-<span class="sourceLineNo">281</span>      @Override<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      public void bulkHFile(final byte[] family, final FileStatus hfile) throws IOException {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>        long length = hfile.getLen();<a name="line.283"></a>
-<span class="sourceLineNo">284</span>        if (length &gt; getConf().getLong(HConstants.HREGION_MAX_FILESIZE,<a name="line.284"></a>
-<span class="sourceLineNo">285</span>            HConstants.DEFAULT_MAX_FILE_SIZE)) {<a name="line.285"></a>
-<span class="sourceLineNo">286</span>          LOG.warn("Trying to bulk load hfile " + hfile.getPath() + " with size: " +<a name="line.286"></a>
-<span class="sourceLineNo">287</span>              length + " bytes can be problematic as it may lead to oversplitting.");<a name="line.287"></a>
-<span class="sourceLineNo">288</span>        }<a name="line.288"></a>
-<span class="sourceLineNo">289</span>        ret.add(new LoadQueueItem(family, hfile.getPath()));<a name="line.289"></a>
-<span class="sourceLineNo">290</span>      }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>    }, validateHFile);<a name="line.291"></a>
-<span class="sourceLineNo">292</span>  }<a name="line.292"></a>
-<span class="sourceLineNo">293</span><a name="line.293"></a>
-<span class="sourceLineNo">294</span>  /**<a name="line.294"></a>
-<span class="sourceLineNo">295</span>   * Perform a bulk load of the given directory into the given<a name="line.295"></a>
-<span class="sourceLineNo">296</span>   * pre-existing table.  This method is not threadsafe.<a name="line.296"></a>
-<span class="sourceLineNo">297</span>   *<a name="line.297"></a>
-<span class="sourceLineNo">298</span>   * @param hfofDir the directory that was provided as the output path<a name="line.298"></a>
-<span class="sourceLineNo">299</span>   * of a job using HFileOutputFormat<a name="line.299"></a>
-<span class="sourceLineNo">300</span>   * @param table the table to load into<a name="line.300"></a>
-<span class="sourceLineNo">301</span>   * @throws TableNotFoundException if table does not yet exist<a name="line.301"></a>
-<span class="sourceLineNo">302</span>   */<a name="line.302"></a>
-<span class="sourceLineNo">303</span>  @SuppressWarnings("deprecation")<a name="line.303"></a>
-<span class="sourceLineNo">304</span>  public void doBulkLoad(Path hfofDir, final HTable table)<a name="line.304"></a>
-<span class="sourceLineNo">305</span>      throws TableNotFoundException, IOException {<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    try (Admin admin = table.getConnection().getAdmin();<a name="line.306"></a>
-<span class="sourceLineNo">307</span>        RegionLocator rl = table.getRegionLocator()) {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>      doBulkLoad(hfofDir, admin, table, rl);<a name="line.308"></a>
-<span class="sourceLineNo">309</span>    }<a name="line.309"></a>
-<span class="sourceLineNo">310</span>  }<a name="line.310"></a>
-<span class="sourceLineNo">311</span><a name="line.311"></a>
-<span class="sourceLineNo">312</span>  /**<a name="line.312"></a>
-<span class="sourceLineNo">313</span>   * Perform a bulk load of the given directory into the given<a name="line.313"></a>
-<span class="sourceLineNo">314</span>   * pre-existing table.  This method is not threadsafe.<a name="line.314"></a>
-<span class="sourceLineNo">315</span>   *<a name="line.315"></a>
-<span class="sourceLineNo">316</span>   * @param hfofDir the directory that was provided as the output path<a name="line.316"></a>
-<span class="sourceLineNo">317</span>   * of a job using HFileOutputFormat<a name="line.317"></a>
-<span class="sourceLineNo">318</span>   * @param table the table to load into<a name="line.318"></a>
-<span class="sourceLineNo">319</span>   * @throws TableNotFoundException if table does not yet exist<a name="line.319"></a>
-<span class="sourceLineNo">320</span>   */<a name="line.320"></a>
-<span class="sourceLineNo">321</span>  public void doBulkLoad(Path hfofDir, final Admin admin, Table table,<a name="line.321"></a>
-<span class="sourceLineNo">322</span>      RegionLocator regionLocator) throws TableNotFoundException, IOException  {<a name="line.322"></a>
+<span class="sourceLineNo">258</span>  /**<a name="line.258"></a>
+<span class="sourceLineNo">259</span>   * Represents an HFile waiting to be loaded. An queue is used<a name="line.259"></a>
+<span class="sourceLineNo">260</span>   * in this class in order to support the case where a region has<a name="line.260"></a>
+<span class="sourceLineNo">261</span>   * split during the process of the load. When this happens,<a name="line.261"></a>
+<span class="sourceLineNo">262</span>   * the HFile is split into two physical parts across the new<a name="line.262"></a>
+<span class="sourceLineNo">263</span>   * region boundary, and each part is added back into the queue.<a name="line.263"></a>
+<span class="sourceLineNo">264</span>   * The import process finishes when the queue is empty.<a name="line.264"></a>
+<span class="sourceLineNo">265</span>   */<a name="line.265"></a>
+<span class="sourceLineNo">266</span>  public static class LoadQueueItem {<a name="line.266"></a>
+<span class="sourceLineNo">267</span>    final byte[] family;<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    final Path hfilePath;<a name="line.268"></a>
+<span class="sourceLineNo">269</span><a name="line.269"></a>
+<span class="sourceLineNo">270</span>    public LoadQueueItem(byte[] family, Path hfilePath) {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      this.family = family;<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      this.hfilePath = hfilePath;<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    }<a name="line.273"></a>
+<span class="sourceLineNo">274</span><a name="line.274"></a>
+<span class="sourceLineNo">275</span>    @Override<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    public String toString() {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      return "family:"+ Bytes.toString(family) + " path:" + hfilePath.toString();<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    }<a name="line.278"></a>
+<span class="sourceLineNo">279</span>  }<a name="line.279"></a>
+<span class="sourceLineNo">280</span><a name="line.280"></a>
+<span class="sourceLineNo">281</span>  /**<a name="line.281"></a>
+<span class="sourceLineNo">282</span>   * Walk the given directory for all HFiles, and return a Queue<a name="line.282"></a>
+<span class="sourceLineNo">283</span>   * containing all such files.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>   */<a name="line.284"></a>
+<span class="sourceLineNo">285</span>  private void discoverLoadQueue(final Deque&lt;LoadQueueItem&gt; ret, final Path hfofDir,<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    final boolean validateHFile) throws IOException {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>    fs = hfofDir.getFileSystem(getConf());<a name="line.287"></a>
+<span class="sourceLineNo">288</span>    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor&lt;byte[]&gt;() {<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      @Override<a name="line.289"></a>
+<span class="sourceLineNo">290</span>      public byte[] bulkFamily(final byte[] familyName) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>        return familyName;<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      }<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      @Override<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      public void bulkHFile(final byte[] family, final FileStatus hfile) throws IOException {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        long length = hfile.getLen();<a name="line.295"></a>
+<span class="sourceLineNo">296</span>        if (length &gt; getConf().getLong(HConstants.HREGION_MAX_FILESIZE,<a name="line.296"></a>
+<span class="sourceLineNo">297</span>            HConstants.DEFAULT_MAX_FILE_SIZE)) {<a name="line.297"></a>
+<span class="sourceLineNo">298</span>          LOG.warn("Trying to bulk load hfile " + hfile.getPath() + " with size: " +<a name="line.298"></a>
+<span class="sourceLineNo">299</span>              length + " bytes can be problematic as it may lead to oversplitting.");<a name="line.299"></a>
+<span class="sourceLineNo">300</span>        }<a name="line.300"></a>
+<span class="sourceLineNo">301</span>        ret.add(new LoadQueueItem(family, hfile.getPath()));<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      }<a name="line.302"></a>
+<span class="sourceLineNo">303</span>    }, validateHFile);<a name="line.303"></a>
+<span class="sourceLineNo">304</span>  }<a name="line.304"></a>
+<span class="sourceLineNo">305</span><a name="line.305"></a>
+<span class="sourceLineNo">306</span>  /**<a name="line.306"></a>
+<span class="sourceLineNo">307</span>   * Perform a bulk load of the given directory into the given<a name="line.307"></a>
+<span class="sourceLineNo">308</span>   * pre-existing table.  This method is not threadsafe.<a name="line.308"></a>
+<span class="sourceLineNo">309</span>   *<a name="line.309"></a>
+<span class="sourceLineNo">310</span>   * @param hfofDir the directory that was provided as the output path<a name="line.310"></a>
+<span class="sourceLineNo">311</span>   * of a job using HFileOutputFormat<a name="line.311"></a>
+<span class="sourceLineNo">312</span>   * @param table the table to load into<a name="line.312"></a>
+<span class="sourceLineNo">313</span>   * @throws TableNotFoundException if table does not yet exist<a name="line.313"></a>
+<span class="sourceLineNo">314</span>   */<a name="line.314"></a>
+<span class="sourceLineNo">315</span>  @SuppressWarnings("deprecation")<a name="line.315"></a>
+<span class="sourceLineNo">316</span>  public void doBulkLoad(Path hfofDir, final HTable table)<a name="line.316"></a>
+<span class="sourceLineNo">317</span>      throws TableNotFoundException, IOException {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    try (Admin admin = table.getConnection().getAdmin();<a name="line.318"></a>
+<span class="sourceLineNo">319</span>        RegionLocator rl = table.getRegionLocator()) {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>      doBulkLoad(hfofDir, admin, table, rl);<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    }<a name="line.321"></a>
+<span class="sourceLineNo">322</span>  }<a name="line.322"></a>
 <span class="sourceLineNo">323</span><a name="line.323"></a>
-<span class="sourceLineNo">324</span>    if (!admin.isTableAvailable(regionLocator.getName())) {<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      throw new TableNotFoundException("Table " + table.getName() + " is not currently available.");<a name="line.325"></a>
-<span class="sourceLineNo">326</span>    }<a name="line.326"></a>
-<span class="sourceLineNo">327</span><a name="line.327"></a>
-<span class="sourceLineNo">328</span>    ExecutorService pool = createExecutorService();<a name="line.328"></a>
-<span class="sourceLineNo">329</span><a name="line.329"></a>
-<span class="sourceLineNo">330</span>    // LQI queue does not need to be threadsafe -- all operations on this queue<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    // happen in this thread<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    Deque&lt;LoadQueueItem&gt; queue = new LinkedList&lt;LoadQueueItem&gt;();<a name="line.332"></a>
-<span class="sourceLineNo">333</span>    try {<a name="line.333"></a>
-<span class="sourceLineNo">334</span>      /*<a name="line.334"></a>
-<span class="sourceLineNo">335</span>       * Checking hfile format is a time-consuming operation, we should have an option to skip<a name="line.335"></a>
-<span class="sourceLineNo">336</span>       * this step when bulkloading millions of HFiles. See HBASE-13985.<a name="line.336"></a>
-<span class="sourceLineNo">337</span>       */<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      boolean validateHFile = getConf().getBoolean("hbase.loadincremental.validate.hfile", true);<a name="line.338"></a>
-<span class="sourceLineNo">339</span>      if(!validateHFile) {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>  LOG.warn("You are skipping HFiles validation, it might cause some data loss if files " +<a name="line.340"></a>
-<span class="sourceLineNo">341</span>      "are not correct. If you fail to read data from your table after using this " +<a name="line.341"></a>
-<span class="sourceLineNo">342</span>      "option, consider removing the files and bulkload again without this option. " +<a name="line.342"></a>
-<span class="sourceLineNo">343</span>      "See HBASE-13985");<a name="line.343"></a>
-<span class="sourceLineNo">344</span>      }<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      prepareHFileQueue(hfofDir, table, queue, validateHFile);<a name="line.345"></a>
-<span class="sourceLineNo">346</span><a name="line.346"></a>
-<span class="sourceLineNo">347</span>      int count = 0;<a name="line.347"></a>
-<span class="sourceLineNo">348</span><a name="line.348"></a>
-<span class="sourceLineNo">349</span>      if (queue.isEmpty()) {<a name="line.349"></a>
-<span class="sourceLineNo">350</span>        LOG.warn("Bulk load operation did not find any files to load in " +<a name="line.350"></a>
-<span class="sourceLineNo">351</span>            "directory " + hfofDir.toUri() + ".  Does it contain files in " +<a name="line.351"></a>
-<span class="sourceLineNo">352</span>            "subdirectories that correspond to column family names?");<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        return;<a name="line.353"></a>
-<span class="sourceLineNo">354</span>      }<a name="line.354"></a>
-<span class="sourceLineNo">355</span><a name="line.355"></a>
-<span class="sourceLineNo">356</span>      //If using secure bulk load, get source delegation token, and<a name="line.356"></a>
-<span class="sourceLineNo">357</span>      //prepare staging directory and token<a name="line.357"></a>
-<span class="sourceLineNo">358</span>      // fs is the source filesystem<a name="line.358"></a>
-<span class="sourceLineNo">359</span>      fsDelegationToken.acquireDelegationToken(fs);<a name="line.359"></a>
-<span class="sourceLineNo">360</span>      if(isSecureBulkLoadEndpointAvailable()) {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>        bulkToken = new SecureBulkLoadClient(table).prepareBulkLoad(table.getName());<a name="line.361"></a>
-<span class="sourceLineNo">362</span>      }<a name="line.362"></a>
-<span class="sourceLineNo">363</span><a name="line.363"></a>
-<span class="sourceLineNo">364</span>      // Assumes that region splits can happen while this occurs.<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      while (!queue.isEmpty()) {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>        // need to reload split keys each iteration.<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        final Pair&lt;byte[][], byte[][]&gt; startEndKeys = regionLocator.getStartEndKeys();<a name="line.367"></a>
-<span class="sourceLineNo">368</span>        if (count != 0) {<a name="line.368"></a>
-<span class="sourceLineNo">369</span>          LOG.info("Split occured while grouping HFiles, retry attempt " +<a name="line.369"></a>
-<span class="sourceLineNo">370</span>              + count + " with " + queue.size() + " files remaining to group or split");<a name="line.370"></a>
-<span class="sourceLineNo">371</span>        }<a name="line.371"></a>
-<span class="sourceLineNo">372</span><a name="line.372"></a>
-<span class="sourceLineNo">373</span>        int maxRetries = getConf().getInt(HConstants.BULKLOAD_MAX_RETRIES_NUMBER, 10);<a name="line.373"></a>
-<span class="sourceLineNo">374</span>        maxRetries = Math.max(maxRetries, startEndKeys.getFirst().length + 1);<a name="line.374"></a>
-<span class="sourceLineNo">375</span>        if (maxRetries != 0 &amp;&amp; count &gt;= maxRetries) {<a name="line.375"></a>
-<span class="sourceLineNo">376</span>          throw new IOException("Retry attempted " + count +<a name="line.376"></a>
-<span class="sourceLineNo">377</span>            " times without completing, bailing out");<a name="line.377"></a>
-<span class="sourceLineNo">378</span>        }<a name="line.378"></a>
-<span class="sourceLineNo">379</span>        count++;<a name="line.379"></a>
-<span class="sourceLineNo">380</span><a name="line.380"></a>
-<span class="sourceLineNo">381</span>        // Using ByteBuffer for byte[] equality semantics<a name="line.381"></a>
-<span class="sourceLineNo">382</span>        Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups = groupOrSplitPhase(table,<a name="line.382"></a>
-<span class="sourceLineNo">383</span>            pool, queue, startEndKeys);<a name="line.383"></a>
+<span class="sourceLineNo">324</span>  /**<a name="line.324"></a>
+<span class="sourceLineNo">325</span>   * Perform a bulk load of the given directory into the given<a name="line.325"></a>
+<span class="sourceLineNo">326</span>   * pre-existing table.  This method is not threadsafe.<a name="line.326"></a>
+<span class="sourceLineNo">327</span>   *<a name="line.327"></a>
+<span class="sourceLineNo">328</span>   * @param hfofDir the directory that was provided as the output path<a name="line.328"></a>
+<span class="sourceLineNo">329</span>   * of a job using HFileOutputFormat<a name="line.329"></a>
+<span class="sourceLineNo">330</span>   * @param table the table to load into<a name="line.330"></a>
+<span class="sourceLineNo">331</span>   * @throws TableNotFoundException if table does not yet exist<a name="line.331"></a>
+<span class="sourceLineNo">332</span>   */<a name="line.332"></a>
+<span class="sourceLineNo">333</span>  public void doBulkLoad(Path hfofDir, final Admin admin, Table table,<a name="line.333"></a>
+<span class="sourceLineNo">334</span>      RegionLocator regionLocator) throws TableNotFoundException, IOException  {<a name="line.334"></a>
+<span class="sourceLineNo">335</span><a name="line.335"></a>
+<span class="sourceLineNo">336</span>    if (!admin.isTableAvailable(regionLocator.getName())) {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>      throw new TableNotFoundException("Table " + table.getName() + " is not currently available.");<a name="line.337"></a>
+<span class="sourceLineNo">338</span>    }<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>    ExecutorService pool = createExecutorService();<a name="line.340"></a>
+<span class="sourceLineNo">341</span><a name="line.341"></a>
+<span class="sourceLineNo">342</span>    // LQI queue does not need to be threadsafe -- all operations on this queue<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    // happen in this thread<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    Deque&lt;LoadQueueItem&gt; queue = new LinkedList&lt;LoadQueueItem&gt;();<a name="line.344"></a>
+<span class="sourceLineNo">345</span>    try {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      /*<a name="line.346"></a>
+<span class="sourceLineNo">347</span>       * Checking hfile format is a time-consuming operation, we should have an option to skip<a name="line.347"></a>
+<span class="sourceLineNo">348</span>       * this step when bulkloading millions of HFiles. See HBASE-13985.<a name="line.348"></a>
+<span class="sourceLineNo">349</span>       */<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      boolean validateHFile = getConf().getBoolean("hbase.loadincremental.validate.hfile", true);<a name="line.350"></a>
+<span class="sourceLineNo">351</span>      if(!validateHFile) {<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  LOG.warn("You are skipping HFiles validation, it might cause some data loss if files " +<a name="line.352"></a>
+<span class="sourceLineNo">353</span>      "are not correct. If you fail to read data from your table after using this " +<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      "option, consider removing the files and bulkload again without this option. " +<a name="line.354"></a>
+<span class="sourceLineNo">355</span>      "See HBASE-13985");<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      }<a name="line.356"></a>
+<span class="sourceLineNo">357</span>      prepareHFileQueue(hfofDir, table, queue, validateHFile);<a name="line.357"></a>
+<span class="sourceLineNo">358</span><a name="line.358"></a>
+<span class="sourceLineNo">359</span>      int count = 0;<a name="line.359"></a>
+<span class="sourceLineNo">360</span><a name="line.360"></a>
+<span class="sourceLineNo">361</span>      if (queue.isEmpty()) {<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        LOG.warn("Bulk load operation did not find any files to load in " +<a name="line.362"></a>
+<span class="sourceLineNo">363</span>            "directory " + hfofDir.toUri() + ".  Does it contain files in " +<a name="line.363"></a>
+<span class="sourceLineNo">364</span>            "subdirectories that correspond to column family names?");<a name="line.364"></a>
+<span class="sourceLineNo">365</span>        return;<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      }<a name="line.366"></a>
+<span class="sourceLineNo">367</span><a name="line.367"></a>
+<span class="sourceLineNo">368</span>      //If using secure bulk load, get source delegation token, and<a name="line.368"></a>
+<span class="sourceLineNo">369</span>      //prepare staging directory and token<a name="line.369"></a>
+<span class="sourceLineNo">370</span>      // fs is the source filesystem<a name="line.370"></a>
+<span class="sourceLineNo">371</span>      fsDelegationToken.acquireDelegationToken(fs);<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      if(isSecureBulkLoadEndpointAvailable()) {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>        bulkToken = new SecureBulkLoadClient(table).prepareBulkLoad(table.getName());<a name="line.373"></a>
+<span class="sourceLineNo">374</span>      }<a name="line.374"></a>
+<span class="sourceLineNo">375</span><a name="line.375"></a>
+<span class="sourceLineNo">376</span>      // Assumes that region splits can happen while this occurs.<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      while (!queue.isEmpty()) {<a name="line.377"></a>
+<span class="sourceLineNo">378</span>        // need to reload split keys each iteration.<a name="line.378"></a>
+<span class="sourceLineNo">379</span>        final Pair&lt;byte[][], byte[][]&gt; startEndKeys = regionLocator.getStartEndKeys();<a name="line.379"></a>
+<span class="sourceLineNo">380</span>        if (count != 0) {<a name="line.380"></a>
+<span class="sourceLineNo">381</span>          LOG.info("Split occured while grouping HFiles, retry attempt " +<a name="line.381"></a>
+<span class="sourceLineNo">382</span>              + count + " with " + queue.size() + " files remaining to group or split");<a name="line.382"></a>
+<span class="sourceLineNo">383</span>        }<a name="line.383"></a>
 <span class="sourceLineNo">384</span><a name="line.384"></a>
-<span class="sourceLineNo">385</span>        if (!checkHFilesCountPerRegionPerFamily(regionGroups)) {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>          // Error is logged inside checkHFilesCountPerRegionPerFamily.<a name="line.386"></a>
-<span class="sourceLineNo">387</span>          throw new IOException("Trying to load more than " + maxFilesPerRegionPerFamily<a name="line.387"></a>
-<span class="sourceLineNo">388</span>            + " hfiles to one family of one region");<a name="line.388"></a>
-<span class="sourceLineNo">389</span>        }<a name="line.389"></a>
-<span class="sourceLineNo">390</span><a name="line.390"></a>
-<span class="sourceLineNo">391</span>        bulkLoadPhase(table, admin.getConnection(), pool, queue, regionGroups);<a name="line.391"></a>
+<span class="sourceLineNo">385</span>        int maxRetries = getConf().getInt(HConstants.BULKLOAD_MAX_RETRIES_NUMBER, 10);<a name="line.385"></a>
+<span class="sourceLineNo">386</span>        maxRetries = Math.max(maxRetries, startEndKeys.getFirst().length + 1);<a name="line.386"></a>
+<span class="sourceLineNo">387</span>        if (maxRetries != 0 &amp;&amp; count &gt;= maxRetries) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>          throw new IOException("Retry attempted " + count +<a name="line.388"></a>
+<span class="sourceLineNo">389</span>            " times without completing, bailing out");<a name="line.389"></a>
+<span class="sourceLineNo">390</span>        }<a name="line.390"></a>
+<span class="sourceLineNo">391</span>        count++;<a name="line.391"></a>
 <span class="sourceLineNo">392</span><a name="line.392"></a>
-<span class="sourceLineNo">393</span>        // NOTE: The next iteration's split / group could happen in parallel to<a name="line.393"></a>
-<span class="sourceLineNo">394</span>        // atomic bulkloads assuming that there are splits and no merges, and<a name="line.394"></a>
-<span class="sourceLineNo">395</span>        // that we can atomically pull out the groups we want to retry.<a name="line.395"></a>
-<span class="sourceLineNo">396</span>      }<a name="line.396"></a>
-<span class="sourceLineNo">397</span><a name="line.397"></a>
-<span class="sourceLineNo">398</span>    } finally {<a name="line.398"></a>
-<span class="sourceLineNo">399</span>      fsDelegationToken.releaseDelegationToken();<a name="line.399"></a>
-<span class="sourceLineNo">400</span>      if(bulkToken != null) {<a name="line.400"></a>
-<span class="sourceLineNo">401</span>        new SecureBulkLoadClient(table).cleanupBulkLoad(bulkToken);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>      }<a name="line.402"></a>
-<span class="sourceLineNo">403</span>      pool.shutdown();<a name="line.403"></a>
-<span class="sourceLineNo">404</span>      if (queue != null &amp;&amp; !queue.isEmpty()) {<a name="line.404"></a>
-<span class="sourceLineNo">405</span>        StringBuilder err = new StringBuilder();<a name="line.405"></a>
-<span class="sourceLineNo">406</span>        err.append("-------------------------------------------------\n");<a name="line.406"></a>
-<span class="sourceLineNo">407</span>        err.append("Bulk load aborted with some files not yet loaded:\n");<a name="line.407"></a>
-<span class="sourceLineNo">408</span>        err.append("-------------------------------------------------\n");<a name="line.408"></a>
-<span class="sourceLineNo">409</span>        for (LoadQueueItem q : queue) {<a name="line.409"></a>
-<span class="sourceLineNo">410</span>          err.append("  ").append(q.hfilePath).append('\n');<a name="line.410"></a>
-<span class="sourceLineNo">411</span>        }<a name="line.411"></a>
-<span class="sourceLineNo">412</span>        LOG.error(err);<a name="line.412"></a>
-<span class="sourceLineNo">413</span>      }<a name="line.413"></a>
-<span class="sourceLineNo">414</span>    }<a name="line.414"></a>
-<span class="sourceLineNo">415</span><a name="line.415"></a>
-<span class="sourceLineNo">416</span>    if (queue != null &amp;&amp; !queue.isEmpty()) {<a name="line.416"></a>
-<span class="sourceLineNo">417</span>        throw new RuntimeException("Bulk load aborted with some files not yet loaded."<a name="line.417"></a>
-<span class="sourceLineNo">418</span>          + "Please check log for more details.");<a name="line.418"></a>
-<span class="sourceLineNo">419</span>    }<a name="line.419"></a>
-<span class="sourceLineNo">420</span>  }<a name="line.420"></a>
-<span class="sourceLineNo">421</span><a name="line.421"></a>
-<span class="sourceLineNo">422</span>  /**<a name="line.422"></a>
-<span class="sourceLineNo">423</span>   * Prepare a collection of {@link LoadQueueItem} from list of source hfiles contained in the<a name="line.423"></a>
-<span class="sourceLineNo">424</span>   * passed directory and validates whether the prepared queue has all the valid table column<a name="line.424"></a>
-<span class="sourceLineNo">425</span>   * families in it.<a name="line.425"></a>
-<span class="sourceLineNo">426</span>   * @param hfilesDir directory containing list of hfiles to be loaded into the table<a name="line.426"></a>
-<span class="sourceLineNo">427</span>   * @param table table to which hfiles should be loaded<a name="line.427"></a>
-<span class="sourceLineNo">428</span>   * @param queue queue which needs to be loaded into the table<a name="line.428"></a>
-<span class="sourceLineNo">429</span>   * @param validateHFile if true hfiles will be validated for its format<a name="line.429"></a>
-<span class="sourceLineNo">430</span>   * @throws IOException If any I/O or network error occurred<a name="line.430"></a>
-<span class="sourceLineNo">431</span>   */<a name="line.431"></a>
-<span class="sourceLineNo">432</span>  public void prepareHFileQueue(Path hfilesDir, Table table, Deque&lt;LoadQueueItem&gt; queue,<a name="line.432"></a>
-<span class="sourceLineNo">433</span>      boolean validateHFile) throws IOException {<a name="line.433"></a>
-<span class="sourceLineNo">434</span>    discoverLoadQueue(queue, hfilesDir, validateHFile);<a name="line.434"></a>
-<span class="sourceLineNo">435</span>    validateFamiliesInHFiles(table, queue);<a name="line.435"></a>
-<span class="sourceLineNo">436</span>  }<a name="line.436"></a>
-<span class="sourceLineNo">437</span><a name="line.437"></a>
-<span class="sourceLineNo">438</span>  // Initialize a thread pool<a name="line.438"></a>
-<span class="sourceLineNo">439</span>  private ExecutorService createExecutorService() {<a name="line.439"></a>
-<span class="sourceLineNo">440</span>    ThreadFactoryBuilder builder = new ThreadFactoryBuilder();<a name="line.440"></a>
-<span class="sourceLineNo">441</span>    builder.setNameFormat("LoadIncrementalHFiles-%1$d");<a name="line.441"></a>
-<span class="sourceLineNo">442</span>    ExecutorService pool = new ThreadPoolExecutor(nrThreads, nrThreads, 60, TimeUnit.SECONDS,<a name="line.442"></a>
-<span class="sourceLineNo">443</span>        new LinkedBlockingQueue&lt;Runnable&gt;(), builder.build());<a name="line.443"></a>
-<span class="sourceLineNo">444</span>    ((ThreadPoolExecutor) pool).allowCoreThreadTimeOut(true);<a name="line.444"></a>
-<span class="sourceLineNo">445</span>    return pool;<a name="line.445"></a>
-<span class="sourceLineNo">446</span>  }<a name="line.446"></a>
-<span class="sourceLineNo">447</span><a name="line.447"></a>
-<span class="sourceLineNo">448</span>  /**<a name="line.448"></a>
-<span class="sourceLineNo">449</span>   * Checks whether there is any invalid family name in HFiles to be bulk loaded.<a name="line.449"></a>
-<span class="sourceLineNo">450</span>   */<a name="line.450"></a>
-<span class="sourceLineNo">451</span>  private void validateFamiliesInHFiles(Table table, Deque&lt;LoadQueueItem&gt; queue)<a name="line.451"></a>
-<span class="sourceLineNo">452</span>      throws IOException {<a name="line.452"></a>
-<span class="sourceLineNo">453</span>    Collection&lt;HColumnDescriptor&gt; families = table.getTableDescriptor().getFamilies();<a name="line.453"></a>
-<span class="sourceLineNo">454</span>    List&lt;String&gt; familyNames = new ArrayList&lt;String&gt;(families.size());<a name="line.454"></a>
-<span class="sourceLineNo">455</span>    for (HColumnDescriptor family : families) {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>      familyNames.add(family.getNameAsString());<a name="line.456"></a>
-<span class="sourceLineNo">457</span>    }<a name="line.457"></a>
-<span class="sourceLineNo">458</span>    List&lt;String&gt; unmatchedFamilies = new ArrayList&lt;String&gt;();<a name="line.458"></a>
-<span class="sourceLineNo">459</span>    Iterator&lt;LoadQueueItem&gt; queueIter = queue.iterator();<a name="line.459"></a>
-<span class="sourceLineNo">460</span>    while (queueIter.hasNext()) {<a name="line.460"></a>
-<span class="sourceLineNo">461</span>      LoadQueueItem lqi = queueIter.next();<a name="line.461"></a>
-<span class="sourceLineNo">462</span>      String familyNameInHFile = Bytes.toString(lqi.family);<a name="line.462"></a>
-<span class="sourceLineNo">463</span>      if (!familyNames.contains(familyNameInHFile)) {<a name="line.463"></a>
-<span class="sourceLineNo">464</span>        unmatchedFamilies.add(familyNameInHFile);<a name="line.464"></a>
-<span class="sourceLineNo">465</span>      }<a name="line.465"></a>
-<span class="sourceLineNo">466</span>    }<a name="line.466"></a>
-<span class="sourceLineNo">467</span>    if (unmatchedFamilies.size() &gt; 0) {<a name="line.467"></a>
-<span class="sourceLineNo">468</span>      String msg =<a name="line.468"></a>
-<span class="sourceLineNo">469</span>          "Unmatched family names found: unmatched family names in HFiles to be bulkloaded: "<a name="line.469"></a>
-<span class="sourceLineNo">470</span>              + unmatchedFamilies + "; valid family names of table " + table.getName() + " are: "<a name="line.470"></a>
-<span class="sourceLineNo">471</span>              + familyNames;<a name="line.471"></a>
-<span class="sourceLineNo">472</span>      LOG.error(msg);<a name="line.472"></a>
-<span class="sourceLineNo">473</span>      throw new IOException(msg);<a name="line.473"></a>
-<span class="sourceLineNo">474</span>    }<a name="line.474"></a>
-<span class="sourceLineNo">475</span>  }<a name="line.475"></a>
-<span class="sourceLineNo">476</span><a name="line.476"></a>
-<span class="sourceLineNo">477</span>  /**<a name="line.477"></a>
-<span class="sourceLineNo">478</span>   * Used by the replication sink to load the hfiles from the source cluster. It does the following,<a name="line.478"></a>
-<span class="sourceLineNo">479</span>   * 1. {@link LoadIncrementalHFiles#groupOrSplitPhase(Table, ExecutorService, Deque, Pair)} 2.<a name="line.479"></a>
-<span class="sourceLineNo">480</span>   * {@link<a name="line.480"></a>
-<span class="sourceLineNo">481</span>   * LoadIncrementalHFiles#bulkLoadPhase(Table, Connection, ExecutorService, Deque, Multimap)}<a name="line.481"></a>
-<span class="sourceLineNo">482</span>   * @param table Table to which these hfiles should be loaded to<a name="line.482"></a>
-<span class="sourceLineNo">483</span>   * @param conn Connection to use<a name="line.483"></a>
-<span class="sourceLineNo">484</span>   * @param queue {@link LoadQueueItem} has hfiles yet to be loaded<a name="line.484"></a>
-<span class="sourceLineNo">485</span>   * @param startEndKeys starting and ending row keys of the region<a name="line.485"></a>
-<span class="sourceLineNo">486</span>   */<a name="line.486"></a>
-<span class="sourceLineNo">487</span>  public void loadHFileQueue(final Table table, final Connection conn, Deque&lt;LoadQueueItem&gt; queue,<a name="line.487"></a>
-<span class="sourceLineNo">488</span>      Pair&lt;byte[][], byte[][]&gt; startEndKeys) throws IOException {<a name="line.488"></a>
-<span class="sourceLineNo">489</span>    ExecutorService pool = null;<a name="line.489"></a>
-<span class="sourceLineNo">490</span>    try {<a name="line.490"></a>
-<span class="sourceLineNo">491</span>      pool = createExecutorService();<a name="line.491"></a>
-<span class="sourceLineNo">492</span>      Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups =<a name="line.492"></a>
-<span class="sourceLineNo">493</span>          groupOrSplitPhase(table, pool, queue, startEndKeys);<a name="line.493"></a>
-<span class="sourceLineNo">494</span>      bulkLoadPhase(table, conn, pool, queue, regionGroups);<a name="line.494"></a>
-<span class="sourceLineNo">495</span>    } finally {<a name="line.495"></a>
-<span class="sourceLineNo">496</span>      if (pool != null) {<a name="line.496"></a>
-<span class="sourceLineNo">497</span>        pool.shutdown();<a name="line.497"></a>
-<span class="sourceLineNo">498</span>      }<a name="line.498"></a>
-<span class="sourceLineNo">499</span>    }<a name="line.499"></a>
-<span class="sourceLineNo">500</span>  }<a name="line.500"></a>
-<span class="sourceLineNo">501</span><a name="line.501"></a>
-<span class="sourceLineNo">502</span>  /**<a name="line.502"></a>
-<span class="sourceLineNo">503</span>   * This takes the LQI's grouped by likely regions and attempts to bulk load<a name="line.503"></a>
-<span class="sourceLineNo">504</span>   * them.  Any failures are re-queued for another pass with the<a name="line.504"></a>
-<span class="sourceLineNo">505</span>   * groupOrSplitPhase.<a name="line.505"></a>
-<span class="sourceLineNo">506</span>   */<a name="line.506"></a>
-<span class="sourceLineNo">507</span>  protected void bulkLoadPhase(final Table table, final Connection conn,<a name="line.507"></a>
-<span class="sourceLineNo">508</span>      ExecutorService pool, Deque&lt;LoadQueueItem&gt; queue,<a name="line.508"></a>
-<span class="sourceLineNo">509</span>      final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups) throws IOException {<a name="line.509"></a>
-<span class="sourceLineNo">510</span>    // atomically bulk load the groups.<a name="line.510"></a>
-<span class="sourceLineNo">511</span>    Set&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt; loadingFutures = new HashSet&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt;();<a name="line.511"></a>
-<span class="sourceLineNo">512</span>    for (Entry&lt;ByteBuffer, ? extends Collection&lt;LoadQueueItem&gt;&gt; e: regionGroups.asMap().entrySet()){<a name="line.512"></a>
-<span class="sourceLineNo">513</span>      final byte[] first = e.getKey().array();<a name="line.513"></a>
-<span class="sourceLineNo">514</span>      final Collection&lt;LoadQueueItem&gt; lqis =  e.getValue();<a name="line.514"></a>
-<span class="sourceLineNo">515</span><a name="line.515"></a>
-<span class="sourceLineNo">516</span>      final Callable&lt;List&lt;LoadQueueItem&gt;&gt; call = new Callable&lt;List&lt;LoadQueueItem&gt;&gt;() {<a name="line.516"></a>
-<span class="sourceLineNo">517</span>        @Override<a name="line.517"></a>
-<span class="sourceLineNo">518</span>        public List&lt;LoadQueueItem&gt; call() throws Exception {<a name="line.518"></a>
-<span class="sourceLineNo">519</span>          List&lt;LoadQueueItem&gt; toRetry =<a name="line.519"></a>
-<span class="sourceLineNo">520</span>              tryAtomicRegionLoad(conn, table.getName(), first, lqis);<a name="line.520"></a>
-<span class="sourceLineNo">521</span>          return toRetry;<a name="line.521"></a>
-<span class="sourceLineNo">522</span>        }<a name="line.522"></a>
-<span class="sourceLineNo">523</span>      };<a name="line.523"></a>
-<span class="sourceLineNo">524</span>      loadingFutures.add(pool.submit(call));<a name="line.524"></a>
-<span class="sourceLineNo">525</span>    }<a name="line.525"></a>
-<span class="sourceLineNo">526</span><a name="line.526"></a>
-<span class="sourceLineNo">527</span>    // get all the results.<a name="line.527"></a>
-<span class="sourceLineNo">528</span>    for (Future&lt;List&lt;LoadQueueItem&gt;&gt; future : loadingFutures) {<a name="line.528"></a>
-<span class="sourceLineNo">529</span>      try {<a name="line.529"></a>
-<span class="sourceLineNo">530</span>        List&lt;LoadQueueItem&gt; toRetry = future.get();<a name="line.530"></a>
-<span class="sourceLineNo">531</span><a name="line.531"></a>
-<span class="sourceLineNo">532</span>        // LQIs that are requeued to be regrouped.<a name="line.532"></a>
-<span class="sourceLineNo">533</span>        queue.addAll(toRetry);<a name="line.533"></a>
-<span class="sourceLineNo">534</span><a name="line.534"></a>
-<span class="sourceLineNo">535</span>      } catch (ExecutionException e1) {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>        Throwable t = e1.getCause();<a name="line.536"></a>
-<span class="sourceLineNo">537</span>        if (t instanceof IOException) {<a name="line.537"></a>
-<span class="sourceLineNo">538</span>          // At this point something unrecoverable has happened.<a name="line.538"></a>
-<span class="sourceLineNo">539</span>          // TODO Implement bulk load recovery<a name="line.539"></a>
-<span class="sourceLineNo">540</span>          throw new IOException("BulkLoad encountered an unrecoverable problem", t);<a name="line.540"></a>
-<span class="sourceLineNo">541</span>        }<a name="line.541"></a>
-<span class="sourceLineNo">542</span>        LOG.error("Unexpected execution exception during bulk load", e1);<a name="line.542"></a>
-<span class="sourceLineNo">543</span>        throw new IllegalStateException(t);<a name="line.543"></a>
-<span class="sourceLineNo">544</span>      } catch (InterruptedException e1) {<a name="line.544"></a>
-<span class="sourceLineNo">545</span>        LOG.error("Unexpected interrupted exception during bulk load", e1);<a name="line.545"></a>
-<span class="sourceLineNo">546</span>        throw (InterruptedIOException)new InterruptedIOException().initCause(e1);<a name="line.546"></a>
-<span class="sourceLineNo">547</span>      }<a name="line.547"></a>
-<span class="sourceLineNo">548</span>    }<a name="line.548"></a>
-<span class="sourceLineNo">549</span>  }<a name="line.549"></a>
-<span class="sourceLineNo">550</span><a name="line.550"></a>
-<span class="sourceLineNo">551</span>  private boolean checkHFilesCountPerRegionPerFamily(<a name="line.551"></a>
-<span class="sourceLineNo">552</span>      final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups) {<a name="line.552"></a>
-<span class="sourceLineNo">553</span>    for (Entry&lt;ByteBuffer,<a name="line.553"></a>
-<span class="sourceLineNo">554</span>        ? extends Collection&lt;LoadQueueItem&gt;&gt; e: regionGroups.asMap().entrySet()) {<a name="line.554"></a>
-<span class="sourceLineNo">555</span>      final Collection&lt;LoadQueueItem&gt; lqis =  e.getValue();<a name="line.555"></a>
-<span class="sourceLineNo">556</span>      HashMap&lt;byte[], MutableInt&gt; filesMap = new HashMap&lt;byte[], MutableInt&gt;();<a name="line.556"></a>
-<span class="sourceLineNo">557</span>      for (LoadQueueItem lqi: lqis) {<a name="line.557"></a>
-<span class="sourceLineNo">558</span>        MutableInt count = filesMap.get(lqi.family);<a name="line.558"></a>
-<span class="sourceLineNo">559</span>        if (count == null) {<a name="line.559"></a>
-<span class="sourceLineNo">560</span>          count = new MutableInt();<a name="line.560"></a>
-<span class="sourceLineNo">561</span>          filesMap.put(lqi.family, count);<a name="line.561"></a>
-<span class="sourceLineNo">562</span>        }<a name="line.562"></a>
-<span class="sourceLineNo">563</span>        count.increment();<a name="line.563"></a>
-<span class="sourceLineNo">564</span>        if (count.intValue() &gt; maxFilesPerRegionPerFamily) {<a name="line.564"></a>
-<span class="sourceLineNo">565</span>          LOG.error("Trying to load more than " + maxFilesPerRegionPerFamily<a name="line.565"></a>
-<span class="sourceLineNo">566</span>            + " hfiles to family " + Bytes.toStringBinary(lqi.family)<a name="line.566"></a>
-<span class="sourceLineNo">567</span>            + " of region with start key "<a name="line.567"></a>
-<span class="sourceLineNo">568</span>            + Bytes.toStringBinary(e.getKey()));<a name="line.568"></a>
-<span class="sourceLineNo">569</span>          return false;<a name="line.569"></a>
-<span class="sourceLineNo">570</span>        }<a name="line.570"></a>
-<span class="sourceLineNo">571</span>      }<a name="line.571"></a>
-<span class="sourceLineNo">572</span>    }<a name="line.572"></a>
-<span class="sourceLineNo">573</span>    return true;<a name="line.573"></a>
-<span class="sourceLineNo">574</span>  }<a name="line.574"></a>
-<span class="sourceLineNo">575</span><a name="line.575"></a>
-<span class="sourceLineNo">576</span>  /**<a name="line.576"></a>
-<span class="sourceLineNo">577</span>   * @return A map that groups LQI by likely bulk load region targets.<a name="line.577"></a>
-<span class="sourceLineNo">578</span>   */<a name="line.578"></a>
-<span class="sourceLineNo">579</span>  private Multimap&lt;ByteBuffer, LoadQueueItem&gt; groupOrSplitPhase(final Table table,<a name="line.579"></a>
-<span class="sourceLineNo">580</span>      ExecutorService pool, Deque&lt;LoadQueueItem&gt; queue,<a name="line.580"></a>
-<span class="sourceLineNo">581</span>      final Pair&lt;byte[][], byte[][]&gt; startEndKeys) throws IOException {<a name="line.581"></a>
-<span class="sourceLineNo">582</span>    // &lt;region start key, LQI&gt; need synchronized only within this scope of this<a name="line.582"></a>
-<span class="sourceLineNo">583</span>    // phase because of the puts that happen in futures.<a name="line.583"></a>
-<span class="sourceLineNo">584</span>    Multimap&lt;ByteBuffer, LoadQueueItem&gt; rgs = HashMultimap.create();<a name="line.584"></a>
-<span class="sourceLineNo">585</span>    final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups = Multimaps.synchronizedMultimap(rgs);<a name="line.585"></a>
-<span class="sourceLineNo">586</span><a name="line.586"></a>
-<span class="sourceLineNo">587</span>    // drain LQIs and figure out bulk load groups<a name="line.587"></a>
-<span class="sourceLineNo">588</span>    Set&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt; splittingFutures = new HashSet&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt;();<a name="line.588"></a>
-<span class="sourceLineNo">589</span>    while (!queue.isEmpty()) {<a name="line.589"></a>
-<span class="sourceLineNo">590</span>      final LoadQueueItem item = queue.remove();<a name="line.590"></a>
-<span class="sourceLineNo">591</span><a name="line.591"></a>
-<span class="sourceLineNo">592</span>      final Callable&lt;List&lt;LoadQueueItem&gt;&gt; call = new Callable&lt;List&lt;LoadQueueItem&gt;&gt;() {<a name="line.592"></a>
-<span class="sourceLineNo">593</span>        @Override<a name="line.593"></a>
-<span class="sourceLineNo">594</span>        public List&lt;LoadQueueItem&gt; call() throws Exception {<a name="line.594"></a>
-<span class="sourceLineNo">595</span>          List&lt;LoadQueueItem&gt; splits = groupOrSplit(regionGroups, item, table, startEndKeys);<a name="line.595"></a>
-<span class="sourceLineNo">596</span>          return splits;<a name="line.596"></a>
-<span class="sourceLineNo">597</span>        }<a name="line.597"></a>
-<span class="sourceLineNo">598</span>      };<a name="line.598"></a>
-<span class="sourceLineNo">599</span>      splittingFutures.add(pool.submit(call));<a name="line.599"></a>
-<span class="sourceLineNo">600</span>    }<a name="line.600"></a>
-<span class="sourceLineNo">601</span>    // get all the results.  All grouping and splitting must finish before<a name="line.601"></a>
-<span class="sourceLineNo">602</span>    // we can attempt the atomic loads.<a name="line.602"></a>
-<span class="sourceLineNo">603</span>    for (Future&lt;List&lt;LoadQueueItem&gt;&gt; lqis : splittingFutures) {<a name="line.603"></a>
-<span class="sourceLineNo">604</span>      try {<a name="line.604"></a>
-<span class="sourceLineNo">605</span>        List&lt;LoadQueueItem&gt; splits = lqis.get();<a name="line.605"></a>
-<span class="sourceLineNo">606</span>        if (splits != null) {<a name="line.606"></a>
-<span class="sourceLineNo">607</span>          queue.addAll(splits);<a name="line.607"></a>
-<span class="sourceLineNo">608</span>        }<a name="line.608"></a>
-<span class="sourceLineNo">609</span>      } catch (ExecutionException e1) {<a name="line.609"></a>
-<span class="sourceLineNo">610</span>        Throwable t = e1.getCause();<a name="line.610"></a>
-<span class="sourceLineNo">611</span>        if (t instanceof IOException) {<a name="line.611"></a>
-<span class="sourceLineNo">612</span>          LOG.error("IOException during splitting", e1);<a name="line.612"></a>
-<span class="sourceLineNo">613</span>          throw (IOException)t; // would have been thrown if not parallelized,<a name="line.613"></a>
-<span class="sourceLineNo">614</span>        }<a name="line.614"></a>
-<span class="sourceLineNo">615</span>        LOG.error("Unexpected execution exception during splitting", e1);<a name="line.615"></a>
-<span class="sourceLineNo">616</span>        throw new IllegalStateException(t);<a name="line.616"></a>
-<span class="sourceLineNo">617</span>      } catch (InterruptedException e1) {<a name="line.617"></a>
-<span class="sourceLineNo">618</span>        LOG.error("Unexpected interrupted exception during splitting", e1);<a name="line.618"></a>
-<span class="sourceLineNo">619</span>        throw (InterruptedIOException)new InterruptedIOException().initCause(e1);<a name="line.619"></a>
-<span class="sourceLineNo">620</span>      }<a name="line.620"></a>
-<span class="sourceLineNo">621</span>    }<a name="line.621"></a>
-<span class="sourceLineNo">622</span>    return regionGroups;<a name="line.622"></a>
-<span class="sourceLineNo">623</span>  }<a name="line.623"></a>
-<span class="sourceLineNo">624</span><a name="line.624"></a>
-<span class="sourceLineNo">625</span>  // unique file name for the table<a name="line.625"></a>
-<span class="sourceLineNo">626</span>  private String getUniqueName() {<a name="line.626"></a>
-<span class="sourceLineNo">627</span>    return UUID.randomUUID().toString().replaceAll("-", "");<a name="line.627"></a>
-<span class="sourceLineNo">628</span>  }<a name="line.628"></a>
-<span class="sourceLineNo">629</span><a name="line.629"></a>
-<span class="sourceLineNo">630</span>  protected List&lt;LoadQueueItem&gt; splitStoreFile(final LoadQueueItem item,<a name="line.630"></a>
-<span class="sourceLineNo">631</span>      final Table table, byte[] startKey,<a name="line.631"></a>
-<span class="sourceLineNo">632</span>      byte[] splitKey) throws IOException {<a name="line.632"></a>
-<span class="sourceLineNo">633</span>    final Path hfilePath = item.hfilePath;<a name="line.633"></a>
-<span class="sourceLineNo">634</span><a name="line.634"></a>
-<span class="sourceLineNo">635</span>    // We use a '_' prefix which is ignored when walking directory trees<a name="line.635"></a>
-<span class="sourceLineNo">636</span>    // above.<a name="line.636"></a>
-<span class="sourceLineNo">637</span>    final String TMP_DIR = "_tmp";<a name="line.637"></a>
-<span class="sourceLineNo">638</span>    Path tmpDir = item.hfilePath.getParent();<a name="line.638"></a>
-<span class="sourceLineNo">639</span>    if (!tmpDir.getName().equals(TMP_DIR)) {<a name="line.639"></a>
-<span class="sourceLineNo">640</span>      tmpDir = new Path(tmpDir, TMP_DIR);<a name="line.640"></a>
-<span class="sourceLineNo">641</span>    }<a name="line.641"></a>
-<span class="sourceLineNo">642</span><a name="line.642"></a>
-<span class="sourceLineNo">643</span>    LOG.info("HFile at " + hfilePath + " no longer fits inside a single " +<a name="line.643"></a>
-<span class="sourceLineNo">644</span>    "region. Splitting...");<a name="line.644"></a>
-<span class="sourceLineNo">645</span><a name="line.645"></a>
-<span class="sourceLineNo">646</span>    String uniqueName = getUniqueName();<a name="line.646"></a>
-<span class="sourceLineNo">647</span>    HColumnDescriptor familyDesc = table.getTableDescriptor().getFamily(item.family);<a name="line.647"></a>
-<span class="sourceLineNo">648</span><a name="line.648"></a>
-<span class="sourceLineNo">649</span>    Path botOut = new Path(tmpDir, uniqueName + ".bottom");<a name="line.649"></a>
-<span class="sourceLineNo">650</span>    Path topOut = new Path(tmpDir, uniqueName + ".top");<a name="line.650"></a>
-<span class="sourceLineNo">651</span>    splitStoreFile(getConf(), hfilePath, familyDesc, splitKey, botOut, topOut);<a name="line.651"></a>
-<span class="sourceLineNo">652</span><a name="line.652"></a>
-<span class="sourceLineNo">653</span>    FileSystem fs = tmpDir.getFileSystem(getConf());<a name="line.653"></a>
-<span class="sourceLineNo">654</span>    fs.setPermission(tmpDir, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.654"></a>
-<span class="sourceLineNo">655</span>    fs.setPermission(botOut, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.655"></a>
-<span class="sourceLineNo">656</span>    fs.setPermission(topOut, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.656"></a>
+<span class="sourceLineNo">393</span>        // Using ByteBuffer for byte[] equality semantics<a name="line.393"></a>
+<span class="sourceLineNo">394</span>        Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups = groupOrSplitPhase(table,<a name="line.394"></a>
+<span class="sourceLineNo">395</span>            pool, queue, startEndKeys);<a name="line.395"></a>
+<span class="sourceLineNo">396</span><a name="line.396"></a>
+<span class="sourceLineNo">397</span>        if (!checkHFilesCountPerRegionPerFamily(regionGroups)) {<a name="line.397"></a>
+<span class="sourceLineNo">398</span>          // Error is logged inside checkHFilesCountPerRegionPerFamily.<a name="line.398"></a>
+<span class="sourceLineNo">399</span>          throw new IOException("Trying to load more than " + maxFilesPerRegionPerFamily<a name="line.399"></a>
+<span class="sourceLineNo">400</span>            + " hfiles to one family of one region");<a name="line.400"></a>
+<span class="sourceLineNo">401</span>        }<a name="line.401"></a>
+<span class="sourceLineNo">402</span><a name="line.402"></a>
+<span class="sourceLineNo">403</span>        bulkLoadPhase(table, admin.getConnection(), pool, queue, regionGroups);<a name="line.403"></a>
+<span class="sourceLineNo">404</span><a name="line.404"></a>
+<span class="sourceLineNo">405</span>        // NOTE: The next iteration's split / group could happen in parallel to<a name="line.405"></a>
+<span class="sourceLineNo">406</span>        // atomic bulkloads assuming that there are splits and no merges, and<a name="line.406"></a>
+<span class="sourceLineNo">407</span>        // that we can atomically pull out the groups we want to retry.<a name="line.407"></a>
+<span class="sourceLineNo">408</span>      }<a name="line.408"></a>
+<span class="sourceLineNo">409</span><a name="line.409"></a>
+<span class="sourceLineNo">410</span>    } finally {<a name="line.410"></a>
+<span class="sourceLineNo">411</span>      fsDelegationToken.releaseDelegationToken();<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      if(bulkToken != null) {<a name="line.412"></a>
+<span class="sourceLineNo">413</span>        new SecureBulkLoadClient(table).cleanupBulkLoad(bulkToken);<a name="line.413"></a>
+<span class="sourceLineNo">414</span>      }<a name="line.414"></a>
+<span class="sourceLineNo">415</span>      pool.shutdown();<a name="line.415"></a>
+<span class="sourceLineNo">416</span>      if (queue != null &amp;&amp; !queue.isEmpty()) {<a name="line.416"></a>
+<span class="sourceLineNo">417</span>        StringBuilder err = new StringBuilder();<a name="line.417"></a>
+<span class="sourceLineNo">418</span>        err.append("-------------------------------------------------\n");<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        err.append("Bulk load aborted with some files not yet loaded:\n");<a name="line.419"></a>
+<span class="sourceLineNo">420</span>        err.append("-------------------------------------------------\n");<a name="line.420"></a>
+<span class="sourceLineNo">421</span>        for (LoadQueueItem q : queue) {<a name="line.421"></a>
+<span class="sourceLineNo">422</span>          err.append("  ").append(q.hfilePath).append('\n');<a name="line.422"></a>
+<span class="sourceLineNo">423</span>        }<a name="line.423"></a>
+<span class="sourceLineNo">424</span>        LOG.error(err);<a name="line.424"></a>
+<span class="sourceLineNo">425</span>      }<a name="line.425"></a>
+<span class="sourceLineNo">426</span>    }<a name="line.426"></a>
+<span class="sourceLineNo">427</span><a name="line.427"></a>
+<span class="sourceLineNo">428</span>    if (queue != null &amp;&amp; !queue.isEmpty()) {<a name="line.428"></a>
+<span class="sourceLineNo">429</span>        throw new RuntimeException("Bulk load aborted with some files not yet loaded."<a name="line.429"></a>
+<span class="sourceLineNo">430</span>          + "Please check log for more details.");<a name="line.430"></a>
+<span class="sourceLineNo">431</span>    }<a name="line.431"></a>
+<span class="sourceLineNo">432</span>  }<a name="line.432"></a>
+<span class="sourceLineNo">433</span><a name="line.433"></a>
+<span class="sourceLineNo">434</span>  /**<a name="line.434"></a>
+<span class="sourceLineNo">435</span>   * Prepare a collection of {@link LoadQueueItem} from list of source hfiles contained in the<a name="line.435"></a>
+<span class="sourceLineNo">436</span>   * passed directory and validates whether the prepared queue has all the valid table column<a name="line.436"></a>
+<span class="sourceLineNo">437</span>   * families in it.<a name="line.437"></a>
+<span class="sourceLineNo">438</span>   * @param hfilesDir directory containing list of hfiles to be loaded into the table<a name="line.438"></a>
+<span class="sourceLineNo">439</span>   * @param table table to which hfiles should be loaded<a name="line.439"></a>
+<span class="sourceLineNo">440</span>   * @param queue queue which needs to be loaded into the table<a name="line.440"></a>
+<span class="sourceLineNo">441</span>   * @param validateHFile if true hfiles will be validated for its format<a name="line.441"></a>
+<span class="sourceLineNo">442</span>   * @throws IOException If any I/O or network error occurred<a name="line.442"></a>
+<span class="sourceLineNo">443</span>   */<a name="line.443"></a>
+<span class="sourceLineNo">444</span>  public void prepareHFileQueue(Path hfilesDir, Table table, Deque&lt;LoadQueueItem&gt; queue,<a name="line.444"></a>
+<span class="sourceLineNo">445</span>      boolean validateHFile) throws IOException {<a name="line.445"></a>
+<span class="sourceLineNo">446</span>    discoverLoadQueue(queue, hfilesDir, validateHFile);<a name="line.446"></a>
+<span class="sourceLineNo">447</span>    validateFamiliesInHFiles(table, queue);<a name="line.447"></a>
+<span class="sourceLineNo">448</span>  }<a name="line.448"></a>
+<span class="sourceLineNo">449</span><a name="line.449"></a>
+<span class="sourceLineNo">450</span>  // Initialize a thread pool<a name="line.450"></a>
+<span class="sourceLineNo">451</span>  private ExecutorService createExecutorService() {<a name="line.451"></a>
+<span class="sourceLineNo">452</span>    ThreadFactoryBuilder builder = new ThreadFactoryBuilder();<a name="line.452"></a>
+<span class="sourceLineNo">453</span>    builder.setNameFormat("LoadIncrementalHFiles-%1$d");<a name="line.453"></a>
+<span class="sourceLineNo">454</span>    ExecutorService pool = new ThreadPoolExecutor(nrThreads, nrThreads, 60, TimeUnit.SECONDS,<a name="line.454"></a>
+<span class="sourceLineNo">455</span>        new LinkedBlockingQueue&lt;Runnable&gt;(), builder.build());<a name="line.455"></a>
+<span class="sourceLineNo">456</span>    ((ThreadPoolExecutor) pool).allowCoreThreadTimeOut(true);<a name="line.456"></a>
+<span class="sourceLineNo">457</span>    return pool;<a name="line.457"></a>
+<span class="sourceLineNo">458</span>  }<a name="line.458"></a>
+<span class="sourceLineNo">459</span><a name="line.459"></a>
+<span class="sourceLineNo">460</span>  /**<a name="line.460"></a>
+<span class="sourceLineNo">461</span>   * Checks whether there is any invalid family name in HFiles to be bulk loaded.<a name="line.461"></a>
+<span class="sourceLineNo">462</span>   */<a name="line.462"></a>
+<span class="sourceLineNo">463</span>  private void validateFamiliesInHFiles(Table table, Deque&lt;LoadQueueItem&gt; queue)<a name="line.463"></a>
+<span class="sourceLineNo">464</span>      throws IOException {<a name="line.464"></a>
+<span class="sourceLineNo">465</span>    Collection&lt;HColumnDescriptor&gt; families = table.getTableDescriptor().getFamilies();<a name="line.465"></a>
+<span class="sourceLineNo">466</span>    List&lt;String&gt; familyNames = new ArrayList&lt;String&gt;(families.size());<a name="line.466"></a>
+<span class="sourceLineNo">467</span>    for (HColumnDescriptor family : families) {<a name="line.467"></a>
+<span class="sourceLineNo">468</span>      familyNames.add(family.getNameAsString());<a name="line.468"></a>
+<span class="sourceLineNo">469</span>    }<a name="line.469"></a>
+<span class="sourceLineNo">470</span>    List&lt;String&gt; unmatchedFamilies = new ArrayList&lt;String&gt;();<a name="line.470"></a>
+<span class="sourceLineNo">471</span>    Iterator&lt;LoadQueueItem&gt; queueIter = queue.iterator();<a name="line.471"></a>
+<span class="sourceLineNo">472</span>    while (queueIter.hasNext()) {<a name="line.472"></a>
+<span class="sourceLineNo">473</span>      LoadQueueItem lqi = queueIter.next();<a name="line.473"></a>
+<span class="sourceLineNo">474</span>      String familyNameInHFile = Bytes.toString(lqi.family);<a name="line.474"></a>
+<span class="sourceLineNo">475</span>      if (!familyNames.contains(familyNameInHFile)) {<a name="line.475"></a>
+<span class="sourceLineNo">476</span>        unmatchedFamilies.add(familyNameInHFile);<a name="line.476"></a>
+<span class="sourceLineNo">477</span>      }<a name="line.477"></a>
+<span class="sourceLineNo">478</span>    }<a name="line.478"></a>
+<span class="sourceLineNo">479</span>    if (unmatchedFamilies.size() &gt; 0) {<a name="line.479"></a>
+<span class="sourceLineNo">480</span>      String msg =<a name="line.480"></a>
+<span class="sourceLineNo">481</span>          "Unmatched family names found: unmatched family names in HFiles to be bulkloaded: "<a name="line.481"></a>
+<span class="sourceLineNo">482</span>              + unmatchedFamilies + "; valid family names of table " + table.getName() + " are: "<a name="line.482"></a>
+<span class="sourceLineNo">483</span>              + familyNames;<a name="line.483"></a>
+<span class="sourceLineNo">484</span>      LOG.error(msg);<a name="line.484"></a>
+<span class="sourceLineNo">485</span>      throw new IOException(msg);<a name="line.485"></a>
+<span class="sourceLineNo">486</span>    }<a name="line.486"></a>
+<span class="sourceLineNo">487</span>  }<a name="line.487"></a>
+<span class="sourceLineNo">488</span><a name="line.488"></a>
+<span class="sourceLineNo">489</span>  /**<a name="line.489"></a>
+<span class="sourceLineNo">490</span>   * Used by the replication sink to load the hfiles from the source cluster. It does the following,<a name="line.490"></a>
+<span class="sourceLineNo">491</span>   * 1. {@link LoadIncrementalHFiles#groupOrSplitPhase(Table, ExecutorService, Deque, Pair)} 2.<a name="line.491"></a>
+<span class="sourceLineNo">492</span>   * {@link<a name="line.492"></a>
+<span class="sourceLineNo">493</span>   * LoadIncrementalHFiles#bulkLoadPhase(Table, Connection, ExecutorService, Deque, Multimap)}<a name="line.493"></a>
+<span class="sourceLineNo">494</span>   * @param table Table to which these hfiles should be loaded to<a name="line.494"></a>
+<span class="sourceLineNo">495</span>   * @param conn Connection to use<a name="line.495"></a>
+<span class="sourceLineNo">496</span>   * @param queue {@link LoadQueueItem} has hfiles yet to be loaded<a name="line.496"></a>
+<span class="sourceLineNo">497</span>   * @param startEndKeys starting and ending row keys of the region<a name="line.497"></a>
+<span class="sourceLineNo">498</span>   */<a name="line.498"></a>
+<span class="sourceLineNo">499</span>  public void loadHFileQueue(final Table table, final Connection conn, Deque&lt;LoadQueueItem&gt; queue,<a name="line.499"></a>
+<span class="sourceLineNo">500</span>      Pair&lt;byte[][], byte[][]&gt; startEndKeys) throws IOException {<a name="line.500"></a>
+<span class="sourceLineNo">501</span>    ExecutorService pool = null;<a name="line.501"></a>
+<span class="sourceLineNo">502</span>    try {<a name="line.502"></a>
+<span class="sourceLineNo">503</span>      pool = createExecutorService();<a name="line.503"></a>
+<span class="sourceLineNo">504</span>      Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups =<a name="line.504"></a>
+<span class="sourceLineNo">505</span>          groupOrSplitPhase(table, pool, queue, startEndKeys);<a name="line.505"></a>
+<span class="sourceLineNo">506</span>      bulkLoadPhase(table, conn, pool, queue, regionGroups);<a name="line.506"></a>
+<span class="sourceLineNo">507</span>    } finally {<a name="line.507"></a>
+<span class="sourceLineNo">508</span>      if (pool != null) {<a name="line.508"></a>
+<span class="sourceLineNo">509</span>        pool.shutdown();<a name="line.509"></a>
+<span class="sourceLineNo">510</span>      }<a name="line.510"></a>
+<span class="sourceLineNo">511</span>    }<a name="line.511"></a>
+<span class="sourceLineNo">512</span>  }<a name="line.512"></a>
+<span class="sourceLineNo">513</span><a name="line.513"></a>
+<span class="sourceLineNo">514</span>  /**<a name="line.514"></a>
+<span class="sourceLineNo">515</span>   * This takes the LQI's grouped by likely regions and attempts to bulk load<a name="line.515"></a>
+<span class="sourceLineNo">516</span>   * them.  Any failures are re-queued for another pass with the<a name="line.516"></a>
+<span class="sourceLineNo">517</span>   * groupOrSplitPhase.<a name="line.517"></a>
+<span class="sourceLineNo">518</span>   */<a name="line.518"></a>
+<span class="sourceLineNo">519</span>  protected void bulkLoadPhase(final Table table, final Connection conn,<a name="line.519"></a>
+<span class="sourceLineNo">520</span>      ExecutorService pool, Deque&lt;LoadQueueItem&gt; queue,<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups) throws IOException {<a name="line.521"></a>
+<span class="sourceLineNo">522</span>    // atomically bulk load the groups.<a name="line.522"></a>
+<span class="sourceLineNo">523</span>    Set&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt; loadingFutures = new HashSet&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt;();<a name="line.523"></a>
+<span class="sourceLineNo">524</span>    for (Entry&lt;ByteBuffer, ? extends Collection&lt;LoadQueueItem&gt;&gt; e: regionGroups.asMap().entrySet()){<a name="line.524"></a>
+<span class="sourceLineNo">525</span>      final byte[] first = e.getKey().array();<a name="line.525"></a>
+<span class="sourceLineNo">526</span>      final Collection&lt;LoadQueueItem&gt; lqis =  e.getValue();<a name="line.526"></a>
+<span class="sourceLineNo">527</span><a name="line.527"></a>
+<span class="sourceLineNo">528</span>      final Callable&lt;List&lt;LoadQueueItem&gt;&gt; call = new Callable&lt;List&lt;LoadQueueItem&gt;&gt;() {<a name="line.528"></a>
+<span class="sourceLineNo">529</span>        @Override<a name="line.529"></a>
+<span class="sourceLineNo">530</span>        public List&lt;LoadQueueItem&gt; call() throws Exception {<a name="line.530"></a>
+<span class="sourceLineNo">531</span>          List&lt;LoadQueueItem&gt; toRetry =<a name="line.531"></a>
+<span class="sourceLineNo">532</span>              tryAtomicRegionLoad(conn, table.getName(), first, lqis);<a name="line.532"></a>
+<span class="sourceLineNo">533</span>          return toRetry;<a name="line.533"></a>
+<span class="sourceLineNo">534</span>        }<a name="line.534"></a>
+<span class="sourceLineNo">535</span>      };<a name="line.535"></a>
+<span class="sourceLineNo">536</span>      loadingFutures.add(pool.submit(call));<a name="line.536"></a>
+<span class="sourceLineNo">537</span>    }<a name="line.537"></a>
+<span class="sourceLineNo">538</span><a name="line.538"></a>
+<span class="sourceLineNo">539</span>    // get all the results.<a name="line.539"></a>
+<span class="sourceLineNo">540</span>    for (Future&lt;List&lt;LoadQueueItem&gt;&gt; future : loadingFutures) {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>      try {<a name="line.541"></a>
+<span class="sourceLineNo">542</span>        List&lt;LoadQueueItem&gt; toRetry = future.get();<a name="line.542"></a>
+<span class="sourceLineNo">543</span><a name="line.543"></a>
+<span class="sourceLineNo">544</span>        // LQIs that are requeued to be regrouped.<a name="line.544"></a>
+<span class="sourceLineNo">545</span>        queue.addAll(toRetry);<a name="line.545"></a>
+<span class="sourceLineNo">546</span><a name="line.546"></a>
+<span class="sourceLineNo">547</span>      } catch (ExecutionException e1) {<a name="line.547"></a>
+<span class="sourceLineNo">548</span>        Throwable t = e1.getCause();<a name="line.548"></a>
+<span class="sourceLineNo">549</span>        if (t instanceof IOException) {<a name="line.549"></a>
+<span class="sourceLineNo">550</span>          // At this point something unrecoverable has happened.<a name="line.550"></a>
+<span class="sourceLineNo">551</span>          // TODO Implement bulk load recovery<a name="line.551"></a>
+<span class="sourceLineNo">552</span>          throw new IOException("BulkLoad encountered an unrecoverable problem", t);<a name="line.552"></a>
+<span class="sourceLineNo">553</span>        }<a name="line.553"></a>
+<span class="sourceLineNo">554</span>        LOG.error("Unexpected execution exception during bulk load", e1);<a name="line.554"></a>
+<span class="sourceLineNo">555</span>        throw new IllegalStateException(t);<a name="line.555"></a>
+<span class="sourceLineNo">556</span>      } catch (InterruptedException e1) {<a name="line.556"></a>
+<span class="sourceLineNo">557</span>        LOG.error("Unexpected interrupted exception during bulk load", e1);<a name="line.557"></a>
+<span class="sourceLineNo">558</span>        throw (InterruptedIOException)new InterruptedIOException().initCause(e1);<a name="line.558"></a>
+<span class="sourceLineNo">559</span>      }<a name="line.559"></a>
+<span class="sourceLineNo">560</span>    }<a name="line.560"></a>
+<span class="sourceLineNo">561</span>  }<a name="line.561"></a>
+<span class="sourceLineNo">562</span><a name="line.562"></a>
+<span class="sourceLineNo">563</span>  private boolean checkHFilesCountPerRegionPerFamily(<a name="line.563"></a>
+<span class="sourceLineNo">564</span>      final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups) {<a name="line.564"></a>
+<span class="sourceLineNo">565</span>    for (Entry&lt;ByteBuffer,<a name="line.565"></a>
+<span class="sourceLineNo">566</span>        ? extends Collection&lt;LoadQueueItem&gt;&gt; e: regionGroups.asMap().entrySet()) {<a name="line.566"></a>
+<span class="sourceLineNo">567</span>      final Collection&lt;LoadQueueItem&gt; lqis =  e.getValue();<a name="line.567"></a>
+<span class="sourceLineNo">568</span>      HashMap&lt;byte[], MutableInt&gt; filesMap = new HashMap&lt;byte[], MutableInt&gt;();<a name="line.568"></a>
+<span class="sourceLineNo">569</span>      for (LoadQueueItem lqi: lqis) {<a name="line.569"></a>
+<span class="sourceLineNo">570</span>        MutableInt count = filesMap.get(lqi.family);<a name="line.570"></a>
+<span class="sourceLineNo">571</span>        if (count == null) {<a name="line.571"></a>
+<span class="sourceLineNo">572</span>          count = new MutableInt();<a name="line.572"></a>
+<span class="sourceLineNo">573</span>          filesMap.put(lqi.family, count);<a name="line.573"></a>
+<span class="sourceLineNo">574</span>        }<a name="line.574"></a>
+<span class="sourceLineNo">575</span>        count.increment();<a name="line.575"></a>
+<span class="sourceLineNo">576</span>        if (count.intValue() &gt; maxFilesPerRegionPerFamily) {<a name="line.576"></a>
+<span class="sourceLineNo">577</span>          LOG.error("Trying to load more than " + maxFilesPerRegionPerFamily<a name="line.577"></a>
+<span class="sourceLineNo">578</span>            + " hfiles to family " + Bytes.toStringBinary(lqi.family)<a name="line.578"></a>
+<span class="sourceLineNo">579</span>            + " of region with start key "<a name="line.579"></a>
+<span class="sourceLineNo">580</span>            + Bytes.toStringBinary(e.getKey()));<a name="line.580"></a>
+<span class="sourceLineNo">581</span>          return false;<a name="line.581"></a>
+<span class="sourceLineNo">582</span>        }<a name="line.582"></a>
+<span class="sourceLineNo">583</span>      }<a name="line.583"></a>
+<span class="sourceLineNo">584</span>    }<a name="line.584"></a>
+<span class="sourceLineNo">585</span>    return true;<a name="line.585"></a>
+<span class="sourceLineNo">586</span>  }<a name="line.586"></a>
+<span class="sourceLineNo">587</span><a name="line.587"></a>
+<span class="sourceLineNo">588</span>  /**<a name="line.588"></a>
+<span class="sourceLineNo">589</span>   * @return A map that groups LQI by likely bulk load region targets.<a name="line.589"></a>
+<span class="sourceLineNo">590</span>   */<a name="line.590"></a>
+<span class="sourceLineNo">591</span>  private Multimap&lt;ByteBuffer, LoadQueueItem&gt; groupOrSplitPhase(final Table table,<a name="line.591"></a>
+<span class="sourceLineNo">592</span>      ExecutorService pool, Deque&lt;LoadQueueItem&gt; queue,<a name="line.592"></a>
+<span class="sourceLineNo">593</span>      final Pair&lt;byte[][], byte[][]&gt; startEndKeys) throws IOException {<a name="line.593"></a>
+<span class="sourceLineNo">594</span>    // &lt;region start key, LQI&gt; need synchronized only within this scope of this<a name="line.594"></a>
+<span class="sourceLineNo">595</span>    // phase because of the puts that happen in futures.<a name="line.595"></a>
+<span class="sourceLineNo">596</span>    Multimap&lt;ByteBuffer, LoadQueueItem&gt; rgs = HashMultimap.create();<a name="line.596"></a>
+<span class="sourceLineNo">597</span>    final Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups = Multimaps.synchronizedMultimap(rgs);<a name="line.597"></a>
+<span class="sourceLineNo">598</span><a name="line.598"></a>
+<span class="sourceLineNo">599</span>    // drain LQIs and figure out bulk load groups<a name="line.599"></a>
+<span class="sourceLineNo">600</span>    Set&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt; splittingFutures = new HashSet&lt;Future&lt;List&lt;LoadQueueItem&gt;&gt;&gt;();<a name="line.600"></a>
+<span class="sourceLineNo">601</span>    while (!queue.isEmpty()) {<a name="line.601"></a>
+<span class="sourceLineNo">602</span>      final LoadQueueItem item = queue.remove();<a name="line.602"></a>
+<span class="sourceLineNo">603</span><a name="line.603"></a>
+<span class="sourceLineNo">604</span>      final Callable&lt;List&lt;LoadQueueItem&gt;&gt; call = new Callable&lt;List&lt;LoadQueueItem&gt;&gt;() {<a name="line.604"></a>
+<span class="sourceLineNo">605</span>        @Override<a name="line.605"></a>
+<span class="sourceLineNo">606</span>        public List&lt;LoadQueueItem&gt; call() throws Exception {<a name="line.606"></a>
+<span class="sourceLineNo">607</span>          List&lt;LoadQueueItem&gt; splits = groupOrSplit(regionGroups, item, table, startEndKeys);<a name="line.607"></a>
+<span class="sourceLineNo">608</span>          return splits;<a name="line.608"></a>
+<span class="sourceLineNo">609</span>        }<a name="line.609"></a>
+<span class="sourceLineNo">610</span>      };<a name="line.610"></a>
+<span class="sourceLineNo">611</span>      splittingFutures.add(pool.submit(call));<a name="line.611"></a>
+<span class="sourceLineNo">612</span>    }<a name="line.612"></a>
+<span class="sourceLineNo">613</span>    // get all the results.  All grouping and splitting must finish before<a name="line.613"></a>
+<span class="sourceLineNo">614</span>    // we can attempt the atomic loads.<a name="line.614"></a>
+<span class="sourceLineNo">615</span>    for (Future&lt;List&lt;LoadQueueItem&gt;&gt; lqis : splittingFutures) {<a name="line.615"></a>
+<span class="sourceLineNo">616</span>      try {<a name="line.616"></a>
+<span class="sourceLineNo">617</span>        List&lt;LoadQueueItem&gt; splits = lqis.get();<a name="line.617"></a>
+<span class="sourceLineNo">618</span>        if (splits != null) {<a name="line.618"></a>
+<span class="sourceLineNo">619</span>          queue.addAll(splits);<a name="line.619"></a>
+<span class="sourceLineNo">620</span>        }<a name="line.620"></a>
+<span class="sourceLineNo">621</span>      } catch (ExecutionException e1) {<a name="line.621"></a>
+<span class="sourceLineNo">622</span>        Throwable t = e1.getCause();<a name="line.622"></a>
+<span class="sourceLineNo">623</span>        if (t instanceof IOException) {<a name="line.623"></a>
+<span class="sourceLineNo">624</span>          LOG.error("IOException during splitting", e1);<a name="line.624"></a>
+<span class="sourceLineNo">625</span>          throw (IOException)t; // would have been thrown if not parallelized,<a name="line.625"></a>
+<span class="sourceLineNo">626</span>        }<a name="line.626"></a>
+<span class="sourceLineNo">627</span>        LOG.error("Unexpected execution exception during splitting", e1);<a name="line.627"></a>
+<span class="sourceLineNo">628</span>        throw new IllegalStateException(t);<a name="line.628"></a>
+<span class="sourceLineNo">629</span>      } catch (InterruptedException e1) {<a name="line.629"></a>
+<span class="sourceLineNo">630</span>        LOG.error("Unexpected interrupted exception during splitting", e1);<a name="line.630"></a>
+<span class="sourceLineNo">631</span>        throw (InterruptedIOException)new InterruptedIOException().initCause(e1);<a name="line.631"></a>
+<span class="sourceLineNo">632</span>      }<a name="line.632"></a>
+<span class="sourceLineNo">633</span>    }<a name="line.633"></a>
+<span class="sourceLineNo">634</span>    return regionGroups;<a name="line.634"></a>
+<span class="sourceLineNo">635</span>  }<a name="line.635"></a>
+<span class="sourceLineNo">636</span><a name="line.636"></a>
+<span class="sourceLineNo">637</span>  // unique file name for the table<a name="line.637"></a>
+<span class="sourceLineNo">638</span>  private String getUniqueName() {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>    return UUID.randomUUID().toString().replaceAll("-", "");<a name="line.639"></a>
+<span class="sourceLineNo">640</span>  }<a name="line.640"></a>
+<span class="sourceLineNo">641</span><a name="line.641"></a>
+<span class="sourceLineNo">642</span>  protected List&lt;LoadQueueItem&gt; splitStoreFile(final LoadQueueItem item,<a name="line.642"></a>
+<span class="sourceLineNo">643</span>      final Table table, byte[] startKey,<a name="line.643"></a>
+<span class="sourceLineNo">644</span>      byte[] splitKey) throws IOException {<a name="line.644"></a>
+<span class="sourceLineNo">645</span>    final Path hfilePath = item.hfilePath;<a name="line.645"></a>
+<span class="sourceLineNo">646</span><a name="line.646"></a>
+<span class="sourceLineNo">647</span>    Path tmpDir = item.hfilePath.getParent();<a name="line.647"></a>
+<span class="sourceLineNo">648</span>    if (!tmpDir.getName().equals(TMP_DIR)) {<a name="line.648"></a>
+<span class="sourceLineNo">649</span>      tmpDir = new Path(tmpDir, TMP_DIR);<a name="line.649"></a>
+<span class="sourceLineNo">650</span>    }<a name="line.650"></a>
+<span class="sourceLineNo">651</span><a name="line.651"></a>
+<span class="sourceLineNo">652</span>    LOG.info("HFile at " + hfilePath + " no longer fits inside a single " +<a name="line.652"></a>
+<span class="sourceLineNo">653</span>    "region. Splitting...");<a name="line.653"></a>
+<span class="sourceLineNo">654</span><a name="line.654"></a>
+<span class="sourceLineNo">655</span>    String uniqueName = getUniqueName();<a name="line.655"></a>
+<span class="sourceLineNo">656</span>    HColumnDescriptor familyDesc = table.getTableDescriptor().getFamily(item.family);<a name="line.656"></a>
 <span class="sourceLineNo">657</span><a name="line.657"></a>
-<span class="sourceLineNo">658</span>    // Add these back at the *front* of the queue, so there's a lower<a name="line.658"></a>
-<span class="sourceLineNo">659</span>    // chance that the region will just split again before we get there.<a name="line.659"></a>
-<span class="sourceLineNo">660</span>    List&lt;LoadQueueItem&gt; lqis = new ArrayList&lt;LoadQueueItem&gt;(2);<a name="line.660"></a>
-<span class="sourceLineNo">661</span>    lqis.add(new LoadQueueItem(item.family, botOut));<a name="line.661"></a>
-<span class="sourceLineNo">662</span>    lqis.add(new LoadQueueItem(item.family, topOut));<a name="line.662"></a>
-<span class="sourceLineNo">663</span><a name="line.663"></a>
-<span class="sourceLineNo">664</span>    LOG.info("Successfully split into new HFiles " + botOut + " and " + topOut);<a name="line.664"></a>
-<span class="sourceLineNo">665</span>    return lqis;<a name="line.665"></a>
-<span class="sourceLineNo">666</span>  }<a name="line.666"></a>
-<span class="sourceLineNo">667</span><a name="line.667"></a>
-<span class="sourceLineNo">668</span>  /**<a name="line.668"></a>
-<span class="sourceLineNo">669</span>   * Attempt to assign the given load queue item into its target region group.<a name="line.669"></a>
-<span class="sourceLineNo">670</span>   * If the hfile boundary no longer fits into a region, physically splits<a name="line.670"></a>
-<span class="sourceLineNo">671</span>   * the hfile such that the new bottom half will fit and returns the list of<a name="line.671"></a>
-<span class="sourceLineNo">672</span>   * LQI's corresponding to the resultant hfiles.<a name="line.672"></a>
-<span class="sourceLineNo">673</span>   *<a name="line.673"></a>
-<span class="sourceLineNo">674</span>   * protected for testing<a name="line.674"></a>
-<span class="sourceLineNo">675</span>   * @throws IOException<a name="line.675"></a>
-<span class="sourceLineNo">676</span>   */<a name="line.676"></a>
-<span class="sourceLineNo">677</span>  protected List&lt;LoadQueueItem&gt; groupOrSplit(Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups,<a name="line.677"></a>
-<span class="sourceLineNo">678</span>      final LoadQueueItem item, final Table table,<a name="line.678"></a>
-<span class="sourceLineNo">679</span>      final Pair&lt;byte[][], byte[][]&gt; startEndKeys)<a name="line.679"></a>
-<span class="sourceLineNo">680</span>      throws IOException {<a name="line.680"></a>
-<span class="sourceLineNo">681</span>    final Path hfilePath = item.hfilePath;<a name="line.681"></a>
-<span class="sourceLineNo">682</span>    // fs is the source filesystem<a name="line.682"></a>
-<span class="sourceLineNo">683</span>    if (fs == null) {<a name="line.683"></a>
-<span class="sourceLineNo">684</span>      fs = hfilePath.getFileSystem(getConf());<a name="line.684"></a>
-<span class="sourceLineNo">685</span>    }<a name="line.685"></a>
-<span class="sourceLineNo">686</span>    HFile.Reader hfr = HFile.createReader(fs, hfilePath,<a name="line.686"></a>
-<span class="sourceLineNo">687</span>        new CacheConfig(getConf()), getConf());<a name="line.687"></a>
-<span class="sourceLineNo">688</span>    final byte[] first, last;<a name="line.688"></a>
-<span class="sourceLineNo">689</span>    try {<a name="line.689"></a>
-<span class="sourceLineNo">690</span>      hfr.loadFileInfo();<a name="line.690"></a>
-<span class="sourceLineNo">691</span>      first = hfr.getFirstRowKey();<a name="line.691"></a>
-<span class="sourceLineNo">692</span>      last = hfr.getLastRowKey();<a name="line.692"></a>
-<span class="sourceLineNo">693</span>    }  finally {<a name="line.693"></a>
-<span class="sourceLineNo">694</span>      hfr.close();<a name="line.694"></a>
-<span class="sourceLineNo">695</span>    }<a name="line.695"></a>
-<span class="sourceLineNo">696</span><a name="line.696"></a>
-<span class="sourceLineNo">697</span>    LOG.info("Trying to load hfile=" + hfilePath +<a name="line.697"></a>
-<span class="sourceLineNo">698</span>        " first=" + Bytes.toStringBinary(first) +<a name="line.698"></a>
-<span class="sourceLineNo">699</span>        " last="  + Bytes.toStringBinary(last));<a name="line.699"></a>
-<span class="sourceLineNo">700</span>    if (first == null || last == null) {<a name="line.700"></a>
-<span class="sourceLineNo">701</span>      assert first == null &amp;&amp; last == null;<a name="line.701"></a>
-<span class="sourceLineNo">702</span>      // TODO what if this is due to a bad HFile?<a name="line.702"></a>
-<span class="sourceLineNo">703</span>      LOG.info("hfile " + hfilePath + " has no entries, skipping");<a name="line.703"></a>
-<span class="sourceLineNo">704</span>      return null;<a name="line.704"></a>
+<span class="sourceLineNo">658</span>    Path botOut = new Path(tmpDir, uniqueName + ".bottom");<a name="line.658"></a>
+<span class="sourceLineNo">659</span>    Path topOut = new Path(tmpDir, uniqueName + ".top");<a name="line.659"></a>
+<span class="sourceLineNo">660</span>    splitStoreFile(getConf(), hfilePath, familyDesc, splitKey, botOut, topOut);<a name="line.660"></a>
+<span class="sourceLineNo">661</span><a name="line.661"></a>
+<span class="sourceLineNo">662</span>    FileSystem fs = tmpDir.getFileSystem(getConf());<a name="line.662"></a>
+<span class="sourceLineNo">663</span>    fs.setPermission(tmpDir, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.663"></a>
+<span class="sourceLineNo">664</span>    fs.setPermission(botOut, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.664"></a>
+<span class="sourceLineNo">665</span>    fs.setPermission(topOut, FsPermission.valueOf("-rwxrwxrwx"));<a name="line.665"></a>
+<span class="sourceLineNo">666</span><a name="line.666"></a>
+<span class="sourceLineNo">667</span>    // Add these back at the *front* of the queue, so there's a lower<a name="line.667"></a>
+<span class="sourceLineNo">668</span>    // chance that the region will just split again before we get there.<a name="line.668"></a>
+<span class="sourceLineNo">669</span>    List&lt;LoadQueueItem&gt; lqis = new ArrayList&lt;LoadQueueItem&gt;(2);<a name="line.669"></a>
+<span class="sourceLineNo">670</span>    lqis.add(new LoadQueueItem(item.family, botOut));<a name="line.670"></a>
+<span class="sourceLineNo">671</span>    lqis.add(new LoadQueueItem(item.family, topOut));<a name="line.671"></a>
+<span class="sourceLineNo">672</span><a name="line.672"></a>
+<span class="sourceLineNo">673</span>    // If the current item is already the result of previous splits,<a name="line.673"></a>
+<span class="sourceLineNo">674</span>    // we don't need it anymore. Clean up to save space.<a name="line.674"></a>
+<span class="sourceLineNo">675</span>    // It is not part of the original input files.<a name="line.675"></a>
+<span class="sourceLineNo">676</span>    try {<a name="line.676"></a>
+<span class="sourceLineNo">677</span>      tmpDir = item.hfilePath.getParent();<a name="line.677"></a>
+<span class="sourceLineNo">678</span>      if (tmpDir.getName().equals(TMP_DIR)) {<a name="line.678"></a>
+<span class="sourceLineNo">679</span>        fs.delete(item.hfilePath, false);<a name="line.679"></a>
+<span class="sourceLineNo">680</span>      }<a name="line.680"></a>
+<span class="sourceLineNo">681</span>    } catch (IOException e) {<a name="line.681"></a>
+<span class="sourceLineNo">682</span>      LOG.warn("Unable to delete temporary split file " + item.hfilePath);<a name="line.682"></a>
+<span class="sourceLineNo">683</span>    }<a name="line.683"></a>
+<span class="sourceLineNo">684</span>    LOG.info("Successfully split into new HFiles " + botOut + " and " + topOut);<a name="line.684"></a>
+<span class="sourceLineNo">685</span>    return lqis;<a name="line.685"></a>
+<span class="sourceLineNo">686</span>  }<a name="line.686"></a>
+<span class="sourceLineNo">687</span><a name="line.687"></a>
+<span class="sourceLineNo">688</span>  /**<a name="line.688"></a>
+<span class="sourceLineNo">689</span>   * Attempt to assign the given load queue item into its target region group.<a name="line.689"></a>
+<span class="sourceLineNo">690</span>   * If the hfile boundary no longer fits into a region, physically splits<a name="line.690"></a>
+<span class="sourceLineNo">691</span>   * the hfile such that the new bottom half will fit and returns the list of<a name="line.691"></a>
+<span class="sourceLineNo">692</span>   * LQI's corresponding to the resultant hfiles.<a name="line.692"></a>
+<span class="sourceLineNo">693</span>   *<a name="line.693"></a>
+<span class="sourceLineNo">694</span>   * protected for testing<a name="line.694"></a>
+<span class="sourceLineNo">695</span>   * @throws IOException<a name="line.695"></a>
+<span class="sourceLineNo">696</span>   */<a name="line.696"></a>
+<span class="sourceLineNo">697</span>  protected List&lt;LoadQueueItem&gt; groupOrSplit(Multimap&lt;ByteBuffer, LoadQueueItem&gt; regionGroups,<a name="line.697"></a>
+<span class="sourceLineNo">698</span>      final LoadQueueItem item, final Table table,<a name="line.698"></a>
+<span class="sourceLineNo">699</span>      final Pair&lt;byte[][], byte[][]&gt; startEndKeys)<a name="line.699"></a>
+<span class="sourceLineNo">700</span>      throws IOException {<a name="line.700"></a>
+<span class="sourceLineNo">701</span>    final Path hfilePath = item.hfilePath;<a name="line.701"></a>
+<span class="sourceLineNo">702</span>    // fs is the source filesystem<a name="line.702"></a>
+<span class="sourceLineNo">703</span>    if (fs == null) {<a name="line.703"></a>
+<span class="sourceLineNo">704</span>      fs = hfilePath.getFileSystem(getConf());<a name="line.704"></a>
 <span class="sourceLineNo">705</span>    }<a name="line.705"></a>
-<span class="sourceLineNo">706</span>    if (Bytes.compareTo(first, last) &gt; 0) {<a name="line.706"></a>
-<span class="sourceLineNo">707</span>      throw new IllegalArgumentException(<a name="line.707"></a>
-<span class="sourceLineNo">708</span>      "Invalid range: " + Bytes.toStringBinary(first) +<a name="line.708"></a>
-<span class="sourceLineNo">709</span>      " &gt; " + Bytes.toStringBinary(last));<a name="line.709"></a>
-<span class="sourceLineNo">710</span>    }<a name="line.710"></a>
-<span class="sourceLineNo">711</span>    int idx = Arrays.binarySearch(startEndKeys.getFirst(), first,<a name="line.711"></a>
-<span class="sourceLineNo">712</span>        Bytes.BYTES_COMPARATOR);<a name="line.712"></a>
-<span class="sourceLineNo">713</span>    if (idx &lt; 0) {<a name="line.713"></a>
-<span class="sourceLineNo">714</span>      // not on boundary, returns -(insertion index).  Calculate region it<a name="line.714"></a>
-<span class="sourceLineNo">715</span>      // would be in.<a name="line.715"></a>
-<span class="sourceLineNo">716</span>      idx = -(idx + 1) - 1;<a name="line.716"></a>
-<span class="sourceLineNo">717</span>    }<a name="line.717"></a>
-<span class="sourceLineNo">718</span>    final int indexForCallable = idx;<a name="line.718"></a>
-<span class="sourceLineNo">719</span><a name="line.719"></a>
-<span class="sourceLineNo">720</span>    /**<a name="line.720"></a>
-<span class="sourceLineNo">721</span>     * we can consider there is a region hole in following conditions. 1) if idx &lt; 0,then first<a name="line.721"></a>
-<span class="sourceLineNo">722</span>     * region info is lost. 2) if the endkey of a region is not equal to the startkey of the next<a name="line.722"></a>
-<span class="sourceLineNo">723</span>     * region. 3) if the endkey of the last region is not empty.<a name="line.723"></a>
-<span class="sourceLineNo">724</span>     */<a name="line.724"></a>
-<span class="sourceLineNo">725</span>    if (indexForCallable &lt; 0) {<a name="line.725"></a>
-<span class="sourceLineNo">726</span>      throw new IOException("The first region info for table "<a name="line.726"></a>
-<span class="sourceLineNo">727</span>          + table.getName()<a name="line.727"></a>
-<span class="sourceLineNo">728</span>          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");<a name="line.728"></a>
-<span class="sourceLineNo">729</span>    } else if ((indexForCallable == startEndKeys.getFirst().length - 1)<a name="line.729"></a>
-<span class="sourceLineNo">730</span>        &amp;&amp; !Bytes.equals(startEndKeys.getSecond()[indexForCallable], HConstants.EMPTY_BYTE_ARRAY)) {<a name="line.730"></a>
-<span class="sourceLineNo">731</span>      throw new IOException("The last region info for table "<a name="line.731"></a>
-<span class="sourceLineNo">732</span>          + table.getName()<a name="line.732"></a>
-<span class="sourceLineNo">733</span>          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");<a name="line.733"></a>
-<span class="sourceLineNo">734</span>    } else if (indexForCallable + 1 &lt; startEndKeys.getFirst().length<a name="line.734"></a>
-<span class="sourceLineNo">735</span>        &amp;&amp; !(Bytes.compareTo(startEndKeys.getSecond()[indexForCallable],<a name="line.735"></a>
-<span class="sourceLineNo">736</span>          startEndKeys.getFirst()[indexForCallable + 1]) == 0)) {<a name="line.736"></a>
-<span class="sourceLineNo">737</span>      throw new IOException("The endkey of one region for table "<a name="line.737"></a>
-<span class="sourceLineNo">738</span>          + table.getName()<a name="line.738"></a>
-<span class="sourceLineNo">739</span>          + " is not equal to the startkey of the next region in hbase:meta."<a name="line.739"></a>
-<span class="sourceLineNo">740</span>          + "Please use hbck tool to fix it first.");<a name="line.740"></a>
-<span class="sourceLineNo">741</span>    }<a name="line.741"></a>
-<span class="sourceLineNo">742</span><a name="line.742"></a>
-<span class="sourceLineNo">743</span>    boolean lastKeyInRange =<a name="line.743"></a>
-<span class="sourceLineNo">744</span>      Bytes.compareTo(last, startEndKeys.getSecond()[idx]) &lt; 0 ||<a name="line.744"></a>
-<span class="sourceLineNo">745</span>      Bytes.equals(startEndKeys.getSecond()[idx], HConstants.EMPTY_BYTE_ARRAY);<a name="line.745"></a>
-<span class="sourceLineNo">746</span>    if (!lastKeyInRange) {<a name="line.746"></a>
-<span class="sourceLineNo">747</span>      List&lt;LoadQueueItem&gt; lqis = splitStoreFile(item, table,<a name="line.747"></a>
-<span class="sourceLineNo">748</span>          startEndKeys.getFirst()[indexForCallable],<a name="line.748"></a>
-<span class="sourceLineNo">749</span>          startEndKeys.getSecond()[indexForCallable]);<a name="line.749"></a>
-<span class="sourceLineNo">750</span>      return lqis;<a name="line.750"></a>
-<span class="sourceLineNo">751</span>    }<a name="line.751"></a>
-<span class="sourceLineNo">752</span><a name="line.752"></a>
-<span class="sourceLineNo">753</span>    // group regions.<a name="line.753"></a>
-<span class="sourceLineNo">754</span>    regionGroups.put(ByteBuffer.wrap(startEndKeys.getFirst()[idx]), item);<a name="line.754"></a>
-<span class="sourceLineNo">755</span>    return null;<a name="line.755"></a>
-<span class="sourceLineNo">756</span>  }<a name="line.756"></a>
-<span class="sourceLineNo">757</span><a name="line.757"></a>
-<span class="sourceLineNo">758</span>  /**<a name="line.758"></a>
-<span class="sourceLineNo">759</span>   * Attempts to do an atomic load of many hfiles into a region.  If it fails,<a name="line.759"></a>
-<span class="sourceLineNo">760</span>   * it returns a list of hfiles that need to be retried.  If it is successful<a name="line.760"></a>
-<span class="sourceLineNo">761</span>   * it will return an empty list.<a name="line.761"></a>
-<span class="sourceLineNo">762</span>   *<a name="line.762"></a>
-<span class="sourceLineNo">763</span>   * NOTE: To maintain row atomicity guarantees, region server callable should<a name="line.763"></a>
-<span class="sourceLineNo">764</span>   * succeed atomically and fails atomically.<a name="line.764"></a>
-<span class="sourceLineNo">765</span>   *<a name="line.765"></a>
-<span class="sourceLineNo">766</span>   * Protected for testing.<a name="line.766"></a>
-<span class="sourceLineNo">767</span>   *<a name="line.767"></a>
-<span class="sourceLineNo">768</span>   * @return empty list if success, list of items to retry on recoverable<a name="line.768"></a>
-<span class="sourceLineNo">769</span>   * failure<a name="line.769"></a>
-<span class="sourceLineNo">770</span>   */<a name="line.770"></a>
-<span class="sourceLineNo">771</span>  protected List&lt;LoadQueueItem&gt; tryAtomicRegionLoad(final Connection conn,<a name="line.771"></a>
-<span class="sourceLineNo">772</span>      final TableName tableName, final byte[] first, final Collection&lt;LoadQueueItem&gt; lqis)<a name="line.772"></a>
-<span class="sourceLineNo">773</span>  throws IOException {<a name="line.773"></a>
-<span class="sourceLineNo">774</span>    final List&lt;Pair&lt;byte[], String&gt;&gt; famPaths =<a name="line.774"></a>
-<span class="sourceLineNo">775</span>      new ArrayList&lt;Pair&lt;byte[], String&gt;&gt;(lqis.size());<a name="line.775"></a>
-<span class="sourceLineNo">776</span>    for (LoadQueueItem lqi : lqis) {<a name="line.776"></a>
-<span class="sourceLineNo">777</span>      famPaths.add(Pair.newPair(lqi.family, lqi.hfilePath.toString()));<a name="line.777"></a>
-<span class="sourceLineNo">778</span>    }<a name="line.778"></a>
-<span class="sourceLineNo">779</span><a name="line.779"></a>
-<span class="sourceLineNo">780</span>    final RegionServerCallable&lt;Boolean&gt; svrCallable =<a name="line.780"></a>
-<span class="sourceLineNo">781</span>        new RegionServerCallable&lt;Boolean&gt;(conn, tableName, first) {<a name="line.781"></a>
-<span class="sourceLineNo">782</span>      @Override<a name="line.782"></a>
-<span class="sourceLineNo">783</span>      public Boolean call(int callTimeout) throws Exception {<a name="line.783"></a>
-<span class="sourceLineNo">784</span>        SecureBulkLoadClient secureClient = null;<a name="line.784"></a>
-<span class="sourceLineNo">785</span>        boolean success = false;<a name="line.785"></a>
-<span class="sourceLineNo">786</span><a name="line.786"></a>
-<span class="sourceLineNo">787</span>        try {<a name="line.787"></a>
-<span class="sourceLineNo">788</span>          LOG.debug("Going to connect to server " + getLocation() + " for row "<a name="line.788"></a>
-<span class="sourceLineNo">789</span>              + Bytes.toStringBinary(getRow()) + " with hfile group " + famPaths);<a name="line.789"></a>
-<span class="sourceLineNo">790</span>          byte[] regionName = getLocation().getRegionInfo().getRegionName();<a name="line.790"></a>
-<span class="sourceLineNo">791</span>          if (!isSecureBulkLoadEndpointAvailable()) {<a name="line.791"></a>
-<span class="sourceLineNo">792</span>            success = ProtobufUtil.bulkLoadHFile(getStub(), famPaths, regionName, assignSeqIds);<a name="line.792"></a>
-<span class="sourceLineNo">793</span>          } else {<a name="line.793"></a>
-<span class="sourceLineNo">794</span>            try (Table table = conn.getTable(getTableName())) {<a name="line.794"></a>
-<span class="sourceLineNo">795</span>              secureClient = new SecureBulkLoadClient(table);<a name="line.795"></a>
-<span class="sourceLineNo">796</span>              success = secureClient.bulkLoadHFiles(famPaths, fsDelegationToken.getUserToken(),<a name="line.796"></a>
-<span class="sourceLineNo">797</span>                bulkToken, getLocation().getRegionInfo().getStartKey());<a name="line.797"></a>
-<span class="sourceLineNo">798</span>            }<a name="line.798"></a>
-<span class="sourceLineNo">799</span>          }<a name="line.799"></a>
-<span class="sourceLineNo">800</span>          return success;<a name="line.800"></a>
-<span class="sourceLineNo">801</span>        } finally {<a name="line.801"></a>
-<span class="sourceLineNo">802</span>          //Best effort copying of files that might not have been imported<a name="line.802"></a>
-<span class="sourceLineNo">803</span>          //from the staging directory back to original location<a name="line.803"></a>
-<span class="sourceLineNo">804</span>          //in user directory<a name="line.804"></a>
-<span class="sourceLineNo">805</span>          if(secureClient != null &amp;&amp; !success) {<a name="line.805"></a>
-<span class="sourceLineNo">806</span>            FileSystem targetFs = FileSystem.get(getConf());<a name="line.806"></a>
-<span class="sourceLineNo">807</span>         // fs is the source filesystem<a name="line.807"></a>
-<span class="sourceLineNo">808</span>            if(fs == null) {<a name="line.808"></a>
-<span class="sourceLineNo">809</span>              fs = lqis.iterator().next().hfilePath.getFileSystem(getConf());<a name="line.809"></a>
-<span class="sourceLineNo">810</span>            }<a name="line.810"></a>
-<span class="sourceLineNo">811</span>            // Check to see if the source and target filesystems are the same<a name="line.811"></a>
-<span class="sourceLineNo">812</span>            // If they are the same filesystem, we will try move the files back<a name="line.812"></a>
-<span class="sourceLineNo">813</span>            // because previously we moved them to the staging directory.<a name="line.813"></a>
-<span class="sourceLineNo">814</span>            if (FSHDFSUtils.isSameHdfs(getConf(), fs, targetFs)) {<a name="line.814"></a>
-<span class="sourceLineNo">815</span>              for(Pair&lt;byte[], String&gt; el : famPaths) {<a name="line.815"></a>
-<span class="sourceLineNo">816</span>                Path hfileStagingPath = null;<a name="line.816"></a>
-<span class="sourceLineNo">817</span>                Path hfileOrigPath = new Path(el.getSecond());<a name="line.817"></a>
-<span class="sourceLineNo">818</span>                try {<a name="line.818"></a>
-<span class="sourceLineNo">819</span>                  hfileStagingPath= new Path(secureClient.getStagingPath(bulkToken, el.getFirst()),<a name="line.819"></a>
-<span class="sourceLineNo">820</span>                    hfileOrigPath.getName());<a name="line.820"></a>
-<span class="sourceLineNo">821</span>                  if(targetFs.rename(hfileStagingPath, hfileOrigPath)) {<a name="line.821"></a>
-<span class="sourceLineNo">822</span>                    LOG.debug("Moved back file " + hfileOrigPath + " from " +<a name="line.822"></a>
-<span class="sourceLineNo">823</span>                        hfileStagingPath);<a name="line.823"></a>
-<span class="sourceLineNo">824</span>                  } else if(targetFs.exists(hfileStagingPath)){<a name="line.824"></a>
-<span class="sourceLineNo">825</span>                    LOG.debug("Unable to move back file " + hfileOrigPath + " from " +<a name="line.825"></a>
-<span class="sourceLineNo">826</span>                        hfileStagingPath);<a name="line.826"></a>
-<span class="sourceLineNo">827</span>                  }<a name="line.827"></a>
-<span class="sourceLineNo">828</span>                } catch(Exception ex) {<a name="line.828"></a>
-<span class="sourceLineNo">829</span>                  LOG.debug("Unable to move back file " + hfileOrigPath + " from " +<a name="line.829"></a>
-<span class="sourceLineNo">830</span>                      hfileStagingPath, ex);<a name="line.830"></a>
-<span class="sourceLineNo">831</span>                }<a name="line.831"></a>
-<span class="sourceLineNo">832</span>              }<a name="line.832"></a>
-<span class="sourceLineNo">833</span>            }<a name="line.833"></a>
-<span class="sourceLineNo">834</span>          }<a name="line.834"></a>
-<span class="sourceLineNo">835</span>        }<a name="line.835"></a>
-<span class="sourceLineNo">836</span>      }<a name="line.836"></a>
-<span class="sourceLineNo">837</span>    };<a name="line.837"></a>
-<span class="sourceLineNo">838</span><a name="line.838"></a>
-<span class="sourceLineNo">839</span>    try {<a name="line.839"></a>
-<span class="sourceLineNo">840</span>      List&lt;LoadQueueItem&gt; toRetry = new ArrayList&lt;LoadQueueItem&gt;();<a name="line.840"></a>
-<span class="sourceLineNo">841</span>      Configuration conf = getConf();<a name="line.841"></a>
-<span class="sourceLineNo">842</span>      boolean success = RpcRetryingCallerFactory.instantiate(conf,<a name="line.842"></a>
-<span class="sourceLineNo">843</span>          null).&lt;Boolean&gt; newCaller()<a name="line.843"></a>
-<span class="sourceLineNo">844</span>          .callWithRetries(svrCallable, Integer.MAX_VALUE);<a name="line.844"></a>
-<span class="sourceLineNo">845</span>      if (!success) {<a name="line.845"></a>
-<span class="sourceLineNo">846</span>        LOG.warn("Attempt to bulk load region containing "<a name="line.846"></a>
-<span class="sourceLineNo">847</span>            + Bytes.toStringBinary(first) + " into table "<a name="line.847"></a>
-<span class="sourceLineNo">848</span>            + tableName  + " with files " + lqis<a name="line.848"></a>
-<span class="sourceLineNo">849</span>            + " failed.  This is recoverable and they will be retried.");<a name="line.849"></a>
-<span class="sourceLineNo">850</span>        toRetry.addAll(lqis); // return lqi's to retry<a name="line.850"></a>
-<span class="sourceLineNo">851</span>      }<a name="line.851"></a>
-<span class="sourceLineNo">852</span>      // success<a name="line.852"></a>
-<span class="sourceLineNo">853</span>      return toRetry;<a name="line.853"></a>
-<span class="sourceLineNo">854</span>    } catch (IOException e) {<a name="line.854"></a>
-<span class="sourceLineNo">855</span>      LOG.error("Encountered unrecoverable error from region server, additional details: "<a name="line.855"></a>
-<span class="sourceLineNo">856</span>          + svrCallable.getExceptionMessageAdditionalDetail(), e);<a name="line.856"></a>
-<span class="sourceLineNo">857</span>      throw e;<a name="line.857"></a>
-<span class="sourceLineNo">858</span>    }<a name="line.858"></a>
-<span class="sourceLineNo">859</span>  }<a name="line.859"></a>
-<span class="sourceLineNo">860</span><a name="line.860"></a>
-<span class="sourceLineNo">861</span>  private boolean isSecureBulkLoadEndpointAvailable() {<a name="line.861"></a>
-<span class="sourceLineNo">862</span>    String classes = getConf().get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, "");<a name="line.862"></a>
-<span class="sourceLineNo">863</span>    return classes.contains("org.apache.hadoop.hbase.security.access.SecureBulkLoadEndpoint");<a name="line.863"></a>
-<span class="sourceLineNo">864</span>  }<a name="line.864"></a>
-<span class="sourceLineNo">865</span><a name="line.865"></a>
-<span class="sourceLineNo">866</span>  /**<a name="line.866"></a>
-<span class="sourceLineNo">867</span>   * Split a storefile into a top and bottom half, maintaining<a name="line.867"></a>
-<span class="sourceLineNo">868</span>   * the metadata, recreating bloom filters, etc.<a name="line.868"></a>
-<span class="sourceLineNo">869</span>   */<a name="line.869"></a>
-<span class="sourceLineNo">870</span>  static void splitStoreFile(<a name="line.870"></a>
-<span class="sourceLineNo">871</span>      Configuration conf, Path inFile,<a name="line.871"></a>
-<span class="sourceLineNo">872</span>      HColumnDescriptor familyDesc, byte[] splitKey,<a name="line.872"></a>
-<span class="sourceLineNo">873</span>      Path bottomOut, Path topOut) throws IOException<a name="line.873"></a>
-<span class="sourceLineNo">874</span>  {<a name="line.874"></a>
-<span class="sourceLineNo">875</span>    // Open reader with no block cache, and not in-memory<a name="line.875"></a>
-<span class="sourceLineNo">876</span>    Reference topReference = Reference.createTopReference(splitKey);<a name="line.876"></a>
-<span class="sourceLineNo">877</span>    Reference bottomReference = Reference.createBottomReference(splitKey);<a name="line.877"></a>
-<span class="sourceLineNo">878</span><a name="line.878"></a>
-<span class="sourceLineNo">879</span>    copyHFileHalf(conf, inFile, topOut, topReference, familyDesc);<a name="line.879"></a>
-<span class="sourceLineNo">880</span>    copyHFileHalf(conf, inFile, bottomOut, bottomReference, familyDesc);<a name="line.880"></a>
-<span class="sourceLineNo">881</span>  }<a name="line.881"></a>
-<span class="sourceLineNo">882</span><a name="line.882"></a>
-<span class="sourceLineNo">883</span>  /**<a name="line.883"></a>
-<span class="sourceLineNo">884</span>   * Copy half of an HFile into a new HFile.<a name="line.884"></a>
-<span class="sourceLineNo">885</span>   */<a name="line.885"></a>
-<span class="sourceLineNo">886</span>  private static void copyHFileHalf(<a name="line.886"></a>
-<span class="sourceLineNo">887</span>      Configuration conf, Path inFile, Path outFile, Reference reference,<a name="line.887"></a>
-<span class="sourceLineNo">888</span>      HColumnDescriptor familyDescriptor)<a name="line.888"></a>
-<span class="sourceLineNo">889</span>  throws IOException {<a name="line.889"></a>
-<span class="sourceLineNo">890</span>    FileSystem fs = inFile.getFileSystem(conf);<a name="line.890"></a>
-<span class="sourceLineNo">891</span>    CacheConfig cacheConf = new CacheConfig(conf);<a name="line.891"></a>
-<span class="sourceLineNo">892</span>    HalfStoreFileReader halfReader = null;<a name="line.892"></a>
-<span class="sourceLineNo">893</span>    StoreFileWriter halfWriter = null;<a name="line.893"></a>
-<span class="sourceLineNo">894</span>    try {<a name="line.894"></a>
-<span class="sourceLineNo">895</span>      halfReader = new HalfStoreFileReader(fs, inFile, cacheConf, reference, conf);<a name="line.895"></a>
-<span class="sourceLineNo">896</span>      Map&lt;byte[], byte[]&gt; fileInfo = halfReader.loadFileInfo();<a name="line.896"></a>
-<span class="sourceLineNo">897</span><a name="line.897"></a>
-<span class="sourceLineNo">898</span>      int blocksize = familyDescriptor.getBlocksize();<a name="line.898"></a>
-<span class="sourceLineNo">899</span>      Algorithm compression = familyDescriptor.getCompressionType();<a name="line.899"></a>
-<span class="sourceLineNo">900</span>      BloomType bloomFilterType = familyDescriptor.getBloomFilterType();<a name="line.900"></a>
-<span class="sourceLineNo">901</span>      HFileContext hFileContext = new HFileContextBuilder()<a name="line.901"></a>
-<span class="sourceLineNo">902</span>                                  .withCompression(compression)<a name="line.902"></a>
-<span class="sourceLineNo">903</span>                                  .withChecksumType(HStore.getChecksumType(conf))<a name="line.903"></a>
-<span class="sourceLineNo">904</span>                                  .withBytesPerCheckSum(HStore.getBytesPerChecksum(conf))<a name="line.904"></a>
-<span class="sourceLineNo">905</span>                                  .withBlockSize(blocksize)<a name="line.905"></a>
-<span class="sourceLineNo">906</span>                                  .withDataBlockEncoding(familyDescriptor.getDataBlockEncoding())<a name="line.906"></a>
-<span class="sourceLineNo">907</span>                                  .withIncludesTags(true)<a name="line.907"></a>
-<span class="sourceLineNo">908</span>                                  .build();<a name="line.908"></a>
-<span class="sourceLineNo">909</span>      halfWriter = new StoreFileWriter.Builder(conf, cacheConf,<a name="line.909"></a>
-<span class="sourceLineNo">910</span>          fs)<a name="line.910"></a>
-<span class="sourceLineNo">911</span>              .withFilePath(outFile)<a name="line.911"></a>
-<span class="sourceLineNo">912</span>              .withBloomType(bloomFilterType)<a name="line.912"></a>
-<span class="sourceLineNo">913</span>              .withFileContext(hFileContext)<a name="line.913"></a>
-<span class="sourceLineNo">914</span>              .build();<a name="line.914"></a>
-<span class="sourceLineNo">915</span>      HFileScanner scanner = halfReader.getScanner(false, false, false);<a name="line.915"></a>
-<span class="sourceLineNo">916</span>      scanner.seekTo();<a name="line.916"></a>
-<span class="sourceLineNo">917</span>      do {<a name="line.917"></a>
-<span class="sourceLineNo">918</span>        halfWriter.append(scanner.getCell());<a name="line.918"></a>
-<span class="sourceLineNo">919</span>      } while (scanner.next());<a name="line.919"></a>
-<span class="sourceLineNo">920</span><a name="line.920"></a>
-<span class="sourceLineNo">921</span>      for (Map.Entry&lt;byte[],byte[]&gt; entry : fileInfo.entrySet()) {<a name="line.921"></a>
-<span class="sourceLineNo">922</span>        if (shouldCopyHFileMetaKey(entry.getKey())) {<a name="line.922"></a>
-<span class="sourceLineNo">923</span>          halfWriter.appendFileInfo(entry.getKey(), entry.getValue());<a name="line.923"></a>
-<span class="sourceLineNo">924</span>        }<a name="line.924"></a>
-<span class="sourceLineNo">925</span>      }<a name="line.925"></a>
-<span class="sourceLineNo">926</span>    } finally {<a name="line.926"></a>
-<span class="sourceLineNo">927</span>      if (halfWriter != null) halfWriter.close();<a name="line.927"></a>
-<span class="sourceLineNo">928</span>      if (halfReader != null) halfReader.close(cacheConf.shouldEvictOnClose());<a name="line.928"></a>
-<span class="sourceLineNo">929</span>    }<a name="line.929"></a>
-<span class="sourceLineNo">930</span>  }<a name="line.930"></a>
-<span class="sourceLineNo">931</span><a name="line.931"></a>
-<span class="sourceLineNo">932</span>  private static boolean shouldCopyHFileMetaKey(byte[] key) {<a name="line.932"></a>
-<span class="sourceLineNo">933</span>    // skip encoding to keep hfile meta consistent with data block info, see HBASE-15085<a name="line.933"></a>
-<span class="sourceLineNo">934</span>    if (Bytes.equals(key, HFileDataBlockEncoder.DATA_BLOCK_ENCODING)) {<a name="line.934"></a>
-<span class="sourceLineNo">935</span>      return false;<a name="line.935"></a>
-<span class="sourceLineNo">936</span>    }<a name="line.936"></a>
-<span class="sourceLineNo">937</span><a name="line.937"></a>
-<span class="sourceLineNo">938</span>    return !HFile.isReservedFileInfoKey(key);<a name="line.938"></a>
-<span class="sourceLineNo">939</span>  }<a name="line.939"></a>
+<span class="sourceLineNo">706</span>    HFile.Reader hfr = HFile.createReader(fs, hfilePath,<a name="line.706"></a>
+<span class="sourceLineNo">707</span>        new CacheConfig(getConf()), getConf());<a name="line.707"></a>
+<span class="sourceLineNo">708</span>    final byte[] first, last;<a name="line.708"></a>
+<span class="sourceLineNo">709</span>    try {<a name="line.709"></a>
+<span class="sourceLineNo">710</span>      hfr.loadFileInfo();<a name="line.710"></a>
+<span class="sourceLineNo">711</span>      first = hfr.getFirstRowKey();<a name="line.711"></a>
+<span class="sourceLineNo">712</span>      last = hfr.getLastRowKey();<a name="line.712"></a>
+<span class="sourceLineNo">713</span>    }  finally {<a name="line.713"></a>
+<span class="sourceLineNo">714</span>      hfr.close();<a name="line.714"></a>
+<span class="sourceLineNo">715</span>    }<a name="line.715"></a>
+<span class="sourceLineNo">716</span><a name="line.716"></a>
+<span class="sourceLineNo">717</span>    LOG.info("Trying to load hfile=" + hfilePath +<a name="line.717"></a>
+<span class="sourceLineNo">718</span>        " first=" + Bytes.toStringBinary(first) +<a name="line.718"></a>
+<span class="sourceLineNo">719</span>        " last="  + Bytes.toStringBinary(last));<a name="line.719"></a>
+<span class="sourceLineNo">720</span>    if (first == null || last == null) {<a name="line.720"></a>
+<span class="sourceLineNo">721</span>      assert first == null &amp;&amp; last == null;<a name="line.721"></a>
+<span class="sourceLineNo">722</span>      // TODO what if this is due to a bad HFile?<a name="line.722"></a>
+<span class="sourceLineNo">723</span>      LOG.info("hfile " + hfilePath + " has no entries, skipping");<a name="line.723"></a>
+<span class="sourceLineNo">724</span>      return null;<a name="line.724"></a>
+<span class="sourceLineNo">725</span>    }<a name="line.725"></a>
+<span class="sourceLineNo">726</span>    if (Bytes.compareTo(first, last) &gt; 0) {<a name="line.726"></a>
+<span class="sourceLineNo">727</span>      throw new IllegalArgumentException(<a name="line.727"></a>
+<span class="sourceLineNo">728</span>      "Invalid range: " + Bytes.toStringBinary(first) +<a name="line.728"></a>
+<span class="sourceLineNo">729</span>      " &gt; " + Bytes.toStringBinary(last));<a name="line.729"></a>
+<span class="sourceLineNo">730</span>    }<a name="line.730"></a>
+<span class="sourceLineNo">731</span>    int idx = Arrays.binarySearch(startEndKeys.getFirst(), first,<a name="line.731"></a>
+<span class="sourceLineNo">732</span>        Bytes.BYTES_COMPARATOR);<a name="line.732"></a>
+<span class="sourceLineNo">733</span>    if (idx &lt; 0) {<a name="line.733"></a>
+<span class="sourceLineNo">734</span>      // not on boundary, returns -(insertion index).  Calculate region it<a name="line.734"></a>
+<span class="sourceLineNo">735</span>      // would be in.<a name="line.735"></a>
+<span class="sourceLineNo">736</span>      idx = -(idx + 1) - 1;<a name="line.736"></a>
+<span class="sourceLineNo">737</span>    }<a name="line.737"></a>
+<span class="sourceLineNo">738</span>    final int indexForCallable = idx;<a name="line.738"></a>
+<span class="sourceLineNo">739</span><a name="line.739"></a>
+<span class="sourceLineNo">740</span>    /**<a name="line.740"></a>
+<span class="sourceLineNo">741</span>     * we can consider there is a region hole in following conditions. 1) if idx &lt; 0,then first<a name="line.741"></a>
+<span class="sourceLineNo">742</span>     * region info is lost. 2) if the endkey of a region is not equal to the startkey of the next<a name="line.742"></a>
+<span class="sourceLineNo">743</span>     * region. 3) if the endkey of the last region is not empty.<a name="line.743"></a>
+<span class="sourceLineNo">744</span>     */<a name="line.744"></a>
+<span class="sourceLineNo">745</span>    if (indexForCallable &lt; 0) {<a name="line.745"></a>
+<span class="sourceLineNo">746</span>      throw new IOException("The first region info for table "<a name="line.746"></a>
+<span class="sourceLineNo">747</span>          + table.getName()<a name="line.747"></a>
+<span class="sourceLineNo">748</span>          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");<a name="line.748"></a>
+<span class="sourceLineNo">749</span>    } else if ((indexForCallable == startEndKeys.getFirst().length - 1)<a name="line.749"></a>
+<span class="sourceLineNo">750</span>        &amp;&amp; !Bytes.equals(startEndKeys.getSecond()[indexForCallable], HConstants.EMPTY_BYTE_ARRAY)) {<a name="line.750"></a>
+<span class="sourceLineNo">751</span>      throw new IOException("The last region info for table "<a name="line.751"></a>
+<span class="sourceLineNo">752</span>          + table.getName()<a name="line.752"></a>
+<span class="sourceLineNo">753</span>          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");<a name="line.753"></a>
+<span class="sourceLineNo">754</span>    } else if (indexForCallable + 1 &lt; startEndKeys.getFirst().length<a name="line.754"></a>
+<span class="sourceLineNo">755</span>        &amp;&amp; !(Bytes.compareTo(startEndKeys.getSecond()[indexForCallable],<a name="line.755"></a>
+<span class="sourceLineNo">756</span>          startEndKeys.getFirst()[indexForCallable + 1]) == 0)) {<a name="line.756"></a>
+<span class="sourceLineNo">757</span>      throw new IOException("The endkey of one region for table "<a name="line.757"></a>
+<span class="sourceLineNo">758</span>          + table.getName()<a name="line.758"></a>
+<span class="sourceLineNo">759</span>          + " is not equal to the startkey of the next region in hbase:meta."<a name="line.759"></a>
+<span class="sourceLineNo">760</span>          + "Please use hbck tool to fix it first.");<a name="line.760"></a>
+<span class="sourceLineNo">761</span>    }<a name="line.761"></a>
+<span class="sourceLineNo">762</span><a name="line.762"></a>
+<span class="sourceLineNo">763</span>    boolean lastKeyInRange =<a name="line.763"></a>
+<span class="sourceLineNo">764</span>      Bytes.compareTo(last, startEndKeys.getSecond()[idx]) &lt; 0 ||<a name="line.764"></a>
+<span class="sourceLineNo">765</span>      Bytes.equals(startEndKeys.getSecond()[idx], HConstants.EMPTY_BYTE_ARRAY);<a name="line.765"></a>
+<span class="sourceLineNo">766</span>    if (!lastKeyInRange) {<a name="line.766"></a>
+<span class="sourceLineNo">767</span>      List&lt;LoadQueueItem&gt; lqis = splitStoreFile(item, table,<a name="line.767"></a>
+<span class="sourceLineNo">768</span>          startEndKeys.getFirst()[indexForCallable],<a name="line.768"></a>
+<span class="sourceLineNo">769</span>          startEndKeys.getSecond()[indexForCallable]);<a name="line.769"></a>
+<span class="sourceLineNo">770</span>      return lqis;<a name="line.770"></a>
+<span class="sourceLineNo">771</span>    }<a name="line.771"></a>
+<span class="sourceLineNo">772</span><a name="line.772"></a>
+<span class="sourceLineNo">773</span>    // group regions.<a name="line.773"></a>
+<span class="sourceLineNo">774</span>    regionGroups.put(ByteBuffer.wrap(startEndKeys.getFirst()[idx]), item);<a name="line.774"></a>
+<span class="sourceLineNo">775</span>    return null;<a name="line.775"></a>
+<span class="sourceLineNo">776</span>  }<a name="line.776"></a>
+<span class="sourceLineNo">777</span><a name="line.777"></a>
+<span class="sourceLineNo">778</span>  /**<a name="line.778"></a>
+<span class="sourceLineNo">779</span>   * Attempts to do an atomic load of many hfiles into a region.  If it fails,<a name="line.779"></a>
+<span class="sourceLineNo">780</span>   * it returns a list of hfiles that need to be retried.  If it is successful<a name="line.780"></a>
+<span class="sourceLineNo">781</span>   * it will return an empty list.<a name="line.781"></a>
+<span class="sourceLineNo">782</span>   *<a name="line.782"></a>
+<span class="sourceLineNo">783</span>   * NOTE: To maintain row atomicity guarantees, region server callable should<a name="line.783"></a>
+<span class="sourceLineNo">784</span>   * succeed atomically and fails atomically.<a name="line.784"></a>
+<span class="sourceLineNo">785</span>   *<a name="line.785"></a>
+<span class="sourceLineNo">786</span>   * Protected for testing.<a name="line.786"></a>
+<span class="sourceLineNo">787</span>   *<a name="line.787"></a>
+<span class="sourceLineNo">788</span>   * @return empty list if success, list of items to retry on recoverable<a name="line.788"></a>
+<span class="sourceLineNo">789</span>   * failure<a name="line.789"></a>
+<span class="sourceLineNo">790</span>   */<a name="line.790"></a>
+<span class="sourceLineNo">791</span>  protected List&lt;LoadQueueItem&gt; tryAtomicRegionLoad(final Connection conn,<a name="line.791"></a>
+<span class="sourceLineNo">792</span>      final TableName tableName, final byte[] first, final Collection&lt;LoadQueueItem&gt; lqis)<a name="line.792"></a>
+<span class="sourceLineNo">793</span>  throws IOException {<a name="line.793"></a>
+<span class="sourceLineNo">794</span>    final List&lt;Pair&lt;byte[], String&gt;&gt; famPaths =<a name="line.794"></a>
+<span class="sourceLineNo">795</span>      new ArrayList&lt;Pair&lt;byte[], String&gt;&gt;(lqis.size());<a name="line.795"></a>
+<span class="sourceLineNo">796</span>    for (LoadQueueItem lqi : lqis) {<a name="line.796"></a>
+<span class="sourceLineNo">797</span>      famPaths.add(Pair.newPair(lqi.family, lqi.hfilePath.toString()));<a name="line.797"></a>
+<span class="sourceLineNo">798</span>    }<a name="line.798"></a>
+<span class="sourceLineNo">799</span><a name="line.799"></a>
+<span class="sourceLineNo">800</span>    final RegionServerCallable&lt;Boolean&gt; svrCallable =<a name="line.800"></a>
+<span class="sourceLineNo">801</span>        new RegionServerCallable&lt;Boolean&gt;(conn, tableName, first) {<a name="line.801"></a>
+<span class="sourceLineNo">802</span>      @Override<a name="line.802"></a>
+<span class="sourceLineNo">803</span>      public Boolean call(int callTimeout) throws Exception {<a name="line.803"></a>
+<span class="sourceLineNo">804</span>        SecureBulkLoadClient secureClient = null;<a name="line.804"></a>
+<span class="sourceLineNo">805</span>        boolean success = false;<a name="line.805"></a>
+<span class="sourceLineNo">806</span><a name="line.806"></a>
+<span class="sourceLineNo">807</span>        try {<a name="line.807"></a>
+<span class="sourceLineNo">808</span>          LOG.debug("Going to connect to server " + getLocation() + " for row "<a name="line.808"></a>
+<span class="sourceLineNo">809</span>              + Bytes.toStringBinary(getRow()) + " with hfile group " + famPaths);<a name="line.809"></a>
+<span class="sourceLineNo">810</span>          byte[] regionName = getLocation().getRegionInfo().getRegionName();<a name="line.810"></a>
+<span class="sourceLineNo">811</span>          if (!isSecureBulkLoadEndpointAvailable()) {<a name="line.811"></a>
+<span class="sourceLineNo">812</span>            success = ProtobufUtil.bulkLoadHFile(getStub(), famPaths, regionName, assignSeqIds);<a name="line.812"></a>
+<span class="sourceLineNo">813</span>          } else {<a name="line.813"></a>
+<span class="sourceLineNo">814</span>            try (Table table = conn.getTable(getTableName())) {<a name="line.814"></a>
+<span class="sourceLineNo">815</span>              secureClient = new SecureBulkLoadClient(table);<a name="line.815"></a>
+<span class="sourceLineNo">816</span>              success = secureClient.bulkLoadHFiles(famPaths, fsDelegationToken.getUserToken(),<a name="line.816"></a>
+<span class="sourceLineNo">817</span>                bulkToken, getLocation().getRegionInfo().getStartKey());<a name="line.817"></a>
+<span class="sourceLineNo">818</span>            }<a name="line.818"></a>
+<span class="sourceLineNo">819</span>          }<a name="line.819"></a>
+<span class="sourceLineNo">820</span>          return success;<a name="line.820"></a>
+<span class="sourceLineNo">821</span>        } finally {<a name="line.821"></a>
+<span class="sourceLineNo">822</span>          //Best effort copying of files that might not have been imported<a name="line.822"></a>
+<span class="sourceLineNo">823</span>          //from the staging directory back to original location<a name="line.823"></a>
+<span class="sourceLineNo">824</span>          //in user directory<a name="line.824"></a>
+<span class="sourceLineNo">825</span>          if(secureClient != null &amp;&amp; !success) {<a name="line.825"></a>
+<span class="sourceLineNo">826</span>            FileSystem targetFs = FileSystem.get(getConf());<a name="line.826"></a>
+<span class="sourceLineNo">827</span>         // fs is the source filesystem<a name="line.827"></a>
+<span class="sourceLineNo">828</span>            if(fs == null) {<a name="line.828"></a>
+<span class="sourceLineNo">829</span>              fs = lqis.iterator().next().hfilePath.getFileSystem(getConf());<a name="line.829"></a>
+<span class="sourceLineNo">830</span>            }<a name="line.830"></a>
+<span class="sourceLineNo">831</span>            // Check to see if the source and target filesystems are the same<a name="line.831"></a>
+<span class="sourceLineNo">832</span>            // If they are the same filesystem, we will try move the files back<a name="line.832"></a>
+<span class="sourceLineNo">833</span>            // because previously we moved them to the staging directory.<a name="line.833"></a>
+<span class="sourceLineNo">834</span>            if (FSHDFSUtils.isSameHdfs(getConf(), fs, targetFs)) {<a name="line.834"></a>
+<span class="sourceLineNo">835</span>              for(Pair&lt;byte[], String&gt; el : famPaths) {<a name="line.835"></a>
+<span class="sourceLineNo">836</span>                Path hfileStagingPath = null;<a name="line.836"></a>
+<span class="sourceLineNo">837</span>                Path hfileOrigPath = new Path(el.getSecond());<a name="line.837"></a>
+<span class="sourceLineNo">838</span>                try {<a name="line.838"></a>
+<span class="sourceLineNo">839</span>                  hfileStagingPath= new Path(secureClient.getStagingPath(bulkToken, el.getFirst()),<a name="line.839"></a>
+<span class="sourceLineNo">840</span>                    hfileOrigPath.getName());<a name="line.840"></a>
+<span class="sourceLineNo">841</span>                  if(targetFs.rename(hfileStagingPath, hfileOrigPath)) {<a name="line.841"></a>
+<span class="sourceLineNo">842</span>                    LOG.debug("Moved back file " + hfileOrigPath + " from " +<a name="line.842"></a>
+<span class="sourceLineNo">843</span>                        hfileStagingPath);<a name="line.843"></a>
+<span class="sourceLineNo">844</span>                  } else if(targetFs.exists(hfileStagingPath)){<a name="line.844"></a>
+<span class="sourceLineNo">845</span>                    LOG.debug("Unable to move back file " + hfileOrigPath + " from " +<a name="line.845"></a>
+<span class="sourceLineNo">846</span>                        hfileStagingPath);<a name="line.846"></a>
+<span class="sourceLineNo">847</span>                  }<a name="line.847"></a>
+<span class="sourceLineNo">848</span>                } catch(Exception ex) {<a name="line.848"></a>
+<span class="sourceLineNo">849</span>                  LOG.debug("Unable to move back file " + hfileOrigPath + " from " +<a name="line.849"></a>
+<span class="sourceLineNo">850</span>                      hfileStagingPath, ex);<a name="line.850"></a>
+<span class="sourceLineNo">851</span>                }<a name="line.851"></a>
+<span class="sourceLineNo">852</span>              }<a name="line.852"></a>
+<span class="sourceLineNo">853</span>            }<a name="line.853"></a>
+<span class="sourceLineNo">854</span>          }<a name="line.854"></a>
+<span class="sourceLineNo">855</span>        }<a name="line.855"></a>
+<span class="sourceLineNo">856</span>      }<a name="line.856"></a>
+<span class="sourceLineNo">857</span>    };<a name="line.857"></a>
+<span class="sourceLineNo">858</span><a name="line.858"></a>
+<span class="sourceLineNo">859</span>    try {<a name="line.859"></a>
+<span class="sourceLineNo">860</span>      List&lt;LoadQueueItem&gt; toRetry = new ArrayList&lt;LoadQueueItem&gt;();<a name="line.860"></a>
+<span class="sourceLineNo">861</span>      Configuration conf = getConf();<a name="line.861"></a>
+<span class="sourceLineNo">862</span>      boolean success = RpcRetryingCallerFactory.instantiate(conf,<a name="line.862"></a>
+<span class="sourceLineNo">863</span>          null).&lt;Boolean&gt; newCaller()<a name="line.863"></a>
+<span class="sourceLineNo">864</span>          .callWithRetries(svrCallable, Integer.MAX_VALUE);<a name="line.864"></a>
+<span class="sourceLineNo">865</span>      if (!success) {<a name="line.865"></a>
+<span class="sourceLineNo">866</span>        LOG.warn("Attempt to bulk load region containing "<a name="line.866"></a>
+<span class="sourceLineNo">867</span>            + Bytes.toStringBinary(first) + " into table "<a name="line.867"></a>
+<span class="sourceLineNo">868</span>            + tableName  + " with files " + lqis<a name="line.868"></a>
+<span class="sourceLineNo">869</span>            + " failed.  This is recoverable and they will be retried.");<a name="line.869"></a>
+<span class="sourceLineNo">870</span>        toRetry.addAll(lqis); // return lqi's to retry<a name="line.870"></a>
+<span class="sourceLineNo">871</span>      }<a name="line.871"></a>
+<span class="sourceLineNo">872</span>      // success<a name="line.872"></a>
+<span class="sourceLineNo">873</span>      return toRetry;<a name="line.873"></a>
+<span class="sourceLineNo">874</span>    } catch (IOException e) {<a name="line.874"></a>
+<span class="sourceLineNo">875</span>      LOG.error("Encountered unrecoverable error from region server, additional details: "<a name="line.875"></a>
+<span class="sourceLineNo">876</span>          + svrCallable.getExceptionMessageAdditionalDetail(), e);<a name="line.876"></a>
+<span class="sourceLineNo">877</span>      throw e;<a name="line.877"></a>
+<span class="sourceLineNo">878</span>    }<a name="line.878"></a>
+<span class="sourceLineNo">879</span>  }<a name="line.879"></a>
+<span class="sourceLineNo">880</span><a name="line.880"></a>
+<span class="sourceLineNo">881</span>  private boolean isSecureBulkLoadEndpointAvailable() {<a name="line.881"></a>
+<span class="sourceLineNo">882</span>    String classes = getConf().get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, "");<a name="line.882"></a>
+<span class="sourceLineNo">883</span>    return classes.contains("org.apache.hadoop.hbase.security.access.SecureBulkLoadEndpoint");<a name="line.883"></a>
+<span class="sourceLineNo">884</span>  }<a name="line.884"></a>
+<span class="sourceLineNo">885</span><a name="line.885"></a>
+<span class="sourceLineNo">886</span>  /**<a name="line.886"></a>
+<span class="sourceLineNo">887</span>   * Split a storefile into a top and bottom half, maintaining<a name="line.887"></a>
+<span class="sourceLineNo">888</span>   * the metadata, recreating bloom filters, etc.<a name="line.888"></a>
+<span class="sourceLineNo">889</span>   */<a name="line.889"></a>
+<span class="sourceLineNo">890</span>  static void splitStoreFile(<a name="line.890"></a>
+<span class="sourceLineNo">891</span>      Configuration conf, Path inFile,<a name="line.891"></a>
+<span class="sourceLineNo">892</span>      HColumnDescriptor familyDesc, byte[] splitKey,<a name="line.892"></a>
+<span class="sourceLineNo">893</span>      Path bottomOut, Path topOut) throws IOException<a name="line.893"></a>
+<span class="sourceLineNo">894</span>  {<a name="line.894"></a>
+<span class="sourceLineNo">895</span>    // Open reader with no block cache, and not in-memory<a name="line.895"></a>
+<span class="sourceLineNo">896</span>    Reference topReference = Reference.createTopReference(splitKey);<a name="line.896"></a>
+<span class="sourceLineNo">897</span>    Reference bottomReference = Reference.createBottomReference(splitKey);<a name="line.897"></a>
+<span class="sourceLineNo">898</span><a name="line.898"></a>
+<span class="sourceLineNo">899</span>    copyHFileHalf(conf, inFile, topOut, topReference, familyDesc);<a name="line.899"></a>
+<span class="sourceLineNo">900</span>    copyHFileHalf(conf, inFile, bottomOut, bottomReference, familyDesc);<a name="line.900"></a>
+<span class="sourceLineNo">901</span>  }<a name="line.901"></a>
+<span class="sourceLineNo">902</span><a name="line.902"></a>
+<span class="sourceLineNo">903</span>  /**<a name="line.903"></a>
+<span class="sourceLineNo">904</span>   * Copy half of an HFile into a new HFile.<a name="line.904"></a>
+<span class="sourceLineNo">905</span>   */<a name="line.905"></a>
+<span class="sourceLineNo">906</span>  private static void copyHFileHalf(<a name="line.906"></a>
+<span class="sourceLineNo">907</span>      Configuration conf, Path inFile, Path outFile, Reference reference,<a name="line.907"></a>
+<span class="sourceLineNo">908</span>      HColumnDescriptor familyDescriptor)<a name="line.908"></a>
+<span class="sourceLineNo">909</span>  throws IOException {<a name="line.909"></a>
+<span class="sourceLineNo">910</span>    FileSystem fs = inFile.getFileSystem(conf);<a name="line.910"></a>
+<span class="sourceLineNo">911</span>    CacheConfig cacheConf = new CacheConfig(conf);<a name="line.911"></a>
+<span class="sourceLineNo">912</span>    HalfStoreFileReader halfReader = null;<a name="line.912"></a>
+<span class="sourceLineNo">913</span>    StoreFileWriter halfWriter = null;<a name="line.913"></a>
+<span class="sourceLineNo">914</span>    try {<a name="line.914"></a>
+<span class="sourceLineNo">915</span>      halfReader = new HalfStoreFileReader(fs, inFile, cacheConf, reference, conf);<a name="line.915"></a>
+<span class="sourceLineNo">916</span>      Map&lt;byte[], byte[]&gt; fileInfo = halfReader.loadFileInfo();<a name="line.916"></a>
+<span class="sourceLineNo">917</span><a name="line.917"></a>
+<span class="sourceLineNo">918</span>      int blocksize = familyDescriptor.getBlocksize();<a name="line.918"></a>
+<span class="sourceLineNo">919</span>      Algorithm compression = familyDescriptor.getCompressionType();<a name="line.919"></a>
+<span class="sourceLineNo">920</span>      BloomType bloomFilterType = familyDescriptor.getBloomFilterType();<a name="line.920"></a>
+<span class="sourceLineNo">921</span>      HFileContext hFileContext = new HFileContextBuilder()<a name="line.921"></a>
+<span class="sourceLineNo">922</span>                                  .withCompression(compression)<a name="line.922"></a>
+<span class="sourceLineNo">923</span>                                  .withChecksumType(HStore.getChecksumType(conf))<a name="line.923"></a>
+<span class="sourceLineNo">924</span>                                  .withBytesPerCheckSum(HStore.getBytesPerChecksum(conf))<a name="line.924"></a>
+<span class="sourceLineNo">925</span>                                  .withBlockSize(blocksize)<a name="line.925"></a>
+<span class="sourceLineNo">926</span>                                  .withDataBlockEncoding(familyDescriptor.getDataBlockEncoding())<a name="line.926"></a>
+<span class="sourceLineNo">927</span>                                  .withIncludesTags(true)<a name="line.927"></a>
+<span class="sourceLineNo">928</span>                                  .build();<a name="line.928"></a>
+<span class="sourceLineNo">929</span>      halfWriter = new StoreFileWriter.Builder(conf, cacheConf,<a name="line.929"></a>
+<span class="sourceLineNo">930</span>          fs)<a name="line.930"></a>
+<span class="sourceLineNo">931</span>              .withFilePath(outFile)<a name="line.931"></a>
+<span class="sourceLineNo">932</span>              .withBloomType(bloomFilterType)<a name="line.932"></a>
+<span class="sourceLineNo">933</span>              .withFileContext(hFileContext)<a name="line.933"></a>
+<span class="sourceLineNo">934</span>              .build();<a name="line.934"></a>
+<span class="sourceLineNo">935</span>      HFileScanner scanner = halfReader.getScanner(false, false, false);<a name="line.935"></a>
+<span class="sourceLineNo">936</span>      scanner.seekTo();<a name="line.936"></a>
+<span class="sourceLineNo">937</span>      do {<a name="line.937"></a>
+<span class="sourceLineNo">938</span>        halfWriter.append(scanner.getCell());<a name="line.938"></a>
+<span class="sourceLineNo">939</span>      } while (scanner.next());<a name="line.939"></a>
 <span class="sourceLineNo">940</span><a name="line.940"></a>
-<span class="sourceLineNo">941</span>  /*<a name="line.941"></a>
-<span class="sourceLineNo">942</span>   * Infers region boundaries for a new table.<a name="line.942"></a>
-<span class="sourceLineNo">943</span>   * Parameter:<a name="line.943"></a>
-<span class="sourceLineNo">944</span>   *   bdryMap is a map between keys to an integer belonging to {+1, -1}<a name="line.944"></a>
-<span class="sourceLineNo">945</span>   *     If a key is a start key of a file, then it maps to +1<a name="line.945"></a>
-<span class="sourceLineNo">946</span>   *     If a key is an end key of a file, then it maps to -1<a name="line.946"></a>
-<span class="sourceLineNo">947</span>   * Algo:<a name="line.947"></a>
-<span class="sourceLineNo">948</span>   * 1) Poll on the keys in order:<a name="line.948"></a>
-<span class="sourceLineNo">949</span>   *    a) Keep adding the mapped values to these keys (runningSum)<a name="line.949"></a>
-<span class="sourceLineNo">950</span>   *    b) Each time runningSum reaches 0, add the start Key from when the runningSum had started to<a name="line.950"></a>
-<span class="sourceLineNo">951</span>   *       a boundary list.<a name="line.951"></a>
-<span class="sourceLineNo">952</span>   * 2) Return the boundary list.<a name="line.952"></a>
-<span class="sourceLineNo">953</span>   */<a name="line.953"></a>
-<span class="sourceLineNo">954</span>  public static byte[][] inferBoundaries(TreeMap&lt;byte[], Integer&gt; bdryMap) {<a name="line.954"></a>
-<span class="sourceLineNo">955</span>    ArrayList&lt;byte[]&gt; keysArray = new ArrayList&lt;byte[]&gt;();<a name="line.955"></a>
-<span class="sourceLineNo">956</span>    int runningValue = 0;<a name="line.956"></a>
-<span class="sourceLineNo">957</span>    byte[] currStartKey = null;<a name="line.957"></a>
-<span class="sourceLineNo">958</span>    boolean firstBoundary = true;<a name="line.958"></a>
-<span class="sourceLineNo">959</span><a name="line.959"></a>
-<span class="sourceLineNo">960</span>    for (Map.Entry&lt;byte[], Integer&gt; item: bdryMap.entrySet()) {<a name="line.960"></a>
-<span class="sourceLineNo">961</span>      if (runningValue == 0) currStartKey = item.getKey();<a name="line.961"></a>
-<span class="sourceLineNo">962</span>      runningValue += item.getValue();<a name="line.962"></a>
-<span class="sourceLineNo">963</span>      if (runningValue == 0) {<a name="line.963"></a>
-<span class="sourceLineNo">964</span>        if (!firstBoundary) keysArray.add(currStartKey);<a name="line.964"></a>
-<span class="sourceLineNo">965</span>        firstBoundary = false;<a name="line.965"></a>
-<span class="sourceLineNo">966</span>      }<a name="line.966"></a>
-<span class="sourceLineNo">967</span>    }<a name="line.967"></a>
-<span class="sourceLineNo">968</span><a name="line.968"></a>
-<span class="sourceLineNo">969</span>    return keysArray.toArray(new byte[0][0]);<a name="line.969"></a>
-<span class="sourceLineNo">970</span>  }<a name="line.970"></a>
-<span class="sourceLineNo">971</span><a name="line.971"></a>
-<span class="sourceLineNo">972</span>  /*<a name="line.972"></a>
-<span class="sourceLineNo">973</span>   * If the table is created for the first time, then "completebulkload" reads the files twice.<a name="line.973"></a>
-<span class="sourceLineNo">974</span>   * More modifications necessary if we want to avoid doing it.<a name="line.974"></a>
-<span class="sourceLineNo">975</span>   */<a name="line.975"></a>
-<span class="sourceLineNo">976</span>  private void createTable(TableName tableName, String dirPath, Admin admin) throws Exception {<a name="line.976"></a>
-<span class="sourceLineNo">977</span>    final Path hfofDir = new Path(dirPath);<a name="line.977"></a>
-<span class="sourceLineNo">978</span>    final FileSystem fs = hfofDir.getFileSystem(getConf());<a name="line.978"></a>
+<span class="sourceLineNo">941</span>      for (Map.Entry&lt;byte[],byte[]&gt; entry : fileInfo.entrySet()) {<a name="line.941"></a>
+<span class="sourceLineNo">942</span>        if (shouldCopyHFileMetaKey(entry.getKey())) {<a name="line.942"></a>
+<span class="sourceLineNo">943</span>          halfWriter.appendFileInfo(entry.getKey(), entry.getValue());<a name="line.943"></a>
+<span class="sourceLineNo">944</span>        }<a name="line.944"></a>
+<span class="sourceLineNo">945</span>      }<a name="line.945"></a>
+<span class="sourceLineNo">946</span>    } finally {<a name="line.946"></a>
+<span class="sourceLineNo">947</span>      if (halfWriter != null) halfWriter.close();<a name="line.947"></a>
+<span class="sourceLineNo">948</span>      if (halfReader != null) halfReader.close(cacheConf.shouldEvictOnClose());<a name="line.948"></a>
+<span class="sourceLineNo">949</span>    }<a name="line.949"></a>
+<span class="sourceLineNo">950</span>  }<a name="line.950"></a>
+<span class="sourceLineNo">951</span><a name="line.951"></a>
+<span class="sourceLineNo">952</span>  private static boolean shouldCopyHFileMetaKey(byte[] key) {<a name="line.952"></a>
+<span class="sourceLineNo">953</span>    // skip encoding to keep hfile meta consistent with data block info, see HBASE-15085<a name="line.953"></a>
+<span class="sourceLineNo">954</span>    if (Bytes.equals(key, HFileDataBlockEncoder.DATA_BLOCK_ENCODING)) {<a name="line.954"></a>
+<span class="sourceLineNo">955</span>      return false;<a name="line.955"></a>
+<span class="sourceLineNo">956</span>    }<a name="line.956"></a>
+<span class="sourceLineNo">957</span><a name="line.957"></a>
+<span class="sourceLineNo">958</span>    return !HFile.isReservedFileInfoKey(key);<a name="line.958"></a>
+<span class="sourceLineNo">959</span>  }<a name="line.959"></a>
+<span class="sourceLineNo">960</span><a name="line.960"></a>
+<span class="sourceLineNo">961</span>  /*<a name="line.961"></a>
+<span class="sourceLineNo">962</span>   * Infers region boundaries for a new table.<a name="line.962"></a>
+<span class="sourceLineNo">963</span>   * Parameter:<a name="line.963"></a>
+<span class="sourceLineNo">964</span>   *   bdryMap is a map between keys to an integer belonging to {+1, -1}<a name="line.964"></a>
+<span class="sourceLineNo">965</span>   *     If a key is a start key of a file, then it maps to +1<a name="line.965"></a>
+<span class="sourceLineNo">966</span>   *     If a key is an end key of a file, then it maps to -1<a name="line.966"></a>
+<span class="sourceLineNo">967</span>   * Algo:<a name="line.967"></a>
+<span class="sourceLineNo">968</span>   * 1) Poll on the keys in order:<a name="line.968"></a>
+<span class="sourceLineNo">969</span>   *    a) Keep adding the mapped values to these keys (runningSum)<a name="line.969"></a>
+<span class="sourceLineNo">970</span>   *    b) Each time runningSum reaches 0, add the start Key from when the runningSum had started to<a name="line.970"></a>
+<span class="sourceLineNo">971</span>   *       a boundary list.<a name="line.971"></a>
+<span class="sourceLineNo">972</span>   * 2) Return the boundary list.<a name="line.972"></a>
+<span class="sourceLineNo">973</span>   */<a name="line.973"></a>
+<span class="sourceLineNo">974</span>  public static byte[][] inferBoundaries(TreeMap&lt;byte[], Integer&gt; bdryMap) {<a name="line.974"></a>
+<span class="sourceLineNo">975</span>    ArrayList&lt;byte[]&gt; keysArray = new ArrayList&lt;byte[]&gt;();<a name="line.975"></a>
+<span class="sourceLineNo">976</span>    int runningValue = 0;<a name="line.976"></a>
+<span class="sourceLineNo">977</span>    byte[] currStartKey = null;<a name="line.977"></a>
+<span class="sourceLineNo">978</span>    boolean firstBoundary = true;<a name="line.978"></a>
 <span class="sourceLineNo">979</span><a name="line.979"></a>
-<span class="sourceLineNo">980</span>    // Add column families<a name="line.980"></a>
-<span class="sourceLineNo">981</span>    // Build a set of keys<a name="line.981"></a>
-<span class="sourceLineNo">982</span>    final HTableDescriptor htd = new HTableDescriptor(tableName);<a name="line.982"></a>
-<span class="sourceLineNo">983</span>    final TreeMap&lt;byte[], Integer&gt; map = new TreeMap&lt;byte[], Integer&gt;(Bytes.BYTES_COMPARATOR);<a name="line.983"></a>
-<span class="sourceLineNo">984</span>    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor&lt;HColumnDescriptor&gt;() {<a name="line.984"></a>
-<span class="sourceLineNo">985</span>      @Override<a name="line.985"></a>
-<span class="sourceLineNo">986</span>      public HColumnDescriptor bulkFamily(final byte[] familyName) {<a name="line.986"></a>
-<span class="sourceLineNo">987</span>        HColumnDescriptor hcd = new HColumnDescriptor(familyName);<a name="line.987"></a>
-<span class="sourceLineNo">988</span>        htd.addFamily(hcd);<a name="line.988"></a>
-<span class="sourceLineNo">989</span>        return hcd;<a name="line.989"></a>
-<span class="sourceLineNo">990</span>      }<a name="line.990"></a>
-<span class="sourceLineNo">991</span>      @Override<a name="line.991"></a>
-<span class="sourceLineNo">992</span>      public void bulkHFile(final HColumnDescriptor hcd, final FileStatus hfileStatus)<a name="line.992"></a>
-<span class="sourceLineNo">993</span>          throws IOException {<a name="line.993"></a>
-<span class="sourceLineNo">994</span>        Path hfile = hfileStatus.getPath();<a name="line.994"></a>
-<span class="sourceLineNo">995</span>        HFile.Reader reader = HFile.createReader(fs, hfile,<a name="line.995"></a>
-<span class="sourceLineNo">996</span>            new CacheConfig(getConf()), getConf());<a name="line.996"></a>
-<span class="sourceLineNo">997</span>        try {<a name="line.997"></a>
-<span class="sourceLineNo">998</span>          if (hcd.getCompressionType() != reader.getFileContext().getCompression()) {<a name="line.998"></a>
-<span class="sourceLineNo">999</span>            hcd.setCompressionType(reader.getFileContext().getCompression());<a name="line.999"></a>
-<span class="sourceLineNo">1000</span>            LOG.info("Setting compression " + hcd.getCompressionType().name() +<a name="line.1000"></a>
-<span class="sourceLineNo">1001</span>                     " for family " + hcd.toString());<a name="line.1001"></a>
-<span class="sourceLineNo">1002</span>          }<a name="line.1002"></a>
-<span class="sourceLineNo">1003</span>          reader.loadFileInfo();<a name="line.1003"></a>
-<span class="sourceLineNo">1004</span>          byte[] first = reader.getFirstRowKey();<a name="line.1004"></a>
-<span class="sourceLineNo">1005</span>          byte[] last  = reader.getLastRowKey();<a name="line.1005"></a>
-<span class="sourceLineNo">1006</span><a name="line.1006"></a>
-<span class="sourceLineNo">1007</span>          LOG.info("Trying to figure out region boundaries hfile=" + hfile +<a name="line.1007"></a>
-<span class="sourceLineNo">1008</span>            " first=" + Bytes.toStringBinary(first) +<a name="line.1008"></a>
-<span class="sourceLineNo">1009</span>            " last="  + Bytes.toStringBinary(last));<a name="line.1009"></a>
-<span class="sourceLineNo">1010</span><a name="line.1010"></a>
-<span class="sourceLineNo">1011</span>          // To eventually infer start key-end key boundaries<a name="line.1011"></a>
-<span class="sourceLineNo">1012</span>          Integer value = map.containsKey(first)? map.get(first):0;<a name="line.1012"></a>
-<span class="sourceLineNo">1013</span>          map.put(first, value+1);<a name="line.1013"></a>
-<span class="sourceLineNo">1014</span><a name="line.1014"></a>
-<span class="sourceLineNo">1015</span>          value = map.containsKey(last)? map.get(last):0;<a name="line.1015"></a>
-<span class="sourceLineNo">1016</span>          map.put(last, value-1);<a name="line.1016"></a>
-<span class="sourceLineNo">1017</span>        } finally {<a name="line.1017"></a>
-<span class="sourceLineNo">1018</span>          reader.close();<a name="line.1018"></a>
-<span class="sourceLineNo">1019</span>        }<a name="line.1019"></a>
-<span class="sourceLineNo">1020</span>      }<a name="line.1020"></a>
-<span class="sourceLineNo">1021</span>    });<a name="line.1021"></a>
-<span class="sourceLineNo">1022</span><a name="line.1022"></a>
-<span class="sourceLineNo">1023</span>    byte[][] keys = LoadIncrementalHFiles.inferBoundaries(map);<a name="line.1023"></a>
-<span class="sourceLineNo">1024</span>    admin.createTable(htd, keys);<a name="line.1024"></a>
-<span class="sourceLineNo">1025</span><a name="line.1025"></a>
-<span class="sourceLineNo">1026</span>    LOG.info("Table "+ tableName +" is available!!");<a name="line.1026"></a>
-<span class="sourceLineNo">1027</span>  }<a name="line.1027"></a>
-<span class="sourceLineNo">1028</span><a name="line.1028"></a>
-<span class="sourceLineNo">1029</span>  @Override<a name="line.1029"></a>
-<span class="sourceLineNo">1030</span>  public int run(String[] args) throws Exception {<a name="line.1030"></a>
-<span class="sourceLineNo">1031</span>    if (args.length != 2) {<a name="line.1031"></a>
-<span class="sourceLineNo">1032</span>      usage();<a name="line.1032"></a>
-<span class="sourceLineNo">1033</span>      return -1;<a name="line.1033"></a>
-<span class="sourceLineNo">1034</span>    }<a name="line.1034"></a>
-<span class="sourceLineNo">1035</span><a name="line.1035"></a>
-<span class="sourceLineNo">1036</span>    initialize();<a name="line.1036"></a>
-<span class="sourceLineNo">1037</span>    try (Connection connection = ConnectionFactory.createConnection(getConf());<a name="line.1037"></a>
-<span class="sourceLineNo">1038</span>        Admin admin = connection.getAdmin()) {<a name="line.1038"></a>
-<span class="sourceLineNo">1039</span>      String dirPath = args[0];<a name="line.1039"></a>
-<span class="sourceLineNo">1040</span>      TableName tableName = TableName.valueOf(args[1]);<a name="line.1040"></a>
-<span class="sourceLineNo">1041</span><a name="line.1041"></a>
-<span class="sourceLineNo">1042</span>      boolean tableExists = admin.tableExists(tableName);<a name="line.1042"></a>
-<span class="sourceLineNo">1043</span>      if (!tableExists) {<a name="line.1043"></a>
-<span class="sourceLineNo">1044</span>        if ("yes".equalsIgnoreCase(getConf().get(CREATE_TABLE_CONF_KEY, "yes"))) {<a name="line.1044"></a>
-<span class="sourceLineNo">1045</span>          this.createTable(tableName, dirPath, admin);<a name="line.1045"></a>
-<span class="sourceLineNo">1046</span>        } else {<a name="line.1046"></a>
-<span class="sourceLineNo">1047</span>          String errorMsg = format("Table '%s' does not exist.", tableName);<a name="line.1047"></a>
-<span class="sourceLineNo">1048</span>          LOG.error(errorMsg);<a name="line.1048"></a>
-<span class="sourceLineNo">1049</span>          throw new TableNotFoundException(errorMsg);<a name="line.1049"></a>
-<span class="sourceLineNo">1050</span>        }<a name="line.1050"></a>
-<span class="sourceLineNo">1051</span>      }<a name="line.1051"></a>
-<span class="sourceLineNo">1052</span><a name="line.1052"></a>
-<span class="sourceLineNo">1053</span>      Path hfofDir = new Path(dirPath);<a name="line.1053"></a>
-<span class="sourceLineNo">1054</span><a name="line.1054"></a>
-<span class="sourceLineNo">1055</span>      try (Table table = connection.getTable(tableName);<a name="line.1055"></a>
-<span class="sourceLineNo">1056</span>          RegionLocator locator = connection.getRegionLocator(tableName)) {<a name="line.1056"></a>
-<span class="sourceLineNo">1057</span>          doBulkLoad(hfofDir, admin, table, locator);<a name="line.1057"></a>
-<span class="sourceLineNo">1058</span>      }<a name="line.1058"></a>
-<span class="sourceLineNo">1059</span>    }<a name="line.1059"></a>
-<span class="sourceLineNo">1060</span><a name="line.1060"></a>
-<span class="sourceLineNo">1061</span>    return 0;<a name="line.1061"></a>
-<span class="sourceLineNo">1062</span>  }<a name="line.1062"></a>
-<span class="sourceLineNo">1063</span><a name="line.1063"></a>
-<span class="sourceLineNo">1064</span>  public static void main(String[] args) throws Exception {<a name="line.1064"></a>
-<span class="sourceLineNo">1065</span>    Configuration conf = HBaseConfiguration.create();<a name="line.1065"></a>
-<span class="sourceLineNo">1066</span>    int ret = ToolRunner.run(conf, new LoadIncrementalHFiles(), args);<a name="line.1066"></a>
-<span class="sourceLineNo">1067</span>    System.exit(ret);<a name="line.1067"></a>
-<span class="sourceLineNo">1068</span>  }<a name="line.1068"></a>
-<span class="sourceLineNo">1069</span><a name="line.1069"></a>
-<span class="sourceLineNo">1070</span>  /**<a name="line.1070"></a>
-<span class="sourceLineNo">1071</span>   * Called from replication sink, where it manages bulkToken(staging directory) by itself. This is<a name="line.1071"></a>
-<span class="sourceLineNo">1072</span>   * used only when {@link SecureBulkLoadEndpoint} is configured in hbase.coprocessor.region.classes<a name="line.1072"></a>
-<span class="sourceLineNo">1073</span>   * property. This directory is used as a temporary directory where all files are initially<a name="line.1073"></a>
-<span class="sourceLineNo">1074</span>   * copied/moved from user given directory, set all the required file permissions and then from<a name="line.1074"></a>
-<span class="sourceLineNo">1075</span>   * their it is finally loaded into a table. This should be set only when, one would like to manage<a name="line.1075"></a>
-<span class="sourceLineNo">1076</span>   * the staging directory by itself. Otherwise this tool will handle this by itself.<a name="line.1076"></a>
-<span class="sourceLineNo">1077</span>   * @param stagingDir staging directory path<a name="line.1077"></a>
-<span class="sourceLineNo">1078</span>   */<a name="line.1078"></a>
-<span class="sourceLineNo">1079</span>  public void setBulkToken(String stagingDir) {<a name="line.1079"></a>
-<span class="sourceLineNo">1080</span>    this.bulkToken = stagingDir;<a name="line.1080"></a>
-<span class="sourceLineNo">1081</span>  }<a name="line.1081"></a>
-<span class="sourceLineNo">1082</span><a name="line.1082"></a>
-<span class="sourceLineNo">1083</span>}<a name="line.1083"></a>
+<span class="sourceLineNo">980</span>    for (Map.Entry&lt;byte[], Integer&gt; item: bdryMap.entrySet()) {<a name="line.980"></a>
+<span class="sourceLineNo">981</span>      if (runningValue == 0) currStartKey = item.getKey();<a name="line.981"></a>
+<span class="sourceLineNo">982</span>      runningValue += item.getValue();<a name="line.982"></a>
+<span class="sourceLineNo">983</span>      if (runningValue == 0) {<a name="line.983"></a>
+<span class="sourceLineNo">984</span>        if (!firstBoundary) keysArray.add(currStartKey);<a name="line.984"></a>
+<span class="sourceLineNo">985</span>        firstBoundary = false;<a name="line.985"></a>
+<span class="sourceLineNo">986</span>      }<a name="line.986"></a>
+<span class="sourceLineNo">987</span>    }<a name="line.987"></a>
+<span class="sourceLineNo">988</span><a name="line.988"></a>
+<span class="sourceLineNo">989</span>    return keysArray.toArray(new byte[0][0]);<a name="line.989"></a>
+<span class="sourceLineNo">990</span>  }<a name="line.990"></a>
+<span class="sourceLineNo">991</span><a name="line.991"></a>
+<span class="sourceLineNo">992</span>  /*<a name="line.992"></a>
+<span class="sourceLineNo">993</span>   * If the table is created for the first time, then "completebulkload" reads the files twice.<a name="line.993"></a>
+<span class="sourceLineNo">994</span>   * More modifications necessary if we want to avoid doing it.<a name="line.994"></a>
+<span class="sourceLineNo">995</span>   */<a name="line.995"></a>
+<span class="sourceLineNo">996</span>  private void createTable(TableName tableName, String dirPath, Admin admin) throws Exception {<a name="line.996"></a>
+<span class="sourceLineNo">997</span>    final Path hfofDir = new Path(dirPath);<a name="line.997"></a>
+<span class="sourceLineNo">998</span>    final FileSystem fs = hfofDir.getFileSystem(getConf());<a name="line.998"></a>
+<span class="sourceLineNo">999</span><a name="line.999"></a>
+<span class="sourceLineNo">1000</span>    // Add column families<a name="line.1000"></a>
+<span class="sourceLineNo">1001</span>    // Build a set of keys<a name="line.1001"></a>
+<span class="sourceLineNo">1002</span>    final HTableDescriptor htd = new HTableDescriptor(tableName);<a name="line.1002"></a>
+<span class="sourceLineNo">1003</span>    final TreeMap&lt;byte[], Integer&gt; map = new TreeMap&lt;byte[], Integer&gt;(Bytes.BYTES_COMPARATOR);<a name="line.1003"></a>
+<span class="sourceLineNo">1004</span>    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor&lt;HColumnDescriptor&gt;() {<a name="line.1004"></a>
+<span class="sourceLineNo">1005</span>      @Override<a name="line.1005"></a>
+<span class="sourceLineNo">1006</span>      public HColumnDescriptor bulkFamily(final byte[] familyName) {<a name="line.1006"></a>
+<span class="sourceLineNo">1007</span>        HColumnDescriptor hcd = new HColumnDescriptor(familyName);<a name="line.1007"></a>
+<span class="sourceLineNo">1008</span>        htd.addFamily(hcd);<a name="line.1008"></a>
+<span class="sourceLineNo">1009</span>        return hcd;<a name="line.1009"></a>
+<span class="sourceLineNo">1010</span>      }<a name="line.1010"></a>
+<span class="sourceLineNo">1011</span>      @Override<a name="line.1011"></a>
+<span class="sourceLineNo">1012</span>      public void bulkHFile(final HColumnDescriptor hcd, final FileStatus hfileStatus)<a name="line.1012"></a>
+<span class="sourceLineNo">1013</span>          throws IOException {<a name="line.1013"></a>
+<span class="sourceLineNo">1014</span>        Path hfile = hfileStatus.getPath();<a name="line.1014"></a>
+<span class="sourceLineNo">1015</span>        HFile.Reader reader = HFile.createReader(fs, hfile,<a name="line.1015"></a>
+<span class="sourceLineNo">1016</span>            new CacheConfig(getConf()), getConf());<a name="line.1016"></a>
+<span class="sourceLineNo">1017</span>        try {<a name="line.1017"></a>
+<span class="sourceLineNo">1018</span>          if (hcd.getCompressionType() != reader.getFileContext().getCompression()) {<a name="line.1018"></a>
+<span class="sourceLineNo">1019</span>            hcd.setCompressionType(reader.getFileContext().getCompression());<a name="line.1019"></a>
+<span class="sourceLineNo">1020</span>            LOG.info("Setting compression " + hcd.getCompressionType().name() +<a name="line.1020"></a>
+<span class="sourceLineNo">1021</span>                     " for family " + hcd.toString());<a name="line.1021"></a>
+<span class="sourceLineNo">1022</span>          }<a name="line.1022"></a>
+<span class="sourceLineNo">1023</span>          reader.loadFileInfo();<a name="line.1023"></a>
+<span class="sourceLineNo">1024</span>          byte[] first = reader.getFirstRowKey();<a name="line.1024"></a>
+<span class="sourceLineNo">1025</span>          byte[] last  = reader.getLastRowKey();<a name="line.1025"></a>
+<span class="sourceLineNo">1026</span><a name="line.1026"></a>
+<span class="sourceLineNo">1027</span>          LOG.info("Trying to figure out region boundaries hfile=" + hfile +<a name="line.1027"></a>
+<span class="sourceLineNo">1028</span>            " first=" + Bytes.toStringBinary(first) +<a name="line.1028"></a>
+<span class="sourceLineNo">1029</span>            " last="  + Bytes.toStringBinary(last));<a name="line.1029"></a>
+<span class="sourceLineNo">1030</span><a name="line.1030"></a>
+<span class="sourceLineNo">1031</span>          // To eventually infer start key-end key boundaries<a name="line.1031"></a>
+<span class="sourceLineNo">1032</span>          Integer value = map.containsKey(first)? map.get(first):0;<a name="line.1032"></a>
+<span class="sourceLineNo">1033</span>          map.put(first, value+1);<a name="line.1033"></a>
+<span class="sourceLineNo">1034</span><a name="line.1034"></a>
+<span class="sourceLineNo">1035</span>          value = map.containsKey(last)? map.get(last):0;<a name="line.1035"></a>
+<span class="sourceLineNo">1036</span>          map.put(last, value-1);<a name="line.1036"></a>
+<span class="sourceLineNo">1037</span>        } finally {<a name="line.1037"></a>
+<span class="sourceLineNo">1038</span>          reader.close();<a name="line.1038"></a>
+<span class="sourceLineNo">1039</span>        }<a name="line.1039"></a>
+<span class="sourceLineNo">1040</span>      }<a name="line.1040"></a>
+<span class="sourceLineNo">1041</span>    });<a name="line.1041"></a>
+<span class="sourceLineNo">1042</span><a name="line.1042"></a>
+<span class="sourceLineNo">1043</span>    byte[][] keys = LoadIncrementalHFiles.inferBoundaries(map);<a name="line.1043"></a>
+<span class="sourceLineNo">1044</span>    admin.createTable(htd, keys);<a name="line.1044"></a>
+<span class="sourceLineNo">1045</span><a name="line.1045"></a>
+<span class="sourceLineNo">1046</span>    LOG.info("Table "+ tableName +" is available!!");<a name="line.1046"></a>
+<span class="sourceLineNo">1047</span>  }<a name="line.1047"></a>
+<span class="sourceLineNo">1048</span><a name="line.1048"></a>
+<span class="sourceLineNo">1049</span>  @Override<a name="line.1049"></a>
+<span class="sourceLineNo">1050</span>  public int run(String[] args) throws Exception {<a name="line.1050"></a>
+<span class="sourceLineNo">1051</span>    if (args.length != 2) {<a name="line.1051"></a>
+<span class="sourceLineNo">1052</span>      usage();<a name="line.1052"></a>
+<span class="sourceLineNo">1053</span>      return -1;<a name="line.1053"></a>
+<span class="sourceLineNo">1054</span>    }<a name="line.1054"></a>
+<span class="sourceLineNo">1055</span><a name="line.1055"></a>
+<span class="sourceLineNo">1056</span>    initialize();<a name="line.1056"></a>
+<span class="sourceLineNo">1057</span>    try (Connection connection = ConnectionFactory.createConnection(getConf());<a name="line.1057"></a>
+<span class="sourceLineNo">1058</span>        Admin admin = connection.getAdmin()) {<a name="line.1058"></a>
+<span class="sourceLineNo">1059</span>      String dirPath = args[0];<a name="line.1059"></a>
+<span class="sourceLineNo">1060</span>      TableName tableName = TableName.valueOf(args[1]);<a name="line.1060"></a>
+<span class="sourceLineNo">1061</span><a name="line.1061"></a>
+<span class="sourceLineNo">1062</span>      boolean tableExists = admin.tableExists(tableName);<a name="line.1062"></a>
+<span class="sourceLineNo">1063</span>      if (!tableExists) {<a name="line.1063"></a>
+<span class="sourceLineNo">1064</span>        if ("yes".equalsIgnoreCase(getConf().get(CREATE_TABLE_CONF_KEY, "yes"))) {<a name="line.1064"></a>
+<span class="sourceLineNo">1065</span>          this.createTable(tableName, dirPath, admin);<a name="line.1065"></a>
+<span class="sourceLineNo">1066</span>        } else {<a name="line.1066"></a>
+<span class="sourceLineNo">1067</span>          String errorMsg = format("Table '%s' does not exist.", tableName);<a name="line.1067"></a>
+<span class="sourceLineNo">1068</span>          LOG.error(errorMsg);<a name="line.1068"></a>
+<span class="sourceLineNo">1069</span>          throw new TableNotFoundException(errorMsg);<a name="line.1069"></a>
+<span class="sourceLineNo">1070</span>        }<a name="line.1070"></a>
+<span class="sourceLineNo">1071</span>      }<a name="line.1071"></a>
+<span class="sourceLineNo">1072</span><a name="line.1072"></a>
+<span class="sourceLineNo">1073</span>      Path hfofDir = new Path(dirPath);<a name="line.1073"></a>
+<span class="sourceLineNo">1074</span><a name="line.1074"></a>
+<span class="sourceLineNo">1075</span>      try (Table table = connection.getTable(tableName);<a name="line.1075"></a>
+<span class="sourceLineNo">1076</span>          RegionLocator locator = connection.getRegionLocator(tableName)) {<a name="line.1076"></a>
+<span class="sourceLineNo">1077</span>          doBulkLoad(hfofDir, admin, table, locator);<a name="line.1077"></a>
+<span class="sourceLineNo">1078</span>      }<a name="line.1078"></a>
+<span class="sourceLineNo">1079</span>    }<a name="line.1079"></a>
+<span class="sourceLineNo">1080</span><a name="line.1080"></a>
+<span class="sourceLineNo">1081</span>    return 0;<a name="line.1081"></a>
+<span class="sourceLineNo">1082</span>  }<a name="line.1082"></a>
+<span class="sourceLineNo">1083</span><a name="line.1083"></a>
+<span class="sourceLineNo">1084</span>  public static void main(String[] args) throws Exception {<a name="line.1084"></a>
+<span class="sourceLineNo">1085</span>    Configuration conf = HBaseConfiguration.create();<a name="line.1085"></a>
+<span class="sourceLineNo">1086</span>    int ret = ToolRunner.run(conf, new LoadIncrementalHFiles(), args);<a name="line.1086"></a>
+<span class="sourceLineNo">1087</span>    System.exit(ret);<a name="line.1087"></a>
+<span class="sourceLineNo">1088</span>  }<a name="line.1088"></a>
+<span class="sourceLineNo">1089</span><a name="line.1089"></a>
+<span class="sourceLineNo">1090</span>  /**<a name="line.1090"></a>
+<span class="sourceLineNo">1091</span>   * Called from replication sink, where it manages bulkToken(staging directory) by itself. This is<a name="line.1091"></a>
+<span class="sourceLineNo">1092</span>   * used only when {@link SecureBulkLoadEndpoint} is configured in hbase.coprocessor.region.classes<a name="line.1092"></a>
+<span class="sourceLineNo">1093</span>   * property. This directory is used as a temporary directory where all files are initially<a name="line.1093"></a>
+<span class="sourceLineNo">1094</span>   * copied/moved from user given directory, set all the required file permissions and then from<a name="line.1094"></a>
+<span class="sourceLineNo">1095</span>   * their it is finally loaded into a table. This should be set only when, one would like to manage<a name="line.1095"></a>
+<span class="sourceLineNo">1096</span>   * the staging directory by itself. Otherwise this tool will handle this by itself.<a name="line.1096"></a>
+<span class="sourceLineNo">1097</span>   * @param stagingDir staging directory path<a name="line.1097"></a>
+<span class="sourceLineNo">1098</span>   */<a name="line.1098"></a>
+<span class="sourceLineNo">1099</span>  public void setBulkToken(String stagingDir) {<a name="line.1099"></a>
+<span class="sourceLineNo">1100</span>    this.bulkToken = stagingDir;<a name="line.1100"></a>
+<span class="sourceLineNo">1101</span>  }<a name="line.1101"></a>
+<span class="sourceLineNo">1102</span><a name="line.1102"></a>
+<span class="sourceLineNo">1103</span>}<a name="line.1103"></a>
 
 
 
