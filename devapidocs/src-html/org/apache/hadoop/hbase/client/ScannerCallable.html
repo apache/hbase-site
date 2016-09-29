@@ -48,7 +48,7 @@
 <span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.UnknownScannerException;<a name="line.40"></a>
 <span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.41"></a>
 <span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.client.metrics.ScanMetrics;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.ipc.HBaseRpcController;<a name="line.43"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.exceptions.ScannerResetException;<a name="line.43"></a>
 <span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.ipc.RpcControllerFactory;<a name="line.44"></a>
 <span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.protobuf.ProtobufUtil;<a name="line.45"></a>
 <span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.protobuf.RequestConverter;<a name="line.46"></a>
@@ -110,7 +110,7 @@
 <span class="sourceLineNo">102</span>   * @param scan the scan to execute<a name="line.102"></a>
 <span class="sourceLineNo">103</span>   * @param scanMetrics the ScanMetrics to used, if it is null, ScannerCallable won't collect<a name="line.103"></a>
 <span class="sourceLineNo">104</span>   *          metrics<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * @param rpcControllerFactory factory to use when creating <a name="line.105"></a>
+<span class="sourceLineNo">105</span>   * @param rpcControllerFactory factory to use when creating<a name="line.105"></a>
 <span class="sourceLineNo">106</span>   *        {@link com.google.protobuf.RpcController}<a name="line.106"></a>
 <span class="sourceLineNo">107</span>   */<a name="line.107"></a>
 <span class="sourceLineNo">108</span>  public ScannerCallable(ClusterConnection connection, TableName tableName, Scan scan,<a name="line.108"></a>
@@ -182,287 +182,293 @@
 <span class="sourceLineNo">174</span>    }<a name="line.174"></a>
 <span class="sourceLineNo">175</span>  }<a name="line.175"></a>
 <span class="sourceLineNo">176</span><a name="line.176"></a>
-<span class="sourceLineNo">177</span>  protected Result [] rpcCall() throws Exception {<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    if (Thread.interrupted()) {<a name="line.178"></a>
-<span class="sourceLineNo">179</span>      throw new InterruptedIOException();<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    if (this.closed) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      if (this.scannerId != -1) {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>        close();<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      }<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    } else {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>      if (this.scannerId == -1L) {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>        this.scannerId = openScanner();<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      } else {<a name="line.188"></a>
-<span class="sourceLineNo">189</span>        Result [] rrs = null;<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        ScanRequest request = null;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>        // Reset the heartbeat flag prior to each RPC in case an exception is thrown by the server<a name="line.191"></a>
-<span class="sourceLineNo">192</span>        setHeartbeatMessage(false);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>        try {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>          incRPCcallsMetrics();<a name="line.194"></a>
-<span class="sourceLineNo">195</span>          request = RequestConverter.buildScanRequest(scannerId, caching, false, nextCallSeq,<a name="line.195"></a>
-<span class="sourceLineNo">196</span>                this.scanMetrics != null, renew);<a name="line.196"></a>
-<span class="sourceLineNo">197</span>          ScanResponse response = null;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>          response = getStub().scan(getRpcController(), request);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>          // Client and RS maintain a nextCallSeq number during the scan. Every next() call<a name="line.199"></a>
-<span class="sourceLineNo">200</span>          // from client to server will increment this number in both sides. Client passes this<a name="line.200"></a>
-<span class="sourceLineNo">201</span>          // number along with the request and at RS side both the incoming nextCallSeq and its<a name="line.201"></a>
-<span class="sourceLineNo">202</span>          // nextCallSeq will be matched. In case of a timeout this increment at the client side<a name="line.202"></a>
-<span class="sourceLineNo">203</span>          // should not happen. If at the server side fetching of next batch of data was over,<a name="line.203"></a>
-<span class="sourceLineNo">204</span>          // there will be mismatch in the nextCallSeq number. Server will throw<a name="line.204"></a>
-<span class="sourceLineNo">205</span>          // OutOfOrderScannerNextException and then client will reopen the scanner with startrow<a name="line.205"></a>
-<span class="sourceLineNo">206</span>          // as the last successfully retrieved row.<a name="line.206"></a>
-<span class="sourceLineNo">207</span>          // See HBASE-5974<a name="line.207"></a>
-<span class="sourceLineNo">208</span>          nextCallSeq++;<a name="line.208"></a>
-<span class="sourceLineNo">209</span>          long timestamp = System.currentTimeMillis();<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          setHeartbeatMessage(response.hasHeartbeatMessage() &amp;&amp; response.getHeartbeatMessage());<a name="line.210"></a>
-<span class="sourceLineNo">211</span>          rrs = ResponseConverter.getResults(getRpcControllerCellScanner(), response);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>          if (logScannerActivity) {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>            long now = System.currentTimeMillis();<a name="line.213"></a>
-<span class="sourceLineNo">214</span>            if (now - timestamp &gt; logCutOffLatency) {<a name="line.214"></a>
-<span class="sourceLineNo">215</span>              int rows = rrs == null ? 0 : rrs.length;<a name="line.215"></a>
-<span class="sourceLineNo">216</span>              LOG.info("Took " + (now-timestamp) + "ms to fetch "<a name="line.216"></a>
-<span class="sourceLineNo">217</span>                  + rows + " rows from scanner=" + scannerId);<a name="line.217"></a>
-<span class="sourceLineNo">218</span>            }<a name="line.218"></a>
-<span class="sourceLineNo">219</span>          }<a name="line.219"></a>
-<span class="sourceLineNo">220</span>          updateServerSideMetrics(response);<a name="line.220"></a>
-<span class="sourceLineNo">221</span>          // moreResults is only used for the case where a filter exhausts all elements<a name="line.221"></a>
-<span class="sourceLineNo">222</span>          if (response.hasMoreResults() &amp;&amp; !response.getMoreResults()) {<a name="line.222"></a>
-<span class="sourceLineNo">223</span>            this.scannerId = -1L;<a name="line.223"></a>
-<span class="sourceLineNo">224</span>            this.closed = true;<a name="line.224"></a>
-<span class="sourceLineNo">225</span>            // Implied that no results were returned back, either.<a name="line.225"></a>
-<span class="sourceLineNo">226</span>            return null;<a name="line.226"></a>
-<span class="sourceLineNo">227</span>          }<a name="line.227"></a>
-<span class="sourceLineNo">228</span>          // moreResultsInRegion explicitly defines when a RS may choose to terminate a batch due<a name="line.228"></a>
-<span class="sourceLineNo">229</span>          // to size or quantity of results in the response.<a name="line.229"></a>
-<span class="sourceLineNo">230</span>          if (response.hasMoreResultsInRegion()) {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>            // Set what the RS said<a name="line.231"></a>
-<span class="sourceLineNo">232</span>            setHasMoreResultsContext(true);<a name="line.232"></a>
-<span class="sourceLineNo">233</span>            setServerHasMoreResults(response.getMoreResultsInRegion());<a name="line.233"></a>
-<span class="sourceLineNo">234</span>          } else {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>            // Server didn't respond whether it has more results or not.<a name="line.235"></a>
-<span class="sourceLineNo">236</span>            setHasMoreResultsContext(false);<a name="line.236"></a>
-<span class="sourceLineNo">237</span>          }<a name="line.237"></a>
-<span class="sourceLineNo">238</span>          updateResultsMetrics(rrs);<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        } catch (IOException e) {<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          if (logScannerActivity) {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>            LOG.info("Got exception making request " + ProtobufUtil.toText(request) + " to " +<a name="line.241"></a>
-<span class="sourceLineNo">242</span>                getLocation(), e);<a name="line.242"></a>
-<span class="sourceLineNo">243</span>          }<a name="line.243"></a>
-<span class="sourceLineNo">244</span>          IOException ioe = e;<a name="line.244"></a>
-<span class="sourceLineNo">245</span>          if (e instanceof RemoteException) {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>            ioe = ((RemoteException) e).unwrapRemoteException();<a name="line.246"></a>
-<span class="sourceLineNo">247</span>          }<a name="line.247"></a>
-<span class="sourceLineNo">248</span>          if (logScannerActivity &amp;&amp; (ioe instanceof UnknownScannerException)) {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>            try {<a name="line.249"></a>
-<span class="sourceLineNo">250</span>              HRegionLocation location =<a name="line.250"></a>
-<span class="sourceLineNo">251</span>                  getConnection().relocateRegion(getTableName(), scan.getStartRow());<a name="line.251"></a>
-<span class="sourceLineNo">252</span>              LOG.info("Scanner=" + scannerId + " expired, current region location is " +<a name="line.252"></a>
-<span class="sourceLineNo">253</span>                  location.toString());<a name="line.253"></a>
-<span class="sourceLineNo">254</span>            } catch (Throwable t) {<a name="line.254"></a>
-<span class="sourceLineNo">255</span>              LOG.info("Failed to relocate region", t);<a name="line.255"></a>
-<span class="sourceLineNo">256</span>            }<a name="line.256"></a>
-<span class="sourceLineNo">257</span>          }<a name="line.257"></a>
-<span class="sourceLineNo">258</span>          // The below convertion of exceptions into DoNotRetryExceptions is a little strange.<a name="line.258"></a>
-<span class="sourceLineNo">259</span>          // Why not just have these exceptions implment DNRIOE you ask?  Well, usually we want<a name="line.259"></a>
-<span class="sourceLineNo">260</span>          // ServerCallable#withRetries to just retry when it gets these exceptions.  In here in<a name="line.260"></a>
-<span class="sourceLineNo">261</span>          // a scan when doing a next in particular, we want to break out and get the scanner to<a name="line.261"></a>
-<span class="sourceLineNo">262</span>          // reset itself up again.  Throwing a DNRIOE is how we signal this to happen (its ugly,<a name="line.262"></a>
-<span class="sourceLineNo">263</span>          // yeah and hard to follow and in need of a refactor).<a name="line.263"></a>
-<span class="sourceLineNo">264</span>          if (ioe instanceof NotServingRegionException) {<a name="line.264"></a>
-<span class="sourceLineNo">265</span>            // Throw a DNRE so that we break out of cycle of calling NSRE<a name="line.265"></a>
-<span class="sourceLineNo">266</span>            // when what we need is to open scanner against new location.<a name="line.266"></a>
-<span class="sourceLineNo">267</span>            // Attach NSRE to signal client that it needs to re-setup scanner.<a name="line.267"></a>
-<span class="sourceLineNo">268</span>            if (this.scanMetrics != null) {<a name="line.268"></a>
-<span class="sourceLineNo">269</span>              this.scanMetrics.countOfNSRE.incrementAndGet();<a name="line.269"></a>
-<span class="sourceLineNo">270</span>            }<a name="line.270"></a>
-<span class="sourceLineNo">271</span>            throw new DoNotRetryIOException("Resetting the scanner -- see exception cause", ioe);<a name="line.271"></a>
-<span class="sourceLineNo">272</span>          } else if (ioe instanceof RegionServerStoppedException) {<a name="line.272"></a>
-<span class="sourceLineNo">273</span>            // Throw a DNRE so that we break out of cycle of the retries and instead go and<a name="line.273"></a>
-<span class="sourceLineNo">274</span>            // open scanner against new location.<a name="line.274"></a>
-<span class="sourceLineNo">275</span>            throw new DoNotRetryIOException("Resetting the scanner -- see exception cause", ioe);<a name="line.275"></a>
-<span class="sourceLineNo">276</span>          } else {<a name="line.276"></a>
-<span class="sourceLineNo">277</span>            // The outer layers will retry<a name="line.277"></a>
-<span class="sourceLineNo">278</span>            throw ioe;<a name="line.278"></a>
-<span class="sourceLineNo">279</span>          }<a name="line.279"></a>
-<span class="sourceLineNo">280</span>        }<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        return rrs;<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      }<a name="line.282"></a>
-<span class="sourceLineNo">283</span>    }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>    return null;<a name="line.284"></a>
-<span class="sourceLineNo">285</span>  }<a name="line.285"></a>
-<span class="sourceLineNo">286</span><a name="line.286"></a>
-<span class="sourceLineNo">287</span>  /**<a name="line.287"></a>
-<span class="sourceLineNo">288</span>   * @return true when the most recent RPC response indicated that the response was a heartbeat<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   *         message. Heartbeat messages are sent back from the server when the processing of the<a name="line.289"></a>
-<span class="sourceLineNo">290</span>   *         scan request exceeds a certain time threshold. Heartbeats allow the server to avoid<a name="line.290"></a>
-<span class="sourceLineNo">291</span>   *         timeouts during long running scan operations.<a name="line.291"></a>
-<span class="sourceLineNo">292</span>   */<a name="line.292"></a>
-<span class="sourceLineNo">293</span>  protected boolean isHeartbeatMessage() {<a name="line.293"></a>
-<span class="sourceLineNo">294</span>    return heartbeatMessage;<a name="line.294"></a>
-<span class="sourceLineNo">295</span>  }<a name="line.295"></a>
-<span class="sourceLineNo">296</span><a name="line.296"></a>
-<span class="sourceLineNo">297</span>  protected void setHeartbeatMessage(boolean heartbeatMessage) {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    this.heartbeatMessage = heartbeatMessage;<a name="line.298"></a>
-<span class="sourceLineNo">299</span>  }<a name="line.299"></a>
-<span class="sourceLineNo">300</span><a name="line.300"></a>
-<span class="sourceLineNo">301</span>  private void incRPCcallsMetrics() {<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    if (this.scanMetrics == null) {<a name="line.302"></a>
-<span class="sourceLineNo">303</span>      return;<a name="line.303"></a>
-<span class="sourceLineNo">304</span>    }<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    this.scanMetrics.countOfRPCcalls.incrementAndGet();<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    if (isRegionServerRemote) {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      this.scanMetrics.countOfRemoteRPCcalls.incrementAndGet();<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    }<a name="line.308"></a>
-<span class="sourceLineNo">309</span>  }<a name="line.309"></a>
-<span class="sourceLineNo">310</span><a name="line.310"></a>
-<span class="sourceLineNo">311</span>  protected void updateResultsMetrics(Result[] rrs) {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    if (this.scanMetrics == null || rrs == null || rrs.length == 0) {<a name="line.312"></a>
-<span class="sourceLineNo">313</span>      return;<a name="line.313"></a>
+<span class="sourceLineNo">177</span>  @Override<a name="line.177"></a>
+<span class="sourceLineNo">178</span>  protected Result [] rpcCall() throws Exception {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>    if (Thread.interrupted()) {<a name="line.179"></a>
+<span class="sourceLineNo">180</span>      throw new InterruptedIOException();<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    if (this.closed) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      if (this.scannerId != -1) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        close();<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      }<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    } else {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      if (this.scannerId == -1L) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        this.scannerId = openScanner();<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      } else {<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        Result [] rrs = null;<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        ScanRequest request = null;<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        // Reset the heartbeat flag prior to each RPC in case an exception is thrown by the server<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        setHeartbeatMessage(false);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        try {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>          incRPCcallsMetrics();<a name="line.195"></a>
+<span class="sourceLineNo">196</span>          request = RequestConverter.buildScanRequest(scannerId, caching, false, nextCallSeq,<a name="line.196"></a>
+<span class="sourceLineNo">197</span>                this.scanMetrics != null, renew);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>          ScanResponse response = null;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          response = getStub().scan(getRpcController(), request);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>          // Client and RS maintain a nextCallSeq number during the scan. Every next() call<a name="line.200"></a>
+<span class="sourceLineNo">201</span>          // from client to server will increment this number in both sides. Client passes this<a name="line.201"></a>
+<span class="sourceLineNo">202</span>          // number along with the request and at RS side both the incoming nextCallSeq and its<a name="line.202"></a>
+<span class="sourceLineNo">203</span>          // nextCallSeq will be matched. In case of a timeout this increment at the client side<a name="line.203"></a>
+<span class="sourceLineNo">204</span>          // should not happen. If at the server side fetching of next batch of data was over,<a name="line.204"></a>
+<span class="sourceLineNo">205</span>          // there will be mismatch in the nextCallSeq number. Server will throw<a name="line.205"></a>
+<span class="sourceLineNo">206</span>          // OutOfOrderScannerNextException and then client will reopen the scanner with startrow<a name="line.206"></a>
+<span class="sourceLineNo">207</span>          // as the last successfully retrieved row.<a name="line.207"></a>
+<span class="sourceLineNo">208</span>          // See HBASE-5974<a name="line.208"></a>
+<span class="sourceLineNo">209</span>          nextCallSeq++;<a name="line.209"></a>
+<span class="sourceLineNo">210</span>          long timestamp = System.currentTimeMillis();<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          setHeartbeatMessage(response.hasHeartbeatMessage() &amp;&amp; response.getHeartbeatMessage());<a name="line.211"></a>
+<span class="sourceLineNo">212</span>          rrs = ResponseConverter.getResults(getRpcControllerCellScanner(), response);<a name="line.212"></a>
+<span class="sourceLineNo">213</span>          if (logScannerActivity) {<a name="line.213"></a>
+<span class="sourceLineNo">214</span>            long now = System.currentTimeMillis();<a name="line.214"></a>
+<span class="sourceLineNo">215</span>            if (now - timestamp &gt; logCutOffLatency) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>              int rows = rrs == null ? 0 : rrs.length;<a name="line.216"></a>
+<span class="sourceLineNo">217</span>              LOG.info("Took " + (now-timestamp) + "ms to fetch "<a name="line.217"></a>
+<span class="sourceLineNo">218</span>                  + rows + " rows from scanner=" + scannerId);<a name="line.218"></a>
+<span class="sourceLineNo">219</span>            }<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          }<a name="line.220"></a>
+<span class="sourceLineNo">221</span>          updateServerSideMetrics(response);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>          // moreResults is only used for the case where a filter exhausts all elements<a name="line.222"></a>
+<span class="sourceLineNo">223</span>          if (response.hasMoreResults() &amp;&amp; !response.getMoreResults()) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>            this.scannerId = -1L;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>            this.closed = true;<a name="line.225"></a>
+<span class="sourceLineNo">226</span>            // Implied that no results were returned back, either.<a name="line.226"></a>
+<span class="sourceLineNo">227</span>            return null;<a name="line.227"></a>
+<span class="sourceLineNo">228</span>          }<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          // moreResultsInRegion explicitly defines when a RS may choose to terminate a batch due<a name="line.229"></a>
+<span class="sourceLineNo">230</span>          // to size or quantity of results in the response.<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          if (response.hasMoreResultsInRegion()) {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>            // Set what the RS said<a name="line.232"></a>
+<span class="sourceLineNo">233</span>            setHasMoreResultsContext(true);<a name="line.233"></a>
+<span class="sourceLineNo">234</span>            setServerHasMoreResults(response.getMoreResultsInRegion());<a name="line.234"></a>
+<span class="sourceLineNo">235</span>          } else {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>            // Server didn't respond whether it has more results or not.<a name="line.236"></a>
+<span class="sourceLineNo">237</span>            setHasMoreResultsContext(false);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>          }<a name="line.238"></a>
+<span class="sourceLineNo">239</span>          updateResultsMetrics(rrs);<a name="line.239"></a>
+<span class="sourceLineNo">240</span>        } catch (IOException e) {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>          if (logScannerActivity) {<a name="line.241"></a>
+<span class="sourceLineNo">242</span>            LOG.info("Got exception making request " + ProtobufUtil.toText(request) + " to " +<a name="line.242"></a>
+<span class="sourceLineNo">243</span>                getLocation(), e);<a name="line.243"></a>
+<span class="sourceLineNo">244</span>          }<a name="line.244"></a>
+<span class="sourceLineNo">245</span>          IOException ioe = e;<a name="line.245"></a>
+<span class="sourceLineNo">246</span>          if (e instanceof RemoteException) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>            ioe = ((RemoteException) e).unwrapRemoteException();<a name="line.247"></a>
+<span class="sourceLineNo">248</span>          }<a name="line.248"></a>
+<span class="sourceLineNo">249</span>          if (logScannerActivity) {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>            if (ioe instanceof UnknownScannerException) {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>              try {<a name="line.251"></a>
+<span class="sourceLineNo">252</span>                HRegionLocation location =<a name="line.252"></a>
+<span class="sourceLineNo">253</span>                    getConnection().relocateRegion(getTableName(), scan.getStartRow());<a name="line.253"></a>
+<span class="sourceLineNo">254</span>                LOG.info("Scanner=" + scannerId + " expired, current region location is " +<a name="line.254"></a>
+<span class="sourceLineNo">255</span>                    location.toString());<a name="line.255"></a>
+<span class="sourceLineNo">256</span>              } catch (Throwable t) {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>                LOG.info("Failed to relocate region", t);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>              }<a name="line.258"></a>
+<span class="sourceLineNo">259</span>            } else if (ioe instanceof ScannerResetException) {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>              LOG.info("Scanner=" + scannerId + " has received an exception, and the server "<a name="line.260"></a>
+<span class="sourceLineNo">261</span>                  + "asked us to reset the scanner state.", ioe);<a name="line.261"></a>
+<span class="sourceLineNo">262</span>            }<a name="line.262"></a>
+<span class="sourceLineNo">263</span>          }<a name="line.263"></a>
+<span class="sourceLineNo">264</span>          // The below convertion of exceptions into DoNotRetryExceptions is a little strange.<a name="line.264"></a>
+<span class="sourceLineNo">265</span>          // Why not just have these exceptions implment DNRIOE you ask?  Well, usually we want<a name="line.265"></a>
+<span class="sourceLineNo">266</span>          // ServerCallable#withRetries to just retry when it gets these exceptions.  In here in<a name="line.266"></a>
+<span class="sourceLineNo">267</span>          // a scan when doing a next in particular, we want to break out and get the scanner to<a name="line.267"></a>
+<span class="sourceLineNo">268</span>          // reset itself up again.  Throwing a DNRIOE is how we signal this to happen (its ugly,<a name="line.268"></a>
+<span class="sourceLineNo">269</span>          // yeah and hard to follow and in need of a refactor).<a name="line.269"></a>
+<span class="sourceLineNo">270</span>          if (ioe instanceof NotServingRegionException) {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>            // Throw a DNRE so that we break out of cycle of calling NSRE<a name="line.271"></a>
+<span class="sourceLineNo">272</span>            // when what we need is to open scanner against new location.<a name="line.272"></a>
+<span class="sourceLineNo">273</span>            // Attach NSRE to signal client that it needs to re-setup scanner.<a name="line.273"></a>
+<span class="sourceLineNo">274</span>            if (this.scanMetrics != null) {<a name="line.274"></a>
+<span class="sourceLineNo">275</span>              this.scanMetrics.countOfNSRE.incrementAndGet();<a name="line.275"></a>
+<span class="sourceLineNo">276</span>            }<a name="line.276"></a>
+<span class="sourceLineNo">277</span>            throw new DoNotRetryIOException("Resetting the scanner -- see exception cause", ioe);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>          } else if (ioe instanceof RegionServerStoppedException) {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>            // Throw a DNRE so that we break out of cycle of the retries and instead go and<a name="line.279"></a>
+<span class="sourceLineNo">280</span>            // open scanner against new location.<a name="line.280"></a>
+<span class="sourceLineNo">281</span>            throw new DoNotRetryIOException("Resetting the scanner -- see exception cause", ioe);<a name="line.281"></a>
+<span class="sourceLineNo">282</span>          } else {<a name="line.282"></a>
+<span class="sourceLineNo">283</span>            // The outer layers will retry<a name="line.283"></a>
+<span class="sourceLineNo">284</span>            throw ioe;<a name="line.284"></a>
+<span class="sourceLineNo">285</span>          }<a name="line.285"></a>
+<span class="sourceLineNo">286</span>        }<a name="line.286"></a>
+<span class="sourceLineNo">287</span>        return rrs;<a name="line.287"></a>
+<span class="sourceLineNo">288</span>      }<a name="line.288"></a>
+<span class="sourceLineNo">289</span>    }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>    return null;<a name="line.290"></a>
+<span class="sourceLineNo">291</span>  }<a name="line.291"></a>
+<span class="sourceLineNo">292</span><a name="line.292"></a>
+<span class="sourceLineNo">293</span>  /**<a name="line.293"></a>
+<span class="sourceLineNo">294</span>   * @return true when the most recent RPC response indicated that the response was a heartbeat<a name="line.294"></a>
+<span class="sourceLineNo">295</span>   *         message. Heartbeat messages are sent back from the server when the processing of the<a name="line.295"></a>
+<span class="sourceLineNo">296</span>   *         scan request exceeds a certain time threshold. Heartbeats allow the server to avoid<a name="line.296"></a>
+<span class="sourceLineNo">297</span>   *         timeouts during long running scan operations.<a name="line.297"></a>
+<span class="sourceLineNo">298</span>   */<a name="line.298"></a>
+<span class="sourceLineNo">299</span>  protected boolean isHeartbeatMessage() {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    return heartbeatMessage;<a name="line.300"></a>
+<span class="sourceLineNo">301</span>  }<a name="line.301"></a>
+<span class="sourceLineNo">302</span><a name="line.302"></a>
+<span class="sourceLineNo">303</span>  protected void setHeartbeatMessage(boolean heartbeatMessage) {<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    this.heartbeatMessage = heartbeatMessage;<a name="line.304"></a>
+<span class="sourceLineNo">305</span>  }<a name="line.305"></a>
+<span class="sourceLineNo">306</span><a name="line.306"></a>
+<span class="sourceLineNo">307</span>  private void incRPCcallsMetrics() {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>    if (this.scanMetrics == null) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      return;<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    }<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    this.scanMetrics.countOfRPCcalls.incrementAndGet();<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    if (isRegionServerRemote) {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      this.scanMetrics.countOfRemoteRPCcalls.incrementAndGet();<a name="line.313"></a>
 <span class="sourceLineNo">314</span>    }<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    long resultSize = 0;<a name="line.315"></a>
-<span class="sourceLineNo">316</span>    for (Result rr : rrs) {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>      for (Cell cell : rr.rawCells()) {<a name="line.317"></a>
-<span class="sourceLineNo">318</span>        resultSize += CellUtil.estimatedSerializedSizeOf(cell);<a name="line.318"></a>
-<span class="sourceLineNo">319</span>      }<a name="line.319"></a>
+<span class="sourceLineNo">315</span>  }<a name="line.315"></a>
+<span class="sourceLineNo">316</span><a name="line.316"></a>
+<span class="sourceLineNo">317</span>  protected void updateResultsMetrics(Result[] rrs) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    if (this.scanMetrics == null || rrs == null || rrs.length == 0) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>      return;<a name="line.319"></a>
 <span class="sourceLineNo">320</span>    }<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    this.scanMetrics.countOfBytesInResults.addAndGet(resultSize);<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    if (isRegionServerRemote) {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      this.scanMetrics.countOfBytesInRemoteResults.addAndGet(resultSize);<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    }<a name="line.324"></a>
-<span class="sourceLineNo">325</span>  }<a name="line.325"></a>
-<span class="sourceLineNo">326</span><a name="line.326"></a>
-<span class="sourceLineNo">327</span>  /**<a name="line.327"></a>
-<span class="sourceLineNo">328</span>   * Use the scan metrics returned by the server to add to the identically named counters in the<a name="line.328"></a>
-<span class="sourceLineNo">329</span>   * client side metrics. If a counter does not exist with the same name as the server side metric,<a name="line.329"></a>
-<span class="sourceLineNo">330</span>   * the attempt to increase the counter will fail.<a name="line.330"></a>
-<span class="sourceLineNo">331</span>   * @param response<a name="line.331"></a>
-<span class="sourceLineNo">332</span>   */<a name="line.332"></a>
-<span class="sourceLineNo">333</span>  private void updateServerSideMetrics(ScanResponse response) {<a name="line.333"></a>
-<span class="sourceLineNo">334</span>    if (this.scanMetrics == null || response == null || !response.hasScanMetrics()) return;<a name="line.334"></a>
-<span class="sourceLineNo">335</span><a name="line.335"></a>
-<span class="sourceLineNo">336</span>    Map&lt;String, Long&gt; serverMetrics = ResponseConverter.getScanMetrics(response);<a name="line.336"></a>
-<span class="sourceLineNo">337</span>    for (Entry&lt;String, Long&gt; entry : serverMetrics.entrySet()) {<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      this.scanMetrics.addToCounter(entry.getKey(), entry.getValue());<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    }<a name="line.339"></a>
-<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
+<span class="sourceLineNo">321</span>    long resultSize = 0;<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    for (Result rr : rrs) {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      for (Cell cell : rr.rawCells()) {<a name="line.323"></a>
+<span class="sourceLineNo">324</span>        resultSize += CellUtil.estimatedSerializedSizeOf(cell);<a name="line.324"></a>
+<span class="sourceLineNo">325</span>      }<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    }<a name="line.326"></a>
+<span class="sourceLineNo">327</span>    this.scanMetrics.countOfBytesInResults.addAndGet(resultSize);<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    if (isRegionServerRemote) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      this.scanMetrics.countOfBytesInRemoteResults.addAndGet(resultSize);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
+<span class="sourceLineNo">331</span>  }<a name="line.331"></a>
+<span class="sourceLineNo">332</span><a name="line.332"></a>
+<span class="sourceLineNo">333</span>  /**<a name="line.333"></a>
+<span class="sourceLineNo">334</span>   * Use the scan metrics returned by the server to add to the identically named counters in the<a name="line.334"></a>
+<span class="sourceLineNo">335</span>   * client side metrics. If a counter does not exist with the same name as the server side metric,<a name="line.335"></a>
+<span class="sourceLineNo">336</span>   * the attempt to increase the counter will fail.<a name="line.336"></a>
+<span class="sourceLineNo">337</span>   * @param response<a name="line.337"></a>
+<span class="sourceLineNo">338</span>   */<a name="line.338"></a>
+<span class="sourceLineNo">339</span>  private void updateServerSideMetrics(ScanResponse response) {<a name="line.339"></a>
+<span class="sourceLineNo">340</span>    if (this.scanMetrics == null || response == null || !response.hasScanMetrics()) return;<a name="line.340"></a>
 <span class="sourceLineNo">341</span><a name="line.341"></a>
-<span class="sourceLineNo">342</span>  private void close() {<a name="line.342"></a>
-<span class="sourceLineNo">343</span>    if (this.scannerId == -1L) {<a name="line.343"></a>
-<span class="sourceLineNo">344</span>      return;<a name="line.344"></a>
+<span class="sourceLineNo">342</span>    Map&lt;String, Long&gt; serverMetrics = ResponseConverter.getScanMetrics(response);<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    for (Entry&lt;String, Long&gt; entry : serverMetrics.entrySet()) {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      this.scanMetrics.addToCounter(entry.getKey(), entry.getValue());<a name="line.344"></a>
 <span class="sourceLineNo">345</span>    }<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    try {<a name="line.346"></a>
-<span class="sourceLineNo">347</span>      incRPCcallsMetrics();<a name="line.347"></a>
-<span class="sourceLineNo">348</span>      ScanRequest request =<a name="line.348"></a>
-<span class="sourceLineNo">349</span>          RequestConverter.buildScanRequest(this.scannerId, 0, true, this.scanMetrics != null);<a name="line.349"></a>
-<span class="sourceLineNo">350</span>      try {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>        getStub().scan(getRpcController(), request);<a name="line.351"></a>
-<span class="sourceLineNo">352</span>      } catch (Exception e) {<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        throw ProtobufUtil.handleRemoteException(e);<a name="line.353"></a>
-<span class="sourceLineNo">354</span>      }<a name="line.354"></a>
-<span class="sourceLineNo">355</span>    } catch (IOException e) {<a name="line.355"></a>
-<span class="sourceLineNo">356</span>      LOG.warn("Ignore, probably already closed", e);<a name="line.356"></a>
-<span class="sourceLineNo">357</span>    }<a name="line.357"></a>
-<span class="sourceLineNo">358</span>    this.scannerId = -1L;<a name="line.358"></a>
-<span class="sourceLineNo">359</span>  }<a name="line.359"></a>
-<span class="sourceLineNo">360</span><a name="line.360"></a>
-<span class="sourceLineNo">361</span>  protected long openScanner() throws IOException {<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    incRPCcallsMetrics();<a name="line.362"></a>
-<span class="sourceLineNo">363</span>    ScanRequest request = RequestConverter.buildScanRequest(<a name="line.363"></a>
-<span class="sourceLineNo">364</span>        getLocation().getRegionInfo().getRegionName(), this.scan, 0, false);<a name="line.364"></a>
-<span class="sourceLineNo">365</span>    try {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>      ScanResponse response = getStub().scan(getRpcController(), request);<a name="line.366"></a>
-<span class="sourceLineNo">367</span>      long id = response.getScannerId();<a name="line.367"></a>
-<span class="sourceLineNo">368</span>      if (logScannerActivity) {<a name="line.368"></a>
-<span class="sourceLineNo">369</span>        LOG.info("Open scanner=" + id + " for scan=" + scan.toString()<a name="line.369"></a>
-<span class="sourceLineNo">370</span>          + " on region " + getLocation().toString());<a name="line.370"></a>
-<span class="sourceLineNo">371</span>      }<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      return id;<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    } catch (Exception e) {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      throw ProtobufUtil.handleRemoteException(e);<a name="line.374"></a>
-<span class="sourceLineNo">375</span>    }<a name="line.375"></a>
-<span class="sourceLineNo">376</span>  }<a name="line.376"></a>
-<span class="sourceLineNo">377</span><a name="line.377"></a>
-<span class="sourceLineNo">378</span>  protected Scan getScan() {<a name="line.378"></a>
-<span class="sourceLineNo">379</span>    return scan;<a name="line.379"></a>
-<span class="sourceLineNo">380</span>  }<a name="line.380"></a>
-<span class="sourceLineNo">381</span><a name="line.381"></a>
-<span class="sourceLineNo">382</span>  /**<a name="line.382"></a>
-<span class="sourceLineNo">383</span>   * Call this when the next invocation of call should close the scanner<a name="line.383"></a>
-<span class="sourceLineNo">384</span>   */<a name="line.384"></a>
-<span class="sourceLineNo">385</span>  public void setClose() {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>    this.closed = true;<a name="line.386"></a>
-<span class="sourceLineNo">387</span>  }<a name="line.387"></a>
-<span class="sourceLineNo">388</span><a name="line.388"></a>
-<span class="sourceLineNo">389</span>  /**<a name="line.389"></a>
-<span class="sourceLineNo">390</span>   * Indicate whether we make a call only to renew the lease, but without affected the scanner in<a name="line.390"></a>
-<span class="sourceLineNo">391</span>   * any other way.<a name="line.391"></a>
-<span class="sourceLineNo">392</span>   * @param val true if only the lease should be renewed<a name="line.392"></a>
-<span class="sourceLineNo">393</span>   */<a name="line.393"></a>
-<span class="sourceLineNo">394</span>  public void setRenew(boolean val) {<a name="line.394"></a>
-<span class="sourceLineNo">395</span>    this.renew = val;<a name="line.395"></a>
-<span class="sourceLineNo">396</span>  }<a name="line.396"></a>
-<span class="sourceLineNo">397</span><a name="line.397"></a>
-<span class="sourceLineNo">398</span>  /**<a name="line.398"></a>
-<span class="sourceLineNo">399</span>   * @return the HRegionInfo for the current region<a name="line.399"></a>
-<span class="sourceLineNo">400</span>   */<a name="line.400"></a>
-<span class="sourceLineNo">401</span>  @Override<a name="line.401"></a>
-<span class="sourceLineNo">402</span>  public HRegionInfo getHRegionInfo() {<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    if (!instantiated) {<a name="line.403"></a>
-<span class="sourceLineNo">404</span>      return null;<a name="line.404"></a>
-<span class="sourceLineNo">405</span>    }<a name="line.405"></a>
-<span class="sourceLineNo">406</span>    return getLocation().getRegionInfo();<a name="line.406"></a>
-<span class="sourceLineNo">407</span>  }<a name="line.407"></a>
-<span class="sourceLineNo">408</span><a name="line.408"></a>
-<span class="sourceLineNo">409</span>  /**<a name="line.409"></a>
-<span class="sourceLineNo">410</span>   * Get the number of rows that will be fetched on next<a name="line.410"></a>
-<span class="sourceLineNo">411</span>   * @return the number of rows for caching<a name="line.411"></a>
-<span class="sourceLineNo">412</span>   */<a name="line.412"></a>
-<span class="sourceLineNo">413</span>  public int getCaching() {<a name="line.413"></a>
-<span class="sourceLineNo">414</span>    return caching;<a name="line.414"></a>
-<span class="sourceLineNo">415</span>  }<a name="line.415"></a>
-<span class="sourceLineNo">416</span><a name="line.416"></a>
-<span class="sourceLineNo">417</span>  /**<a name="line.417"></a>
-<span class="sourceLineNo">418</span>   * Set the number of rows that will be fetched on next<a name="line.418"></a>
-<span class="sourceLineNo">419</span>   * @param caching the number of rows for caching<a name="line.419"></a>
-<span class="sourceLineNo">420</span>   */<a name="line.420"></a>
-<span class="sourceLineNo">421</span>  public void setCaching(int caching) {<a name="line.421"></a>
-<span class="sourceLineNo">422</span>    this.caching = caching;<a name="line.422"></a>
-<span class="sourceLineNo">423</span>  }<a name="line.423"></a>
-<span class="sourceLineNo">424</span><a name="line.424"></a>
-<span class="sourceLineNo">425</span>  public ScannerCallable getScannerCallableForReplica(int id) {<a name="line.425"></a>
-<span class="sourceLineNo">426</span>    ScannerCallable s = new ScannerCallable(this.getConnection(), this.tableName,<a name="line.426"></a>
-<span class="sourceLineNo">427</span>        this.getScan(), this.scanMetrics, this.rpcControllerFactory, id);<a name="line.427"></a>
-<span class="sourceLineNo">428</span>    s.setCaching(this.caching);<a name="line.428"></a>
-<span class="sourceLineNo">429</span>    return s;<a name="line.429"></a>
-<span class="sourceLineNo">430</span>  }<a name="line.430"></a>
-<span class="sourceLineNo">431</span><a name="line.431"></a>
-<span class="sourceLineNo">432</span>  /**<a name="line.432"></a>
-<span class="sourceLineNo">433</span>   * Should the client attempt to fetch more results from this region<a name="line.433"></a>
-<span class="sourceLineNo">434</span>   * @return True if the client should attempt to fetch more results, false otherwise.<a name="line.434"></a>
-<span class="sourceLineNo">435</span>   */<a name="line.435"></a>
-<span class="sourceLineNo">436</span>  protected boolean getServerHasMoreResults() {<a name="line.436"></a>
-<span class="sourceLineNo">437</span>    assert serverHasMoreResultsContext;<a name="line.437"></a>
-<span class="sourceLineNo">438</span>    return this.serverHasMoreResults;<a name="line.438"></a>
-<span class="sourceLineNo">439</span>  }<a name="line.439"></a>
-<span class="sourceLineNo">440</span><a name="line.440"></a>
-<span class="sourceLineNo">441</span>  protected void setServerHasMoreResults(boolean serverHasMoreResults) {<a name="line.441"></a>
-<span class="sourceLineNo">442</span>    this.serverHasMoreResults = serverHasMoreResults;<a name="line.442"></a>
-<span class="sourceLineNo">443</span>  }<a name="line.443"></a>
-<span class="sourceLineNo">444</span><a name="line.444"></a>
-<span class="sourceLineNo">445</span>  /**<a name="line.445"></a>
-<span class="sourceLineNo">446</span>   * Did the server respond with information about whether more results might exist.<a name="line.446"></a>
-<span class="sourceLineNo">447</span>   * Not guaranteed to respond with older server versions<a name="line.447"></a>
-<span class="sourceLineNo">448</span>   * @return True if the server responded with information about more results.<a name="line.448"></a>
-<span class="sourceLineNo">449</span>   */<a name="line.449"></a>
-<span class="sourceLineNo">450</span>  protected boolean hasMoreResultsContext() {<a name="line.450"></a>
-<span class="sourceLineNo">451</span>    return serverHasMoreResultsContext;<a name="line.451"></a>
-<span class="sourceLineNo">452</span>  }<a name="line.452"></a>
-<span class="sourceLineNo">453</span><a name="line.453"></a>
-<span class="sourceLineNo">454</span>  protected void setHasMoreResultsContext(boolean serverHasMoreResultsContext) {<a name="line.454"></a>
-<span class="sourceLineNo">455</span>    this.serverHasMoreResultsContext = serverHasMoreResultsContext;<a name="line.455"></a>
-<span class="sourceLineNo">456</span>  }<a name="line.456"></a>
-<span class="sourceLineNo">457</span>}<a name="line.457"></a>
+<span class="sourceLineNo">346</span>  }<a name="line.346"></a>
+<span class="sourceLineNo">347</span><a name="line.347"></a>
+<span class="sourceLineNo">348</span>  private void close() {<a name="line.348"></a>
+<span class="sourceLineNo">349</span>    if (this.scannerId == -1L) {<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      return;<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    }<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    try {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>      incRPCcallsMetrics();<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      ScanRequest request =<a name="line.354"></a>
+<span class="sourceLineNo">355</span>          RequestConverter.buildScanRequest(this.scannerId, 0, true, this.scanMetrics != null);<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      try {<a name="line.356"></a>
+<span class="sourceLineNo">357</span>        getStub().scan(getRpcController(), request);<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      } catch (Exception e) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>        throw ProtobufUtil.handleRemoteException(e);<a name="line.359"></a>
+<span class="sourceLineNo">360</span>      }<a name="line.360"></a>
+<span class="sourceLineNo">361</span>    } catch (IOException e) {<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      LOG.warn("Ignore, probably already closed", e);<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    }<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    this.scannerId = -1L;<a name="line.364"></a>
+<span class="sourceLineNo">365</span>  }<a name="line.365"></a>
+<span class="sourceLineNo">366</span><a name="line.366"></a>
+<span class="sourceLineNo">367</span>  protected long openScanner() throws IOException {<a name="line.367"></a>
+<span class="sourceLineNo">368</span>    incRPCcallsMetrics();<a name="line.368"></a>
+<span class="sourceLineNo">369</span>    ScanRequest request = RequestConverter.buildScanRequest(<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        getLocation().getRegionInfo().getRegionName(), this.scan, 0, false);<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    try {<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      ScanResponse response = getStub().scan(getRpcController(), request);<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      long id = response.getScannerId();<a name="line.373"></a>
+<span class="sourceLineNo">374</span>      if (logScannerActivity) {<a name="line.374"></a>
+<span class="sourceLineNo">375</span>        LOG.info("Open scanner=" + id + " for scan=" + scan.toString()<a name="line.375"></a>
+<span class="sourceLineNo">376</span>          + " on region " + getLocation().toString());<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      }<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      return id;<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    } catch (Exception e) {<a name="line.379"></a>
+<span class="sourceLineNo">380</span>      throw ProtobufUtil.handleRemoteException(e);<a name="line.380"></a>
+<span class="sourceLineNo">381</span>    }<a name="line.381"></a>
+<span class="sourceLineNo">382</span>  }<a name="line.382"></a>
+<span class="sourceLineNo">383</span><a name="line.383"></a>
+<span class="sourceLineNo">384</span>  protected Scan getScan() {<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    return scan;<a name="line.385"></a>
+<span class="sourceLineNo">386</span>  }<a name="line.386"></a>
+<span class="sourceLineNo">387</span><a name="line.387"></a>
+<span class="sourceLineNo">388</span>  /**<a name="line.388"></a>
+<span class="sourceLineNo">389</span>   * Call this when the next invocation of call should close the scanner<a name="line.389"></a>
+<span class="sourceLineNo">390</span>   */<a name="line.390"></a>
+<span class="sourceLineNo">391</span>  public void setClose() {<a name="line.391"></a>
+<span class="sourceLineNo">392</span>    this.closed = true;<a name="line.392"></a>
+<span class="sourceLineNo">393</span>  }<a name="line.393"></a>
+<span class="sourceLineNo">394</span><a name="line.394"></a>
+<span class="sourceLineNo">395</span>  /**<a name="line.395"></a>
+<span class="sourceLineNo">396</span>   * Indicate whether we make a call only to renew the lease, but without affected the scanner in<a name="line.396"></a>
+<span class="sourceLineNo">397</span>   * any other way.<a name="line.397"></a>
+<span class="sourceLineNo">398</span>   * @param val true if only the lease should be renewed<a name="line.398"></a>
+<span class="sourceLineNo">399</span>   */<a name="line.399"></a>
+<span class="sourceLineNo">400</span>  public void setRenew(boolean val) {<a name="line.400"></a>
+<span class="sourceLineNo">401</span>    this.renew = val;<a name="line.401"></a>
+<span class="sourceLineNo">402</span>  }<a name="line.402"></a>
+<span class="sourceLineNo">403</span><a name="line.403"></a>
+<span class="sourceLineNo">404</span>  /**<a name="line.404"></a>
+<span class="sourceLineNo">405</span>   * @return the HRegionInfo for the current region<a name="line.405"></a>
+<span class="sourceLineNo">406</span>   */<a name="line.406"></a>
+<span class="sourceLineNo">407</span>  @Override<a name="line.407"></a>
+<span class="sourceLineNo">408</span>  public HRegionInfo getHRegionInfo() {<a name="line.408"></a>
+<span class="sourceLineNo">409</span>    if (!instantiated) {<a name="line.409"></a>
+<span class="sourceLineNo">410</span>      return null;<a name="line.410"></a>
+<span class="sourceLineNo">411</span>    }<a name="line.411"></a>
+<span class="sourceLineNo">412</span>    return getLocation().getRegionInfo();<a name="line.412"></a>
+<span class="sourceLineNo">413</span>  }<a name="line.413"></a>
+<span class="sourceLineNo">414</span><a name="line.414"></a>
+<span class="sourceLineNo">415</span>  /**<a name="line.415"></a>
+<span class="sourceLineNo">416</span>   * Get the number of rows that will be fetched on next<a name="line.416"></a>
+<span class="sourceLineNo">417</span>   * @return the number of rows for caching<a name="line.417"></a>
+<span class="sourceLineNo">418</span>   */<a name="line.418"></a>
+<span class="sourceLineNo">419</span>  public int getCaching() {<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    return caching;<a name="line.420"></a>
+<span class="sourceLineNo">421</span>  }<a name="line.421"></a>
+<span class="sourceLineNo">422</span><a name="line.422"></a>
+<span class="sourceLineNo">423</span>  /**<a name="line.423"></a>
+<span class="sourceLineNo">424</span>   * Set the number of rows that will be fetched on next<a name="line.424"></a>
+<span class="sourceLineNo">425</span>   * @param caching the number of rows for caching<a name="line.425"></a>
+<span class="sourceLineNo">426</span>   */<a name="line.426"></a>
+<span class="sourceLineNo">427</span>  public void setCaching(int caching) {<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    this.caching = caching;<a name="line.428"></a>
+<span class="sourceLineNo">429</span>  }<a name="line.429"></a>
+<span class="sourceLineNo">430</span><a name="line.430"></a>
+<span class="sourceLineNo">431</span>  public ScannerCallable getScannerCallableForReplica(int id) {<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    ScannerCallable s = new ScannerCallable(this.getConnection(), this.tableName,<a name="line.432"></a>
+<span class="sourceLineNo">433</span>        this.getScan(), this.scanMetrics, this.rpcControllerFactory, id);<a name="line.433"></a>
+<span class="sourceLineNo">434</span>    s.setCaching(this.caching);<a name="line.434"></a>
+<span class="sourceLineNo">435</span>    return s;<a name="line.435"></a>
+<span class="sourceLineNo">436</span>  }<a name="line.436"></a>
+<span class="sourceLineNo">437</span><a name="line.437"></a>
+<span class="sourceLineNo">438</span>  /**<a name="line.438"></a>
+<span class="sourceLineNo">439</span>   * Should the client attempt to fetch more results from this region<a name="line.439"></a>
+<span class="sourceLineNo">440</span>   * @return True if the client should attempt to fetch more results, false otherwise.<a name="line.440"></a>
+<span class="sourceLineNo">441</span>   */<a name="line.441"></a>
+<span class="sourceLineNo">442</span>  protected boolean getServerHasMoreResults() {<a name="line.442"></a>
+<span class="sourceLineNo">443</span>    assert serverHasMoreResultsContext;<a name="line.443"></a>
+<span class="sourceLineNo">444</span>    return this.serverHasMoreResults;<a name="line.444"></a>
+<span class="sourceLineNo">445</span>  }<a name="line.445"></a>
+<span class="sourceLineNo">446</span><a name="line.446"></a>
+<span class="sourceLineNo">447</span>  protected void setServerHasMoreResults(boolean serverHasMoreResults) {<a name="line.447"></a>
+<span class="sourceLineNo">448</span>    this.serverHasMoreResults = serverHasMoreResults;<a name="line.448"></a>
+<span class="sourceLineNo">449</span>  }<a name="line.449"></a>
+<span class="sourceLineNo">450</span><a name="line.450"></a>
+<span class="sourceLineNo">451</span>  /**<a name="line.451"></a>
+<span class="sourceLineNo">452</span>   * Did the server respond with information about whether more results might exist.<a name="line.452"></a>
+<span class="sourceLineNo">453</span>   * Not guaranteed to respond with older server versions<a name="line.453"></a>
+<span class="sourceLineNo">454</span>   * @return True if the server responded with information about more results.<a name="line.454"></a>
+<span class="sourceLineNo">455</span>   */<a name="line.455"></a>
+<span class="sourceLineNo">456</span>  protected boolean hasMoreResultsContext() {<a name="line.456"></a>
+<span class="sourceLineNo">457</span>    return serverHasMoreResultsContext;<a name="line.457"></a>
+<span class="sourceLineNo">458</span>  }<a name="line.458"></a>
+<span class="sourceLineNo">459</span><a name="line.459"></a>
+<span class="sourceLineNo">460</span>  protected void setHasMoreResultsContext(boolean serverHasMoreResultsContext) {<a name="line.460"></a>
+<span class="sourceLineNo">461</span>    this.serverHasMoreResultsContext = serverHasMoreResultsContext;<a name="line.461"></a>
+<span class="sourceLineNo">462</span>  }<a name="line.462"></a>
+<span class="sourceLineNo">463</span>}<a name="line.463"></a>
 
 
 
