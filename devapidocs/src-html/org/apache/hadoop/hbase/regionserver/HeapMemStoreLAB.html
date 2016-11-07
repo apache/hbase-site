@@ -77,178 +77,180 @@
 <span class="sourceLineNo">069</span><a name="line.69"></a>
 <span class="sourceLineNo">070</span>  private AtomicReference&lt;Chunk&gt; curChunk = new AtomicReference&lt;Chunk&gt;();<a name="line.70"></a>
 <span class="sourceLineNo">071</span>  // A queue of chunks from pool contained by this memstore LAB<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  @VisibleForTesting<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  BlockingQueue&lt;PooledChunk&gt; pooledChunkQueue = null;<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private final int chunkSize;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private final int maxAlloc;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private final MemStoreChunkPool chunkPool;<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  // This flag is for closing this instance, its set when clearing snapshot of<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // memstore<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  private volatile boolean closed = false;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  // This flag is for reclaiming chunks. Its set when putting chunks back to<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  // pool<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private AtomicBoolean reclaimed = new AtomicBoolean(false);<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  // Current count of open scanners which reading data from this MemStoreLAB<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  private final AtomicInteger openScannerCount = new AtomicInteger();<a name="line.85"></a>
-<span class="sourceLineNo">086</span><a name="line.86"></a>
-<span class="sourceLineNo">087</span>  // Used in testing<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  public HeapMemStoreLAB() {<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    this(new Configuration());<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  }<a name="line.90"></a>
-<span class="sourceLineNo">091</span><a name="line.91"></a>
-<span class="sourceLineNo">092</span>  public HeapMemStoreLAB(Configuration conf) {<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    chunkSize = conf.getInt(CHUNK_SIZE_KEY, CHUNK_SIZE_DEFAULT);<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    maxAlloc = conf.getInt(MAX_ALLOC_KEY, MAX_ALLOC_DEFAULT);<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    this.chunkPool = MemStoreChunkPool.getPool(conf);<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    // currently chunkQueue is only used for chunkPool<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    if (this.chunkPool != null) {<a name="line.97"></a>
-<span class="sourceLineNo">098</span>      // set queue length to chunk pool max count to avoid keeping reference of<a name="line.98"></a>
-<span class="sourceLineNo">099</span>      // too many non-reclaimable chunks<a name="line.99"></a>
-<span class="sourceLineNo">100</span>      pooledChunkQueue = new LinkedBlockingQueue&lt;PooledChunk&gt;(chunkPool.getMaxCount());<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    }<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>    // if we don't exclude allocations &gt;CHUNK_SIZE, we'd infiniteloop on one!<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    Preconditions.checkArgument(<a name="line.104"></a>
-<span class="sourceLineNo">105</span>      maxAlloc &lt;= chunkSize,<a name="line.105"></a>
-<span class="sourceLineNo">106</span>      MAX_ALLOC_KEY + " must be less than " + CHUNK_SIZE_KEY);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  }<a name="line.107"></a>
-<span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  @Override<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  public Cell copyCellInto(Cell cell) {<a name="line.110"></a>
-<span class="sourceLineNo">111</span>    int size = KeyValueUtil.length(cell);<a name="line.111"></a>
-<span class="sourceLineNo">112</span>    Preconditions.checkArgument(size &gt;= 0, "negative size");<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    // Callers should satisfy large allocations directly from JVM since they<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    // don't cause fragmentation as badly.<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    if (size &gt; maxAlloc) {<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      return null;<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    }<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    Chunk c = null;<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    int allocOffset = 0;<a name="line.119"></a>
-<span class="sourceLineNo">120</span>    while (true) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      c = getOrMakeChunk();<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      // Try to allocate from this chunk<a name="line.122"></a>
-<span class="sourceLineNo">123</span>      allocOffset = c.alloc(size);<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      if (allocOffset != -1) {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>        // We succeeded - this is the common case - small alloc<a name="line.125"></a>
-<span class="sourceLineNo">126</span>        // from a big buffer<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        break;<a name="line.127"></a>
-<span class="sourceLineNo">128</span>      }<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      // not enough space!<a name="line.129"></a>
-<span class="sourceLineNo">130</span>      // try to retire this chunk<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      tryRetireChunk(c);<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    return KeyValueUtil.copyCellTo(cell, c.getData(), allocOffset, size);<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
-<span class="sourceLineNo">135</span><a name="line.135"></a>
-<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * Close this instance since it won't be used any more, try to put the chunks<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   * back to pool<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   */<a name="line.139"></a>
-<span class="sourceLineNo">140</span>  @Override<a name="line.140"></a>
-<span class="sourceLineNo">141</span>  public void close() {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    this.closed = true;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    // We could put back the chunks to pool for reusing only when there is no<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    // opening scanner which will read their data<a name="line.144"></a>
-<span class="sourceLineNo">145</span>    if (chunkPool != null &amp;&amp; openScannerCount.get() == 0<a name="line.145"></a>
-<span class="sourceLineNo">146</span>        &amp;&amp; reclaimed.compareAndSet(false, true)) {<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      chunkPool.putbackChunks(this.pooledChunkQueue);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    }<a name="line.148"></a>
-<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
-<span class="sourceLineNo">150</span><a name="line.150"></a>
-<span class="sourceLineNo">151</span>  /**<a name="line.151"></a>
-<span class="sourceLineNo">152</span>   * Called when opening a scanner on the data of this MemStoreLAB<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   */<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  @Override<a name="line.154"></a>
-<span class="sourceLineNo">155</span>  public void incScannerCount() {<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    this.openScannerCount.incrementAndGet();<a name="line.156"></a>
-<span class="sourceLineNo">157</span>  }<a name="line.157"></a>
-<span class="sourceLineNo">158</span><a name="line.158"></a>
-<span class="sourceLineNo">159</span>  /**<a name="line.159"></a>
-<span class="sourceLineNo">160</span>   * Called when closing a scanner on the data of this MemStoreLAB<a name="line.160"></a>
-<span class="sourceLineNo">161</span>   */<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  @Override<a name="line.162"></a>
-<span class="sourceLineNo">163</span>  public void decScannerCount() {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    int count = this.openScannerCount.decrementAndGet();<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    if (this.closed &amp;&amp; chunkPool != null &amp;&amp; count == 0<a name="line.165"></a>
-<span class="sourceLineNo">166</span>        &amp;&amp; reclaimed.compareAndSet(false, true)) {<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      chunkPool.putbackChunks(this.pooledChunkQueue);<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    }<a name="line.168"></a>
-<span class="sourceLineNo">169</span>  }<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>  /**<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   * Try to retire the current chunk if it is still<a name="line.172"></a>
-<span class="sourceLineNo">173</span>   * &lt;code&gt;c&lt;/code&gt;. Postcondition is that curChunk.get()<a name="line.173"></a>
-<span class="sourceLineNo">174</span>   * != c<a name="line.174"></a>
-<span class="sourceLineNo">175</span>   * @param c the chunk to retire<a name="line.175"></a>
-<span class="sourceLineNo">176</span>   * @return true if we won the race to retire the chunk<a name="line.176"></a>
-<span class="sourceLineNo">177</span>   */<a name="line.177"></a>
-<span class="sourceLineNo">178</span>  private void tryRetireChunk(Chunk c) {<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    curChunk.compareAndSet(c, null);<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    // If the CAS succeeds, that means that we won the race<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    // to retire the chunk. We could use this opportunity to<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    // update metrics on external fragmentation.<a name="line.182"></a>
-<span class="sourceLineNo">183</span>    //<a name="line.183"></a>
-<span class="sourceLineNo">184</span>    // If the CAS fails, that means that someone else already<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    // retired the chunk for us.<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  }<a name="line.186"></a>
-<span class="sourceLineNo">187</span><a name="line.187"></a>
-<span class="sourceLineNo">188</span>  /**<a name="line.188"></a>
-<span class="sourceLineNo">189</span>   * Get the current chunk, or, if there is no current chunk,<a name="line.189"></a>
-<span class="sourceLineNo">190</span>   * allocate a new one from the JVM.<a name="line.190"></a>
-<span class="sourceLineNo">191</span>   */<a name="line.191"></a>
-<span class="sourceLineNo">192</span>  private Chunk getOrMakeChunk() {<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    while (true) {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      // Try to get the chunk<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      Chunk c = curChunk.get();<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      if (c != null) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>        return c;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      }<a name="line.198"></a>
-<span class="sourceLineNo">199</span><a name="line.199"></a>
-<span class="sourceLineNo">200</span>      // No current chunk, so we want to allocate one. We race<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      // against other allocators to CAS in an uninitialized chunk<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      // (which is cheap to allocate)<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      if (chunkPool != null) {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>        c = chunkPool.getChunk();<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      }<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      boolean pooledChunk = false;<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      if (c != null) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        // This is chunk from pool<a name="line.208"></a>
-<span class="sourceLineNo">209</span>        pooledChunk = true;<a name="line.209"></a>
-<span class="sourceLineNo">210</span>      } else {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        c = new Chunk(chunkSize);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      }<a name="line.212"></a>
-<span class="sourceLineNo">213</span>      if (curChunk.compareAndSet(null, c)) {<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        // we won race - now we need to actually do the expensive<a name="line.214"></a>
-<span class="sourceLineNo">215</span>        // allocation step<a name="line.215"></a>
-<span class="sourceLineNo">216</span>        c.init();<a name="line.216"></a>
-<span class="sourceLineNo">217</span>        if (pooledChunk) {<a name="line.217"></a>
-<span class="sourceLineNo">218</span>          if (!this.closed &amp;&amp; !this.pooledChunkQueue.offer((PooledChunk) c)) {<a name="line.218"></a>
-<span class="sourceLineNo">219</span>            if (LOG.isTraceEnabled()) {<a name="line.219"></a>
-<span class="sourceLineNo">220</span>              LOG.trace("Chunk queue is full, won't reuse this new chunk. Current queue size: "<a name="line.220"></a>
-<span class="sourceLineNo">221</span>                  + pooledChunkQueue.size());<a name="line.221"></a>
-<span class="sourceLineNo">222</span>            }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>          }<a name="line.223"></a>
-<span class="sourceLineNo">224</span>        }<a name="line.224"></a>
-<span class="sourceLineNo">225</span>        return c;<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      } else if (pooledChunk) {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>        chunkPool.putbackChunk((PooledChunk) c);<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      }<a name="line.228"></a>
-<span class="sourceLineNo">229</span>      // someone else won race - that's fine, we'll try to grab theirs<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      // in the next iteration of the loop.<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    }<a name="line.231"></a>
-<span class="sourceLineNo">232</span>  }<a name="line.232"></a>
-<span class="sourceLineNo">233</span><a name="line.233"></a>
-<span class="sourceLineNo">234</span>  @VisibleForTesting<a name="line.234"></a>
-<span class="sourceLineNo">235</span>  Chunk getCurrentChunk() {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    return this.curChunk.get();<a name="line.236"></a>
-<span class="sourceLineNo">237</span>  }<a name="line.237"></a>
-<span class="sourceLineNo">238</span><a name="line.238"></a>
-<span class="sourceLineNo">239</span>  @VisibleForTesting<a name="line.239"></a>
-<span class="sourceLineNo">240</span>  BlockingQueue&lt;PooledChunk&gt; getChunkQueue() {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>    return this.pooledChunkQueue;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>  }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>}<a name="line.243"></a>
+<span class="sourceLineNo">072</span>  // TODO: in the future, it would be better to have List implementation instead of Queue,<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  // as FIFO order is not so important here<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  @VisibleForTesting<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  BlockingQueue&lt;PooledChunk&gt; pooledChunkQueue = null;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private final int chunkSize;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private final int maxAlloc;<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private final MemStoreChunkPool chunkPool;<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>  // This flag is for closing this instance, its set when clearing snapshot of<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  // memstore<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private volatile boolean closed = false;<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  // This flag is for reclaiming chunks. Its set when putting chunks back to<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  // pool<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  private AtomicBoolean reclaimed = new AtomicBoolean(false);<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  // Current count of open scanners which reading data from this MemStoreLAB<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  private final AtomicInteger openScannerCount = new AtomicInteger();<a name="line.87"></a>
+<span class="sourceLineNo">088</span><a name="line.88"></a>
+<span class="sourceLineNo">089</span>  // Used in testing<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  public HeapMemStoreLAB() {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this(new Configuration());<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  }<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>  public HeapMemStoreLAB(Configuration conf) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    chunkSize = conf.getInt(CHUNK_SIZE_KEY, CHUNK_SIZE_DEFAULT);<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    maxAlloc = conf.getInt(MAX_ALLOC_KEY, MAX_ALLOC_DEFAULT);<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    this.chunkPool = MemStoreChunkPool.getPool(conf);<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    // currently chunkQueue is only used for chunkPool<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    if (this.chunkPool != null) {<a name="line.99"></a>
+<span class="sourceLineNo">100</span>      // set queue length to chunk pool max count to avoid keeping reference of<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      // too many non-reclaimable chunks<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      pooledChunkQueue = new LinkedBlockingQueue&lt;PooledChunk&gt;(chunkPool.getMaxCount());<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    }<a name="line.103"></a>
+<span class="sourceLineNo">104</span><a name="line.104"></a>
+<span class="sourceLineNo">105</span>    // if we don't exclude allocations &gt;CHUNK_SIZE, we'd infiniteloop on one!<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    Preconditions.checkArgument(maxAlloc &lt;= chunkSize,<a name="line.106"></a>
+<span class="sourceLineNo">107</span>        MAX_ALLOC_KEY + " must be less than " + CHUNK_SIZE_KEY);<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  }<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  @Override<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  public Cell copyCellInto(Cell cell) {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    int size = KeyValueUtil.length(cell);<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    Preconditions.checkArgument(size &gt;= 0, "negative size");<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    // Callers should satisfy large allocations directly from JVM since they<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    // don't cause fragmentation as badly.<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    if (size &gt; maxAlloc) {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      return null;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    }<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    Chunk c = null;<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    int allocOffset = 0;<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    while (true) {<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      c = getOrMakeChunk();<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      // Try to allocate from this chunk<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      allocOffset = c.alloc(size);<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      if (allocOffset != -1) {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>        // We succeeded - this is the common case - small alloc<a name="line.127"></a>
+<span class="sourceLineNo">128</span>        // from a big buffer<a name="line.128"></a>
+<span class="sourceLineNo">129</span>        break;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      }<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      // not enough space!<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      // try to retire this chunk<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      tryRetireChunk(c);<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    }<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    return KeyValueUtil.copyCellTo(cell, c.getData(), allocOffset, size);<a name="line.135"></a>
+<span class="sourceLineNo">136</span>  }<a name="line.136"></a>
+<span class="sourceLineNo">137</span><a name="line.137"></a>
+<span class="sourceLineNo">138</span>  /**<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   * Close this instance since it won't be used any more, try to put the chunks<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   * back to pool<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   */<a name="line.141"></a>
+<span class="sourceLineNo">142</span>  @Override<a name="line.142"></a>
+<span class="sourceLineNo">143</span>  public void close() {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    this.closed = true;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    // We could put back the chunks to pool for reusing only when there is no<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    // opening scanner which will read their data<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    if (chunkPool != null &amp;&amp; openScannerCount.get() == 0<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        &amp;&amp; reclaimed.compareAndSet(false, true)) {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      chunkPool.putbackChunks(this.pooledChunkQueue);<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    }<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  }<a name="line.151"></a>
+<span class="sourceLineNo">152</span><a name="line.152"></a>
+<span class="sourceLineNo">153</span>  /**<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   * Called when opening a scanner on the data of this MemStoreLAB<a name="line.154"></a>
+<span class="sourceLineNo">155</span>   */<a name="line.155"></a>
+<span class="sourceLineNo">156</span>  @Override<a name="line.156"></a>
+<span class="sourceLineNo">157</span>  public void incScannerCount() {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    this.openScannerCount.incrementAndGet();<a name="line.158"></a>
+<span class="sourceLineNo">159</span>  }<a name="line.159"></a>
+<span class="sourceLineNo">160</span><a name="line.160"></a>
+<span class="sourceLineNo">161</span>  /**<a name="line.161"></a>
+<span class="sourceLineNo">162</span>   * Called when closing a scanner on the data of this MemStoreLAB<a name="line.162"></a>
+<span class="sourceLineNo">163</span>   */<a name="line.163"></a>
+<span class="sourceLineNo">164</span>  @Override<a name="line.164"></a>
+<span class="sourceLineNo">165</span>  public void decScannerCount() {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    int count = this.openScannerCount.decrementAndGet();<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    if (this.closed &amp;&amp; chunkPool != null &amp;&amp; count == 0<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        &amp;&amp; reclaimed.compareAndSet(false, true)) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      chunkPool.putbackChunks(this.pooledChunkQueue);<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  }<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>  /**<a name="line.173"></a>
+<span class="sourceLineNo">174</span>   * Try to retire the current chunk if it is still<a name="line.174"></a>
+<span class="sourceLineNo">175</span>   * &lt;code&gt;c&lt;/code&gt;. Postcondition is that curChunk.get()<a name="line.175"></a>
+<span class="sourceLineNo">176</span>   * != c<a name="line.176"></a>
+<span class="sourceLineNo">177</span>   * @param c the chunk to retire<a name="line.177"></a>
+<span class="sourceLineNo">178</span>   * @return true if we won the race to retire the chunk<a name="line.178"></a>
+<span class="sourceLineNo">179</span>   */<a name="line.179"></a>
+<span class="sourceLineNo">180</span>  private void tryRetireChunk(Chunk c) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    curChunk.compareAndSet(c, null);<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    // If the CAS succeeds, that means that we won the race<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    // to retire the chunk. We could use this opportunity to<a name="line.183"></a>
+<span class="sourceLineNo">184</span>    // update metrics on external fragmentation.<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    //<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    // If the CAS fails, that means that someone else already<a name="line.186"></a>
+<span class="sourceLineNo">187</span>    // retired the chunk for us.<a name="line.187"></a>
+<span class="sourceLineNo">188</span>  }<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>  /**<a name="line.190"></a>
+<span class="sourceLineNo">191</span>   * Get the current chunk, or, if there is no current chunk,<a name="line.191"></a>
+<span class="sourceLineNo">192</span>   * allocate a new one from the JVM.<a name="line.192"></a>
+<span class="sourceLineNo">193</span>   */<a name="line.193"></a>
+<span class="sourceLineNo">194</span>  private Chunk getOrMakeChunk() {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    while (true) {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      // Try to get the chunk<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      Chunk c = curChunk.get();<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      if (c != null) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>        return c;<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      }<a name="line.200"></a>
+<span class="sourceLineNo">201</span><a name="line.201"></a>
+<span class="sourceLineNo">202</span>      // No current chunk, so we want to allocate one. We race<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      // against other allocators to CAS in an uninitialized chunk<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      // (which is cheap to allocate)<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      if (chunkPool != null) {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        c = chunkPool.getChunk();<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      }<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      boolean pooledChunk = false;<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      if (c != null) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        // This is chunk from pool<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        pooledChunk = true;<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      } else {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        c = new Chunk(chunkSize);<a name="line.213"></a>
+<span class="sourceLineNo">214</span>      }<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      if (curChunk.compareAndSet(null, c)) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>        // we won race - now we need to actually do the expensive<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        // allocation step<a name="line.217"></a>
+<span class="sourceLineNo">218</span>        c.init();<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        if (pooledChunk) {<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          if (!this.closed &amp;&amp; !this.pooledChunkQueue.offer((PooledChunk) c)) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>            if (LOG.isTraceEnabled()) {<a name="line.221"></a>
+<span class="sourceLineNo">222</span>              LOG.trace("Chunk queue is full, won't reuse this new chunk. Current queue size: "<a name="line.222"></a>
+<span class="sourceLineNo">223</span>                  + pooledChunkQueue.size());<a name="line.223"></a>
+<span class="sourceLineNo">224</span>            }<a name="line.224"></a>
+<span class="sourceLineNo">225</span>          }<a name="line.225"></a>
+<span class="sourceLineNo">226</span>        }<a name="line.226"></a>
+<span class="sourceLineNo">227</span>        return c;<a name="line.227"></a>
+<span class="sourceLineNo">228</span>      } else if (pooledChunk) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        chunkPool.putbackChunk((PooledChunk) c);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>      }<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      // someone else won race - that's fine, we'll try to grab theirs<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      // in the next iteration of the loop.<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>  }<a name="line.234"></a>
+<span class="sourceLineNo">235</span><a name="line.235"></a>
+<span class="sourceLineNo">236</span>  @VisibleForTesting<a name="line.236"></a>
+<span class="sourceLineNo">237</span>  Chunk getCurrentChunk() {<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    return this.curChunk.get();<a name="line.238"></a>
+<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
+<span class="sourceLineNo">240</span><a name="line.240"></a>
+<span class="sourceLineNo">241</span><a name="line.241"></a>
+<span class="sourceLineNo">242</span>  BlockingQueue&lt;PooledChunk&gt; getPooledChunks() {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    return this.pooledChunkQueue;<a name="line.243"></a>
+<span class="sourceLineNo">244</span>  }<a name="line.244"></a>
+<span class="sourceLineNo">245</span>}<a name="line.245"></a>
 
 
 
