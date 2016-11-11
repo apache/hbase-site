@@ -42,115 +42,129 @@
 <span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.CollectionUtils;<a name="line.34"></a>
 <span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.wal.WAL.Entry;<a name="line.35"></a>
 <span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.wal.WALKey;<a name="line.36"></a>
-<span class="sourceLineNo">037</span><a name="line.37"></a>
-<span class="sourceLineNo">038</span>/**<a name="line.38"></a>
-<span class="sourceLineNo">039</span> * A WAL Entry for {@link AbstractFSWAL} implementation.  Immutable.<a name="line.39"></a>
-<span class="sourceLineNo">040</span> * A subclass of {@link Entry} that carries extra info across the ring buffer such as<a name="line.40"></a>
-<span class="sourceLineNo">041</span> * region sequence id (we want to use this later, just before we write the WAL to ensure region<a name="line.41"></a>
-<span class="sourceLineNo">042</span> * edits maintain order).  The extra info added here is not 'serialized' as part of the WALEdit<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * hence marked 'transient' to underline this fact.  It also adds mechanism so we can wait on<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * the assign of the region sequence id.  See #stampRegionSequenceId().<a name="line.44"></a>
-<span class="sourceLineNo">045</span> */<a name="line.45"></a>
-<span class="sourceLineNo">046</span>@InterfaceAudience.Private<a name="line.46"></a>
-<span class="sourceLineNo">047</span>class FSWALEntry extends Entry {<a name="line.47"></a>
-<span class="sourceLineNo">048</span>  // The below data members are denoted 'transient' just to highlight these are not persisted;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>  // they are only in memory and held here while passing over the ring buffer.<a name="line.49"></a>
-<span class="sourceLineNo">050</span>  private final transient long txid;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>  private final transient boolean inMemstore;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>  private final transient HRegionInfo hri;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>  private final transient Set&lt;byte[]&gt; familyNames;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>  // In the new WAL logic, we will rewrite failed WAL entries to new WAL file, so we need to avoid<a name="line.54"></a>
-<span class="sourceLineNo">055</span>  // calling stampRegionSequenceId again.<a name="line.55"></a>
-<span class="sourceLineNo">056</span>  private transient boolean stamped = false;<a name="line.56"></a>
-<span class="sourceLineNo">057</span><a name="line.57"></a>
-<span class="sourceLineNo">058</span>  FSWALEntry(final long txid, final WALKey key, final WALEdit edit,<a name="line.58"></a>
-<span class="sourceLineNo">059</span>      final HRegionInfo hri, final boolean inMemstore) {<a name="line.59"></a>
-<span class="sourceLineNo">060</span>    super(key, edit);<a name="line.60"></a>
-<span class="sourceLineNo">061</span>    this.inMemstore = inMemstore;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>    this.hri = hri;<a name="line.62"></a>
-<span class="sourceLineNo">063</span>    this.txid = txid;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>    if (inMemstore) {<a name="line.64"></a>
-<span class="sourceLineNo">065</span>      // construct familyNames here to reduce the work of log sinker.<a name="line.65"></a>
-<span class="sourceLineNo">066</span>      ArrayList&lt;Cell&gt; cells = this.getEdit().getCells();<a name="line.66"></a>
-<span class="sourceLineNo">067</span>      if (CollectionUtils.isEmpty(cells)) {<a name="line.67"></a>
-<span class="sourceLineNo">068</span>        this.familyNames = Collections.&lt;byte[]&gt; emptySet();<a name="line.68"></a>
-<span class="sourceLineNo">069</span>      } else {<a name="line.69"></a>
-<span class="sourceLineNo">070</span>        Set&lt;byte[]&gt; familySet = Sets.newTreeSet(Bytes.BYTES_COMPARATOR);<a name="line.70"></a>
-<span class="sourceLineNo">071</span>        for (Cell cell : cells) {<a name="line.71"></a>
-<span class="sourceLineNo">072</span>          if (!CellUtil.matchingFamily(cell, WALEdit.METAFAMILY)) {<a name="line.72"></a>
-<span class="sourceLineNo">073</span>            // TODO: Avoid this clone?<a name="line.73"></a>
-<span class="sourceLineNo">074</span>            familySet.add(CellUtil.cloneFamily(cell));<a name="line.74"></a>
-<span class="sourceLineNo">075</span>          }<a name="line.75"></a>
-<span class="sourceLineNo">076</span>        }<a name="line.76"></a>
-<span class="sourceLineNo">077</span>        this.familyNames = Collections.unmodifiableSet(familySet);<a name="line.77"></a>
-<span class="sourceLineNo">078</span>      }<a name="line.78"></a>
-<span class="sourceLineNo">079</span>    } else {<a name="line.79"></a>
-<span class="sourceLineNo">080</span>      this.familyNames = Collections.&lt;byte[]&gt; emptySet();<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    }<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  }<a name="line.82"></a>
-<span class="sourceLineNo">083</span><a name="line.83"></a>
-<span class="sourceLineNo">084</span>  public String toString() {<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    return "sequence=" + this.txid + ", " + super.toString();<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  };<a name="line.86"></a>
+<span class="sourceLineNo">037</span>import org.apache.htrace.Span;<a name="line.37"></a>
+<span class="sourceLineNo">038</span><a name="line.38"></a>
+<span class="sourceLineNo">039</span>/**<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * A WAL Entry for {@link AbstractFSWAL} implementation.  Immutable.<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * A subclass of {@link Entry} that carries extra info across the ring buffer such as<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * region sequence id (we want to use this later, just before we write the WAL to ensure region<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * edits maintain order).  The extra info added here is not 'serialized' as part of the WALEdit<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * hence marked 'transient' to underline this fact.  It also adds mechanism so we can wait on<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * the assign of the region sequence id.  See #stampRegionSequenceId().<a name="line.45"></a>
+<span class="sourceLineNo">046</span> */<a name="line.46"></a>
+<span class="sourceLineNo">047</span>@InterfaceAudience.Private<a name="line.47"></a>
+<span class="sourceLineNo">048</span>class FSWALEntry extends Entry {<a name="line.48"></a>
+<span class="sourceLineNo">049</span>  // The below data members are denoted 'transient' just to highlight these are not persisted;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>  // they are only in memory and held here while passing over the ring buffer.<a name="line.50"></a>
+<span class="sourceLineNo">051</span>  private final transient long txid;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>  private final transient boolean inMemstore;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  private final transient HRegionInfo hri;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>  private final transient Set&lt;byte[]&gt; familyNames;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  // In the new WAL logic, we will rewrite failed WAL entries to new WAL file, so we need to avoid<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  // calling stampRegionSequenceId again.<a name="line.56"></a>
+<span class="sourceLineNo">057</span>  private transient boolean stamped = false;<a name="line.57"></a>
+<span class="sourceLineNo">058</span><a name="line.58"></a>
+<span class="sourceLineNo">059</span>  // The tracing span for this entry when writing WAL.<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private transient Span span;<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  FSWALEntry(final long txid, final WALKey key, final WALEdit edit,<a name="line.62"></a>
+<span class="sourceLineNo">063</span>      final HRegionInfo hri, final boolean inMemstore) {<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    super(key, edit);<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    this.inMemstore = inMemstore;<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    this.hri = hri;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    this.txid = txid;<a name="line.67"></a>
+<span class="sourceLineNo">068</span>    if (inMemstore) {<a name="line.68"></a>
+<span class="sourceLineNo">069</span>      // construct familyNames here to reduce the work of log sinker.<a name="line.69"></a>
+<span class="sourceLineNo">070</span>      ArrayList&lt;Cell&gt; cells = this.getEdit().getCells();<a name="line.70"></a>
+<span class="sourceLineNo">071</span>      if (CollectionUtils.isEmpty(cells)) {<a name="line.71"></a>
+<span class="sourceLineNo">072</span>        this.familyNames = Collections.&lt;byte[]&gt; emptySet();<a name="line.72"></a>
+<span class="sourceLineNo">073</span>      } else {<a name="line.73"></a>
+<span class="sourceLineNo">074</span>        Set&lt;byte[]&gt; familySet = Sets.newTreeSet(Bytes.BYTES_COMPARATOR);<a name="line.74"></a>
+<span class="sourceLineNo">075</span>        for (Cell cell : cells) {<a name="line.75"></a>
+<span class="sourceLineNo">076</span>          if (!CellUtil.matchingFamily(cell, WALEdit.METAFAMILY)) {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>            // TODO: Avoid this clone?<a name="line.77"></a>
+<span class="sourceLineNo">078</span>            familySet.add(CellUtil.cloneFamily(cell));<a name="line.78"></a>
+<span class="sourceLineNo">079</span>          }<a name="line.79"></a>
+<span class="sourceLineNo">080</span>        }<a name="line.80"></a>
+<span class="sourceLineNo">081</span>        this.familyNames = Collections.unmodifiableSet(familySet);<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      }<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    } else {<a name="line.83"></a>
+<span class="sourceLineNo">084</span>      this.familyNames = Collections.&lt;byte[]&gt; emptySet();<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    }<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  }<a name="line.86"></a>
 <span class="sourceLineNo">087</span><a name="line.87"></a>
-<span class="sourceLineNo">088</span>  boolean isInMemstore() {<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    return this.inMemstore;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  }<a name="line.90"></a>
+<span class="sourceLineNo">088</span>  public String toString() {<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    return "sequence=" + this.txid + ", " + super.toString();<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  };<a name="line.90"></a>
 <span class="sourceLineNo">091</span><a name="line.91"></a>
-<span class="sourceLineNo">092</span>  HRegionInfo getHRegionInfo() {<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    return this.hri;<a name="line.93"></a>
+<span class="sourceLineNo">092</span>  boolean isInMemstore() {<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    return this.inMemstore;<a name="line.93"></a>
 <span class="sourceLineNo">094</span>  }<a name="line.94"></a>
 <span class="sourceLineNo">095</span><a name="line.95"></a>
-<span class="sourceLineNo">096</span>  /**<a name="line.96"></a>
-<span class="sourceLineNo">097</span>   * @return The transaction id of this edit.<a name="line.97"></a>
-<span class="sourceLineNo">098</span>   */<a name="line.98"></a>
-<span class="sourceLineNo">099</span>  long getTxid() {<a name="line.99"></a>
-<span class="sourceLineNo">100</span>    return this.txid;<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  }<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  /**<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * Here is where a WAL edit gets its sequenceid.<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * SIDE-EFFECT is our stamping the sequenceid into every Cell AND setting the sequenceid into the<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   * MVCC WriteEntry!!!!<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * @return The sequenceid we stamped on this edit.<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   */<a name="line.108"></a>
-<span class="sourceLineNo">109</span>  long stampRegionSequenceId() throws IOException {<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    if (stamped) {<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      return getKey().getSequenceId();<a name="line.111"></a>
-<span class="sourceLineNo">112</span>    }<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    stamped = true;<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    long regionSequenceId = WALKey.NO_SEQUENCE_ID;<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    WALKey key = getKey();<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    MultiVersionConcurrencyControl.WriteEntry we = key.getPreAssignedWriteEntry();<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    boolean preAssigned = (we != null);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    if (!preAssigned) {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>      MultiVersionConcurrencyControl mvcc = key.getMvcc();<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      if (mvcc != null) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>        we = mvcc.begin();<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      }<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    }<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    if (we != null) {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>      regionSequenceId = we.getWriteNumber();<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    }<a name="line.126"></a>
-<span class="sourceLineNo">127</span><a name="line.127"></a>
-<span class="sourceLineNo">128</span>    if (!this.getEdit().isReplay() &amp;&amp; inMemstore) {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      for (Cell c:getEdit().getCells()) {<a name="line.129"></a>
-<span class="sourceLineNo">130</span>        CellUtil.setSequenceId(c, regionSequenceId);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      }<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    if (!preAssigned) {<a name="line.133"></a>
-<span class="sourceLineNo">134</span>      key.setWriteEntry(we);<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    }<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    return regionSequenceId;<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  }<a name="line.137"></a>
-<span class="sourceLineNo">138</span><a name="line.138"></a>
-<span class="sourceLineNo">139</span>  /**<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * @return the family names which are effected by this edit.<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   */<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  Set&lt;byte[]&gt; getFamilyNames() {<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    return familyNames;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>  }<a name="line.144"></a>
-<span class="sourceLineNo">145</span>}<a name="line.145"></a>
+<span class="sourceLineNo">096</span>  HRegionInfo getHRegionInfo() {<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    return this.hri;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  /**<a name="line.100"></a>
+<span class="sourceLineNo">101</span>   * @return The transaction id of this edit.<a name="line.101"></a>
+<span class="sourceLineNo">102</span>   */<a name="line.102"></a>
+<span class="sourceLineNo">103</span>  long getTxid() {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    return this.txid;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  }<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  /**<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   * Here is where a WAL edit gets its sequenceid.<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   * SIDE-EFFECT is our stamping the sequenceid into every Cell AND setting the sequenceid into the<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   * MVCC WriteEntry!!!!<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   * @return The sequenceid we stamped on this edit.<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   */<a name="line.112"></a>
+<span class="sourceLineNo">113</span>  long stampRegionSequenceId() throws IOException {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    if (stamped) {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      return getKey().getSequenceId();<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    }<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    stamped = true;<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    long regionSequenceId = WALKey.NO_SEQUENCE_ID;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    WALKey key = getKey();<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    MultiVersionConcurrencyControl.WriteEntry we = key.getPreAssignedWriteEntry();<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    boolean preAssigned = (we != null);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    if (!preAssigned) {<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      MultiVersionConcurrencyControl mvcc = key.getMvcc();<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      if (mvcc != null) {<a name="line.124"></a>
+<span class="sourceLineNo">125</span>        we = mvcc.begin();<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      }<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    }<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    if (we != null) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      regionSequenceId = we.getWriteNumber();<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    }<a name="line.130"></a>
+<span class="sourceLineNo">131</span><a name="line.131"></a>
+<span class="sourceLineNo">132</span>    if (!this.getEdit().isReplay() &amp;&amp; inMemstore) {<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      for (Cell c:getEdit().getCells()) {<a name="line.133"></a>
+<span class="sourceLineNo">134</span>        CellUtil.setSequenceId(c, regionSequenceId);<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      }<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    }<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    if (!preAssigned) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      key.setWriteEntry(we);<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    }<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    return regionSequenceId;<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>  /**<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   * @return the family names which are effected by this edit.<a name="line.144"></a>
+<span class="sourceLineNo">145</span>   */<a name="line.145"></a>
+<span class="sourceLineNo">146</span>  Set&lt;byte[]&gt; getFamilyNames() {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    return familyNames;<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  }<a name="line.148"></a>
+<span class="sourceLineNo">149</span><a name="line.149"></a>
+<span class="sourceLineNo">150</span>  void attachSpan(Span span) {<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    this.span = span;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  }<a name="line.152"></a>
+<span class="sourceLineNo">153</span><a name="line.153"></a>
+<span class="sourceLineNo">154</span>  Span detachSpan() {<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    Span span = this.span;<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    this.span = null;<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    return span;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  }<a name="line.158"></a>
+<span class="sourceLineNo">159</span>}<a name="line.159"></a>
 
 
 

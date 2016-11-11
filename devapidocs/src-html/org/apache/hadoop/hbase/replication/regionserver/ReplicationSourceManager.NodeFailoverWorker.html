@@ -868,8 +868,8 @@
 <span class="sourceLineNo">860</span>     *    It is mainly because we alter REPLICATION_SCOPE = 2. We can not guarantee the<a name="line.860"></a>
 <span class="sourceLineNo">861</span>     *    order of logs that is written before altering.<a name="line.861"></a>
 <span class="sourceLineNo">862</span>     * 3) This entry is in the first interval of barriers. We can push them because it is the<a name="line.862"></a>
-<span class="sourceLineNo">863</span>     *    start of a region. Splitting/merging regions are also ok because the first section of<a name="line.863"></a>
-<span class="sourceLineNo">864</span>     *    daughter region is in same region of parents and the order in one RS is guaranteed.<a name="line.864"></a>
+<span class="sourceLineNo">863</span>     *    start of a region. But if the region is created by region split, we should check<a name="line.863"></a>
+<span class="sourceLineNo">864</span>     *    if the parent regions are fully pushed.<a name="line.864"></a>
 <span class="sourceLineNo">865</span>     * 4) If the entry's seq id and the position are in same section, or the pos is the last<a name="line.865"></a>
 <span class="sourceLineNo">866</span>     *    number of previous section. Because when open a region we put a barrier the number<a name="line.866"></a>
 <span class="sourceLineNo">867</span>     *    is the last log's id + 1.<a name="line.867"></a>
@@ -887,33 +887,66 @@
 <span class="sourceLineNo">879</span>    }<a name="line.879"></a>
 <span class="sourceLineNo">880</span>    if (interval == 1) {<a name="line.880"></a>
 <span class="sourceLineNo">881</span>      // Case 3<a name="line.881"></a>
-<span class="sourceLineNo">882</span>      return;<a name="line.882"></a>
-<span class="sourceLineNo">883</span>    }<a name="line.883"></a>
-<span class="sourceLineNo">884</span><a name="line.884"></a>
-<span class="sourceLineNo">885</span>    while (true) {<a name="line.885"></a>
-<span class="sourceLineNo">886</span>      long pos = MetaTableAccessor.getReplicationPositionForOnePeer(connection, encodedName, peerId);<a name="line.886"></a>
-<span class="sourceLineNo">887</span>      if (seq &lt;= pos) {<a name="line.887"></a>
-<span class="sourceLineNo">888</span>        // Case 5<a name="line.888"></a>
-<span class="sourceLineNo">889</span>      }<a name="line.889"></a>
-<span class="sourceLineNo">890</span>      if (pos &gt;= 0) {<a name="line.890"></a>
-<span class="sourceLineNo">891</span>        // Case 4<a name="line.891"></a>
-<span class="sourceLineNo">892</span>        int posInterval = Collections.binarySearch(barriers, pos);<a name="line.892"></a>
-<span class="sourceLineNo">893</span>        if (posInterval &lt; 0) {<a name="line.893"></a>
-<span class="sourceLineNo">894</span>          posInterval = -posInterval - 1;// get the insert position if negative<a name="line.894"></a>
-<span class="sourceLineNo">895</span>        }<a name="line.895"></a>
-<span class="sourceLineNo">896</span>        if (posInterval == interval || pos == barriers.get(interval - 1) - 1) {<a name="line.896"></a>
-<span class="sourceLineNo">897</span>          return;<a name="line.897"></a>
-<span class="sourceLineNo">898</span>        }<a name="line.898"></a>
-<span class="sourceLineNo">899</span>      }<a name="line.899"></a>
-<span class="sourceLineNo">900</span><a name="line.900"></a>
-<span class="sourceLineNo">901</span>      LOG.info(Bytes.toString(encodedName) + " can not start pushing to peer " + peerId<a name="line.901"></a>
-<span class="sourceLineNo">902</span>          + " because previous log has not been pushed: sequence=" + seq + " pos=" + pos<a name="line.902"></a>
-<span class="sourceLineNo">903</span>          + " barriers=" + Arrays.toString(barriers.toArray()));<a name="line.903"></a>
-<span class="sourceLineNo">904</span>      Thread.sleep(replicationWaitTime);<a name="line.904"></a>
-<span class="sourceLineNo">905</span>    }<a name="line.905"></a>
-<span class="sourceLineNo">906</span>  }<a name="line.906"></a>
-<span class="sourceLineNo">907</span><a name="line.907"></a>
-<span class="sourceLineNo">908</span>}<a name="line.908"></a>
+<span class="sourceLineNo">882</span>      // Check if there are parent regions<a name="line.882"></a>
+<span class="sourceLineNo">883</span>      String parentValue = MetaTableAccessor.getSerialReplicationParentRegion(connection,<a name="line.883"></a>
+<span class="sourceLineNo">884</span>          encodedName);<a name="line.884"></a>
+<span class="sourceLineNo">885</span>      if (parentValue == null) {<a name="line.885"></a>
+<span class="sourceLineNo">886</span>        // This region has no parent or the parent's log entries are fully pushed.<a name="line.886"></a>
+<span class="sourceLineNo">887</span>        return;<a name="line.887"></a>
+<span class="sourceLineNo">888</span>      }<a name="line.888"></a>
+<span class="sourceLineNo">889</span>      while (true) {<a name="line.889"></a>
+<span class="sourceLineNo">890</span>        boolean allParentDone = true;<a name="line.890"></a>
+<span class="sourceLineNo">891</span>        String[] parentRegions = parentValue.split(",");<a name="line.891"></a>
+<span class="sourceLineNo">892</span>        for (String parent : parentRegions) {<a name="line.892"></a>
+<span class="sourceLineNo">893</span>          byte[] region = Bytes.toBytes(parent);<a name="line.893"></a>
+<span class="sourceLineNo">894</span>          long pos = MetaTableAccessor.getReplicationPositionForOnePeer(connection, region, peerId);<a name="line.894"></a>
+<span class="sourceLineNo">895</span>          List&lt;Long&gt; parentBarriers = MetaTableAccessor.getReplicationBarriers(connection, region);<a name="line.895"></a>
+<span class="sourceLineNo">896</span>          if (parentBarriers.size() &gt; 0<a name="line.896"></a>
+<span class="sourceLineNo">897</span>              &amp;&amp; parentBarriers.get(parentBarriers.size() - 1) - 1 &gt; pos) {<a name="line.897"></a>
+<span class="sourceLineNo">898</span>            allParentDone = false;<a name="line.898"></a>
+<span class="sourceLineNo">899</span>            // For a closed region, we will write a close event marker to WAL whose sequence id is<a name="line.899"></a>
+<span class="sourceLineNo">900</span>            // larger than final barrier but still smaller than next region's openSeqNum.<a name="line.900"></a>
+<span class="sourceLineNo">901</span>            // So if the pos is larger than last barrier, we can say we have read the event marker<a name="line.901"></a>
+<span class="sourceLineNo">902</span>            // which means the parent region has been fully pushed.<a name="line.902"></a>
+<span class="sourceLineNo">903</span>            LOG.info(Bytes.toString(encodedName) + " can not start pushing because parent region's"<a name="line.903"></a>
+<span class="sourceLineNo">904</span>                + " log has not been fully pushed: parent=" + Bytes.toString(region) + " pos=" + pos<a name="line.904"></a>
+<span class="sourceLineNo">905</span>                + " barriers=" + Arrays.toString(barriers.toArray()));<a name="line.905"></a>
+<span class="sourceLineNo">906</span>            break;<a name="line.906"></a>
+<span class="sourceLineNo">907</span>          }<a name="line.907"></a>
+<span class="sourceLineNo">908</span>        }<a name="line.908"></a>
+<span class="sourceLineNo">909</span>        if (allParentDone) {<a name="line.909"></a>
+<span class="sourceLineNo">910</span>          return;<a name="line.910"></a>
+<span class="sourceLineNo">911</span>        } else {<a name="line.911"></a>
+<span class="sourceLineNo">912</span>          Thread.sleep(replicationWaitTime);<a name="line.912"></a>
+<span class="sourceLineNo">913</span>        }<a name="line.913"></a>
+<span class="sourceLineNo">914</span>      }<a name="line.914"></a>
+<span class="sourceLineNo">915</span><a name="line.915"></a>
+<span class="sourceLineNo">916</span>    }<a name="line.916"></a>
+<span class="sourceLineNo">917</span><a name="line.917"></a>
+<span class="sourceLineNo">918</span>    while (true) {<a name="line.918"></a>
+<span class="sourceLineNo">919</span>      long pos = MetaTableAccessor.getReplicationPositionForOnePeer(connection, encodedName, peerId);<a name="line.919"></a>
+<span class="sourceLineNo">920</span>      if (seq &lt;= pos) {<a name="line.920"></a>
+<span class="sourceLineNo">921</span>        // Case 5<a name="line.921"></a>
+<span class="sourceLineNo">922</span>      }<a name="line.922"></a>
+<span class="sourceLineNo">923</span>      if (pos &gt;= 0) {<a name="line.923"></a>
+<span class="sourceLineNo">924</span>        // Case 4<a name="line.924"></a>
+<span class="sourceLineNo">925</span>        int posInterval = Collections.binarySearch(barriers, pos);<a name="line.925"></a>
+<span class="sourceLineNo">926</span>        if (posInterval &lt; 0) {<a name="line.926"></a>
+<span class="sourceLineNo">927</span>          posInterval = -posInterval - 1;// get the insert position if negative<a name="line.927"></a>
+<span class="sourceLineNo">928</span>        }<a name="line.928"></a>
+<span class="sourceLineNo">929</span>        if (posInterval == interval || pos == barriers.get(interval - 1) - 1) {<a name="line.929"></a>
+<span class="sourceLineNo">930</span>          return;<a name="line.930"></a>
+<span class="sourceLineNo">931</span>        }<a name="line.931"></a>
+<span class="sourceLineNo">932</span>      }<a name="line.932"></a>
+<span class="sourceLineNo">933</span><a name="line.933"></a>
+<span class="sourceLineNo">934</span>      LOG.info(Bytes.toString(encodedName) + " can not start pushing to peer " + peerId<a name="line.934"></a>
+<span class="sourceLineNo">935</span>          + " because previous log has not been pushed: sequence=" + seq + " pos=" + pos<a name="line.935"></a>
+<span class="sourceLineNo">936</span>          + " barriers=" + Arrays.toString(barriers.toArray()));<a name="line.936"></a>
+<span class="sourceLineNo">937</span>      Thread.sleep(replicationWaitTime);<a name="line.937"></a>
+<span class="sourceLineNo">938</span>    }<a name="line.938"></a>
+<span class="sourceLineNo">939</span>  }<a name="line.939"></a>
+<span class="sourceLineNo">940</span><a name="line.940"></a>
+<span class="sourceLineNo">941</span>}<a name="line.941"></a>
 
 
 
