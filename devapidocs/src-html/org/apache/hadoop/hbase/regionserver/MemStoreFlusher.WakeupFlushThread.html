@@ -32,7 +32,7 @@
 <span class="sourceLineNo">024</span><a name="line.24"></a>
 <span class="sourceLineNo">025</span>import java.io.IOException;<a name="line.25"></a>
 <span class="sourceLineNo">026</span>import java.lang.Thread.UncaughtExceptionHandler;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import java.lang.management.ManagementFactory;<a name="line.27"></a>
+<span class="sourceLineNo">027</span>import java.lang.management.MemoryType;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import java.util.ArrayList;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import java.util.ConcurrentModificationException;<a name="line.29"></a>
 <span class="sourceLineNo">030</span>import java.util.HashMap;<a name="line.30"></a>
@@ -57,770 +57,780 @@
 <span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.HConstants;<a name="line.49"></a>
 <span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.50"></a>
 <span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.client.RegionReplicaUtil;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.io.util.HeapMemorySizeUtil;<a name="line.52"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.io.util.MemorySizeUtil;<a name="line.52"></a>
 <span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.regionserver.Region.FlushResult;<a name="line.53"></a>
 <span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.54"></a>
 <span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.55"></a>
 <span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.util.HasThread;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>import org.apache.hadoop.ipc.RemoteException;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>import org.apache.hadoop.util.StringUtils;<a name="line.60"></a>
-<span class="sourceLineNo">061</span>import org.apache.hadoop.util.StringUtils.TraditionalBinaryPrefix;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>import org.apache.htrace.Trace;<a name="line.62"></a>
-<span class="sourceLineNo">063</span>import org.apache.htrace.TraceScope;<a name="line.63"></a>
-<span class="sourceLineNo">064</span><a name="line.64"></a>
-<span class="sourceLineNo">065</span>/**<a name="line.65"></a>
-<span class="sourceLineNo">066</span> * Thread that flushes cache on request<a name="line.66"></a>
-<span class="sourceLineNo">067</span> *<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * NOTE: This class extends Thread rather than Chore because the sleep time<a name="line.68"></a>
-<span class="sourceLineNo">069</span> * can be interrupted when there is something to do, rather than the Chore<a name="line.69"></a>
-<span class="sourceLineNo">070</span> * sleep time which is invariant.<a name="line.70"></a>
-<span class="sourceLineNo">071</span> *<a name="line.71"></a>
-<span class="sourceLineNo">072</span> * @see FlushRequester<a name="line.72"></a>
-<span class="sourceLineNo">073</span> */<a name="line.73"></a>
-<span class="sourceLineNo">074</span>@InterfaceAudience.Private<a name="line.74"></a>
-<span class="sourceLineNo">075</span>class MemStoreFlusher implements FlushRequester {<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private static final Log LOG = LogFactory.getLog(MemStoreFlusher.class);<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  private Configuration conf;<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // These two data members go together.  Any entry in the one must have<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  // a corresponding entry in the other.<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private final BlockingQueue&lt;FlushQueueEntry&gt; flushQueue =<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    new DelayQueue&lt;FlushQueueEntry&gt;();<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private final Map&lt;Region, FlushRegionEntry&gt; regionsInQueue =<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    new HashMap&lt;Region, FlushRegionEntry&gt;();<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  private AtomicBoolean wakeupPending = new AtomicBoolean();<a name="line.85"></a>
-<span class="sourceLineNo">086</span><a name="line.86"></a>
-<span class="sourceLineNo">087</span>  private final long threadWakeFrequency;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  private final HRegionServer server;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  private final Object blockSignal = new Object();<a name="line.90"></a>
-<span class="sourceLineNo">091</span><a name="line.91"></a>
-<span class="sourceLineNo">092</span>  protected long globalMemStoreLimit;<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  protected float globalMemStoreLimitLowMarkPercent;<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  protected long globalMemStoreLimitLowMark;<a name="line.94"></a>
-<span class="sourceLineNo">095</span><a name="line.95"></a>
-<span class="sourceLineNo">096</span>  private long blockingWaitTime;<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  private final LongAdder updatesBlockedMsHighWater = new LongAdder();<a name="line.97"></a>
-<span class="sourceLineNo">098</span><a name="line.98"></a>
-<span class="sourceLineNo">099</span>  private final FlushHandler[] flushHandlers;<a name="line.99"></a>
-<span class="sourceLineNo">100</span>  private List&lt;FlushRequestListener&gt; flushRequestListeners = new ArrayList&lt;FlushRequestListener&gt;(1);<a name="line.100"></a>
-<span class="sourceLineNo">101</span><a name="line.101"></a>
-<span class="sourceLineNo">102</span>  /**<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * @param conf<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * @param server<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   */<a name="line.105"></a>
-<span class="sourceLineNo">106</span>  public MemStoreFlusher(final Configuration conf,<a name="line.106"></a>
-<span class="sourceLineNo">107</span>      final HRegionServer server) {<a name="line.107"></a>
-<span class="sourceLineNo">108</span>    super();<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    this.conf = conf;<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    this.server = server;<a name="line.110"></a>
-<span class="sourceLineNo">111</span>    this.threadWakeFrequency =<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      conf.getLong(HConstants.THREAD_WAKE_FREQUENCY, 10 * 1000);<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    long max = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax();<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    float globalMemStorePercent = HeapMemorySizeUtil.getGlobalMemStorePercent(conf, true);<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    this.globalMemStoreLimit = (long) (max * globalMemStorePercent);<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    this.globalMemStoreLimitLowMarkPercent =<a name="line.116"></a>
-<span class="sourceLineNo">117</span>        HeapMemorySizeUtil.getGlobalMemStoreLowerMark(conf, globalMemStorePercent);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    this.globalMemStoreLimitLowMark =<a name="line.118"></a>
-<span class="sourceLineNo">119</span>        (long) (this.globalMemStoreLimit * this.globalMemStoreLimitLowMarkPercent);<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>    this.blockingWaitTime = conf.getInt("hbase.hstore.blockingWaitTime",<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      90000);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    int handlerCount = conf.getInt("hbase.hstore.flusher.count", 2);<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    this.flushHandlers = new FlushHandler[handlerCount];<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    LOG.info("globalMemStoreLimit="<a name="line.125"></a>
-<span class="sourceLineNo">126</span>        + TraditionalBinaryPrefix.long2String(this.globalMemStoreLimit, "", 1)<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        + ", globalMemStoreLimitLowMark="<a name="line.127"></a>
-<span class="sourceLineNo">128</span>        + TraditionalBinaryPrefix.long2String(this.globalMemStoreLimitLowMark, "", 1)<a name="line.128"></a>
-<span class="sourceLineNo">129</span>        + ", maxHeap=" + TraditionalBinaryPrefix.long2String(max, "", 1));<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  }<a name="line.130"></a>
-<span class="sourceLineNo">131</span><a name="line.131"></a>
-<span class="sourceLineNo">132</span>  public LongAdder getUpdatesBlockedMsHighWater() {<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    return this.updatesBlockedMsHighWater;<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
-<span class="sourceLineNo">135</span><a name="line.135"></a>
-<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * The memstore across all regions has exceeded the low water mark. Pick<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   * one region to flush and flush it synchronously (this is called from the<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   * flush thread)<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * @return true if successful<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   */<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  private boolean flushOneForGlobalPressure() {<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    SortedMap&lt;Long, Region&gt; regionsBySize = server.getCopyOfOnlineRegionsSortedBySize();<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    Set&lt;Region&gt; excludedRegions = new HashSet&lt;Region&gt;();<a name="line.144"></a>
+<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>import org.apache.hadoop.ipc.RemoteException;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>import org.apache.hadoop.util.StringUtils;<a name="line.61"></a>
+<span class="sourceLineNo">062</span>import org.apache.hadoop.util.StringUtils.TraditionalBinaryPrefix;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>import org.apache.htrace.Trace;<a name="line.63"></a>
+<span class="sourceLineNo">064</span>import org.apache.htrace.TraceScope;<a name="line.64"></a>
+<span class="sourceLineNo">065</span><a name="line.65"></a>
+<span class="sourceLineNo">066</span>/**<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * Thread that flushes cache on request<a name="line.67"></a>
+<span class="sourceLineNo">068</span> *<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * NOTE: This class extends Thread rather than Chore because the sleep time<a name="line.69"></a>
+<span class="sourceLineNo">070</span> * can be interrupted when there is something to do, rather than the Chore<a name="line.70"></a>
+<span class="sourceLineNo">071</span> * sleep time which is invariant.<a name="line.71"></a>
+<span class="sourceLineNo">072</span> *<a name="line.72"></a>
+<span class="sourceLineNo">073</span> * @see FlushRequester<a name="line.73"></a>
+<span class="sourceLineNo">074</span> */<a name="line.74"></a>
+<span class="sourceLineNo">075</span>@InterfaceAudience.Private<a name="line.75"></a>
+<span class="sourceLineNo">076</span>class MemStoreFlusher implements FlushRequester {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private static final Log LOG = LogFactory.getLog(MemStoreFlusher.class);<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>  private Configuration conf;<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  // These two data members go together.  Any entry in the one must have<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  // a corresponding entry in the other.<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private final BlockingQueue&lt;FlushQueueEntry&gt; flushQueue =<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    new DelayQueue&lt;FlushQueueEntry&gt;();<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private final Map&lt;Region, FlushRegionEntry&gt; regionsInQueue =<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    new HashMap&lt;Region, FlushRegionEntry&gt;();<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private AtomicBoolean wakeupPending = new AtomicBoolean();<a name="line.86"></a>
+<span class="sourceLineNo">087</span><a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private final long threadWakeFrequency;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  private final HRegionServer server;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  private final Object blockSignal = new Object();<a name="line.91"></a>
+<span class="sourceLineNo">092</span><a name="line.92"></a>
+<span class="sourceLineNo">093</span>  protected long globalMemStoreLimit;<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  protected float globalMemStoreLimitLowMarkPercent;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  protected long globalMemStoreLimitLowMark;<a name="line.95"></a>
+<span class="sourceLineNo">096</span><a name="line.96"></a>
+<span class="sourceLineNo">097</span>  private long blockingWaitTime;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  private final LongAdder updatesBlockedMsHighWater = new LongAdder();<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  private final FlushHandler[] flushHandlers;<a name="line.100"></a>
+<span class="sourceLineNo">101</span>  private List&lt;FlushRequestListener&gt; flushRequestListeners = new ArrayList&lt;FlushRequestListener&gt;(1);<a name="line.101"></a>
+<span class="sourceLineNo">102</span><a name="line.102"></a>
+<span class="sourceLineNo">103</span>  /**<a name="line.103"></a>
+<span class="sourceLineNo">104</span>   * @param conf<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   * @param server<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   */<a name="line.106"></a>
+<span class="sourceLineNo">107</span>  public MemStoreFlusher(final Configuration conf,<a name="line.107"></a>
+<span class="sourceLineNo">108</span>      final HRegionServer server) {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>    super();<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    this.conf = conf;<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    this.server = server;<a name="line.111"></a>
+<span class="sourceLineNo">112</span>    this.threadWakeFrequency =<a name="line.112"></a>
+<span class="sourceLineNo">113</span>        conf.getLong(HConstants.THREAD_WAKE_FREQUENCY, 10 * 1000);<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    Pair&lt;Long, MemoryType&gt; pair = MemorySizeUtil.getGlobalMemstoreSize(conf);<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    this.globalMemStoreLimit = pair.getFirst();<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    boolean onheap = pair.getSecond() == MemoryType.HEAP;<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    // When off heap memstore in use we configure the global off heap space for memstore as bytes<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    // not as % of max memory size. In such case, the lower water mark should be specified using the<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    // key "hbase.regionserver.global.memstore.size.lower.limit" which says % of the global upper<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    // bound and defaults to 95%. In on heap case also specifying this way is ideal. But in the past<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    // we used to take lower bound also as the % of xmx (38% as default). For backward compatibility<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    // for this deprecated config,we will fall back to read that config when new one is missing.<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    // Only for on heap case, do this fallback mechanism. For off heap it makes no sense.<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    // TODO When to get rid of the deprecated config? ie<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    // "hbase.regionserver.global.memstore.lowerLimit". Can get rid of this boolean passing then.<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    this.globalMemStoreLimitLowMarkPercent = MemorySizeUtil.getGlobalMemStoreHeapLowerMark(conf,<a name="line.126"></a>
+<span class="sourceLineNo">127</span>        onheap);<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    this.globalMemStoreLimitLowMark =<a name="line.128"></a>
+<span class="sourceLineNo">129</span>        (long) (this.globalMemStoreLimit * this.globalMemStoreLimitLowMarkPercent);<a name="line.129"></a>
+<span class="sourceLineNo">130</span><a name="line.130"></a>
+<span class="sourceLineNo">131</span>    this.blockingWaitTime = conf.getInt("hbase.hstore.blockingWaitTime",<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      90000);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    int handlerCount = conf.getInt("hbase.hstore.flusher.count", 2);<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    this.flushHandlers = new FlushHandler[handlerCount];<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    LOG.info("globalMemStoreLimit="<a name="line.135"></a>
+<span class="sourceLineNo">136</span>        + TraditionalBinaryPrefix.long2String(this.globalMemStoreLimit, "", 1)<a name="line.136"></a>
+<span class="sourceLineNo">137</span>        + ", globalMemStoreLimitLowMark="<a name="line.137"></a>
+<span class="sourceLineNo">138</span>        + TraditionalBinaryPrefix.long2String(this.globalMemStoreLimitLowMark, "", 1)<a name="line.138"></a>
+<span class="sourceLineNo">139</span>        + ", Offheap=" + !onheap);<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  }<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>  public LongAdder getUpdatesBlockedMsHighWater() {<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    return this.updatesBlockedMsHighWater;<a name="line.143"></a>
+<span class="sourceLineNo">144</span>  }<a name="line.144"></a>
 <span class="sourceLineNo">145</span><a name="line.145"></a>
-<span class="sourceLineNo">146</span>    double secondaryMultiplier<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      = ServerRegionReplicaUtil.getRegionReplicaStoreFileRefreshMultiplier(conf);<a name="line.147"></a>
-<span class="sourceLineNo">148</span><a name="line.148"></a>
-<span class="sourceLineNo">149</span>    boolean flushedOne = false;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    while (!flushedOne) {<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      // Find the biggest region that doesn't have too many storefiles<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      // (might be null!)<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      Region bestFlushableRegion = getBiggestMemstoreRegion(regionsBySize, excludedRegions, true);<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      // Find the biggest region, total, even if it might have too many flushes.<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      Region bestAnyRegion = getBiggestMemstoreRegion(<a name="line.155"></a>
-<span class="sourceLineNo">156</span>          regionsBySize, excludedRegions, false);<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      // Find the biggest region that is a secondary region<a name="line.157"></a>
-<span class="sourceLineNo">158</span>      Region bestRegionReplica = getBiggestMemstoreOfRegionReplica(regionsBySize,<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        excludedRegions);<a name="line.159"></a>
-<span class="sourceLineNo">160</span><a name="line.160"></a>
-<span class="sourceLineNo">161</span>      if (bestAnyRegion == null &amp;&amp; bestRegionReplica == null) {<a name="line.161"></a>
-<span class="sourceLineNo">162</span>        LOG.error("Above memory mark but there are no flushable regions!");<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        return false;<a name="line.163"></a>
-<span class="sourceLineNo">164</span>      }<a name="line.164"></a>
-<span class="sourceLineNo">165</span><a name="line.165"></a>
-<span class="sourceLineNo">166</span>      Region regionToFlush;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      if (bestFlushableRegion != null &amp;&amp;<a name="line.167"></a>
-<span class="sourceLineNo">168</span>          bestAnyRegion.getMemstoreSize() &gt; 2 * bestFlushableRegion.getMemstoreSize()) {<a name="line.168"></a>
-<span class="sourceLineNo">169</span>        // Even if it's not supposed to be flushed, pick a region if it's more than twice<a name="line.169"></a>
-<span class="sourceLineNo">170</span>        // as big as the best flushable one - otherwise when we're under pressure we make<a name="line.170"></a>
-<span class="sourceLineNo">171</span>        // lots of little flushes and cause lots of compactions, etc, which just makes<a name="line.171"></a>
-<span class="sourceLineNo">172</span>        // life worse!<a name="line.172"></a>
-<span class="sourceLineNo">173</span>        if (LOG.isDebugEnabled()) {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>          LOG.debug("Under global heap pressure: " + "Region "<a name="line.174"></a>
-<span class="sourceLineNo">175</span>              + bestAnyRegion.getRegionInfo().getRegionNameAsString()<a name="line.175"></a>
-<span class="sourceLineNo">176</span>              + " has too many " + "store files, but is "<a name="line.176"></a>
-<span class="sourceLineNo">177</span>              + TraditionalBinaryPrefix.long2String(bestAnyRegion.getMemstoreSize(), "", 1)<a name="line.177"></a>
-<span class="sourceLineNo">178</span>              + " vs best flushable region's "<a name="line.178"></a>
-<span class="sourceLineNo">179</span>              + TraditionalBinaryPrefix.long2String(bestFlushableRegion.getMemstoreSize(), "", 1)<a name="line.179"></a>
-<span class="sourceLineNo">180</span>              + ". Choosing the bigger.");<a name="line.180"></a>
-<span class="sourceLineNo">181</span>        }<a name="line.181"></a>
-<span class="sourceLineNo">182</span>        regionToFlush = bestAnyRegion;<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      } else {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>        if (bestFlushableRegion == null) {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>          regionToFlush = bestAnyRegion;<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        } else {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>          regionToFlush = bestFlushableRegion;<a name="line.187"></a>
-<span class="sourceLineNo">188</span>        }<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      }<a name="line.189"></a>
-<span class="sourceLineNo">190</span><a name="line.190"></a>
-<span class="sourceLineNo">191</span>      Preconditions.checkState(<a name="line.191"></a>
-<span class="sourceLineNo">192</span>        (regionToFlush != null &amp;&amp; regionToFlush.getMemstoreSize() &gt; 0) ||<a name="line.192"></a>
-<span class="sourceLineNo">193</span>        (bestRegionReplica != null &amp;&amp; bestRegionReplica.getMemstoreSize() &gt; 0));<a name="line.193"></a>
-<span class="sourceLineNo">194</span><a name="line.194"></a>
-<span class="sourceLineNo">195</span>      if (regionToFlush == null ||<a name="line.195"></a>
-<span class="sourceLineNo">196</span>          (bestRegionReplica != null &amp;&amp;<a name="line.196"></a>
-<span class="sourceLineNo">197</span>           ServerRegionReplicaUtil.isRegionReplicaStoreFileRefreshEnabled(conf) &amp;&amp;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>           (bestRegionReplica.getMemstoreSize()<a name="line.198"></a>
-<span class="sourceLineNo">199</span>               &gt; secondaryMultiplier * regionToFlush.getMemstoreSize()))) {<a name="line.199"></a>
-<span class="sourceLineNo">200</span>        LOG.info("Refreshing storefiles of region " + bestRegionReplica<a name="line.200"></a>
-<span class="sourceLineNo">201</span>            + " due to global heap pressure. Total memstore size="<a name="line.201"></a>
-<span class="sourceLineNo">202</span>            + StringUtils<a name="line.202"></a>
-<span class="sourceLineNo">203</span>                .humanReadableInt(server.getRegionServerAccounting().getGlobalMemstoreSize())<a name="line.203"></a>
-<span class="sourceLineNo">204</span>            + " memstore heap overhead=" + StringUtils.humanReadableInt(<a name="line.204"></a>
-<span class="sourceLineNo">205</span>                server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead()));<a name="line.205"></a>
-<span class="sourceLineNo">206</span>        flushedOne = refreshStoreFilesAndReclaimMemory(bestRegionReplica);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>        if (!flushedOne) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>          LOG.info("Excluding secondary region " + bestRegionReplica +<a name="line.208"></a>
-<span class="sourceLineNo">209</span>              " - trying to find a different region to refresh files.");<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          excludedRegions.add(bestRegionReplica);<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        }<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      } else {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>        LOG.info("Flush of region " + regionToFlush + " due to global heap pressure. "<a name="line.213"></a>
-<span class="sourceLineNo">214</span>            + "Total Memstore size="<a name="line.214"></a>
-<span class="sourceLineNo">215</span>            + humanReadableInt(server.getRegionServerAccounting().getGlobalMemstoreSize())<a name="line.215"></a>
-<span class="sourceLineNo">216</span>            + ", Region memstore size="<a name="line.216"></a>
-<span class="sourceLineNo">217</span>            + humanReadableInt(regionToFlush.getMemstoreSize()));<a name="line.217"></a>
-<span class="sourceLineNo">218</span>        flushedOne = flushRegion(regionToFlush, true, true);<a name="line.218"></a>
-<span class="sourceLineNo">219</span><a name="line.219"></a>
-<span class="sourceLineNo">220</span>        if (!flushedOne) {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>          LOG.info("Excluding unflushable region " + regionToFlush +<a name="line.221"></a>
-<span class="sourceLineNo">222</span>              " - trying to find a different region to flush.");<a name="line.222"></a>
-<span class="sourceLineNo">223</span>          excludedRegions.add(regionToFlush);<a name="line.223"></a>
-<span class="sourceLineNo">224</span>        }<a name="line.224"></a>
-<span class="sourceLineNo">225</span>      }<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    }<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    return true;<a name="line.227"></a>
-<span class="sourceLineNo">228</span>  }<a name="line.228"></a>
+<span class="sourceLineNo">146</span>  /**<a name="line.146"></a>
+<span class="sourceLineNo">147</span>   * The memstore across all regions has exceeded the low water mark. Pick<a name="line.147"></a>
+<span class="sourceLineNo">148</span>   * one region to flush and flush it synchronously (this is called from the<a name="line.148"></a>
+<span class="sourceLineNo">149</span>   * flush thread)<a name="line.149"></a>
+<span class="sourceLineNo">150</span>   * @return true if successful<a name="line.150"></a>
+<span class="sourceLineNo">151</span>   */<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  private boolean flushOneForGlobalPressure() {<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    SortedMap&lt;Long, Region&gt; regionsBySize = server.getCopyOfOnlineRegionsSortedBySize();<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    Set&lt;Region&gt; excludedRegions = new HashSet&lt;Region&gt;();<a name="line.154"></a>
+<span class="sourceLineNo">155</span><a name="line.155"></a>
+<span class="sourceLineNo">156</span>    double secondaryMultiplier<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      = ServerRegionReplicaUtil.getRegionReplicaStoreFileRefreshMultiplier(conf);<a name="line.157"></a>
+<span class="sourceLineNo">158</span><a name="line.158"></a>
+<span class="sourceLineNo">159</span>    boolean flushedOne = false;<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    while (!flushedOne) {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      // Find the biggest region that doesn't have too many storefiles<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      // (might be null!)<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      Region bestFlushableRegion = getBiggestMemstoreRegion(regionsBySize, excludedRegions, true);<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      // Find the biggest region, total, even if it might have too many flushes.<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      Region bestAnyRegion = getBiggestMemstoreRegion(<a name="line.165"></a>
+<span class="sourceLineNo">166</span>          regionsBySize, excludedRegions, false);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      // Find the biggest region that is a secondary region<a name="line.167"></a>
+<span class="sourceLineNo">168</span>      Region bestRegionReplica = getBiggestMemstoreOfRegionReplica(regionsBySize,<a name="line.168"></a>
+<span class="sourceLineNo">169</span>        excludedRegions);<a name="line.169"></a>
+<span class="sourceLineNo">170</span><a name="line.170"></a>
+<span class="sourceLineNo">171</span>      if (bestAnyRegion == null &amp;&amp; bestRegionReplica == null) {<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        LOG.error("Above memory mark but there are no flushable regions!");<a name="line.172"></a>
+<span class="sourceLineNo">173</span>        return false;<a name="line.173"></a>
+<span class="sourceLineNo">174</span>      }<a name="line.174"></a>
+<span class="sourceLineNo">175</span><a name="line.175"></a>
+<span class="sourceLineNo">176</span>      Region regionToFlush;<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      if (bestFlushableRegion != null &amp;&amp;<a name="line.177"></a>
+<span class="sourceLineNo">178</span>          bestAnyRegion.getMemstoreSize() &gt; 2 * bestFlushableRegion.getMemstoreSize()) {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        // Even if it's not supposed to be flushed, pick a region if it's more than twice<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        // as big as the best flushable one - otherwise when we're under pressure we make<a name="line.180"></a>
+<span class="sourceLineNo">181</span>        // lots of little flushes and cause lots of compactions, etc, which just makes<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        // life worse!<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        if (LOG.isDebugEnabled()) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>          LOG.debug("Under global heap pressure: " + "Region "<a name="line.184"></a>
+<span class="sourceLineNo">185</span>              + bestAnyRegion.getRegionInfo().getRegionNameAsString()<a name="line.185"></a>
+<span class="sourceLineNo">186</span>              + " has too many " + "store files, but is "<a name="line.186"></a>
+<span class="sourceLineNo">187</span>              + TraditionalBinaryPrefix.long2String(bestAnyRegion.getMemstoreSize(), "", 1)<a name="line.187"></a>
+<span class="sourceLineNo">188</span>              + " vs best flushable region's "<a name="line.188"></a>
+<span class="sourceLineNo">189</span>              + TraditionalBinaryPrefix.long2String(bestFlushableRegion.getMemstoreSize(), "", 1)<a name="line.189"></a>
+<span class="sourceLineNo">190</span>              + ". Choosing the bigger.");<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        }<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        regionToFlush = bestAnyRegion;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      } else {<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        if (bestFlushableRegion == null) {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>          regionToFlush = bestAnyRegion;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>        } else {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>          regionToFlush = bestFlushableRegion;<a name="line.197"></a>
+<span class="sourceLineNo">198</span>        }<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      }<a name="line.199"></a>
+<span class="sourceLineNo">200</span><a name="line.200"></a>
+<span class="sourceLineNo">201</span>      Preconditions.checkState(<a name="line.201"></a>
+<span class="sourceLineNo">202</span>        (regionToFlush != null &amp;&amp; regionToFlush.getMemstoreSize() &gt; 0) ||<a name="line.202"></a>
+<span class="sourceLineNo">203</span>        (bestRegionReplica != null &amp;&amp; bestRegionReplica.getMemstoreSize() &gt; 0));<a name="line.203"></a>
+<span class="sourceLineNo">204</span><a name="line.204"></a>
+<span class="sourceLineNo">205</span>      if (regionToFlush == null ||<a name="line.205"></a>
+<span class="sourceLineNo">206</span>          (bestRegionReplica != null &amp;&amp;<a name="line.206"></a>
+<span class="sourceLineNo">207</span>           ServerRegionReplicaUtil.isRegionReplicaStoreFileRefreshEnabled(conf) &amp;&amp;<a name="line.207"></a>
+<span class="sourceLineNo">208</span>           (bestRegionReplica.getMemstoreSize()<a name="line.208"></a>
+<span class="sourceLineNo">209</span>               &gt; secondaryMultiplier * regionToFlush.getMemstoreSize()))) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        LOG.info("Refreshing storefiles of region " + bestRegionReplica<a name="line.210"></a>
+<span class="sourceLineNo">211</span>            + " due to global heap pressure. Total memstore size="<a name="line.211"></a>
+<span class="sourceLineNo">212</span>            + StringUtils<a name="line.212"></a>
+<span class="sourceLineNo">213</span>                .humanReadableInt(server.getRegionServerAccounting().getGlobalMemstoreSize())<a name="line.213"></a>
+<span class="sourceLineNo">214</span>            + " memstore heap overhead=" + StringUtils.humanReadableInt(<a name="line.214"></a>
+<span class="sourceLineNo">215</span>                server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead()));<a name="line.215"></a>
+<span class="sourceLineNo">216</span>        flushedOne = refreshStoreFilesAndReclaimMemory(bestRegionReplica);<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        if (!flushedOne) {<a name="line.217"></a>
+<span class="sourceLineNo">218</span>          LOG.info("Excluding secondary region " + bestRegionReplica +<a name="line.218"></a>
+<span class="sourceLineNo">219</span>              " - trying to find a different region to refresh files.");<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          excludedRegions.add(bestRegionReplica);<a name="line.220"></a>
+<span class="sourceLineNo">221</span>        }<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      } else {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>        LOG.info("Flush of region " + regionToFlush + " due to global heap pressure. "<a name="line.223"></a>
+<span class="sourceLineNo">224</span>            + "Total Memstore size="<a name="line.224"></a>
+<span class="sourceLineNo">225</span>            + humanReadableInt(server.getRegionServerAccounting().getGlobalMemstoreSize())<a name="line.225"></a>
+<span class="sourceLineNo">226</span>            + ", Region memstore size="<a name="line.226"></a>
+<span class="sourceLineNo">227</span>            + humanReadableInt(regionToFlush.getMemstoreSize()));<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        flushedOne = flushRegion(regionToFlush, true, true);<a name="line.228"></a>
 <span class="sourceLineNo">229</span><a name="line.229"></a>
-<span class="sourceLineNo">230</span>  private class FlushHandler extends HasThread {<a name="line.230"></a>
-<span class="sourceLineNo">231</span><a name="line.231"></a>
-<span class="sourceLineNo">232</span>    private FlushHandler(String name) {<a name="line.232"></a>
-<span class="sourceLineNo">233</span>      super(name);<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    }<a name="line.234"></a>
-<span class="sourceLineNo">235</span><a name="line.235"></a>
-<span class="sourceLineNo">236</span>    @Override<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    public void run() {<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      while (!server.isStopped()) {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        FlushQueueEntry fqe = null;<a name="line.239"></a>
-<span class="sourceLineNo">240</span>        try {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>          wakeupPending.set(false); // allow someone to wake us up again<a name="line.241"></a>
-<span class="sourceLineNo">242</span>          fqe = flushQueue.poll(threadWakeFrequency, TimeUnit.MILLISECONDS);<a name="line.242"></a>
-<span class="sourceLineNo">243</span>          if (fqe == null || fqe instanceof WakeupFlushThread) {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>            if (isAboveLowWaterMark()) {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>              LOG.debug("Flush thread woke up because memory above low water="<a name="line.245"></a>
-<span class="sourceLineNo">246</span>                  + TraditionalBinaryPrefix.long2String(globalMemStoreLimitLowMark, "", 1));<a name="line.246"></a>
-<span class="sourceLineNo">247</span>              if (!flushOneForGlobalPressure()) {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>                // Wasn't able to flush any region, but we're above low water mark<a name="line.248"></a>
-<span class="sourceLineNo">249</span>                // This is unlikely to happen, but might happen when closing the<a name="line.249"></a>
-<span class="sourceLineNo">250</span>                // entire server - another thread is flushing regions. We'll just<a name="line.250"></a>
-<span class="sourceLineNo">251</span>                // sleep a little bit to avoid spinning, and then pretend that<a name="line.251"></a>
-<span class="sourceLineNo">252</span>                // we flushed one, so anyone blocked will check again<a name="line.252"></a>
-<span class="sourceLineNo">253</span>                Thread.sleep(1000);<a name="line.253"></a>
-<span class="sourceLineNo">254</span>                wakeUpIfBlocking();<a name="line.254"></a>
-<span class="sourceLineNo">255</span>              }<a name="line.255"></a>
-<span class="sourceLineNo">256</span>              // Enqueue another one of these tokens so we'll wake up again<a name="line.256"></a>
-<span class="sourceLineNo">257</span>              wakeupFlushThread();<a name="line.257"></a>
-<span class="sourceLineNo">258</span>            }<a name="line.258"></a>
-<span class="sourceLineNo">259</span>            continue;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>          }<a name="line.260"></a>
-<span class="sourceLineNo">261</span>          FlushRegionEntry fre = (FlushRegionEntry) fqe;<a name="line.261"></a>
-<span class="sourceLineNo">262</span>          if (!flushRegion(fre)) {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>            break;<a name="line.263"></a>
-<span class="sourceLineNo">264</span>          }<a name="line.264"></a>
-<span class="sourceLineNo">265</span>        } catch (InterruptedException ex) {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>          continue;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>        } catch (ConcurrentModificationException ex) {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>          continue;<a name="line.268"></a>
-<span class="sourceLineNo">269</span>        } catch (Exception ex) {<a name="line.269"></a>
-<span class="sourceLineNo">270</span>          LOG.error("Cache flusher failed for entry " + fqe, ex);<a name="line.270"></a>
-<span class="sourceLineNo">271</span>          if (!server.checkFileSystem()) {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>            break;<a name="line.272"></a>
-<span class="sourceLineNo">273</span>          }<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        }<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      }<a name="line.275"></a>
-<span class="sourceLineNo">276</span>      synchronized (regionsInQueue) {<a name="line.276"></a>
-<span class="sourceLineNo">277</span>        regionsInQueue.clear();<a name="line.277"></a>
-<span class="sourceLineNo">278</span>        flushQueue.clear();<a name="line.278"></a>
-<span class="sourceLineNo">279</span>      }<a name="line.279"></a>
-<span class="sourceLineNo">280</span><a name="line.280"></a>
-<span class="sourceLineNo">281</span>      // Signal anyone waiting, so they see the close flag<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      wakeUpIfBlocking();<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      LOG.info(getName() + " exiting");<a name="line.283"></a>
-<span class="sourceLineNo">284</span>    }<a name="line.284"></a>
-<span class="sourceLineNo">285</span>  }<a name="line.285"></a>
-<span class="sourceLineNo">286</span><a name="line.286"></a>
-<span class="sourceLineNo">287</span><a name="line.287"></a>
-<span class="sourceLineNo">288</span>  private void wakeupFlushThread() {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>    if (wakeupPending.compareAndSet(false, true)) {<a name="line.289"></a>
-<span class="sourceLineNo">290</span>      flushQueue.add(new WakeupFlushThread());<a name="line.290"></a>
-<span class="sourceLineNo">291</span>    }<a name="line.291"></a>
-<span class="sourceLineNo">292</span>  }<a name="line.292"></a>
-<span class="sourceLineNo">293</span><a name="line.293"></a>
-<span class="sourceLineNo">294</span>  private Region getBiggestMemstoreRegion(<a name="line.294"></a>
-<span class="sourceLineNo">295</span>      SortedMap&lt;Long, Region&gt; regionsBySize,<a name="line.295"></a>
-<span class="sourceLineNo">296</span>      Set&lt;Region&gt; excludedRegions,<a name="line.296"></a>
-<span class="sourceLineNo">297</span>      boolean checkStoreFileCount) {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    synchronized (regionsInQueue) {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      for (Region region : regionsBySize.values()) {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>        if (excludedRegions.contains(region)) {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>          continue;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>        }<a name="line.302"></a>
+<span class="sourceLineNo">230</span>        if (!flushedOne) {<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          LOG.info("Excluding unflushable region " + regionToFlush +<a name="line.231"></a>
+<span class="sourceLineNo">232</span>              " - trying to find a different region to flush.");<a name="line.232"></a>
+<span class="sourceLineNo">233</span>          excludedRegions.add(regionToFlush);<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        }<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      }<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    }<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    return true;<a name="line.237"></a>
+<span class="sourceLineNo">238</span>  }<a name="line.238"></a>
+<span class="sourceLineNo">239</span><a name="line.239"></a>
+<span class="sourceLineNo">240</span>  private class FlushHandler extends HasThread {<a name="line.240"></a>
+<span class="sourceLineNo">241</span><a name="line.241"></a>
+<span class="sourceLineNo">242</span>    private FlushHandler(String name) {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>      super(name);<a name="line.243"></a>
+<span class="sourceLineNo">244</span>    }<a name="line.244"></a>
+<span class="sourceLineNo">245</span><a name="line.245"></a>
+<span class="sourceLineNo">246</span>    @Override<a name="line.246"></a>
+<span class="sourceLineNo">247</span>    public void run() {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      while (!server.isStopped()) {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>        FlushQueueEntry fqe = null;<a name="line.249"></a>
+<span class="sourceLineNo">250</span>        try {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>          wakeupPending.set(false); // allow someone to wake us up again<a name="line.251"></a>
+<span class="sourceLineNo">252</span>          fqe = flushQueue.poll(threadWakeFrequency, TimeUnit.MILLISECONDS);<a name="line.252"></a>
+<span class="sourceLineNo">253</span>          if (fqe == null || fqe instanceof WakeupFlushThread) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>            if (isAboveLowWaterMark()) {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>              LOG.debug("Flush thread woke up because memory above low water="<a name="line.255"></a>
+<span class="sourceLineNo">256</span>                  + TraditionalBinaryPrefix.long2String(globalMemStoreLimitLowMark, "", 1));<a name="line.256"></a>
+<span class="sourceLineNo">257</span>              if (!flushOneForGlobalPressure()) {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>                // Wasn't able to flush any region, but we're above low water mark<a name="line.258"></a>
+<span class="sourceLineNo">259</span>                // This is unlikely to happen, but might happen when closing the<a name="line.259"></a>
+<span class="sourceLineNo">260</span>                // entire server - another thread is flushing regions. We'll just<a name="line.260"></a>
+<span class="sourceLineNo">261</span>                // sleep a little bit to avoid spinning, and then pretend that<a name="line.261"></a>
+<span class="sourceLineNo">262</span>                // we flushed one, so anyone blocked will check again<a name="line.262"></a>
+<span class="sourceLineNo">263</span>                Thread.sleep(1000);<a name="line.263"></a>
+<span class="sourceLineNo">264</span>                wakeUpIfBlocking();<a name="line.264"></a>
+<span class="sourceLineNo">265</span>              }<a name="line.265"></a>
+<span class="sourceLineNo">266</span>              // Enqueue another one of these tokens so we'll wake up again<a name="line.266"></a>
+<span class="sourceLineNo">267</span>              wakeupFlushThread();<a name="line.267"></a>
+<span class="sourceLineNo">268</span>            }<a name="line.268"></a>
+<span class="sourceLineNo">269</span>            continue;<a name="line.269"></a>
+<span class="sourceLineNo">270</span>          }<a name="line.270"></a>
+<span class="sourceLineNo">271</span>          FlushRegionEntry fre = (FlushRegionEntry) fqe;<a name="line.271"></a>
+<span class="sourceLineNo">272</span>          if (!flushRegion(fre)) {<a name="line.272"></a>
+<span class="sourceLineNo">273</span>            break;<a name="line.273"></a>
+<span class="sourceLineNo">274</span>          }<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        } catch (InterruptedException ex) {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>          continue;<a name="line.276"></a>
+<span class="sourceLineNo">277</span>        } catch (ConcurrentModificationException ex) {<a name="line.277"></a>
+<span class="sourceLineNo">278</span>          continue;<a name="line.278"></a>
+<span class="sourceLineNo">279</span>        } catch (Exception ex) {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>          LOG.error("Cache flusher failed for entry " + fqe, ex);<a name="line.280"></a>
+<span class="sourceLineNo">281</span>          if (!server.checkFileSystem()) {<a name="line.281"></a>
+<span class="sourceLineNo">282</span>            break;<a name="line.282"></a>
+<span class="sourceLineNo">283</span>          }<a name="line.283"></a>
+<span class="sourceLineNo">284</span>        }<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      }<a name="line.285"></a>
+<span class="sourceLineNo">286</span>      synchronized (regionsInQueue) {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>        regionsInQueue.clear();<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        flushQueue.clear();<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      }<a name="line.289"></a>
+<span class="sourceLineNo">290</span><a name="line.290"></a>
+<span class="sourceLineNo">291</span>      // Signal anyone waiting, so they see the close flag<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      wakeUpIfBlocking();<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      LOG.info(getName() + " exiting");<a name="line.293"></a>
+<span class="sourceLineNo">294</span>    }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>  }<a name="line.295"></a>
+<span class="sourceLineNo">296</span><a name="line.296"></a>
+<span class="sourceLineNo">297</span><a name="line.297"></a>
+<span class="sourceLineNo">298</span>  private void wakeupFlushThread() {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>    if (wakeupPending.compareAndSet(false, true)) {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>      flushQueue.add(new WakeupFlushThread());<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    }<a name="line.301"></a>
+<span class="sourceLineNo">302</span>  }<a name="line.302"></a>
 <span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>        if (((HRegion)region).writestate.flushing ||<a name="line.304"></a>
-<span class="sourceLineNo">305</span>            !((HRegion)region).writestate.writesEnabled) {<a name="line.305"></a>
-<span class="sourceLineNo">306</span>          continue;<a name="line.306"></a>
-<span class="sourceLineNo">307</span>        }<a name="line.307"></a>
-<span class="sourceLineNo">308</span><a name="line.308"></a>
-<span class="sourceLineNo">309</span>        if (checkStoreFileCount &amp;&amp; isTooManyStoreFiles(region)) {<a name="line.309"></a>
-<span class="sourceLineNo">310</span>          continue;<a name="line.310"></a>
-<span class="sourceLineNo">311</span>        }<a name="line.311"></a>
-<span class="sourceLineNo">312</span>        return region;<a name="line.312"></a>
-<span class="sourceLineNo">313</span>      }<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    }<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    return null;<a name="line.315"></a>
-<span class="sourceLineNo">316</span>  }<a name="line.316"></a>
-<span class="sourceLineNo">317</span><a name="line.317"></a>
-<span class="sourceLineNo">318</span>  private Region getBiggestMemstoreOfRegionReplica(SortedMap&lt;Long, Region&gt; regionsBySize,<a name="line.318"></a>
-<span class="sourceLineNo">319</span>      Set&lt;Region&gt; excludedRegions) {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>    synchronized (regionsInQueue) {<a name="line.320"></a>
-<span class="sourceLineNo">321</span>      for (Region region : regionsBySize.values()) {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>        if (excludedRegions.contains(region)) {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>          continue;<a name="line.323"></a>
-<span class="sourceLineNo">324</span>        }<a name="line.324"></a>
-<span class="sourceLineNo">325</span><a name="line.325"></a>
-<span class="sourceLineNo">326</span>        if (RegionReplicaUtil.isDefaultReplica(region.getRegionInfo())) {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>          continue;<a name="line.327"></a>
-<span class="sourceLineNo">328</span>        }<a name="line.328"></a>
-<span class="sourceLineNo">329</span><a name="line.329"></a>
-<span class="sourceLineNo">330</span>        return region;<a name="line.330"></a>
-<span class="sourceLineNo">331</span>      }<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    }<a name="line.332"></a>
-<span class="sourceLineNo">333</span>    return null;<a name="line.333"></a>
-<span class="sourceLineNo">334</span>  }<a name="line.334"></a>
+<span class="sourceLineNo">304</span>  private Region getBiggestMemstoreRegion(<a name="line.304"></a>
+<span class="sourceLineNo">305</span>      SortedMap&lt;Long, Region&gt; regionsBySize,<a name="line.305"></a>
+<span class="sourceLineNo">306</span>      Set&lt;Region&gt; excludedRegions,<a name="line.306"></a>
+<span class="sourceLineNo">307</span>      boolean checkStoreFileCount) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>    synchronized (regionsInQueue) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      for (Region region : regionsBySize.values()) {<a name="line.309"></a>
+<span class="sourceLineNo">310</span>        if (excludedRegions.contains(region)) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>          continue;<a name="line.311"></a>
+<span class="sourceLineNo">312</span>        }<a name="line.312"></a>
+<span class="sourceLineNo">313</span><a name="line.313"></a>
+<span class="sourceLineNo">314</span>        if (((HRegion)region).writestate.flushing ||<a name="line.314"></a>
+<span class="sourceLineNo">315</span>            !((HRegion)region).writestate.writesEnabled) {<a name="line.315"></a>
+<span class="sourceLineNo">316</span>          continue;<a name="line.316"></a>
+<span class="sourceLineNo">317</span>        }<a name="line.317"></a>
+<span class="sourceLineNo">318</span><a name="line.318"></a>
+<span class="sourceLineNo">319</span>        if (checkStoreFileCount &amp;&amp; isTooManyStoreFiles(region)) {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>          continue;<a name="line.320"></a>
+<span class="sourceLineNo">321</span>        }<a name="line.321"></a>
+<span class="sourceLineNo">322</span>        return region;<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      }<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    }<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    return null;<a name="line.325"></a>
+<span class="sourceLineNo">326</span>  }<a name="line.326"></a>
+<span class="sourceLineNo">327</span><a name="line.327"></a>
+<span class="sourceLineNo">328</span>  private Region getBiggestMemstoreOfRegionReplica(SortedMap&lt;Long, Region&gt; regionsBySize,<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      Set&lt;Region&gt; excludedRegions) {<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    synchronized (regionsInQueue) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>      for (Region region : regionsBySize.values()) {<a name="line.331"></a>
+<span class="sourceLineNo">332</span>        if (excludedRegions.contains(region)) {<a name="line.332"></a>
+<span class="sourceLineNo">333</span>          continue;<a name="line.333"></a>
+<span class="sourceLineNo">334</span>        }<a name="line.334"></a>
 <span class="sourceLineNo">335</span><a name="line.335"></a>
-<span class="sourceLineNo">336</span>  private boolean refreshStoreFilesAndReclaimMemory(Region region) {<a name="line.336"></a>
-<span class="sourceLineNo">337</span>    try {<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      return region.refreshStoreFiles();<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    } catch (IOException e) {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>      LOG.warn("Refreshing store files failed with exception", e);<a name="line.340"></a>
-<span class="sourceLineNo">341</span>    }<a name="line.341"></a>
-<span class="sourceLineNo">342</span>    return false;<a name="line.342"></a>
-<span class="sourceLineNo">343</span>  }<a name="line.343"></a>
-<span class="sourceLineNo">344</span><a name="line.344"></a>
-<span class="sourceLineNo">345</span>  /**<a name="line.345"></a>
-<span class="sourceLineNo">346</span>   * Return true if global memory usage is above the high watermark<a name="line.346"></a>
-<span class="sourceLineNo">347</span>   */<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  private boolean isAboveHighWaterMark() {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    return server.getRegionServerAccounting().getGlobalMemstoreSize()<a name="line.349"></a>
-<span class="sourceLineNo">350</span>        + server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead() &gt;= globalMemStoreLimit;<a name="line.350"></a>
-<span class="sourceLineNo">351</span>  }<a name="line.351"></a>
-<span class="sourceLineNo">352</span><a name="line.352"></a>
-<span class="sourceLineNo">353</span>  /**<a name="line.353"></a>
-<span class="sourceLineNo">354</span>   * Return true if we're above the high watermark<a name="line.354"></a>
-<span class="sourceLineNo">355</span>   */<a name="line.355"></a>
-<span class="sourceLineNo">356</span>  private boolean isAboveLowWaterMark() {<a name="line.356"></a>
-<span class="sourceLineNo">357</span>    return server.getRegionServerAccounting().getGlobalMemstoreSize() + server<a name="line.357"></a>
-<span class="sourceLineNo">358</span>        .getRegionServerAccounting().getGlobalMemstoreHeapOverhead() &gt;= globalMemStoreLimitLowMark;<a name="line.358"></a>
-<span class="sourceLineNo">359</span>  }<a name="line.359"></a>
-<span class="sourceLineNo">360</span><a name="line.360"></a>
-<span class="sourceLineNo">361</span>  @Override<a name="line.361"></a>
-<span class="sourceLineNo">362</span>  public void requestFlush(Region r, boolean forceFlushAllStores) {<a name="line.362"></a>
-<span class="sourceLineNo">363</span>    synchronized (regionsInQueue) {<a name="line.363"></a>
-<span class="sourceLineNo">364</span>      if (!regionsInQueue.containsKey(r)) {<a name="line.364"></a>
-<span class="sourceLineNo">365</span>        // This entry has no delay so it will be added at the top of the flush<a name="line.365"></a>
-<span class="sourceLineNo">366</span>        // queue.  It'll come out near immediately.<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        FlushRegionEntry fqe = new FlushRegionEntry(r, forceFlushAllStores);<a name="line.367"></a>
-<span class="sourceLineNo">368</span>        this.regionsInQueue.put(r, fqe);<a name="line.368"></a>
-<span class="sourceLineNo">369</span>        this.flushQueue.add(fqe);<a name="line.369"></a>
-<span class="sourceLineNo">370</span>      }<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    }<a name="line.371"></a>
-<span class="sourceLineNo">372</span>  }<a name="line.372"></a>
-<span class="sourceLineNo">373</span><a name="line.373"></a>
-<span class="sourceLineNo">374</span>  @Override<a name="line.374"></a>
-<span class="sourceLineNo">375</span>  public void requestDelayedFlush(Region r, long delay, boolean forceFlushAllStores) {<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    synchronized (regionsInQueue) {<a name="line.376"></a>
-<span class="sourceLineNo">377</span>      if (!regionsInQueue.containsKey(r)) {<a name="line.377"></a>
-<span class="sourceLineNo">378</span>        // This entry has some delay<a name="line.378"></a>
-<span class="sourceLineNo">379</span>        FlushRegionEntry fqe = new FlushRegionEntry(r, forceFlushAllStores);<a name="line.379"></a>
-<span class="sourceLineNo">380</span>        fqe.requeue(delay);<a name="line.380"></a>
-<span class="sourceLineNo">381</span>        this.regionsInQueue.put(r, fqe);<a name="line.381"></a>
-<span class="sourceLineNo">382</span>        this.flushQueue.add(fqe);<a name="line.382"></a>
-<span class="sourceLineNo">383</span>      }<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    }<a name="line.384"></a>
-<span class="sourceLineNo">385</span>  }<a name="line.385"></a>
-<span class="sourceLineNo">386</span><a name="line.386"></a>
-<span class="sourceLineNo">387</span>  public int getFlushQueueSize() {<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    return flushQueue.size();<a name="line.388"></a>
-<span class="sourceLineNo">389</span>  }<a name="line.389"></a>
-<span class="sourceLineNo">390</span><a name="line.390"></a>
-<span class="sourceLineNo">391</span>  /**<a name="line.391"></a>
-<span class="sourceLineNo">392</span>   * Only interrupt once it's done with a run through the work loop.<a name="line.392"></a>
-<span class="sourceLineNo">393</span>   */<a name="line.393"></a>
-<span class="sourceLineNo">394</span>  void interruptIfNecessary() {<a name="line.394"></a>
-<span class="sourceLineNo">395</span>    lock.writeLock().lock();<a name="line.395"></a>
-<span class="sourceLineNo">396</span>    try {<a name="line.396"></a>
-<span class="sourceLineNo">397</span>      for (FlushHandler flushHander : flushHandlers) {<a name="line.397"></a>
-<span class="sourceLineNo">398</span>        if (flushHander != null) flushHander.interrupt();<a name="line.398"></a>
-<span class="sourceLineNo">399</span>      }<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    } finally {<a name="line.400"></a>
-<span class="sourceLineNo">401</span>      lock.writeLock().unlock();<a name="line.401"></a>
-<span class="sourceLineNo">402</span>    }<a name="line.402"></a>
-<span class="sourceLineNo">403</span>  }<a name="line.403"></a>
-<span class="sourceLineNo">404</span><a name="line.404"></a>
-<span class="sourceLineNo">405</span>  synchronized void start(UncaughtExceptionHandler eh) {<a name="line.405"></a>
-<span class="sourceLineNo">406</span>    ThreadFactory flusherThreadFactory = Threads.newDaemonThreadFactory(<a name="line.406"></a>
-<span class="sourceLineNo">407</span>        server.getServerName().toShortString() + "-MemStoreFlusher", eh);<a name="line.407"></a>
-<span class="sourceLineNo">408</span>    for (int i = 0; i &lt; flushHandlers.length; i++) {<a name="line.408"></a>
-<span class="sourceLineNo">409</span>      flushHandlers[i] = new FlushHandler("MemStoreFlusher." + i);<a name="line.409"></a>
-<span class="sourceLineNo">410</span>      flusherThreadFactory.newThread(flushHandlers[i]);<a name="line.410"></a>
-<span class="sourceLineNo">411</span>      flushHandlers[i].start();<a name="line.411"></a>
+<span class="sourceLineNo">336</span>        if (RegionReplicaUtil.isDefaultReplica(region.getRegionInfo())) {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          continue;<a name="line.337"></a>
+<span class="sourceLineNo">338</span>        }<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>        return region;<a name="line.340"></a>
+<span class="sourceLineNo">341</span>      }<a name="line.341"></a>
+<span class="sourceLineNo">342</span>    }<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    return null;<a name="line.343"></a>
+<span class="sourceLineNo">344</span>  }<a name="line.344"></a>
+<span class="sourceLineNo">345</span><a name="line.345"></a>
+<span class="sourceLineNo">346</span>  private boolean refreshStoreFilesAndReclaimMemory(Region region) {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    try {<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      return region.refreshStoreFiles();<a name="line.348"></a>
+<span class="sourceLineNo">349</span>    } catch (IOException e) {<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      LOG.warn("Refreshing store files failed with exception", e);<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    }<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    return false;<a name="line.352"></a>
+<span class="sourceLineNo">353</span>  }<a name="line.353"></a>
+<span class="sourceLineNo">354</span><a name="line.354"></a>
+<span class="sourceLineNo">355</span>  /**<a name="line.355"></a>
+<span class="sourceLineNo">356</span>   * Return true if global memory usage is above the high watermark<a name="line.356"></a>
+<span class="sourceLineNo">357</span>   */<a name="line.357"></a>
+<span class="sourceLineNo">358</span>  private boolean isAboveHighWaterMark() {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    return server.getRegionServerAccounting().getGlobalMemstoreSize()<a name="line.359"></a>
+<span class="sourceLineNo">360</span>        + server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead() &gt;= globalMemStoreLimit;<a name="line.360"></a>
+<span class="sourceLineNo">361</span>  }<a name="line.361"></a>
+<span class="sourceLineNo">362</span><a name="line.362"></a>
+<span class="sourceLineNo">363</span>  /**<a name="line.363"></a>
+<span class="sourceLineNo">364</span>   * Return true if we're above the high watermark<a name="line.364"></a>
+<span class="sourceLineNo">365</span>   */<a name="line.365"></a>
+<span class="sourceLineNo">366</span>  private boolean isAboveLowWaterMark() {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    return server.getRegionServerAccounting().getGlobalMemstoreSize() + server<a name="line.367"></a>
+<span class="sourceLineNo">368</span>        .getRegionServerAccounting().getGlobalMemstoreHeapOverhead() &gt;= globalMemStoreLimitLowMark;<a name="line.368"></a>
+<span class="sourceLineNo">369</span>  }<a name="line.369"></a>
+<span class="sourceLineNo">370</span><a name="line.370"></a>
+<span class="sourceLineNo">371</span>  @Override<a name="line.371"></a>
+<span class="sourceLineNo">372</span>  public void requestFlush(Region r, boolean forceFlushAllStores) {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>    synchronized (regionsInQueue) {<a name="line.373"></a>
+<span class="sourceLineNo">374</span>      if (!regionsInQueue.containsKey(r)) {<a name="line.374"></a>
+<span class="sourceLineNo">375</span>        // This entry has no delay so it will be added at the top of the flush<a name="line.375"></a>
+<span class="sourceLineNo">376</span>        // queue.  It'll come out near immediately.<a name="line.376"></a>
+<span class="sourceLineNo">377</span>        FlushRegionEntry fqe = new FlushRegionEntry(r, forceFlushAllStores);<a name="line.377"></a>
+<span class="sourceLineNo">378</span>        this.regionsInQueue.put(r, fqe);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>        this.flushQueue.add(fqe);<a name="line.379"></a>
+<span class="sourceLineNo">380</span>      }<a name="line.380"></a>
+<span class="sourceLineNo">381</span>    }<a name="line.381"></a>
+<span class="sourceLineNo">382</span>  }<a name="line.382"></a>
+<span class="sourceLineNo">383</span><a name="line.383"></a>
+<span class="sourceLineNo">384</span>  @Override<a name="line.384"></a>
+<span class="sourceLineNo">385</span>  public void requestDelayedFlush(Region r, long delay, boolean forceFlushAllStores) {<a name="line.385"></a>
+<span class="sourceLineNo">386</span>    synchronized (regionsInQueue) {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>      if (!regionsInQueue.containsKey(r)) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>        // This entry has some delay<a name="line.388"></a>
+<span class="sourceLineNo">389</span>        FlushRegionEntry fqe = new FlushRegionEntry(r, forceFlushAllStores);<a name="line.389"></a>
+<span class="sourceLineNo">390</span>        fqe.requeue(delay);<a name="line.390"></a>
+<span class="sourceLineNo">391</span>        this.regionsInQueue.put(r, fqe);<a name="line.391"></a>
+<span class="sourceLineNo">392</span>        this.flushQueue.add(fqe);<a name="line.392"></a>
+<span class="sourceLineNo">393</span>      }<a name="line.393"></a>
+<span class="sourceLineNo">394</span>    }<a name="line.394"></a>
+<span class="sourceLineNo">395</span>  }<a name="line.395"></a>
+<span class="sourceLineNo">396</span><a name="line.396"></a>
+<span class="sourceLineNo">397</span>  public int getFlushQueueSize() {<a name="line.397"></a>
+<span class="sourceLineNo">398</span>    return flushQueue.size();<a name="line.398"></a>
+<span class="sourceLineNo">399</span>  }<a name="line.399"></a>
+<span class="sourceLineNo">400</span><a name="line.400"></a>
+<span class="sourceLineNo">401</span>  /**<a name="line.401"></a>
+<span class="sourceLineNo">402</span>   * Only interrupt once it's done with a run through the work loop.<a name="line.402"></a>
+<span class="sourceLineNo">403</span>   */<a name="line.403"></a>
+<span class="sourceLineNo">404</span>  void interruptIfNecessary() {<a name="line.404"></a>
+<span class="sourceLineNo">405</span>    lock.writeLock().lock();<a name="line.405"></a>
+<span class="sourceLineNo">406</span>    try {<a name="line.406"></a>
+<span class="sourceLineNo">407</span>      for (FlushHandler flushHander : flushHandlers) {<a name="line.407"></a>
+<span class="sourceLineNo">408</span>        if (flushHander != null) flushHander.interrupt();<a name="line.408"></a>
+<span class="sourceLineNo">409</span>      }<a name="line.409"></a>
+<span class="sourceLineNo">410</span>    } finally {<a name="line.410"></a>
+<span class="sourceLineNo">411</span>      lock.writeLock().unlock();<a name="line.411"></a>
 <span class="sourceLineNo">412</span>    }<a name="line.412"></a>
 <span class="sourceLineNo">413</span>  }<a name="line.413"></a>
 <span class="sourceLineNo">414</span><a name="line.414"></a>
-<span class="sourceLineNo">415</span>  boolean isAlive() {<a name="line.415"></a>
-<span class="sourceLineNo">416</span>    for (FlushHandler flushHander : flushHandlers) {<a name="line.416"></a>
-<span class="sourceLineNo">417</span>      if (flushHander != null &amp;&amp; flushHander.isAlive()) {<a name="line.417"></a>
-<span class="sourceLineNo">418</span>        return true;<a name="line.418"></a>
-<span class="sourceLineNo">419</span>      }<a name="line.419"></a>
-<span class="sourceLineNo">420</span>    }<a name="line.420"></a>
-<span class="sourceLineNo">421</span>    return false;<a name="line.421"></a>
-<span class="sourceLineNo">422</span>  }<a name="line.422"></a>
-<span class="sourceLineNo">423</span><a name="line.423"></a>
-<span class="sourceLineNo">424</span>  void join() {<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    for (FlushHandler flushHander : flushHandlers) {<a name="line.425"></a>
-<span class="sourceLineNo">426</span>      if (flushHander != null) {<a name="line.426"></a>
-<span class="sourceLineNo">427</span>        Threads.shutdown(flushHander.getThread());<a name="line.427"></a>
-<span class="sourceLineNo">428</span>      }<a name="line.428"></a>
-<span class="sourceLineNo">429</span>    }<a name="line.429"></a>
-<span class="sourceLineNo">430</span>  }<a name="line.430"></a>
-<span class="sourceLineNo">431</span><a name="line.431"></a>
-<span class="sourceLineNo">432</span>  /**<a name="line.432"></a>
-<span class="sourceLineNo">433</span>   * A flushRegion that checks store file count.  If too many, puts the flush<a name="line.433"></a>
-<span class="sourceLineNo">434</span>   * on delay queue to retry later.<a name="line.434"></a>
-<span class="sourceLineNo">435</span>   * @param fqe<a name="line.435"></a>
-<span class="sourceLineNo">436</span>   * @return true if the region was successfully flushed, false otherwise. If<a name="line.436"></a>
-<span class="sourceLineNo">437</span>   * false, there will be accompanying log messages explaining why the region was<a name="line.437"></a>
-<span class="sourceLineNo">438</span>   * not flushed.<a name="line.438"></a>
-<span class="sourceLineNo">439</span>   */<a name="line.439"></a>
-<span class="sourceLineNo">440</span>  private boolean flushRegion(final FlushRegionEntry fqe) {<a name="line.440"></a>
-<span class="sourceLineNo">441</span>    Region region = fqe.region;<a name="line.441"></a>
-<span class="sourceLineNo">442</span>    if (!region.getRegionInfo().isMetaRegion() &amp;&amp;<a name="line.442"></a>
-<span class="sourceLineNo">443</span>        isTooManyStoreFiles(region)) {<a name="line.443"></a>
-<span class="sourceLineNo">444</span>      if (fqe.isMaximumWait(this.blockingWaitTime)) {<a name="line.444"></a>
-<span class="sourceLineNo">445</span>        LOG.info("Waited " + (EnvironmentEdgeManager.currentTime() - fqe.createTime) +<a name="line.445"></a>
-<span class="sourceLineNo">446</span>          "ms on a compaction to clean up 'too many store files'; waited " +<a name="line.446"></a>
-<span class="sourceLineNo">447</span>          "long enough... proceeding with flush of " +<a name="line.447"></a>
-<span class="sourceLineNo">448</span>          region.getRegionInfo().getRegionNameAsString());<a name="line.448"></a>
-<span class="sourceLineNo">449</span>      } else {<a name="line.449"></a>
-<span class="sourceLineNo">450</span>        // If this is first time we've been put off, then emit a log message.<a name="line.450"></a>
-<span class="sourceLineNo">451</span>        if (fqe.getRequeueCount() &lt;= 0) {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>          // Note: We don't impose blockingStoreFiles constraint on meta regions<a name="line.452"></a>
-<span class="sourceLineNo">453</span>          LOG.warn("Region " + region.getRegionInfo().getRegionNameAsString() + " has too many " +<a name="line.453"></a>
-<span class="sourceLineNo">454</span>            "store files; delaying flush up to " + this.blockingWaitTime + "ms");<a name="line.454"></a>
-<span class="sourceLineNo">455</span>          if (!this.server.compactSplitThread.requestSplit(region)) {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>            try {<a name="line.456"></a>
-<span class="sourceLineNo">457</span>              this.server.compactSplitThread.requestSystemCompaction(<a name="line.457"></a>
-<span class="sourceLineNo">458</span>                  region, Thread.currentThread().getName());<a name="line.458"></a>
-<span class="sourceLineNo">459</span>            } catch (IOException e) {<a name="line.459"></a>
-<span class="sourceLineNo">460</span>              e = e instanceof RemoteException ?<a name="line.460"></a>
-<span class="sourceLineNo">461</span>                      ((RemoteException)e).unwrapRemoteException() : e;<a name="line.461"></a>
-<span class="sourceLineNo">462</span>              LOG.error("Cache flush failed for region " +<a name="line.462"></a>
-<span class="sourceLineNo">463</span>                Bytes.toStringBinary(region.getRegionInfo().getRegionName()), e);<a name="line.463"></a>
-<span class="sourceLineNo">464</span>            }<a name="line.464"></a>
-<span class="sourceLineNo">465</span>          }<a name="line.465"></a>
-<span class="sourceLineNo">466</span>        }<a name="line.466"></a>
-<span class="sourceLineNo">467</span><a name="line.467"></a>
-<span class="sourceLineNo">468</span>        // Put back on the queue.  Have it come back out of the queue<a name="line.468"></a>
-<span class="sourceLineNo">469</span>        // after a delay of this.blockingWaitTime / 100 ms.<a name="line.469"></a>
-<span class="sourceLineNo">470</span>        this.flushQueue.add(fqe.requeue(this.blockingWaitTime / 100));<a name="line.470"></a>
-<span class="sourceLineNo">471</span>        // Tell a lie, it's not flushed but it's ok<a name="line.471"></a>
-<span class="sourceLineNo">472</span>        return true;<a name="line.472"></a>
-<span class="sourceLineNo">473</span>      }<a name="line.473"></a>
-<span class="sourceLineNo">474</span>    }<a name="line.474"></a>
-<span class="sourceLineNo">475</span>    return flushRegion(region, false, fqe.isForceFlushAllStores());<a name="line.475"></a>
-<span class="sourceLineNo">476</span>  }<a name="line.476"></a>
+<span class="sourceLineNo">415</span>  synchronized void start(UncaughtExceptionHandler eh) {<a name="line.415"></a>
+<span class="sourceLineNo">416</span>    ThreadFactory flusherThreadFactory = Threads.newDaemonThreadFactory(<a name="line.416"></a>
+<span class="sourceLineNo">417</span>        server.getServerName().toShortString() + "-MemStoreFlusher", eh);<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    for (int i = 0; i &lt; flushHandlers.length; i++) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>      flushHandlers[i] = new FlushHandler("MemStoreFlusher." + i);<a name="line.419"></a>
+<span class="sourceLineNo">420</span>      flusherThreadFactory.newThread(flushHandlers[i]);<a name="line.420"></a>
+<span class="sourceLineNo">421</span>      flushHandlers[i].start();<a name="line.421"></a>
+<span class="sourceLineNo">422</span>    }<a name="line.422"></a>
+<span class="sourceLineNo">423</span>  }<a name="line.423"></a>
+<span class="sourceLineNo">424</span><a name="line.424"></a>
+<span class="sourceLineNo">425</span>  boolean isAlive() {<a name="line.425"></a>
+<span class="sourceLineNo">426</span>    for (FlushHandler flushHander : flushHandlers) {<a name="line.426"></a>
+<span class="sourceLineNo">427</span>      if (flushHander != null &amp;&amp; flushHander.isAlive()) {<a name="line.427"></a>
+<span class="sourceLineNo">428</span>        return true;<a name="line.428"></a>
+<span class="sourceLineNo">429</span>      }<a name="line.429"></a>
+<span class="sourceLineNo">430</span>    }<a name="line.430"></a>
+<span class="sourceLineNo">431</span>    return false;<a name="line.431"></a>
+<span class="sourceLineNo">432</span>  }<a name="line.432"></a>
+<span class="sourceLineNo">433</span><a name="line.433"></a>
+<span class="sourceLineNo">434</span>  void join() {<a name="line.434"></a>
+<span class="sourceLineNo">435</span>    for (FlushHandler flushHander : flushHandlers) {<a name="line.435"></a>
+<span class="sourceLineNo">436</span>      if (flushHander != null) {<a name="line.436"></a>
+<span class="sourceLineNo">437</span>        Threads.shutdown(flushHander.getThread());<a name="line.437"></a>
+<span class="sourceLineNo">438</span>      }<a name="line.438"></a>
+<span class="sourceLineNo">439</span>    }<a name="line.439"></a>
+<span class="sourceLineNo">440</span>  }<a name="line.440"></a>
+<span class="sourceLineNo">441</span><a name="line.441"></a>
+<span class="sourceLineNo">442</span>  /**<a name="line.442"></a>
+<span class="sourceLineNo">443</span>   * A flushRegion that checks store file count.  If too many, puts the flush<a name="line.443"></a>
+<span class="sourceLineNo">444</span>   * on delay queue to retry later.<a name="line.444"></a>
+<span class="sourceLineNo">445</span>   * @param fqe<a name="line.445"></a>
+<span class="sourceLineNo">446</span>   * @return true if the region was successfully flushed, false otherwise. If<a name="line.446"></a>
+<span class="sourceLineNo">447</span>   * false, there will be accompanying log messages explaining why the region was<a name="line.447"></a>
+<span class="sourceLineNo">448</span>   * not flushed.<a name="line.448"></a>
+<span class="sourceLineNo">449</span>   */<a name="line.449"></a>
+<span class="sourceLineNo">450</span>  private boolean flushRegion(final FlushRegionEntry fqe) {<a name="line.450"></a>
+<span class="sourceLineNo">451</span>    Region region = fqe.region;<a name="line.451"></a>
+<span class="sourceLineNo">452</span>    if (!region.getRegionInfo().isMetaRegion() &amp;&amp;<a name="line.452"></a>
+<span class="sourceLineNo">453</span>        isTooManyStoreFiles(region)) {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>      if (fqe.isMaximumWait(this.blockingWaitTime)) {<a name="line.454"></a>
+<span class="sourceLineNo">455</span>        LOG.info("Waited " + (EnvironmentEdgeManager.currentTime() - fqe.createTime) +<a name="line.455"></a>
+<span class="sourceLineNo">456</span>          "ms on a compaction to clean up 'too many store files'; waited " +<a name="line.456"></a>
+<span class="sourceLineNo">457</span>          "long enough... proceeding with flush of " +<a name="line.457"></a>
+<span class="sourceLineNo">458</span>          region.getRegionInfo().getRegionNameAsString());<a name="line.458"></a>
+<span class="sourceLineNo">459</span>      } else {<a name="line.459"></a>
+<span class="sourceLineNo">460</span>        // If this is first time we've been put off, then emit a log message.<a name="line.460"></a>
+<span class="sourceLineNo">461</span>        if (fqe.getRequeueCount() &lt;= 0) {<a name="line.461"></a>
+<span class="sourceLineNo">462</span>          // Note: We don't impose blockingStoreFiles constraint on meta regions<a name="line.462"></a>
+<span class="sourceLineNo">463</span>          LOG.warn("Region " + region.getRegionInfo().getRegionNameAsString() + " has too many " +<a name="line.463"></a>
+<span class="sourceLineNo">464</span>            "store files; delaying flush up to " + this.blockingWaitTime + "ms");<a name="line.464"></a>
+<span class="sourceLineNo">465</span>          if (!this.server.compactSplitThread.requestSplit(region)) {<a name="line.465"></a>
+<span class="sourceLineNo">466</span>            try {<a name="line.466"></a>
+<span class="sourceLineNo">467</span>              this.server.compactSplitThread.requestSystemCompaction(<a name="line.467"></a>
+<span class="sourceLineNo">468</span>                  region, Thread.currentThread().getName());<a name="line.468"></a>
+<span class="sourceLineNo">469</span>            } catch (IOException e) {<a name="line.469"></a>
+<span class="sourceLineNo">470</span>              e = e instanceof RemoteException ?<a name="line.470"></a>
+<span class="sourceLineNo">471</span>                      ((RemoteException)e).unwrapRemoteException() : e;<a name="line.471"></a>
+<span class="sourceLineNo">472</span>              LOG.error("Cache flush failed for region " +<a name="line.472"></a>
+<span class="sourceLineNo">473</span>                Bytes.toStringBinary(region.getRegionInfo().getRegionName()), e);<a name="line.473"></a>
+<span class="sourceLineNo">474</span>            }<a name="line.474"></a>
+<span class="sourceLineNo">475</span>          }<a name="line.475"></a>
+<span class="sourceLineNo">476</span>        }<a name="line.476"></a>
 <span class="sourceLineNo">477</span><a name="line.477"></a>
-<span class="sourceLineNo">478</span>  /**<a name="line.478"></a>
-<span class="sourceLineNo">479</span>   * Flush a region.<a name="line.479"></a>
-<span class="sourceLineNo">480</span>   * @param region Region to flush.<a name="line.480"></a>
-<span class="sourceLineNo">481</span>   * @param emergencyFlush Set if we are being force flushed. If true the region<a name="line.481"></a>
-<span class="sourceLineNo">482</span>   * needs to be removed from the flush queue. If false, when we were called<a name="line.482"></a>
-<span class="sourceLineNo">483</span>   * from the main flusher run loop and we got the entry to flush by calling<a name="line.483"></a>
-<span class="sourceLineNo">484</span>   * poll on the flush queue (which removed it).<a name="line.484"></a>
-<span class="sourceLineNo">485</span>   * @param forceFlushAllStores whether we want to flush all store.<a name="line.485"></a>
-<span class="sourceLineNo">486</span>   * @return true if the region was successfully flushed, false otherwise. If<a name="line.486"></a>
-<span class="sourceLineNo">487</span>   * false, there will be accompanying log messages explaining why the region was<a name="line.487"></a>
-<span class="sourceLineNo">488</span>   * not flushed.<a name="line.488"></a>
-<span class="sourceLineNo">489</span>   */<a name="line.489"></a>
-<span class="sourceLineNo">490</span>  private boolean flushRegion(final Region region, final boolean emergencyFlush,<a name="line.490"></a>
-<span class="sourceLineNo">491</span>      boolean forceFlushAllStores) {<a name="line.491"></a>
-<span class="sourceLineNo">492</span>    synchronized (this.regionsInQueue) {<a name="line.492"></a>
-<span class="sourceLineNo">493</span>      FlushRegionEntry fqe = this.regionsInQueue.remove(region);<a name="line.493"></a>
-<span class="sourceLineNo">494</span>      // Use the start time of the FlushRegionEntry if available<a name="line.494"></a>
-<span class="sourceLineNo">495</span>      if (fqe != null &amp;&amp; emergencyFlush) {<a name="line.495"></a>
-<span class="sourceLineNo">496</span>        // Need to remove from region from delay queue.  When NOT an<a name="line.496"></a>
-<span class="sourceLineNo">497</span>        // emergencyFlush, then item was removed via a flushQueue.poll.<a name="line.497"></a>
-<span class="sourceLineNo">498</span>        flushQueue.remove(fqe);<a name="line.498"></a>
-<span class="sourceLineNo">499</span>      }<a name="line.499"></a>
-<span class="sourceLineNo">500</span>    }<a name="line.500"></a>
-<span class="sourceLineNo">501</span><a name="line.501"></a>
-<span class="sourceLineNo">502</span>    lock.readLock().lock();<a name="line.502"></a>
-<span class="sourceLineNo">503</span>    try {<a name="line.503"></a>
-<span class="sourceLineNo">504</span>      notifyFlushRequest(region, emergencyFlush);<a name="line.504"></a>
-<span class="sourceLineNo">505</span>      FlushResult flushResult = region.flush(forceFlushAllStores);<a name="line.505"></a>
-<span class="sourceLineNo">506</span>      boolean shouldCompact = flushResult.isCompactionNeeded();<a name="line.506"></a>
-<span class="sourceLineNo">507</span>      // We just want to check the size<a name="line.507"></a>
-<span class="sourceLineNo">508</span>      boolean shouldSplit = ((HRegion)region).checkSplit() != null;<a name="line.508"></a>
-<span class="sourceLineNo">509</span>      if (shouldSplit) {<a name="line.509"></a>
-<span class="sourceLineNo">510</span>        this.server.compactSplitThread.requestSplit(region);<a name="line.510"></a>
-<span class="sourceLineNo">511</span>      } else if (shouldCompact) {<a name="line.511"></a>
-<span class="sourceLineNo">512</span>        server.compactSplitThread.requestSystemCompaction(<a name="line.512"></a>
-<span class="sourceLineNo">513</span>            region, Thread.currentThread().getName());<a name="line.513"></a>
-<span class="sourceLineNo">514</span>      }<a name="line.514"></a>
-<span class="sourceLineNo">515</span>    } catch (DroppedSnapshotException ex) {<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      // Cache flush can fail in a few places. If it fails in a critical<a name="line.516"></a>
-<span class="sourceLineNo">517</span>      // section, we get a DroppedSnapshotException and a replay of wal<a name="line.517"></a>
-<span class="sourceLineNo">518</span>      // is required. Currently the only way to do this is a restart of<a name="line.518"></a>
-<span class="sourceLineNo">519</span>      // the server. Abort because hdfs is probably bad (HBASE-644 is a case<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      // where hdfs was bad but passed the hdfs check).<a name="line.520"></a>
-<span class="sourceLineNo">521</span>      server.abort("Replay of WAL required. Forcing server shutdown", ex);<a name="line.521"></a>
-<span class="sourceLineNo">522</span>      return false;<a name="line.522"></a>
-<span class="sourceLineNo">523</span>    } catch (IOException ex) {<a name="line.523"></a>
-<span class="sourceLineNo">524</span>      ex = ex instanceof RemoteException ? ((RemoteException) ex).unwrapRemoteException() : ex;<a name="line.524"></a>
-<span class="sourceLineNo">525</span>      LOG.error(<a name="line.525"></a>
-<span class="sourceLineNo">526</span>        "Cache flush failed"<a name="line.526"></a>
-<span class="sourceLineNo">527</span>            + (region != null ? (" for region " +<a name="line.527"></a>
-<span class="sourceLineNo">528</span>                Bytes.toStringBinary(region.getRegionInfo().getRegionName()))<a name="line.528"></a>
-<span class="sourceLineNo">529</span>              : ""), ex);<a name="line.529"></a>
-<span class="sourceLineNo">530</span>      if (!server.checkFileSystem()) {<a name="line.530"></a>
-<span class="sourceLineNo">531</span>        return false;<a name="line.531"></a>
-<span class="sourceLineNo">532</span>      }<a name="line.532"></a>
-<span class="sourceLineNo">533</span>    } finally {<a name="line.533"></a>
-<span class="sourceLineNo">534</span>      lock.readLock().unlock();<a name="line.534"></a>
-<span class="sourceLineNo">535</span>      wakeUpIfBlocking();<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    }<a name="line.536"></a>
-<span class="sourceLineNo">537</span>    return true;<a name="line.537"></a>
-<span class="sourceLineNo">538</span>  }<a name="line.538"></a>
-<span class="sourceLineNo">539</span><a name="line.539"></a>
-<span class="sourceLineNo">540</span>  private void notifyFlushRequest(Region region, boolean emergencyFlush) {<a name="line.540"></a>
-<span class="sourceLineNo">541</span>    FlushType type = FlushType.NORMAL;<a name="line.541"></a>
-<span class="sourceLineNo">542</span>    if (emergencyFlush) {<a name="line.542"></a>
-<span class="sourceLineNo">543</span>      type = isAboveHighWaterMark() ? FlushType.ABOVE_HIGHER_MARK : FlushType.ABOVE_LOWER_MARK;<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    }<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    for (FlushRequestListener listener : flushRequestListeners) {<a name="line.545"></a>
-<span class="sourceLineNo">546</span>      listener.flushRequested(type, region);<a name="line.546"></a>
-<span class="sourceLineNo">547</span>    }<a name="line.547"></a>
+<span class="sourceLineNo">478</span>        // Put back on the queue.  Have it come back out of the queue<a name="line.478"></a>
+<span class="sourceLineNo">479</span>        // after a delay of this.blockingWaitTime / 100 ms.<a name="line.479"></a>
+<span class="sourceLineNo">480</span>        this.flushQueue.add(fqe.requeue(this.blockingWaitTime / 100));<a name="line.480"></a>
+<span class="sourceLineNo">481</span>        // Tell a lie, it's not flushed but it's ok<a name="line.481"></a>
+<span class="sourceLineNo">482</span>        return true;<a name="line.482"></a>
+<span class="sourceLineNo">483</span>      }<a name="line.483"></a>
+<span class="sourceLineNo">484</span>    }<a name="line.484"></a>
+<span class="sourceLineNo">485</span>    return flushRegion(region, false, fqe.isForceFlushAllStores());<a name="line.485"></a>
+<span class="sourceLineNo">486</span>  }<a name="line.486"></a>
+<span class="sourceLineNo">487</span><a name="line.487"></a>
+<span class="sourceLineNo">488</span>  /**<a name="line.488"></a>
+<span class="sourceLineNo">489</span>   * Flush a region.<a name="line.489"></a>
+<span class="sourceLineNo">490</span>   * @param region Region to flush.<a name="line.490"></a>
+<span class="sourceLineNo">491</span>   * @param emergencyFlush Set if we are being force flushed. If true the region<a name="line.491"></a>
+<span class="sourceLineNo">492</span>   * needs to be removed from the flush queue. If false, when we were called<a name="line.492"></a>
+<span class="sourceLineNo">493</span>   * from the main flusher run loop and we got the entry to flush by calling<a name="line.493"></a>
+<span class="sourceLineNo">494</span>   * poll on the flush queue (which removed it).<a name="line.494"></a>
+<span class="sourceLineNo">495</span>   * @param forceFlushAllStores whether we want to flush all store.<a name="line.495"></a>
+<span class="sourceLineNo">496</span>   * @return true if the region was successfully flushed, false otherwise. If<a name="line.496"></a>
+<span class="sourceLineNo">497</span>   * false, there will be accompanying log messages explaining why the region was<a name="line.497"></a>
+<span class="sourceLineNo">498</span>   * not flushed.<a name="line.498"></a>
+<span class="sourceLineNo">499</span>   */<a name="line.499"></a>
+<span class="sourceLineNo">500</span>  private boolean flushRegion(final Region region, final boolean emergencyFlush,<a name="line.500"></a>
+<span class="sourceLineNo">501</span>      boolean forceFlushAllStores) {<a name="line.501"></a>
+<span class="sourceLineNo">502</span>    synchronized (this.regionsInQueue) {<a name="line.502"></a>
+<span class="sourceLineNo">503</span>      FlushRegionEntry fqe = this.regionsInQueue.remove(region);<a name="line.503"></a>
+<span class="sourceLineNo">504</span>      // Use the start time of the FlushRegionEntry if available<a name="line.504"></a>
+<span class="sourceLineNo">505</span>      if (fqe != null &amp;&amp; emergencyFlush) {<a name="line.505"></a>
+<span class="sourceLineNo">506</span>        // Need to remove from region from delay queue.  When NOT an<a name="line.506"></a>
+<span class="sourceLineNo">507</span>        // emergencyFlush, then item was removed via a flushQueue.poll.<a name="line.507"></a>
+<span class="sourceLineNo">508</span>        flushQueue.remove(fqe);<a name="line.508"></a>
+<span class="sourceLineNo">509</span>      }<a name="line.509"></a>
+<span class="sourceLineNo">510</span>    }<a name="line.510"></a>
+<span class="sourceLineNo">511</span><a name="line.511"></a>
+<span class="sourceLineNo">512</span>    lock.readLock().lock();<a name="line.512"></a>
+<span class="sourceLineNo">513</span>    try {<a name="line.513"></a>
+<span class="sourceLineNo">514</span>      notifyFlushRequest(region, emergencyFlush);<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      FlushResult flushResult = region.flush(forceFlushAllStores);<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      boolean shouldCompact = flushResult.isCompactionNeeded();<a name="line.516"></a>
+<span class="sourceLineNo">517</span>      // We just want to check the size<a name="line.517"></a>
+<span class="sourceLineNo">518</span>      boolean shouldSplit = ((HRegion)region).checkSplit() != null;<a name="line.518"></a>
+<span class="sourceLineNo">519</span>      if (shouldSplit) {<a name="line.519"></a>
+<span class="sourceLineNo">520</span>        this.server.compactSplitThread.requestSplit(region);<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      } else if (shouldCompact) {<a name="line.521"></a>
+<span class="sourceLineNo">522</span>        server.compactSplitThread.requestSystemCompaction(<a name="line.522"></a>
+<span class="sourceLineNo">523</span>            region, Thread.currentThread().getName());<a name="line.523"></a>
+<span class="sourceLineNo">524</span>      }<a name="line.524"></a>
+<span class="sourceLineNo">525</span>    } catch (DroppedSnapshotException ex) {<a name="line.525"></a>
+<span class="sourceLineNo">526</span>      // Cache flush can fail in a few places. If it fails in a critical<a name="line.526"></a>
+<span class="sourceLineNo">527</span>      // section, we get a DroppedSnapshotException and a replay of wal<a name="line.527"></a>
+<span class="sourceLineNo">528</span>      // is required. Currently the only way to do this is a restart of<a name="line.528"></a>
+<span class="sourceLineNo">529</span>      // the server. Abort because hdfs is probably bad (HBASE-644 is a case<a name="line.529"></a>
+<span class="sourceLineNo">530</span>      // where hdfs was bad but passed the hdfs check).<a name="line.530"></a>
+<span class="sourceLineNo">531</span>      server.abort("Replay of WAL required. Forcing server shutdown", ex);<a name="line.531"></a>
+<span class="sourceLineNo">532</span>      return false;<a name="line.532"></a>
+<span class="sourceLineNo">533</span>    } catch (IOException ex) {<a name="line.533"></a>
+<span class="sourceLineNo">534</span>      ex = ex instanceof RemoteException ? ((RemoteException) ex).unwrapRemoteException() : ex;<a name="line.534"></a>
+<span class="sourceLineNo">535</span>      LOG.error(<a name="line.535"></a>
+<span class="sourceLineNo">536</span>        "Cache flush failed"<a name="line.536"></a>
+<span class="sourceLineNo">537</span>            + (region != null ? (" for region " +<a name="line.537"></a>
+<span class="sourceLineNo">538</span>                Bytes.toStringBinary(region.getRegionInfo().getRegionName()))<a name="line.538"></a>
+<span class="sourceLineNo">539</span>              : ""), ex);<a name="line.539"></a>
+<span class="sourceLineNo">540</span>      if (!server.checkFileSystem()) {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>        return false;<a name="line.541"></a>
+<span class="sourceLineNo">542</span>      }<a name="line.542"></a>
+<span class="sourceLineNo">543</span>    } finally {<a name="line.543"></a>
+<span class="sourceLineNo">544</span>      lock.readLock().unlock();<a name="line.544"></a>
+<span class="sourceLineNo">545</span>      wakeUpIfBlocking();<a name="line.545"></a>
+<span class="sourceLineNo">546</span>    }<a name="line.546"></a>
+<span class="sourceLineNo">547</span>    return true;<a name="line.547"></a>
 <span class="sourceLineNo">548</span>  }<a name="line.548"></a>
 <span class="sourceLineNo">549</span><a name="line.549"></a>
-<span class="sourceLineNo">550</span>  private void wakeUpIfBlocking() {<a name="line.550"></a>
-<span class="sourceLineNo">551</span>    synchronized (blockSignal) {<a name="line.551"></a>
-<span class="sourceLineNo">552</span>      blockSignal.notifyAll();<a name="line.552"></a>
-<span class="sourceLineNo">553</span>    }<a name="line.553"></a>
-<span class="sourceLineNo">554</span>  }<a name="line.554"></a>
-<span class="sourceLineNo">555</span><a name="line.555"></a>
-<span class="sourceLineNo">556</span>  private boolean isTooManyStoreFiles(Region region) {<a name="line.556"></a>
-<span class="sourceLineNo">557</span><a name="line.557"></a>
-<span class="sourceLineNo">558</span>    // When compaction is disabled, the region is flushable<a name="line.558"></a>
-<span class="sourceLineNo">559</span>    if (!region.getTableDesc().isCompactionEnabled()) {<a name="line.559"></a>
-<span class="sourceLineNo">560</span>      return false;<a name="line.560"></a>
-<span class="sourceLineNo">561</span>    }<a name="line.561"></a>
-<span class="sourceLineNo">562</span><a name="line.562"></a>
-<span class="sourceLineNo">563</span>    for (Store store : region.getStores()) {<a name="line.563"></a>
-<span class="sourceLineNo">564</span>      if (store.hasTooManyStoreFiles()) {<a name="line.564"></a>
-<span class="sourceLineNo">565</span>        return true;<a name="line.565"></a>
-<span class="sourceLineNo">566</span>      }<a name="line.566"></a>
-<span class="sourceLineNo">567</span>    }<a name="line.567"></a>
-<span class="sourceLineNo">568</span>    return false;<a name="line.568"></a>
-<span class="sourceLineNo">569</span>  }<a name="line.569"></a>
-<span class="sourceLineNo">570</span><a name="line.570"></a>
-<span class="sourceLineNo">571</span>  /**<a name="line.571"></a>
-<span class="sourceLineNo">572</span>   * Check if the regionserver's memstore memory usage is greater than the<a name="line.572"></a>
-<span class="sourceLineNo">573</span>   * limit. If so, flush regions with the biggest memstores until we're down<a name="line.573"></a>
-<span class="sourceLineNo">574</span>   * to the lower limit. This method blocks callers until we're down to a safe<a name="line.574"></a>
-<span class="sourceLineNo">575</span>   * amount of memstore consumption.<a name="line.575"></a>
-<span class="sourceLineNo">576</span>   */<a name="line.576"></a>
-<span class="sourceLineNo">577</span>  public void reclaimMemStoreMemory() {<a name="line.577"></a>
-<span class="sourceLineNo">578</span>    TraceScope scope = Trace.startSpan("MemStoreFluser.reclaimMemStoreMemory");<a name="line.578"></a>
-<span class="sourceLineNo">579</span>    if (isAboveHighWaterMark()) {<a name="line.579"></a>
-<span class="sourceLineNo">580</span>      if (Trace.isTracing()) {<a name="line.580"></a>
-<span class="sourceLineNo">581</span>        scope.getSpan().addTimelineAnnotation("Force Flush. We're above high water mark.");<a name="line.581"></a>
-<span class="sourceLineNo">582</span>      }<a name="line.582"></a>
-<span class="sourceLineNo">583</span>      long start = EnvironmentEdgeManager.currentTime();<a name="line.583"></a>
-<span class="sourceLineNo">584</span>      synchronized (this.blockSignal) {<a name="line.584"></a>
-<span class="sourceLineNo">585</span>        boolean blocked = false;<a name="line.585"></a>
-<span class="sourceLineNo">586</span>        long startTime = 0;<a name="line.586"></a>
-<span class="sourceLineNo">587</span>        boolean interrupted = false;<a name="line.587"></a>
-<span class="sourceLineNo">588</span>        try {<a name="line.588"></a>
-<span class="sourceLineNo">589</span>          while (isAboveHighWaterMark() &amp;&amp; !server.isStopped()) {<a name="line.589"></a>
-<span class="sourceLineNo">590</span>            if (!blocked) {<a name="line.590"></a>
-<span class="sourceLineNo">591</span>              startTime = EnvironmentEdgeManager.currentTime();<a name="line.591"></a>
-<span class="sourceLineNo">592</span>              LOG.info("Blocking updates on " + server.toString() + ": the global memstore size "<a name="line.592"></a>
-<span class="sourceLineNo">593</span>                  + TraditionalBinaryPrefix.long2String(<a name="line.593"></a>
-<span class="sourceLineNo">594</span>                      server.getRegionServerAccounting().getGlobalMemstoreSize(), "", 1)<a name="line.594"></a>
-<span class="sourceLineNo">595</span>                  + " + global memstore heap overhead "<a name="line.595"></a>
-<span class="sourceLineNo">596</span>                  + TraditionalBinaryPrefix.long2String(<a name="line.596"></a>
-<span class="sourceLineNo">597</span>                      server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead(), "", 1)<a name="line.597"></a>
-<span class="sourceLineNo">598</span>                  + " is &gt;= than blocking "<a name="line.598"></a>
-<span class="sourceLineNo">599</span>                  + TraditionalBinaryPrefix.long2String(globalMemStoreLimit, "", 1) + " size");<a name="line.599"></a>
-<span class="sourceLineNo">600</span>            }<a name="line.600"></a>
-<span class="sourceLineNo">601</span>            blocked = true;<a name="line.601"></a>
-<span class="sourceLineNo">602</span>            wakeupFlushThread();<a name="line.602"></a>
-<span class="sourceLineNo">603</span>            try {<a name="line.603"></a>
-<span class="sourceLineNo">604</span>              // we should be able to wait forever, but we've seen a bug where<a name="line.604"></a>
-<span class="sourceLineNo">605</span>              // we miss a notify, so put a 5 second bound on it at least.<a name="line.605"></a>
-<span class="sourceLineNo">606</span>              blockSignal.wait(5 * 1000);<a name="line.606"></a>
-<span class="sourceLineNo">607</span>            } catch (InterruptedException ie) {<a name="line.607"></a>
-<span class="sourceLineNo">608</span>              LOG.warn("Interrupted while waiting");<a name="line.608"></a>
-<span class="sourceLineNo">609</span>              interrupted = true;<a name="line.609"></a>
+<span class="sourceLineNo">550</span>  private void notifyFlushRequest(Region region, boolean emergencyFlush) {<a name="line.550"></a>
+<span class="sourceLineNo">551</span>    FlushType type = FlushType.NORMAL;<a name="line.551"></a>
+<span class="sourceLineNo">552</span>    if (emergencyFlush) {<a name="line.552"></a>
+<span class="sourceLineNo">553</span>      type = isAboveHighWaterMark() ? FlushType.ABOVE_HIGHER_MARK : FlushType.ABOVE_LOWER_MARK;<a name="line.553"></a>
+<span class="sourceLineNo">554</span>    }<a name="line.554"></a>
+<span class="sourceLineNo">555</span>    for (FlushRequestListener listener : flushRequestListeners) {<a name="line.555"></a>
+<span class="sourceLineNo">556</span>      listener.flushRequested(type, region);<a name="line.556"></a>
+<span class="sourceLineNo">557</span>    }<a name="line.557"></a>
+<span class="sourceLineNo">558</span>  }<a name="line.558"></a>
+<span class="sourceLineNo">559</span><a name="line.559"></a>
+<span class="sourceLineNo">560</span>  private void wakeUpIfBlocking() {<a name="line.560"></a>
+<span class="sourceLineNo">561</span>    synchronized (blockSignal) {<a name="line.561"></a>
+<span class="sourceLineNo">562</span>      blockSignal.notifyAll();<a name="line.562"></a>
+<span class="sourceLineNo">563</span>    }<a name="line.563"></a>
+<span class="sourceLineNo">564</span>  }<a name="line.564"></a>
+<span class="sourceLineNo">565</span><a name="line.565"></a>
+<span class="sourceLineNo">566</span>  private boolean isTooManyStoreFiles(Region region) {<a name="line.566"></a>
+<span class="sourceLineNo">567</span><a name="line.567"></a>
+<span class="sourceLineNo">568</span>    // When compaction is disabled, the region is flushable<a name="line.568"></a>
+<span class="sourceLineNo">569</span>    if (!region.getTableDesc().isCompactionEnabled()) {<a name="line.569"></a>
+<span class="sourceLineNo">570</span>      return false;<a name="line.570"></a>
+<span class="sourceLineNo">571</span>    }<a name="line.571"></a>
+<span class="sourceLineNo">572</span><a name="line.572"></a>
+<span class="sourceLineNo">573</span>    for (Store store : region.getStores()) {<a name="line.573"></a>
+<span class="sourceLineNo">574</span>      if (store.hasTooManyStoreFiles()) {<a name="line.574"></a>
+<span class="sourceLineNo">575</span>        return true;<a name="line.575"></a>
+<span class="sourceLineNo">576</span>      }<a name="line.576"></a>
+<span class="sourceLineNo">577</span>    }<a name="line.577"></a>
+<span class="sourceLineNo">578</span>    return false;<a name="line.578"></a>
+<span class="sourceLineNo">579</span>  }<a name="line.579"></a>
+<span class="sourceLineNo">580</span><a name="line.580"></a>
+<span class="sourceLineNo">581</span>  /**<a name="line.581"></a>
+<span class="sourceLineNo">582</span>   * Check if the regionserver's memstore memory usage is greater than the<a name="line.582"></a>
+<span class="sourceLineNo">583</span>   * limit. If so, flush regions with the biggest memstores until we're down<a name="line.583"></a>
+<span class="sourceLineNo">584</span>   * to the lower limit. This method blocks callers until we're down to a safe<a name="line.584"></a>
+<span class="sourceLineNo">585</span>   * amount of memstore consumption.<a name="line.585"></a>
+<span class="sourceLineNo">586</span>   */<a name="line.586"></a>
+<span class="sourceLineNo">587</span>  public void reclaimMemStoreMemory() {<a name="line.587"></a>
+<span class="sourceLineNo">588</span>    TraceScope scope = Trace.startSpan("MemStoreFluser.reclaimMemStoreMemory");<a name="line.588"></a>
+<span class="sourceLineNo">589</span>    if (isAboveHighWaterMark()) {<a name="line.589"></a>
+<span class="sourceLineNo">590</span>      if (Trace.isTracing()) {<a name="line.590"></a>
+<span class="sourceLineNo">591</span>        scope.getSpan().addTimelineAnnotation("Force Flush. We're above high water mark.");<a name="line.591"></a>
+<span class="sourceLineNo">592</span>      }<a name="line.592"></a>
+<span class="sourceLineNo">593</span>      long start = EnvironmentEdgeManager.currentTime();<a name="line.593"></a>
+<span class="sourceLineNo">594</span>      synchronized (this.blockSignal) {<a name="line.594"></a>
+<span class="sourceLineNo">595</span>        boolean blocked = false;<a name="line.595"></a>
+<span class="sourceLineNo">596</span>        long startTime = 0;<a name="line.596"></a>
+<span class="sourceLineNo">597</span>        boolean interrupted = false;<a name="line.597"></a>
+<span class="sourceLineNo">598</span>        try {<a name="line.598"></a>
+<span class="sourceLineNo">599</span>          while (isAboveHighWaterMark() &amp;&amp; !server.isStopped()) {<a name="line.599"></a>
+<span class="sourceLineNo">600</span>            if (!blocked) {<a name="line.600"></a>
+<span class="sourceLineNo">601</span>              startTime = EnvironmentEdgeManager.currentTime();<a name="line.601"></a>
+<span class="sourceLineNo">602</span>              LOG.info("Blocking updates on " + server.toString() + ": the global memstore size "<a name="line.602"></a>
+<span class="sourceLineNo">603</span>                  + TraditionalBinaryPrefix.long2String(<a name="line.603"></a>
+<span class="sourceLineNo">604</span>                      server.getRegionServerAccounting().getGlobalMemstoreSize(), "", 1)<a name="line.604"></a>
+<span class="sourceLineNo">605</span>                  + " + global memstore heap overhead "<a name="line.605"></a>
+<span class="sourceLineNo">606</span>                  + TraditionalBinaryPrefix.long2String(<a name="line.606"></a>
+<span class="sourceLineNo">607</span>                      server.getRegionServerAccounting().getGlobalMemstoreHeapOverhead(), "", 1)<a name="line.607"></a>
+<span class="sourceLineNo">608</span>                  + " is &gt;= than blocking "<a name="line.608"></a>
+<span class="sourceLineNo">609</span>                  + TraditionalBinaryPrefix.long2String(globalMemStoreLimit, "", 1) + " size");<a name="line.609"></a>
 <span class="sourceLineNo">610</span>            }<a name="line.610"></a>
-<span class="sourceLineNo">611</span>            long took = EnvironmentEdgeManager.currentTime() - start;<a name="line.611"></a>
-<span class="sourceLineNo">612</span>            LOG.warn("Memstore is above high water mark and block " + took + "ms");<a name="line.612"></a>
-<span class="sourceLineNo">613</span>          }<a name="line.613"></a>
-<span class="sourceLineNo">614</span>        } finally {<a name="line.614"></a>
-<span class="sourceLineNo">615</span>          if (interrupted) {<a name="line.615"></a>
-<span class="sourceLineNo">616</span>            Thread.currentThread().interrupt();<a name="line.616"></a>
-<span class="sourceLineNo">617</span>          }<a name="line.617"></a>
-<span class="sourceLineNo">618</span>        }<a name="line.618"></a>
-<span class="sourceLineNo">619</span><a name="line.619"></a>
-<span class="sourceLineNo">620</span>        if(blocked){<a name="line.620"></a>
-<span class="sourceLineNo">621</span>          final long totalTime = EnvironmentEdgeManager.currentTime() - startTime;<a name="line.621"></a>
-<span class="sourceLineNo">622</span>          if(totalTime &gt; 0){<a name="line.622"></a>
-<span class="sourceLineNo">623</span>            this.updatesBlockedMsHighWater.add(totalTime);<a name="line.623"></a>
-<span class="sourceLineNo">624</span>          }<a name="line.624"></a>
-<span class="sourceLineNo">625</span>          LOG.info("Unblocking updates for server " + server.toString());<a name="line.625"></a>
-<span class="sourceLineNo">626</span>        }<a name="line.626"></a>
-<span class="sourceLineNo">627</span>      }<a name="line.627"></a>
-<span class="sourceLineNo">628</span>    } else if (isAboveLowWaterMark()) {<a name="line.628"></a>
-<span class="sourceLineNo">629</span>      wakeupFlushThread();<a name="line.629"></a>
-<span class="sourceLineNo">630</span>    }<a name="line.630"></a>
-<span class="sourceLineNo">631</span>    scope.close();<a name="line.631"></a>
-<span class="sourceLineNo">632</span>  }<a name="line.632"></a>
-<span class="sourceLineNo">633</span>  @Override<a name="line.633"></a>
-<span class="sourceLineNo">634</span>  public String toString() {<a name="line.634"></a>
-<span class="sourceLineNo">635</span>    return "flush_queue="<a name="line.635"></a>
-<span class="sourceLineNo">636</span>        + flushQueue.size();<a name="line.636"></a>
-<span class="sourceLineNo">637</span>  }<a name="line.637"></a>
-<span class="sourceLineNo">638</span><a name="line.638"></a>
-<span class="sourceLineNo">639</span>  public String dumpQueue() {<a name="line.639"></a>
-<span class="sourceLineNo">640</span>    StringBuilder queueList = new StringBuilder();<a name="line.640"></a>
-<span class="sourceLineNo">641</span>    queueList.append("Flush Queue Queue dump:\n");<a name="line.641"></a>
-<span class="sourceLineNo">642</span>    queueList.append("  Flush Queue:\n");<a name="line.642"></a>
-<span class="sourceLineNo">643</span>    java.util.Iterator&lt;FlushQueueEntry&gt; it = flushQueue.iterator();<a name="line.643"></a>
-<span class="sourceLineNo">644</span><a name="line.644"></a>
-<span class="sourceLineNo">645</span>    while(it.hasNext()){<a name="line.645"></a>
-<span class="sourceLineNo">646</span>      queueList.append("    "+it.next().toString());<a name="line.646"></a>
-<span class="sourceLineNo">647</span>      queueList.append("\n");<a name="line.647"></a>
-<span class="sourceLineNo">648</span>    }<a name="line.648"></a>
-<span class="sourceLineNo">649</span><a name="line.649"></a>
-<span class="sourceLineNo">650</span>    return queueList.toString();<a name="line.650"></a>
-<span class="sourceLineNo">651</span>  }<a name="line.651"></a>
-<span class="sourceLineNo">652</span><a name="line.652"></a>
-<span class="sourceLineNo">653</span>  /**<a name="line.653"></a>
-<span class="sourceLineNo">654</span>   * Register a MemstoreFlushListener<a name="line.654"></a>
-<span class="sourceLineNo">655</span>   * @param listener<a name="line.655"></a>
-<span class="sourceLineNo">656</span>   */<a name="line.656"></a>
-<span class="sourceLineNo">657</span>  @Override<a name="line.657"></a>
-<span class="sourceLineNo">658</span>  public void registerFlushRequestListener(final FlushRequestListener listener) {<a name="line.658"></a>
-<span class="sourceLineNo">659</span>    this.flushRequestListeners.add(listener);<a name="line.659"></a>
-<span class="sourceLineNo">660</span>  }<a name="line.660"></a>
-<span class="sourceLineNo">661</span><a name="line.661"></a>
-<span class="sourceLineNo">662</span>  /**<a name="line.662"></a>
-<span class="sourceLineNo">663</span>   * Unregister the listener from MemstoreFlushListeners<a name="line.663"></a>
-<span class="sourceLineNo">664</span>   * @param listener<a name="line.664"></a>
-<span class="sourceLineNo">665</span>   * @return true when passed listener is unregistered successfully.<a name="line.665"></a>
+<span class="sourceLineNo">611</span>            blocked = true;<a name="line.611"></a>
+<span class="sourceLineNo">612</span>            wakeupFlushThread();<a name="line.612"></a>
+<span class="sourceLineNo">613</span>            try {<a name="line.613"></a>
+<span class="sourceLineNo">614</span>              // we should be able to wait forever, but we've seen a bug where<a name="line.614"></a>
+<span class="sourceLineNo">615</span>              // we miss a notify, so put a 5 second bound on it at least.<a name="line.615"></a>
+<span class="sourceLineNo">616</span>              blockSignal.wait(5 * 1000);<a name="line.616"></a>
+<span class="sourceLineNo">617</span>            } catch (InterruptedException ie) {<a name="line.617"></a>
+<span class="sourceLineNo">618</span>              LOG.warn("Interrupted while waiting");<a name="line.618"></a>
+<span class="sourceLineNo">619</span>              interrupted = true;<a name="line.619"></a>
+<span class="sourceLineNo">620</span>            }<a name="line.620"></a>
+<span class="sourceLineNo">621</span>            long took = EnvironmentEdgeManager.currentTime() - start;<a name="line.621"></a>
+<span class="sourceLineNo">622</span>            LOG.warn("Memstore is above high water mark and block " + took + "ms");<a name="line.622"></a>
+<span class="sourceLineNo">623</span>          }<a name="line.623"></a>
+<span class="sourceLineNo">624</span>        } finally {<a name="line.624"></a>
+<span class="sourceLineNo">625</span>          if (interrupted) {<a name="line.625"></a>
+<span class="sourceLineNo">626</span>            Thread.currentThread().interrupt();<a name="line.626"></a>
+<span class="sourceLineNo">627</span>          }<a name="line.627"></a>
+<span class="sourceLineNo">628</span>        }<a name="line.628"></a>
+<span class="sourceLineNo">629</span><a name="line.629"></a>
+<span class="sourceLineNo">630</span>        if(blocked){<a name="line.630"></a>
+<span class="sourceLineNo">631</span>          final long totalTime = EnvironmentEdgeManager.currentTime() - startTime;<a name="line.631"></a>
+<span class="sourceLineNo">632</span>          if(totalTime &gt; 0){<a name="line.632"></a>
+<span class="sourceLineNo">633</span>            this.updatesBlockedMsHighWater.add(totalTime);<a name="line.633"></a>
+<span class="sourceLineNo">634</span>          }<a name="line.634"></a>
+<span class="sourceLineNo">635</span>          LOG.info("Unblocking updates for server " + server.toString());<a name="line.635"></a>
+<span class="sourceLineNo">636</span>        }<a name="line.636"></a>
+<span class="sourceLineNo">637</span>      }<a name="line.637"></a>
+<span class="sourceLineNo">638</span>    } else if (isAboveLowWaterMark()) {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>      wakeupFlushThread();<a name="line.639"></a>
+<span class="sourceLineNo">640</span>    }<a name="line.640"></a>
+<span class="sourceLineNo">641</span>    scope.close();<a name="line.641"></a>
+<span class="sourceLineNo">642</span>  }<a name="line.642"></a>
+<span class="sourceLineNo">643</span>  @Override<a name="line.643"></a>
+<span class="sourceLineNo">644</span>  public String toString() {<a name="line.644"></a>
+<span class="sourceLineNo">645</span>    return "flush_queue="<a name="line.645"></a>
+<span class="sourceLineNo">646</span>        + flushQueue.size();<a name="line.646"></a>
+<span class="sourceLineNo">647</span>  }<a name="line.647"></a>
+<span class="sourceLineNo">648</span><a name="line.648"></a>
+<span class="sourceLineNo">649</span>  public String dumpQueue() {<a name="line.649"></a>
+<span class="sourceLineNo">650</span>    StringBuilder queueList = new StringBuilder();<a name="line.650"></a>
+<span class="sourceLineNo">651</span>    queueList.append("Flush Queue Queue dump:\n");<a name="line.651"></a>
+<span class="sourceLineNo">652</span>    queueList.append("  Flush Queue:\n");<a name="line.652"></a>
+<span class="sourceLineNo">653</span>    java.util.Iterator&lt;FlushQueueEntry&gt; it = flushQueue.iterator();<a name="line.653"></a>
+<span class="sourceLineNo">654</span><a name="line.654"></a>
+<span class="sourceLineNo">655</span>    while(it.hasNext()){<a name="line.655"></a>
+<span class="sourceLineNo">656</span>      queueList.append("    "+it.next().toString());<a name="line.656"></a>
+<span class="sourceLineNo">657</span>      queueList.append("\n");<a name="line.657"></a>
+<span class="sourceLineNo">658</span>    }<a name="line.658"></a>
+<span class="sourceLineNo">659</span><a name="line.659"></a>
+<span class="sourceLineNo">660</span>    return queueList.toString();<a name="line.660"></a>
+<span class="sourceLineNo">661</span>  }<a name="line.661"></a>
+<span class="sourceLineNo">662</span><a name="line.662"></a>
+<span class="sourceLineNo">663</span>  /**<a name="line.663"></a>
+<span class="sourceLineNo">664</span>   * Register a MemstoreFlushListener<a name="line.664"></a>
+<span class="sourceLineNo">665</span>   * @param listener<a name="line.665"></a>
 <span class="sourceLineNo">666</span>   */<a name="line.666"></a>
 <span class="sourceLineNo">667</span>  @Override<a name="line.667"></a>
-<span class="sourceLineNo">668</span>  public boolean unregisterFlushRequestListener(final FlushRequestListener listener) {<a name="line.668"></a>
-<span class="sourceLineNo">669</span>    return this.flushRequestListeners.remove(listener);<a name="line.669"></a>
+<span class="sourceLineNo">668</span>  public void registerFlushRequestListener(final FlushRequestListener listener) {<a name="line.668"></a>
+<span class="sourceLineNo">669</span>    this.flushRequestListeners.add(listener);<a name="line.669"></a>
 <span class="sourceLineNo">670</span>  }<a name="line.670"></a>
 <span class="sourceLineNo">671</span><a name="line.671"></a>
 <span class="sourceLineNo">672</span>  /**<a name="line.672"></a>
-<span class="sourceLineNo">673</span>   * Sets the global memstore limit to a new size.<a name="line.673"></a>
-<span class="sourceLineNo">674</span>   * @param globalMemStoreSize<a name="line.674"></a>
-<span class="sourceLineNo">675</span>   */<a name="line.675"></a>
-<span class="sourceLineNo">676</span>  @Override<a name="line.676"></a>
-<span class="sourceLineNo">677</span>  public void setGlobalMemstoreLimit(long globalMemStoreSize) {<a name="line.677"></a>
-<span class="sourceLineNo">678</span>    this.globalMemStoreLimit = globalMemStoreSize;<a name="line.678"></a>
-<span class="sourceLineNo">679</span>    this.globalMemStoreLimitLowMark =<a name="line.679"></a>
-<span class="sourceLineNo">680</span>        (long) (this.globalMemStoreLimitLowMarkPercent * globalMemStoreSize);<a name="line.680"></a>
-<span class="sourceLineNo">681</span>    reclaimMemStoreMemory();<a name="line.681"></a>
-<span class="sourceLineNo">682</span>  }<a name="line.682"></a>
-<span class="sourceLineNo">683</span><a name="line.683"></a>
-<span class="sourceLineNo">684</span>  public long getMemoryLimit() {<a name="line.684"></a>
-<span class="sourceLineNo">685</span>    return this.globalMemStoreLimit;<a name="line.685"></a>
-<span class="sourceLineNo">686</span>  }<a name="line.686"></a>
-<span class="sourceLineNo">687</span><a name="line.687"></a>
-<span class="sourceLineNo">688</span>  interface FlushQueueEntry extends Delayed {<a name="line.688"></a>
-<span class="sourceLineNo">689</span>  }<a name="line.689"></a>
-<span class="sourceLineNo">690</span><a name="line.690"></a>
-<span class="sourceLineNo">691</span>  /**<a name="line.691"></a>
-<span class="sourceLineNo">692</span>   * Token to insert into the flush queue that ensures that the flusher does not sleep<a name="line.692"></a>
-<span class="sourceLineNo">693</span>   */<a name="line.693"></a>
-<span class="sourceLineNo">694</span>  static class WakeupFlushThread implements FlushQueueEntry {<a name="line.694"></a>
-<span class="sourceLineNo">695</span>    @Override<a name="line.695"></a>
-<span class="sourceLineNo">696</span>    public long getDelay(TimeUnit unit) {<a name="line.696"></a>
-<span class="sourceLineNo">697</span>      return 0;<a name="line.697"></a>
-<span class="sourceLineNo">698</span>    }<a name="line.698"></a>
-<span class="sourceLineNo">699</span><a name="line.699"></a>
-<span class="sourceLineNo">700</span>    @Override<a name="line.700"></a>
-<span class="sourceLineNo">701</span>    public int compareTo(Delayed o) {<a name="line.701"></a>
-<span class="sourceLineNo">702</span>      return -1;<a name="line.702"></a>
-<span class="sourceLineNo">703</span>    }<a name="line.703"></a>
-<span class="sourceLineNo">704</span><a name="line.704"></a>
+<span class="sourceLineNo">673</span>   * Unregister the listener from MemstoreFlushListeners<a name="line.673"></a>
+<span class="sourceLineNo">674</span>   * @param listener<a name="line.674"></a>
+<span class="sourceLineNo">675</span>   * @return true when passed listener is unregistered successfully.<a name="line.675"></a>
+<span class="sourceLineNo">676</span>   */<a name="line.676"></a>
+<span class="sourceLineNo">677</span>  @Override<a name="line.677"></a>
+<span class="sourceLineNo">678</span>  public boolean unregisterFlushRequestListener(final FlushRequestListener listener) {<a name="line.678"></a>
+<span class="sourceLineNo">679</span>    return this.flushRequestListeners.remove(listener);<a name="line.679"></a>
+<span class="sourceLineNo">680</span>  }<a name="line.680"></a>
+<span class="sourceLineNo">681</span><a name="line.681"></a>
+<span class="sourceLineNo">682</span>  /**<a name="line.682"></a>
+<span class="sourceLineNo">683</span>   * Sets the global memstore limit to a new size.<a name="line.683"></a>
+<span class="sourceLineNo">684</span>   * @param globalMemStoreSize<a name="line.684"></a>
+<span class="sourceLineNo">685</span>   */<a name="line.685"></a>
+<span class="sourceLineNo">686</span>  @Override<a name="line.686"></a>
+<span class="sourceLineNo">687</span>  public void setGlobalMemstoreLimit(long globalMemStoreSize) {<a name="line.687"></a>
+<span class="sourceLineNo">688</span>    this.globalMemStoreLimit = globalMemStoreSize;<a name="line.688"></a>
+<span class="sourceLineNo">689</span>    this.globalMemStoreLimitLowMark =<a name="line.689"></a>
+<span class="sourceLineNo">690</span>        (long) (this.globalMemStoreLimitLowMarkPercent * globalMemStoreSize);<a name="line.690"></a>
+<span class="sourceLineNo">691</span>    reclaimMemStoreMemory();<a name="line.691"></a>
+<span class="sourceLineNo">692</span>  }<a name="line.692"></a>
+<span class="sourceLineNo">693</span><a name="line.693"></a>
+<span class="sourceLineNo">694</span>  public long getMemoryLimit() {<a name="line.694"></a>
+<span class="sourceLineNo">695</span>    return this.globalMemStoreLimit;<a name="line.695"></a>
+<span class="sourceLineNo">696</span>  }<a name="line.696"></a>
+<span class="sourceLineNo">697</span><a name="line.697"></a>
+<span class="sourceLineNo">698</span>  interface FlushQueueEntry extends Delayed {<a name="line.698"></a>
+<span class="sourceLineNo">699</span>  }<a name="line.699"></a>
+<span class="sourceLineNo">700</span><a name="line.700"></a>
+<span class="sourceLineNo">701</span>  /**<a name="line.701"></a>
+<span class="sourceLineNo">702</span>   * Token to insert into the flush queue that ensures that the flusher does not sleep<a name="line.702"></a>
+<span class="sourceLineNo">703</span>   */<a name="line.703"></a>
+<span class="sourceLineNo">704</span>  static class WakeupFlushThread implements FlushQueueEntry {<a name="line.704"></a>
 <span class="sourceLineNo">705</span>    @Override<a name="line.705"></a>
-<span class="sourceLineNo">706</span>    public boolean equals(Object obj) {<a name="line.706"></a>
-<span class="sourceLineNo">707</span>      return (this == obj);<a name="line.707"></a>
+<span class="sourceLineNo">706</span>    public long getDelay(TimeUnit unit) {<a name="line.706"></a>
+<span class="sourceLineNo">707</span>      return 0;<a name="line.707"></a>
 <span class="sourceLineNo">708</span>    }<a name="line.708"></a>
-<span class="sourceLineNo">709</span>  }<a name="line.709"></a>
-<span class="sourceLineNo">710</span><a name="line.710"></a>
-<span class="sourceLineNo">711</span>  /**<a name="line.711"></a>
-<span class="sourceLineNo">712</span>   * Datastructure used in the flush queue.  Holds region and retry count.<a name="line.712"></a>
-<span class="sourceLineNo">713</span>   * Keeps tabs on how old this object is.  Implements {@link Delayed}.  On<a name="line.713"></a>
-<span class="sourceLineNo">714</span>   * construction, the delay is zero. When added to a delay queue, we'll come<a name="line.714"></a>
-<span class="sourceLineNo">715</span>   * out near immediately.  Call {@link #requeue(long)} passing delay in<a name="line.715"></a>
-<span class="sourceLineNo">716</span>   * milliseconds before readding to delay queue if you want it to stay there<a name="line.716"></a>
-<span class="sourceLineNo">717</span>   * a while.<a name="line.717"></a>
-<span class="sourceLineNo">718</span>   */<a name="line.718"></a>
-<span class="sourceLineNo">719</span>  static class FlushRegionEntry implements FlushQueueEntry {<a name="line.719"></a>
-<span class="sourceLineNo">720</span>    private final Region region;<a name="line.720"></a>
-<span class="sourceLineNo">721</span><a name="line.721"></a>
-<span class="sourceLineNo">722</span>    private final long createTime;<a name="line.722"></a>
-<span class="sourceLineNo">723</span>    private long whenToExpire;<a name="line.723"></a>
-<span class="sourceLineNo">724</span>    private int requeueCount = 0;<a name="line.724"></a>
-<span class="sourceLineNo">725</span><a name="line.725"></a>
-<span class="sourceLineNo">726</span>    private boolean forceFlushAllStores;<a name="line.726"></a>
-<span class="sourceLineNo">727</span><a name="line.727"></a>
-<span class="sourceLineNo">728</span>    FlushRegionEntry(final Region r, boolean forceFlushAllStores) {<a name="line.728"></a>
-<span class="sourceLineNo">729</span>      this.region = r;<a name="line.729"></a>
-<span class="sourceLineNo">730</span>      this.createTime = EnvironmentEdgeManager.currentTime();<a name="line.730"></a>
-<span class="sourceLineNo">731</span>      this.whenToExpire = this.createTime;<a name="line.731"></a>
-<span class="sourceLineNo">732</span>      this.forceFlushAllStores = forceFlushAllStores;<a name="line.732"></a>
-<span class="sourceLineNo">733</span>    }<a name="line.733"></a>
-<span class="sourceLineNo">734</span><a name="line.734"></a>
-<span class="sourceLineNo">735</span>    /**<a name="line.735"></a>
-<span class="sourceLineNo">736</span>     * @param maximumWait<a name="line.736"></a>
-<span class="sourceLineNo">737</span>     * @return True if we have been delayed &gt; &lt;code&gt;maximumWait&lt;/code&gt; milliseconds.<a name="line.737"></a>
-<span class="sourceLineNo">738</span>     */<a name="line.738"></a>
-<span class="sourceLineNo">739</span>    public boolean isMaximumWait(final long maximumWait) {<a name="line.739"></a>
-<span class="sourceLineNo">740</span>      return (EnvironmentEdgeManager.currentTime() - this.createTime) &gt; maximumWait;<a name="line.740"></a>
-<span class="sourceLineNo">741</span>    }<a name="line.741"></a>
-<span class="sourceLineNo">742</span><a name="line.742"></a>
-<span class="sourceLineNo">743</span>    /**<a name="line.743"></a>
-<span class="sourceLineNo">744</span>     * @return Count of times {@link #requeue(long)} was called; i.e this is<a name="line.744"></a>
-<span class="sourceLineNo">745</span>     * number of times we've been requeued.<a name="line.745"></a>
-<span class="sourceLineNo">746</span>     */<a name="line.746"></a>
-<span class="sourceLineNo">747</span>    public int getRequeueCount() {<a name="line.747"></a>
-<span class="sourceLineNo">748</span>      return this.requeueCount;<a name="line.748"></a>
-<span class="sourceLineNo">749</span>    }<a name="line.749"></a>
-<span class="sourceLineNo">750</span><a name="line.750"></a>
-<span class="sourceLineNo">751</span>    /**<a name="line.751"></a>
-<span class="sourceLineNo">752</span>     * @return whether we need to flush all stores.<a name="line.752"></a>
-<span class="sourceLineNo">753</span>     */<a name="line.753"></a>
-<span class="sourceLineNo">754</span>    public boolean isForceFlushAllStores() {<a name="line.754"></a>
-<span class="sourceLineNo">755</span>      return forceFlushAllStores;<a name="line.755"></a>
-<span class="sourceLineNo">756</span>    }<a name="line.756"></a>
-<span class="sourceLineNo">757</span><a name="line.757"></a>
-<span class="sourceLineNo">758</span>    /**<a name="line.758"></a>
-<span class="sourceLineNo">759</span>     * @param when When to expire, when to come up out of the queue.<a name="line.759"></a>
-<span class="sourceLineNo">760</span>     * Specify in milliseconds.  This method adds EnvironmentEdgeManager.currentTime()<a name="line.760"></a>
-<span class="sourceLineNo">761</span>     * to whatever you pass.<a name="line.761"></a>
-<span class="sourceLineNo">762</span>     * @return This.<a name="line.762"></a>
+<span class="sourceLineNo">709</span><a name="line.709"></a>
+<span class="sourceLineNo">710</span>    @Override<a name="line.710"></a>
+<span class="sourceLineNo">711</span>    public int compareTo(Delayed o) {<a name="line.711"></a>
+<span class="sourceLineNo">712</span>      return -1;<a name="line.712"></a>
+<span class="sourceLineNo">713</span>    }<a name="line.713"></a>
+<span class="sourceLineNo">714</span><a name="line.714"></a>
+<span class="sourceLineNo">715</span>    @Override<a name="line.715"></a>
+<span class="sourceLineNo">716</span>    public boolean equals(Object obj) {<a name="line.716"></a>
+<span class="sourceLineNo">717</span>      return (this == obj);<a name="line.717"></a>
+<span class="sourceLineNo">718</span>    }<a name="line.718"></a>
+<span class="sourceLineNo">719</span>  }<a name="line.719"></a>
+<span class="sourceLineNo">720</span><a name="line.720"></a>
+<span class="sourceLineNo">721</span>  /**<a name="line.721"></a>
+<span class="sourceLineNo">722</span>   * Datastructure used in the flush queue.  Holds region and retry count.<a name="line.722"></a>
+<span class="sourceLineNo">723</span>   * Keeps tabs on how old this object is.  Implements {@link Delayed}.  On<a name="line.723"></a>
+<span class="sourceLineNo">724</span>   * construction, the delay is zero. When added to a delay queue, we'll come<a name="line.724"></a>
+<span class="sourceLineNo">725</span>   * out near immediately.  Call {@link #requeue(long)} passing delay in<a name="line.725"></a>
+<span class="sourceLineNo">726</span>   * milliseconds before readding to delay queue if you want it to stay there<a name="line.726"></a>
+<span class="sourceLineNo">727</span>   * a while.<a name="line.727"></a>
+<span class="sourceLineNo">728</span>   */<a name="line.728"></a>
+<span class="sourceLineNo">729</span>  static class FlushRegionEntry implements FlushQueueEntry {<a name="line.729"></a>
+<span class="sourceLineNo">730</span>    private final Region region;<a name="line.730"></a>
+<span class="sourceLineNo">731</span><a name="line.731"></a>
+<span class="sourceLineNo">732</span>    private final long createTime;<a name="line.732"></a>
+<span class="sourceLineNo">733</span>    private long whenToExpire;<a name="line.733"></a>
+<span class="sourceLineNo">734</span>    private int requeueCount = 0;<a name="line.734"></a>
+<span class="sourceLineNo">735</span><a name="line.735"></a>
+<span class="sourceLineNo">736</span>    private boolean forceFlushAllStores;<a name="line.736"></a>
+<span class="sourceLineNo">737</span><a name="line.737"></a>
+<span class="sourceLineNo">738</span>    FlushRegionEntry(final Region r, boolean forceFlushAllStores) {<a name="line.738"></a>
+<span class="sourceLineNo">739</span>      this.region = r;<a name="line.739"></a>
+<span class="sourceLineNo">740</span>      this.createTime = EnvironmentEdgeManager.currentTime();<a name="line.740"></a>
+<span class="sourceLineNo">741</span>      this.whenToExpire = this.createTime;<a name="line.741"></a>
+<span class="sourceLineNo">742</span>      this.forceFlushAllStores = forceFlushAllStores;<a name="line.742"></a>
+<span class="sourceLineNo">743</span>    }<a name="line.743"></a>
+<span class="sourceLineNo">744</span><a name="line.744"></a>
+<span class="sourceLineNo">745</span>    /**<a name="line.745"></a>
+<span class="sourceLineNo">746</span>     * @param maximumWait<a name="line.746"></a>
+<span class="sourceLineNo">747</span>     * @return True if we have been delayed &gt; &lt;code&gt;maximumWait&lt;/code&gt; milliseconds.<a name="line.747"></a>
+<span class="sourceLineNo">748</span>     */<a name="line.748"></a>
+<span class="sourceLineNo">749</span>    public boolean isMaximumWait(final long maximumWait) {<a name="line.749"></a>
+<span class="sourceLineNo">750</span>      return (EnvironmentEdgeManager.currentTime() - this.createTime) &gt; maximumWait;<a name="line.750"></a>
+<span class="sourceLineNo">751</span>    }<a name="line.751"></a>
+<span class="sourceLineNo">752</span><a name="line.752"></a>
+<span class="sourceLineNo">753</span>    /**<a name="line.753"></a>
+<span class="sourceLineNo">754</span>     * @return Count of times {@link #requeue(long)} was called; i.e this is<a name="line.754"></a>
+<span class="sourceLineNo">755</span>     * number of times we've been requeued.<a name="line.755"></a>
+<span class="sourceLineNo">756</span>     */<a name="line.756"></a>
+<span class="sourceLineNo">757</span>    public int getRequeueCount() {<a name="line.757"></a>
+<span class="sourceLineNo">758</span>      return this.requeueCount;<a name="line.758"></a>
+<span class="sourceLineNo">759</span>    }<a name="line.759"></a>
+<span class="sourceLineNo">760</span><a name="line.760"></a>
+<span class="sourceLineNo">761</span>    /**<a name="line.761"></a>
+<span class="sourceLineNo">762</span>     * @return whether we need to flush all stores.<a name="line.762"></a>
 <span class="sourceLineNo">763</span>     */<a name="line.763"></a>
-<span class="sourceLineNo">764</span>    public FlushRegionEntry requeue(final long when) {<a name="line.764"></a>
-<span class="sourceLineNo">765</span>      this.whenToExpire = EnvironmentEdgeManager.currentTime() + when;<a name="line.765"></a>
-<span class="sourceLineNo">766</span>      this.requeueCount++;<a name="line.766"></a>
-<span class="sourceLineNo">767</span>      return this;<a name="line.767"></a>
-<span class="sourceLineNo">768</span>    }<a name="line.768"></a>
-<span class="sourceLineNo">769</span><a name="line.769"></a>
-<span class="sourceLineNo">770</span>    @Override<a name="line.770"></a>
-<span class="sourceLineNo">771</span>    public long getDelay(TimeUnit unit) {<a name="line.771"></a>
-<span class="sourceLineNo">772</span>      return unit.convert(this.whenToExpire - EnvironmentEdgeManager.currentTime(),<a name="line.772"></a>
-<span class="sourceLineNo">773</span>          TimeUnit.MILLISECONDS);<a name="line.773"></a>
-<span class="sourceLineNo">774</span>    }<a name="line.774"></a>
-<span class="sourceLineNo">775</span><a name="line.775"></a>
-<span class="sourceLineNo">776</span>    @Override<a name="line.776"></a>
-<span class="sourceLineNo">777</span>    public int compareTo(Delayed other) {<a name="line.777"></a>
-<span class="sourceLineNo">778</span>      // Delay is compared first. If there is a tie, compare region's hash code<a name="line.778"></a>
-<span class="sourceLineNo">779</span>      int ret = Long.valueOf(getDelay(TimeUnit.MILLISECONDS) -<a name="line.779"></a>
-<span class="sourceLineNo">780</span>        other.getDelay(TimeUnit.MILLISECONDS)).intValue();<a name="line.780"></a>
-<span class="sourceLineNo">781</span>      if (ret != 0) {<a name="line.781"></a>
-<span class="sourceLineNo">782</span>        return ret;<a name="line.782"></a>
-<span class="sourceLineNo">783</span>      }<a name="line.783"></a>
-<span class="sourceLineNo">784</span>      FlushQueueEntry otherEntry = (FlushQueueEntry) other;<a name="line.784"></a>
-<span class="sourceLineNo">785</span>      return hashCode() - otherEntry.hashCode();<a name="line.785"></a>
-<span class="sourceLineNo">786</span>    }<a name="line.786"></a>
-<span class="sourceLineNo">787</span><a name="line.787"></a>
-<span class="sourceLineNo">788</span>    @Override<a name="line.788"></a>
-<span class="sourceLineNo">789</span>    public String toString() {<a name="line.789"></a>
-<span class="sourceLineNo">790</span>      return "[flush region "+Bytes.toStringBinary(region.getRegionInfo().getRegionName())+"]";<a name="line.790"></a>
-<span class="sourceLineNo">791</span>    }<a name="line.791"></a>
-<span class="sourceLineNo">792</span><a name="line.792"></a>
-<span class="sourceLineNo">793</span>    @Override<a name="line.793"></a>
-<span class="sourceLineNo">794</span>    public int hashCode() {<a name="line.794"></a>
-<span class="sourceLineNo">795</span>      int hash = (int) getDelay(TimeUnit.MILLISECONDS);<a name="line.795"></a>
-<span class="sourceLineNo">796</span>      return hash ^ region.hashCode();<a name="line.796"></a>
-<span class="sourceLineNo">797</span>    }<a name="line.797"></a>
-<span class="sourceLineNo">798</span><a name="line.798"></a>
-<span class="sourceLineNo">799</span>   @Override<a name="line.799"></a>
-<span class="sourceLineNo">800</span>    public boolean equals(Object obj) {<a name="line.800"></a>
-<span class="sourceLineNo">801</span>      if (this == obj) {<a name="line.801"></a>
-<span class="sourceLineNo">802</span>        return true;<a name="line.802"></a>
-<span class="sourceLineNo">803</span>      }<a name="line.803"></a>
-<span class="sourceLineNo">804</span>      if (obj == null || getClass() != obj.getClass()) {<a name="line.804"></a>
-<span class="sourceLineNo">805</span>        return false;<a name="line.805"></a>
-<span class="sourceLineNo">806</span>      }<a name="line.806"></a>
-<span class="sourceLineNo">807</span>      Delayed other = (Delayed) obj;<a name="line.807"></a>
-<span class="sourceLineNo">808</span>      return compareTo(other) == 0;<a name="line.808"></a>
-<span class="sourceLineNo">809</span>    }<a name="line.809"></a>
-<span class="sourceLineNo">810</span>  }<a name="line.810"></a>
-<span class="sourceLineNo">811</span>}<a name="line.811"></a>
-<span class="sourceLineNo">812</span><a name="line.812"></a>
-<span class="sourceLineNo">813</span>enum FlushType {<a name="line.813"></a>
-<span class="sourceLineNo">814</span>  NORMAL, ABOVE_LOWER_MARK, ABOVE_HIGHER_MARK;<a name="line.814"></a>
-<span class="sourceLineNo">815</span>}<a name="line.815"></a>
+<span class="sourceLineNo">764</span>    public boolean isForceFlushAllStores() {<a name="line.764"></a>
+<span class="sourceLineNo">765</span>      return forceFlushAllStores;<a name="line.765"></a>
+<span class="sourceLineNo">766</span>    }<a name="line.766"></a>
+<span class="sourceLineNo">767</span><a name="line.767"></a>
+<span class="sourceLineNo">768</span>    /**<a name="line.768"></a>
+<span class="sourceLineNo">769</span>     * @param when When to expire, when to come up out of the queue.<a name="line.769"></a>
+<span class="sourceLineNo">770</span>     * Specify in milliseconds.  This method adds EnvironmentEdgeManager.currentTime()<a name="line.770"></a>
+<span class="sourceLineNo">771</span>     * to whatever you pass.<a name="line.771"></a>
+<span class="sourceLineNo">772</span>     * @return This.<a name="line.772"></a>
+<span class="sourceLineNo">773</span>     */<a name="line.773"></a>
+<span class="sourceLineNo">774</span>    public FlushRegionEntry requeue(final long when) {<a name="line.774"></a>
+<span class="sourceLineNo">775</span>      this.whenToExpire = EnvironmentEdgeManager.currentTime() + when;<a name="line.775"></a>
+<span class="sourceLineNo">776</span>      this.requeueCount++;<a name="line.776"></a>
+<span class="sourceLineNo">777</span>      return this;<a name="line.777"></a>
+<span class="sourceLineNo">778</span>    }<a name="line.778"></a>
+<span class="sourceLineNo">779</span><a name="line.779"></a>
+<span class="sourceLineNo">780</span>    @Override<a name="line.780"></a>
+<span class="sourceLineNo">781</span>    public long getDelay(TimeUnit unit) {<a name="line.781"></a>
+<span class="sourceLineNo">782</span>      return unit.convert(this.whenToExpire - EnvironmentEdgeManager.currentTime(),<a name="line.782"></a>
+<span class="sourceLineNo">783</span>          TimeUnit.MILLISECONDS);<a name="line.783"></a>
+<span class="sourceLineNo">784</span>    }<a name="line.784"></a>
+<span class="sourceLineNo">785</span><a name="line.785"></a>
+<span class="sourceLineNo">786</span>    @Override<a name="line.786"></a>
+<span class="sourceLineNo">787</span>    public int compareTo(Delayed other) {<a name="line.787"></a>
+<span class="sourceLineNo">788</span>      // Delay is compared first. If there is a tie, compare region's hash code<a name="line.788"></a>
+<span class="sourceLineNo">789</span>      int ret = Long.valueOf(getDelay(TimeUnit.MILLISECONDS) -<a name="line.789"></a>
+<span class="sourceLineNo">790</span>        other.getDelay(TimeUnit.MILLISECONDS)).intValue();<a name="line.790"></a>
+<span class="sourceLineNo">791</span>      if (ret != 0) {<a name="line.791"></a>
+<span class="sourceLineNo">792</span>        return ret;<a name="line.792"></a>
+<span class="sourceLineNo">793</span>      }<a name="line.793"></a>
+<span class="sourceLineNo">794</span>      FlushQueueEntry otherEntry = (FlushQueueEntry) other;<a name="line.794"></a>
+<span class="sourceLineNo">795</span>      return hashCode() - otherEntry.hashCode();<a name="line.795"></a>
+<span class="sourceLineNo">796</span>    }<a name="line.796"></a>
+<span class="sourceLineNo">797</span><a name="line.797"></a>
+<span class="sourceLineNo">798</span>    @Override<a name="line.798"></a>
+<span class="sourceLineNo">799</span>    public String toString() {<a name="line.799"></a>
+<span class="sourceLineNo">800</span>      return "[flush region "+Bytes.toStringBinary(region.getRegionInfo().getRegionName())+"]";<a name="line.800"></a>
+<span class="sourceLineNo">801</span>    }<a name="line.801"></a>
+<span class="sourceLineNo">802</span><a name="line.802"></a>
+<span class="sourceLineNo">803</span>    @Override<a name="line.803"></a>
+<span class="sourceLineNo">804</span>    public int hashCode() {<a name="line.804"></a>
+<span class="sourceLineNo">805</span>      int hash = (int) getDelay(TimeUnit.MILLISECONDS);<a name="line.805"></a>
+<span class="sourceLineNo">806</span>      return hash ^ region.hashCode();<a name="line.806"></a>
+<span class="sourceLineNo">807</span>    }<a name="line.807"></a>
+<span class="sourceLineNo">808</span><a name="line.808"></a>
+<span class="sourceLineNo">809</span>   @Override<a name="line.809"></a>
+<span class="sourceLineNo">810</span>    public boolean equals(Object obj) {<a name="line.810"></a>
+<span class="sourceLineNo">811</span>      if (this == obj) {<a name="line.811"></a>
+<span class="sourceLineNo">812</span>        return true;<a name="line.812"></a>
+<span class="sourceLineNo">813</span>      }<a name="line.813"></a>
+<span class="sourceLineNo">814</span>      if (obj == null || getClass() != obj.getClass()) {<a name="line.814"></a>
+<span class="sourceLineNo">815</span>        return false;<a name="line.815"></a>
+<span class="sourceLineNo">816</span>      }<a name="line.816"></a>
+<span class="sourceLineNo">817</span>      Delayed other = (Delayed) obj;<a name="line.817"></a>
+<span class="sourceLineNo">818</span>      return compareTo(other) == 0;<a name="line.818"></a>
+<span class="sourceLineNo">819</span>    }<a name="line.819"></a>
+<span class="sourceLineNo">820</span>  }<a name="line.820"></a>
+<span class="sourceLineNo">821</span>}<a name="line.821"></a>
+<span class="sourceLineNo">822</span><a name="line.822"></a>
+<span class="sourceLineNo">823</span>enum FlushType {<a name="line.823"></a>
+<span class="sourceLineNo">824</span>  NORMAL, ABOVE_LOWER_MARK, ABOVE_HIGHER_MARK;<a name="line.824"></a>
+<span class="sourceLineNo">825</span>}<a name="line.825"></a>
 
 
 
