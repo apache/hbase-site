@@ -26,425 +26,411 @@
 <span class="sourceLineNo">018</span><a name="line.18"></a>
 <span class="sourceLineNo">019</span>package org.apache.hadoop.hbase.client;<a name="line.19"></a>
 <span class="sourceLineNo">020</span><a name="line.20"></a>
-<span class="sourceLineNo">021</span>import static org.apache.hadoop.hbase.client.ConnectionUtils.createClosestRowAfter;<a name="line.21"></a>
-<span class="sourceLineNo">022</span>import static org.apache.hadoop.hbase.client.ConnectionUtils.createClosestRowBefore;<a name="line.22"></a>
-<span class="sourceLineNo">023</span><a name="line.23"></a>
-<span class="sourceLineNo">024</span>import com.google.common.annotations.VisibleForTesting;<a name="line.24"></a>
-<span class="sourceLineNo">025</span><a name="line.25"></a>
-<span class="sourceLineNo">026</span>import java.io.IOException;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import java.io.InterruptedIOException;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import java.util.HashSet;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import java.util.Set;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import java.util.concurrent.Callable;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import java.util.concurrent.CancellationException;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import java.util.concurrent.ExecutionException;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import java.util.concurrent.ExecutorService;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import java.util.concurrent.Future;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import java.util.concurrent.TimeUnit;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import java.util.concurrent.atomic.AtomicBoolean;<a name="line.36"></a>
-<span class="sourceLineNo">037</span><a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.commons.logging.Log;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.commons.logging.LogFactory;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.conf.Configuration;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.RegionLocations;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.TableName;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.client.ScannerCallable.MoreResults;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.46"></a>
-<span class="sourceLineNo">047</span><a name="line.47"></a>
-<span class="sourceLineNo">048</span>/**<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * This class has the logic for handling scanners for regions with and without replicas.<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * 1. A scan is attempted on the default (primary) region<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * 2. The scanner sends all the RPCs to the default region until it is done, or, there<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * is a timeout on the default (a timeout of zero is disallowed).<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * 3. If there is a timeout in (2) above, scanner(s) is opened on the non-default replica(s)<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * 4. The results from the first successful scanner are taken, and it is stored which server<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * returned the results.<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * 5. The next RPCs are done on the above stored server until it is done or there is a timeout,<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * in which case, the other replicas are queried (as in (3) above).<a name="line.57"></a>
-<span class="sourceLineNo">058</span> *<a name="line.58"></a>
-<span class="sourceLineNo">059</span> */<a name="line.59"></a>
-<span class="sourceLineNo">060</span>@InterfaceAudience.Private<a name="line.60"></a>
-<span class="sourceLineNo">061</span>class ScannerCallableWithReplicas implements RetryingCallable&lt;Result[]&gt; {<a name="line.61"></a>
-<span class="sourceLineNo">062</span>  private static final Log LOG = LogFactory.getLog(ScannerCallableWithReplicas.class);<a name="line.62"></a>
-<span class="sourceLineNo">063</span>  volatile ScannerCallable currentScannerCallable;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>  AtomicBoolean replicaSwitched = new AtomicBoolean(false);<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  final ClusterConnection cConnection;<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  protected final ExecutorService pool;<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  protected final int timeBeforeReplicas;<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  private final Scan scan;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  private final int retries;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>  private Result lastResult;<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  private final RpcRetryingCaller&lt;Result[]&gt; caller;<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private final TableName tableName;<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private Configuration conf;<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private int scannerTimeout;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private Set&lt;ScannerCallable&gt; outstandingCallables = new HashSet&lt;ScannerCallable&gt;();<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private boolean someRPCcancelled = false; //required for testing purposes only<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  public ScannerCallableWithReplicas(TableName tableName, ClusterConnection cConnection,<a name="line.78"></a>
-<span class="sourceLineNo">079</span>      ScannerCallable baseCallable, ExecutorService pool, int timeBeforeReplicas, Scan scan,<a name="line.79"></a>
-<span class="sourceLineNo">080</span>      int retries, int scannerTimeout, int caching, Configuration conf,<a name="line.80"></a>
-<span class="sourceLineNo">081</span>      RpcRetryingCaller&lt;Result []&gt; caller) {<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    this.currentScannerCallable = baseCallable;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    this.cConnection = cConnection;<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    this.pool = pool;<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    if (timeBeforeReplicas &lt; 0) {<a name="line.85"></a>
-<span class="sourceLineNo">086</span>      throw new IllegalArgumentException("Invalid value of operation timeout on the primary");<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    }<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    this.timeBeforeReplicas = timeBeforeReplicas;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    this.scan = scan;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    this.retries = retries;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    this.tableName = tableName;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    this.conf = conf;<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    this.scannerTimeout = scannerTimeout;<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    this.caller = caller;<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  }<a name="line.95"></a>
-<span class="sourceLineNo">096</span><a name="line.96"></a>
-<span class="sourceLineNo">097</span>  public void setClose() {<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    currentScannerCallable.setClose();<a name="line.98"></a>
-<span class="sourceLineNo">099</span>  }<a name="line.99"></a>
-<span class="sourceLineNo">100</span><a name="line.100"></a>
-<span class="sourceLineNo">101</span>  public void setRenew(boolean val) {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    currentScannerCallable.setRenew(val);<a name="line.102"></a>
-<span class="sourceLineNo">103</span>  }<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  public void setCaching(int caching) {<a name="line.105"></a>
-<span class="sourceLineNo">106</span>    currentScannerCallable.setCaching(caching);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  }<a name="line.107"></a>
-<span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  public int getCaching() {<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    return currentScannerCallable.getCaching();<a name="line.110"></a>
-<span class="sourceLineNo">111</span>  }<a name="line.111"></a>
-<span class="sourceLineNo">112</span><a name="line.112"></a>
-<span class="sourceLineNo">113</span>  public HRegionInfo getHRegionInfo() {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    return currentScannerCallable.getHRegionInfo();<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  }<a name="line.115"></a>
-<span class="sourceLineNo">116</span><a name="line.116"></a>
-<span class="sourceLineNo">117</span>  public MoreResults moreResultsInRegion() {<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    return currentScannerCallable.moreResultsInRegion();<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  }<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  public MoreResults moreResultsForScan() {<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    return currentScannerCallable.moreResultsForScan();<a name="line.122"></a>
-<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>  public boolean isOpenScanner() {<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    return currentScannerCallable.isOpenScanner();<a name="line.126"></a>
-<span class="sourceLineNo">127</span>  }<a name="line.127"></a>
-<span class="sourceLineNo">128</span><a name="line.128"></a>
-<span class="sourceLineNo">129</span>  @Override<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  public Result [] call(int timeout) throws IOException {<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    // If the active replica callable was closed somewhere, invoke the RPC to<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    // really close it. In the case of regular scanners, this applies. We make couple<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    // of RPCs to a RegionServer, and when that region is exhausted, we set<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    // the closed flag. Then an RPC is required to actually close the scanner.<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    if (currentScannerCallable != null &amp;&amp; currentScannerCallable.closed) {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      // For closing we target that exact scanner (and not do replica fallback like in<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      // the case of normal reads)<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      if (LOG.isTraceEnabled()) {<a name="line.138"></a>
-<span class="sourceLineNo">139</span>        LOG.trace("Closing scanner id=" + currentScannerCallable.scannerId);<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      }<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      Result[] r = currentScannerCallable.call(timeout);<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      currentScannerCallable = null;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      return r;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    }<a name="line.144"></a>
-<span class="sourceLineNo">145</span>    // We need to do the following:<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    //1. When a scan goes out to a certain replica (default or not), we need to<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    //   continue to hit that until there is a failure. So store the last successfully invoked<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    //   replica<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    //2. We should close the "losing" scanners (scanners other than the ones we hear back<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    //   from first)<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    //<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    RegionLocations rl = RpcRetryingCallerWithReadReplicas.getRegionLocations(true,<a name="line.152"></a>
-<span class="sourceLineNo">153</span>        RegionReplicaUtil.DEFAULT_REPLICA_ID, cConnection, tableName,<a name="line.153"></a>
-<span class="sourceLineNo">154</span>        currentScannerCallable.getRow());<a name="line.154"></a>
+<span class="sourceLineNo">021</span>import com.google.common.annotations.VisibleForTesting;<a name="line.21"></a>
+<span class="sourceLineNo">022</span><a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.io.IOException;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import java.io.InterruptedIOException;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import java.util.HashSet;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import java.util.Set;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import java.util.concurrent.Callable;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import java.util.concurrent.CancellationException;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import java.util.concurrent.ExecutionException;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import java.util.concurrent.ExecutorService;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.concurrent.Future;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import java.util.concurrent.TimeUnit;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import java.util.concurrent.atomic.AtomicBoolean;<a name="line.33"></a>
+<span class="sourceLineNo">034</span><a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.commons.logging.Log;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.commons.logging.LogFactory;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.conf.Configuration;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.RegionLocations;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.TableName;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.client.ScannerCallable.MoreResults;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.43"></a>
+<span class="sourceLineNo">044</span><a name="line.44"></a>
+<span class="sourceLineNo">045</span>/**<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * This class has the logic for handling scanners for regions with and without replicas.<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * 1. A scan is attempted on the default (primary) region<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * 2. The scanner sends all the RPCs to the default region until it is done, or, there<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * is a timeout on the default (a timeout of zero is disallowed).<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * 3. If there is a timeout in (2) above, scanner(s) is opened on the non-default replica(s)<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * 4. The results from the first successful scanner are taken, and it is stored which server<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * returned the results.<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * 5. The next RPCs are done on the above stored server until it is done or there is a timeout,<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * in which case, the other replicas are queried (as in (3) above).<a name="line.54"></a>
+<span class="sourceLineNo">055</span> *<a name="line.55"></a>
+<span class="sourceLineNo">056</span> */<a name="line.56"></a>
+<span class="sourceLineNo">057</span>@InterfaceAudience.Private<a name="line.57"></a>
+<span class="sourceLineNo">058</span>class ScannerCallableWithReplicas implements RetryingCallable&lt;Result[]&gt; {<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  private static final Log LOG = LogFactory.getLog(ScannerCallableWithReplicas.class);<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  volatile ScannerCallable currentScannerCallable;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>  AtomicBoolean replicaSwitched = new AtomicBoolean(false);<a name="line.61"></a>
+<span class="sourceLineNo">062</span>  final ClusterConnection cConnection;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  protected final ExecutorService pool;<a name="line.63"></a>
+<span class="sourceLineNo">064</span>  protected final int timeBeforeReplicas;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private final Scan scan;<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  private final int retries;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private Result lastResult;<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  private final RpcRetryingCaller&lt;Result[]&gt; caller;<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private final TableName tableName;<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  private Configuration conf;<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  private int scannerTimeout;<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private Set&lt;ScannerCallable&gt; outstandingCallables = new HashSet&lt;ScannerCallable&gt;();<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  private boolean someRPCcancelled = false; //required for testing purposes only<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  public ScannerCallableWithReplicas(TableName tableName, ClusterConnection cConnection,<a name="line.75"></a>
+<span class="sourceLineNo">076</span>      ScannerCallable baseCallable, ExecutorService pool, int timeBeforeReplicas, Scan scan,<a name="line.76"></a>
+<span class="sourceLineNo">077</span>      int retries, int scannerTimeout, int caching, Configuration conf,<a name="line.77"></a>
+<span class="sourceLineNo">078</span>      RpcRetryingCaller&lt;Result []&gt; caller) {<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    this.currentScannerCallable = baseCallable;<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    this.cConnection = cConnection;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    this.pool = pool;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    if (timeBeforeReplicas &lt; 0) {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>      throw new IllegalArgumentException("Invalid value of operation timeout on the primary");<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    }<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    this.timeBeforeReplicas = timeBeforeReplicas;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    this.scan = scan;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    this.retries = retries;<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    this.tableName = tableName;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    this.conf = conf;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    this.scannerTimeout = scannerTimeout;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this.caller = caller;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  }<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>  public void setClose() {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    currentScannerCallable.setClose();<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  }<a name="line.96"></a>
+<span class="sourceLineNo">097</span><a name="line.97"></a>
+<span class="sourceLineNo">098</span>  public void setRenew(boolean val) {<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    currentScannerCallable.setRenew(val);<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  }<a name="line.100"></a>
+<span class="sourceLineNo">101</span><a name="line.101"></a>
+<span class="sourceLineNo">102</span>  public void setCaching(int caching) {<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    currentScannerCallable.setCaching(caching);<a name="line.103"></a>
+<span class="sourceLineNo">104</span>  }<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  public int getCaching() {<a name="line.106"></a>
+<span class="sourceLineNo">107</span>    return currentScannerCallable.getCaching();<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  }<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  public HRegionInfo getHRegionInfo() {<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    return currentScannerCallable.getHRegionInfo();<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  }<a name="line.112"></a>
+<span class="sourceLineNo">113</span><a name="line.113"></a>
+<span class="sourceLineNo">114</span>  public MoreResults moreResultsInRegion() {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    return currentScannerCallable.moreResultsInRegion();<a name="line.115"></a>
+<span class="sourceLineNo">116</span>  }<a name="line.116"></a>
+<span class="sourceLineNo">117</span><a name="line.117"></a>
+<span class="sourceLineNo">118</span>  public MoreResults moreResultsForScan() {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    return currentScannerCallable.moreResultsForScan();<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  }<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  @Override<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  public Result [] call(int timeout) throws IOException {<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    // If the active replica callable was closed somewhere, invoke the RPC to<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    // really close it. In the case of regular scanners, this applies. We make couple<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    // of RPCs to a RegionServer, and when that region is exhausted, we set<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    // the closed flag. Then an RPC is required to actually close the scanner.<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    if (currentScannerCallable != null &amp;&amp; currentScannerCallable.closed) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      // For closing we target that exact scanner (and not do replica fallback like in<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      // the case of normal reads)<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      if (LOG.isTraceEnabled()) {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>        LOG.trace("Closing scanner id=" + currentScannerCallable.scannerId);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      }<a name="line.133"></a>
+<span class="sourceLineNo">134</span>      Result[] r = currentScannerCallable.call(timeout);<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      currentScannerCallable = null;<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      return r;<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    }<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    // We need to do the following:<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    //1. When a scan goes out to a certain replica (default or not), we need to<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    //   continue to hit that until there is a failure. So store the last successfully invoked<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    //   replica<a name="line.141"></a>
+<span class="sourceLineNo">142</span>    //2. We should close the "losing" scanners (scanners other than the ones we hear back<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    //   from first)<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    //<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    RegionLocations rl = RpcRetryingCallerWithReadReplicas.getRegionLocations(true,<a name="line.145"></a>
+<span class="sourceLineNo">146</span>        RegionReplicaUtil.DEFAULT_REPLICA_ID, cConnection, tableName,<a name="line.146"></a>
+<span class="sourceLineNo">147</span>        currentScannerCallable.getRow());<a name="line.147"></a>
+<span class="sourceLineNo">148</span><a name="line.148"></a>
+<span class="sourceLineNo">149</span>    // allocate a boundedcompletion pool of some multiple of number of replicas.<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    // We want to accomodate some RPCs for redundant replica scans (but are still in progress)<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs =<a name="line.151"></a>
+<span class="sourceLineNo">152</span>        new ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt;(<a name="line.152"></a>
+<span class="sourceLineNo">153</span>            RpcRetryingCallerFactory.instantiate(ScannerCallableWithReplicas.this.conf), pool,<a name="line.153"></a>
+<span class="sourceLineNo">154</span>            rl.size() * 5);<a name="line.154"></a>
 <span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>    // allocate a boundedcompletion pool of some multiple of number of replicas.<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    // We want to accomodate some RPCs for redundant replica scans (but are still in progress)<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs =<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        new ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt;(<a name="line.159"></a>
-<span class="sourceLineNo">160</span>            RpcRetryingCallerFactory.instantiate(ScannerCallableWithReplicas.this.conf), pool,<a name="line.160"></a>
-<span class="sourceLineNo">161</span>            rl.size() * 5);<a name="line.161"></a>
-<span class="sourceLineNo">162</span><a name="line.162"></a>
-<span class="sourceLineNo">163</span>    AtomicBoolean done = new AtomicBoolean(false);<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    replicaSwitched.set(false);<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    // submit call for the primary replica.<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    addCallsForCurrentReplica(cs, rl);<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    int startIndex = 0;<a name="line.167"></a>
-<span class="sourceLineNo">168</span><a name="line.168"></a>
-<span class="sourceLineNo">169</span>    try {<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      // wait for the timeout to see whether the primary responds back<a name="line.170"></a>
-<span class="sourceLineNo">171</span>      Future&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; f = cs.poll(timeBeforeReplicas,<a name="line.171"></a>
-<span class="sourceLineNo">172</span>          TimeUnit.MICROSECONDS); // Yes, microseconds<a name="line.172"></a>
-<span class="sourceLineNo">173</span>      if (f != null) {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>        // After poll, if f is not null, there must be a completed task<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        Pair&lt;Result[], ScannerCallable&gt; r = f.get();<a name="line.175"></a>
-<span class="sourceLineNo">176</span>        if (r != null &amp;&amp; r.getSecond() != null) {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>          updateCurrentlyServingReplica(r.getSecond(), r.getFirst(), done, pool);<a name="line.177"></a>
-<span class="sourceLineNo">178</span>        }<a name="line.178"></a>
-<span class="sourceLineNo">179</span>        return r == null ? null : r.getFirst(); //great we got a response<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      }<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    } catch (ExecutionException e) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      // We ignore the ExecutionException and continue with the replicas<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      if (LOG.isDebugEnabled()) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>        LOG.debug("Scan with primary region returns " + e.getCause());<a name="line.184"></a>
+<span class="sourceLineNo">156</span>    AtomicBoolean done = new AtomicBoolean(false);<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    replicaSwitched.set(false);<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    // submit call for the primary replica.<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    addCallsForCurrentReplica(cs, rl);<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    int startIndex = 0;<a name="line.160"></a>
+<span class="sourceLineNo">161</span><a name="line.161"></a>
+<span class="sourceLineNo">162</span>    try {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      // wait for the timeout to see whether the primary responds back<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      Future&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; f = cs.poll(timeBeforeReplicas,<a name="line.164"></a>
+<span class="sourceLineNo">165</span>          TimeUnit.MICROSECONDS); // Yes, microseconds<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      if (f != null) {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>        // After poll, if f is not null, there must be a completed task<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        Pair&lt;Result[], ScannerCallable&gt; r = f.get();<a name="line.168"></a>
+<span class="sourceLineNo">169</span>        if (r != null &amp;&amp; r.getSecond() != null) {<a name="line.169"></a>
+<span class="sourceLineNo">170</span>          updateCurrentlyServingReplica(r.getSecond(), r.getFirst(), done, pool);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        }<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        return r == null ? null : r.getFirst(); //great we got a response<a name="line.172"></a>
+<span class="sourceLineNo">173</span>      }<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    } catch (ExecutionException e) {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      // We ignore the ExecutionException and continue with the replicas<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      if (LOG.isDebugEnabled()) {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        LOG.debug("Scan with primary region returns " + e.getCause());<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      }<a name="line.178"></a>
+<span class="sourceLineNo">179</span><a name="line.179"></a>
+<span class="sourceLineNo">180</span>      // If rl's size is 1 or scan's consitency is strong, it needs to throw<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      // out the exception from the primary replica<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      if ((rl.size() == 1) || (scan.getConsistency() == Consistency.STRONG)) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        // Rethrow the first exception<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        RpcRetryingCallerWithReadReplicas.throwEnrichedException(e, retries);<a name="line.184"></a>
 <span class="sourceLineNo">185</span>      }<a name="line.185"></a>
 <span class="sourceLineNo">186</span><a name="line.186"></a>
-<span class="sourceLineNo">187</span>      // If rl's size is 1 or scan's consitency is strong, it needs to throw<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      // out the exception from the primary replica<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      if ((rl.size() == 1) || (scan.getConsistency() == Consistency.STRONG)) {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        // Rethrow the first exception<a name="line.190"></a>
-<span class="sourceLineNo">191</span>        RpcRetryingCallerWithReadReplicas.throwEnrichedException(e, retries);<a name="line.191"></a>
-<span class="sourceLineNo">192</span>      }<a name="line.192"></a>
+<span class="sourceLineNo">187</span>      startIndex = 1;<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    } catch (CancellationException e) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      throw new InterruptedIOException(e.getMessage());<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    } catch (InterruptedException e) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      throw new InterruptedIOException(e.getMessage());<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    }<a name="line.192"></a>
 <span class="sourceLineNo">193</span><a name="line.193"></a>
-<span class="sourceLineNo">194</span>      startIndex = 1;<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    } catch (CancellationException e) {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      throw new InterruptedIOException(e.getMessage());<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    } catch (InterruptedException e) {<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      throw new InterruptedIOException(e.getMessage());<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
-<span class="sourceLineNo">200</span><a name="line.200"></a>
-<span class="sourceLineNo">201</span>    // submit call for the all of the secondaries at once<a name="line.201"></a>
-<span class="sourceLineNo">202</span>    int endIndex = rl.size();<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    if (scan.getConsistency() == Consistency.STRONG) {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      // When scan's consistency is strong, do not send to the secondaries<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      endIndex = 1;<a name="line.205"></a>
-<span class="sourceLineNo">206</span>    } else {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      // TODO: this may be an overkill for large region replication<a name="line.207"></a>
-<span class="sourceLineNo">208</span>      addCallsForOtherReplicas(cs, rl, 0, rl.size() - 1);<a name="line.208"></a>
-<span class="sourceLineNo">209</span>    }<a name="line.209"></a>
-<span class="sourceLineNo">210</span><a name="line.210"></a>
-<span class="sourceLineNo">211</span>    try {<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      Future&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; f = cs.pollForFirstSuccessfullyCompletedTask(timeout,<a name="line.212"></a>
-<span class="sourceLineNo">213</span>          TimeUnit.MILLISECONDS, startIndex, endIndex);<a name="line.213"></a>
-<span class="sourceLineNo">214</span><a name="line.214"></a>
-<span class="sourceLineNo">215</span>      if (f == null) {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>        throw new IOException("Failed to get result within timeout, timeout=" + timeout + "ms");<a name="line.216"></a>
-<span class="sourceLineNo">217</span>      }<a name="line.217"></a>
-<span class="sourceLineNo">218</span>      Pair&lt;Result[], ScannerCallable&gt; r = f.get();<a name="line.218"></a>
-<span class="sourceLineNo">219</span><a name="line.219"></a>
-<span class="sourceLineNo">220</span>      if (r != null &amp;&amp; r.getSecond() != null) {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>        updateCurrentlyServingReplica(r.getSecond(), r.getFirst(), done, pool);<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>      return r == null ? null : r.getFirst(); // great we got an answer<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>    } catch (ExecutionException e) {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      RpcRetryingCallerWithReadReplicas.throwEnrichedException(e, retries);<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    } catch (CancellationException e) {<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      throw new InterruptedIOException(e.getMessage());<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    } catch (InterruptedException e) {<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      throw new InterruptedIOException(e.getMessage());<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    } finally {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      // We get there because we were interrupted or because one or more of the<a name="line.232"></a>
-<span class="sourceLineNo">233</span>      // calls succeeded or failed. In all case, we stop all our tasks.<a name="line.233"></a>
-<span class="sourceLineNo">234</span>      cs.cancelAll();<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    LOG.error("Imposible? Arrive at an unreachable line..."); // unreachable<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    throw new IOException("Imposible? Arrive at an unreachable line...");<a name="line.237"></a>
-<span class="sourceLineNo">238</span>  }<a name="line.238"></a>
-<span class="sourceLineNo">239</span><a name="line.239"></a>
-<span class="sourceLineNo">240</span>  private void updateCurrentlyServingReplica(ScannerCallable scanner, Result[] result,<a name="line.240"></a>
-<span class="sourceLineNo">241</span>      AtomicBoolean done, ExecutorService pool) {<a name="line.241"></a>
-<span class="sourceLineNo">242</span>    if (done.compareAndSet(false, true)) {<a name="line.242"></a>
-<span class="sourceLineNo">243</span>      if (currentScannerCallable != scanner) replicaSwitched.set(true);<a name="line.243"></a>
-<span class="sourceLineNo">244</span>      currentScannerCallable = scanner;<a name="line.244"></a>
-<span class="sourceLineNo">245</span>      // store where to start the replica scanner from if we need to.<a name="line.245"></a>
-<span class="sourceLineNo">246</span>      if (result != null &amp;&amp; result.length != 0) this.lastResult = result[result.length - 1];<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      if (LOG.isTraceEnabled()) {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>        LOG.trace("Setting current scanner as id=" + currentScannerCallable.scannerId +<a name="line.248"></a>
-<span class="sourceLineNo">249</span>            " associated with replica=" + currentScannerCallable.getHRegionInfo().getReplicaId());<a name="line.249"></a>
-<span class="sourceLineNo">250</span>      }<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      // close all outstanding replica scanners but the one we heard back from<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      outstandingCallables.remove(scanner);<a name="line.252"></a>
-<span class="sourceLineNo">253</span>      for (ScannerCallable s : outstandingCallables) {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>        if (LOG.isTraceEnabled()) {<a name="line.254"></a>
-<span class="sourceLineNo">255</span>          LOG.trace("Closing scanner id=" + s.scannerId +<a name="line.255"></a>
-<span class="sourceLineNo">256</span>            ", replica=" + s.getHRegionInfo().getRegionId() +<a name="line.256"></a>
-<span class="sourceLineNo">257</span>            " because slow and replica=" +<a name="line.257"></a>
-<span class="sourceLineNo">258</span>            this.currentScannerCallable.getHRegionInfo().getReplicaId() + " succeeded");<a name="line.258"></a>
-<span class="sourceLineNo">259</span>        }<a name="line.259"></a>
-<span class="sourceLineNo">260</span>        // Submit the "close" to the pool since this might take time, and we don't<a name="line.260"></a>
-<span class="sourceLineNo">261</span>        // want to wait for the "close" to happen yet. The "wait" will happen when<a name="line.261"></a>
-<span class="sourceLineNo">262</span>        // the table is closed (when the awaitTermination of the underlying pool is called)<a name="line.262"></a>
-<span class="sourceLineNo">263</span>        s.setClose();<a name="line.263"></a>
-<span class="sourceLineNo">264</span>        final RetryingRPC r = new RetryingRPC(s);<a name="line.264"></a>
-<span class="sourceLineNo">265</span>        pool.submit(new Callable&lt;Void&gt;(){<a name="line.265"></a>
-<span class="sourceLineNo">266</span>          @Override<a name="line.266"></a>
-<span class="sourceLineNo">267</span>          public Void call() throws Exception {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>            r.call(scannerTimeout);<a name="line.268"></a>
-<span class="sourceLineNo">269</span>            return null;<a name="line.269"></a>
-<span class="sourceLineNo">270</span>          }<a name="line.270"></a>
-<span class="sourceLineNo">271</span>        });<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      }<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      // now clear outstandingCallables since we scheduled a close for all the contained scanners<a name="line.273"></a>
-<span class="sourceLineNo">274</span>      outstandingCallables.clear();<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    }<a name="line.275"></a>
-<span class="sourceLineNo">276</span>  }<a name="line.276"></a>
-<span class="sourceLineNo">277</span><a name="line.277"></a>
-<span class="sourceLineNo">278</span>  /**<a name="line.278"></a>
-<span class="sourceLineNo">279</span>   * When a scanner switches in the middle of scanning (the 'next' call fails<a name="line.279"></a>
-<span class="sourceLineNo">280</span>   * for example), the upper layer {@link ClientScanner} needs to know<a name="line.280"></a>
-<span class="sourceLineNo">281</span>   */<a name="line.281"></a>
-<span class="sourceLineNo">282</span>  public boolean switchedToADifferentReplica() {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>    return replicaSwitched.get();<a name="line.283"></a>
-<span class="sourceLineNo">284</span>  }<a name="line.284"></a>
-<span class="sourceLineNo">285</span><a name="line.285"></a>
-<span class="sourceLineNo">286</span>  /**<a name="line.286"></a>
-<span class="sourceLineNo">287</span>   * @return true when the most recent RPC response indicated that the response was a heartbeat<a name="line.287"></a>
-<span class="sourceLineNo">288</span>   *         message. Heartbeat messages are sent back from the server when the processing of the<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   *         scan request exceeds a certain time threshold. Heartbeats allow the server to avoid<a name="line.289"></a>
-<span class="sourceLineNo">290</span>   *         timeouts during long running scan operations.<a name="line.290"></a>
-<span class="sourceLineNo">291</span>   */<a name="line.291"></a>
-<span class="sourceLineNo">292</span>  public boolean isHeartbeatMessage() {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    return currentScannerCallable != null &amp;&amp; currentScannerCallable.isHeartbeatMessage();<a name="line.293"></a>
+<span class="sourceLineNo">194</span>    // submit call for the all of the secondaries at once<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    int endIndex = rl.size();<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    if (scan.getConsistency() == Consistency.STRONG) {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      // When scan's consistency is strong, do not send to the secondaries<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      endIndex = 1;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    } else {<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      // TODO: this may be an overkill for large region replication<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      addCallsForOtherReplicas(cs, rl, 0, rl.size() - 1);<a name="line.201"></a>
+<span class="sourceLineNo">202</span>    }<a name="line.202"></a>
+<span class="sourceLineNo">203</span><a name="line.203"></a>
+<span class="sourceLineNo">204</span>    try {<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      Future&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; f = cs.pollForFirstSuccessfullyCompletedTask(timeout,<a name="line.205"></a>
+<span class="sourceLineNo">206</span>          TimeUnit.MILLISECONDS, startIndex, endIndex);<a name="line.206"></a>
+<span class="sourceLineNo">207</span><a name="line.207"></a>
+<span class="sourceLineNo">208</span>      if (f == null) {<a name="line.208"></a>
+<span class="sourceLineNo">209</span>        throw new IOException("Failed to get result within timeout, timeout=" + timeout + "ms");<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      }<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      Pair&lt;Result[], ScannerCallable&gt; r = f.get();<a name="line.211"></a>
+<span class="sourceLineNo">212</span><a name="line.212"></a>
+<span class="sourceLineNo">213</span>      if (r != null &amp;&amp; r.getSecond() != null) {<a name="line.213"></a>
+<span class="sourceLineNo">214</span>        updateCurrentlyServingReplica(r.getSecond(), r.getFirst(), done, pool);<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      }<a name="line.215"></a>
+<span class="sourceLineNo">216</span>      return r == null ? null : r.getFirst(); // great we got an answer<a name="line.216"></a>
+<span class="sourceLineNo">217</span><a name="line.217"></a>
+<span class="sourceLineNo">218</span>    } catch (ExecutionException e) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>      RpcRetryingCallerWithReadReplicas.throwEnrichedException(e, retries);<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    } catch (CancellationException e) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>      throw new InterruptedIOException(e.getMessage());<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    } catch (InterruptedException e) {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      throw new InterruptedIOException(e.getMessage());<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    } finally {<a name="line.224"></a>
+<span class="sourceLineNo">225</span>      // We get there because we were interrupted or because one or more of the<a name="line.225"></a>
+<span class="sourceLineNo">226</span>      // calls succeeded or failed. In all case, we stop all our tasks.<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      cs.cancelAll();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    }<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    LOG.error("Imposible? Arrive at an unreachable line..."); // unreachable<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    throw new IOException("Imposible? Arrive at an unreachable line...");<a name="line.230"></a>
+<span class="sourceLineNo">231</span>  }<a name="line.231"></a>
+<span class="sourceLineNo">232</span><a name="line.232"></a>
+<span class="sourceLineNo">233</span>  private void updateCurrentlyServingReplica(ScannerCallable scanner, Result[] result,<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      AtomicBoolean done, ExecutorService pool) {<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    if (done.compareAndSet(false, true)) {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      if (currentScannerCallable != scanner) replicaSwitched.set(true);<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      currentScannerCallable = scanner;<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      // store where to start the replica scanner from if we need to.<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      if (result != null &amp;&amp; result.length != 0) this.lastResult = result[result.length - 1];<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      if (LOG.isTraceEnabled()) {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>        LOG.trace("Setting current scanner as id=" + currentScannerCallable.scannerId +<a name="line.241"></a>
+<span class="sourceLineNo">242</span>            " associated with replica=" + currentScannerCallable.getHRegionInfo().getReplicaId());<a name="line.242"></a>
+<span class="sourceLineNo">243</span>      }<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      // close all outstanding replica scanners but the one we heard back from<a name="line.244"></a>
+<span class="sourceLineNo">245</span>      outstandingCallables.remove(scanner);<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      for (ScannerCallable s : outstandingCallables) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        if (LOG.isTraceEnabled()) {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>          LOG.trace("Closing scanner id=" + s.scannerId +<a name="line.248"></a>
+<span class="sourceLineNo">249</span>            ", replica=" + s.getHRegionInfo().getRegionId() +<a name="line.249"></a>
+<span class="sourceLineNo">250</span>            " because slow and replica=" +<a name="line.250"></a>
+<span class="sourceLineNo">251</span>            this.currentScannerCallable.getHRegionInfo().getReplicaId() + " succeeded");<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        }<a name="line.252"></a>
+<span class="sourceLineNo">253</span>        // Submit the "close" to the pool since this might take time, and we don't<a name="line.253"></a>
+<span class="sourceLineNo">254</span>        // want to wait for the "close" to happen yet. The "wait" will happen when<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        // the table is closed (when the awaitTermination of the underlying pool is called)<a name="line.255"></a>
+<span class="sourceLineNo">256</span>        s.setClose();<a name="line.256"></a>
+<span class="sourceLineNo">257</span>        final RetryingRPC r = new RetryingRPC(s);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>        pool.submit(new Callable&lt;Void&gt;(){<a name="line.258"></a>
+<span class="sourceLineNo">259</span>          @Override<a name="line.259"></a>
+<span class="sourceLineNo">260</span>          public Void call() throws Exception {<a name="line.260"></a>
+<span class="sourceLineNo">261</span>            r.call(scannerTimeout);<a name="line.261"></a>
+<span class="sourceLineNo">262</span>            return null;<a name="line.262"></a>
+<span class="sourceLineNo">263</span>          }<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        });<a name="line.264"></a>
+<span class="sourceLineNo">265</span>      }<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      // now clear outstandingCallables since we scheduled a close for all the contained scanners<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      outstandingCallables.clear();<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    }<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  }<a name="line.269"></a>
+<span class="sourceLineNo">270</span><a name="line.270"></a>
+<span class="sourceLineNo">271</span>  /**<a name="line.271"></a>
+<span class="sourceLineNo">272</span>   * When a scanner switches in the middle of scanning (the 'next' call fails<a name="line.272"></a>
+<span class="sourceLineNo">273</span>   * for example), the upper layer {@link ClientScanner} needs to know<a name="line.273"></a>
+<span class="sourceLineNo">274</span>   */<a name="line.274"></a>
+<span class="sourceLineNo">275</span>  public boolean switchedToADifferentReplica() {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    return replicaSwitched.get();<a name="line.276"></a>
+<span class="sourceLineNo">277</span>  }<a name="line.277"></a>
+<span class="sourceLineNo">278</span><a name="line.278"></a>
+<span class="sourceLineNo">279</span>  /**<a name="line.279"></a>
+<span class="sourceLineNo">280</span>   * @return true when the most recent RPC response indicated that the response was a heartbeat<a name="line.280"></a>
+<span class="sourceLineNo">281</span>   *         message. Heartbeat messages are sent back from the server when the processing of the<a name="line.281"></a>
+<span class="sourceLineNo">282</span>   *         scan request exceeds a certain time threshold. Heartbeats allow the server to avoid<a name="line.282"></a>
+<span class="sourceLineNo">283</span>   *         timeouts during long running scan operations.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>   */<a name="line.284"></a>
+<span class="sourceLineNo">285</span>  public boolean isHeartbeatMessage() {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    return currentScannerCallable != null &amp;&amp; currentScannerCallable.isHeartbeatMessage();<a name="line.286"></a>
+<span class="sourceLineNo">287</span>  }<a name="line.287"></a>
+<span class="sourceLineNo">288</span><a name="line.288"></a>
+<span class="sourceLineNo">289</span>  private void addCallsForCurrentReplica(<a name="line.289"></a>
+<span class="sourceLineNo">290</span>      ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs, RegionLocations rl) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>    RetryingRPC retryingOnReplica = new RetryingRPC(currentScannerCallable);<a name="line.291"></a>
+<span class="sourceLineNo">292</span>    outstandingCallables.add(currentScannerCallable);<a name="line.292"></a>
+<span class="sourceLineNo">293</span>    cs.submit(retryingOnReplica, scannerTimeout, currentScannerCallable.id);<a name="line.293"></a>
 <span class="sourceLineNo">294</span>  }<a name="line.294"></a>
 <span class="sourceLineNo">295</span><a name="line.295"></a>
-<span class="sourceLineNo">296</span>  private void addCallsForCurrentReplica(<a name="line.296"></a>
-<span class="sourceLineNo">297</span>      ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs, RegionLocations rl) {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    RetryingRPC retryingOnReplica = new RetryingRPC(currentScannerCallable);<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    outstandingCallables.add(currentScannerCallable);<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    cs.submit(retryingOnReplica, scannerTimeout, currentScannerCallable.id);<a name="line.300"></a>
-<span class="sourceLineNo">301</span>  }<a name="line.301"></a>
-<span class="sourceLineNo">302</span><a name="line.302"></a>
-<span class="sourceLineNo">303</span>  private void addCallsForOtherReplicas(<a name="line.303"></a>
-<span class="sourceLineNo">304</span>      ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs, RegionLocations rl,<a name="line.304"></a>
-<span class="sourceLineNo">305</span>      int min, int max) {<a name="line.305"></a>
-<span class="sourceLineNo">306</span><a name="line.306"></a>
-<span class="sourceLineNo">307</span>    for (int id = min; id &lt;= max; id++) {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>      if (currentScannerCallable.id == id) {<a name="line.308"></a>
-<span class="sourceLineNo">309</span>        continue; //this was already scheduled earlier<a name="line.309"></a>
-<span class="sourceLineNo">310</span>      }<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      ScannerCallable s = currentScannerCallable.getScannerCallableForReplica(id);<a name="line.311"></a>
-<span class="sourceLineNo">312</span>      setStartRowForReplicaCallable(s);<a name="line.312"></a>
-<span class="sourceLineNo">313</span>      outstandingCallables.add(s);<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      RetryingRPC retryingOnReplica = new RetryingRPC(s);<a name="line.314"></a>
-<span class="sourceLineNo">315</span>      cs.submit(retryingOnReplica, scannerTimeout, id);<a name="line.315"></a>
-<span class="sourceLineNo">316</span>    }<a name="line.316"></a>
-<span class="sourceLineNo">317</span>  }<a name="line.317"></a>
-<span class="sourceLineNo">318</span><a name="line.318"></a>
-<span class="sourceLineNo">319</span>  /**<a name="line.319"></a>
-<span class="sourceLineNo">320</span>   * Set the start row for the replica callable based on the state of the last result received.<a name="line.320"></a>
-<span class="sourceLineNo">321</span>   * @param callable The callable to set the start row on<a name="line.321"></a>
-<span class="sourceLineNo">322</span>   */<a name="line.322"></a>
-<span class="sourceLineNo">323</span>  private void setStartRowForReplicaCallable(ScannerCallable callable) {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    if (this.lastResult == null || callable == null) return;<a name="line.324"></a>
-<span class="sourceLineNo">325</span><a name="line.325"></a>
-<span class="sourceLineNo">326</span>    if (this.lastResult.isPartial()) {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>      // The last result was a partial result which means we have not received all of the cells<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      // for this row. Thus, use the last result's row as the start row. If a replica switch<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      // occurs, the scanner will ensure that any accumulated partial results are cleared,<a name="line.329"></a>
-<span class="sourceLineNo">330</span>      // and the scan can resume from this row.<a name="line.330"></a>
-<span class="sourceLineNo">331</span>      callable.getScan().setStartRow(this.lastResult.getRow());<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    } else {<a name="line.332"></a>
-<span class="sourceLineNo">333</span>      // The last result was not a partial result which means it contained all of the cells for<a name="line.333"></a>
-<span class="sourceLineNo">334</span>      // that row (we no longer need any information from it). Set the start row to the next<a name="line.334"></a>
-<span class="sourceLineNo">335</span>      // closest row that could be seen.<a name="line.335"></a>
-<span class="sourceLineNo">336</span>      if (callable.getScan().isReversed()) {<a name="line.336"></a>
-<span class="sourceLineNo">337</span>        callable.getScan().setStartRow(createClosestRowBefore(this.lastResult.getRow()));<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      } else {<a name="line.338"></a>
-<span class="sourceLineNo">339</span>        callable.getScan().setStartRow(createClosestRowAfter(this.lastResult.getRow()));<a name="line.339"></a>
-<span class="sourceLineNo">340</span>      }<a name="line.340"></a>
-<span class="sourceLineNo">341</span>    }<a name="line.341"></a>
-<span class="sourceLineNo">342</span>  }<a name="line.342"></a>
-<span class="sourceLineNo">343</span><a name="line.343"></a>
-<span class="sourceLineNo">344</span>  @VisibleForTesting<a name="line.344"></a>
-<span class="sourceLineNo">345</span>  boolean isAnyRPCcancelled() {<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    return someRPCcancelled;<a name="line.346"></a>
-<span class="sourceLineNo">347</span>  }<a name="line.347"></a>
-<span class="sourceLineNo">348</span><a name="line.348"></a>
-<span class="sourceLineNo">349</span>  class RetryingRPC implements RetryingCallable&lt;Pair&lt;Result[], ScannerCallable&gt;&gt;, Cancellable {<a name="line.349"></a>
-<span class="sourceLineNo">350</span>    final ScannerCallable callable;<a name="line.350"></a>
-<span class="sourceLineNo">351</span>    RpcRetryingCaller&lt;Result[]&gt; caller;<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    private volatile boolean cancelled = false;<a name="line.352"></a>
+<span class="sourceLineNo">296</span>  private void addCallsForOtherReplicas(<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      ResultBoundedCompletionService&lt;Pair&lt;Result[], ScannerCallable&gt;&gt; cs, RegionLocations rl,<a name="line.297"></a>
+<span class="sourceLineNo">298</span>      int min, int max) {<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>    for (int id = min; id &lt;= max; id++) {<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      if (currentScannerCallable.id == id) {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>        continue; //this was already scheduled earlier<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      }<a name="line.303"></a>
+<span class="sourceLineNo">304</span>      ScannerCallable s = currentScannerCallable.getScannerCallableForReplica(id);<a name="line.304"></a>
+<span class="sourceLineNo">305</span>      setStartRowForReplicaCallable(s);<a name="line.305"></a>
+<span class="sourceLineNo">306</span>      outstandingCallables.add(s);<a name="line.306"></a>
+<span class="sourceLineNo">307</span>      RetryingRPC retryingOnReplica = new RetryingRPC(s);<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      cs.submit(retryingOnReplica, scannerTimeout, id);<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>  }<a name="line.310"></a>
+<span class="sourceLineNo">311</span><a name="line.311"></a>
+<span class="sourceLineNo">312</span>  /**<a name="line.312"></a>
+<span class="sourceLineNo">313</span>   * Set the start row for the replica callable based on the state of the last result received.<a name="line.313"></a>
+<span class="sourceLineNo">314</span>   * @param callable The callable to set the start row on<a name="line.314"></a>
+<span class="sourceLineNo">315</span>   */<a name="line.315"></a>
+<span class="sourceLineNo">316</span>  private void setStartRowForReplicaCallable(ScannerCallable callable) {<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    if (this.lastResult == null || callable == null) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>      return;<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    }<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    // 1. The last result was a partial result which means we have not received all of the cells<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    // for this row. Thus, use the last result's row as the start row. If a replica switch<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    // occurs, the scanner will ensure that any accumulated partial results are cleared,<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    // and the scan can resume from this row.<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    // 2. The last result was not a partial result which means it contained all of the cells for<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    // that row (we no longer need any information from it). Set the start row to the next<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    // closest row that could be seen.<a name="line.326"></a>
+<span class="sourceLineNo">327</span>    callable.getScan().withStartRow(this.lastResult.getRow(), this.lastResult.isPartial());<a name="line.327"></a>
+<span class="sourceLineNo">328</span>  }<a name="line.328"></a>
+<span class="sourceLineNo">329</span><a name="line.329"></a>
+<span class="sourceLineNo">330</span>  @VisibleForTesting<a name="line.330"></a>
+<span class="sourceLineNo">331</span>  boolean isAnyRPCcancelled() {<a name="line.331"></a>
+<span class="sourceLineNo">332</span>    return someRPCcancelled;<a name="line.332"></a>
+<span class="sourceLineNo">333</span>  }<a name="line.333"></a>
+<span class="sourceLineNo">334</span><a name="line.334"></a>
+<span class="sourceLineNo">335</span>  class RetryingRPC implements RetryingCallable&lt;Pair&lt;Result[], ScannerCallable&gt;&gt;, Cancellable {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    final ScannerCallable callable;<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    RpcRetryingCaller&lt;Result[]&gt; caller;<a name="line.337"></a>
+<span class="sourceLineNo">338</span>    private volatile boolean cancelled = false;<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>    RetryingRPC(ScannerCallable callable) {<a name="line.340"></a>
+<span class="sourceLineNo">341</span>      this.callable = callable;<a name="line.341"></a>
+<span class="sourceLineNo">342</span>      // For the Consistency.STRONG (default case), we reuse the caller<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      // to keep compatibility with what is done in the past<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      // For the Consistency.TIMELINE case, we can't reuse the caller<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      // since we could be making parallel RPCs (caller.callWithRetries is synchronized<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      // and we can't invoke it multiple times at the same time)<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      this.caller = ScannerCallableWithReplicas.this.caller;<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      if (scan.getConsistency() == Consistency.TIMELINE) {<a name="line.348"></a>
+<span class="sourceLineNo">349</span>        this.caller = RpcRetryingCallerFactory.instantiate(ScannerCallableWithReplicas.this.conf)<a name="line.349"></a>
+<span class="sourceLineNo">350</span>            .&lt;Result[]&gt;newCaller();<a name="line.350"></a>
+<span class="sourceLineNo">351</span>      }<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    }<a name="line.352"></a>
 <span class="sourceLineNo">353</span><a name="line.353"></a>
-<span class="sourceLineNo">354</span>    RetryingRPC(ScannerCallable callable) {<a name="line.354"></a>
-<span class="sourceLineNo">355</span>      this.callable = callable;<a name="line.355"></a>
-<span class="sourceLineNo">356</span>      // For the Consistency.STRONG (default case), we reuse the caller<a name="line.356"></a>
-<span class="sourceLineNo">357</span>      // to keep compatibility with what is done in the past<a name="line.357"></a>
-<span class="sourceLineNo">358</span>      // For the Consistency.TIMELINE case, we can't reuse the caller<a name="line.358"></a>
-<span class="sourceLineNo">359</span>      // since we could be making parallel RPCs (caller.callWithRetries is synchronized<a name="line.359"></a>
-<span class="sourceLineNo">360</span>      // and we can't invoke it multiple times at the same time)<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      this.caller = ScannerCallableWithReplicas.this.caller;<a name="line.361"></a>
-<span class="sourceLineNo">362</span>      if (scan.getConsistency() == Consistency.TIMELINE) {<a name="line.362"></a>
-<span class="sourceLineNo">363</span>        this.caller = RpcRetryingCallerFactory.instantiate(ScannerCallableWithReplicas.this.conf)<a name="line.363"></a>
-<span class="sourceLineNo">364</span>            .&lt;Result[]&gt;newCaller();<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      }<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    }<a name="line.366"></a>
-<span class="sourceLineNo">367</span><a name="line.367"></a>
-<span class="sourceLineNo">368</span>    @Override<a name="line.368"></a>
-<span class="sourceLineNo">369</span>    public Pair&lt;Result[], ScannerCallable&gt; call(int callTimeout) throws IOException {<a name="line.369"></a>
-<span class="sourceLineNo">370</span>      // since the retries is done within the ResultBoundedCompletionService,<a name="line.370"></a>
-<span class="sourceLineNo">371</span>      // we don't invoke callWithRetries here<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      if (cancelled) {<a name="line.372"></a>
-<span class="sourceLineNo">373</span>        return null;<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      }<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      Result[] res = this.caller.callWithoutRetries(this.callable, callTimeout);<a name="line.375"></a>
-<span class="sourceLineNo">376</span>      return new Pair&lt;Result[], ScannerCallable&gt;(res, this.callable);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    }<a name="line.377"></a>
-<span class="sourceLineNo">378</span><a name="line.378"></a>
-<span class="sourceLineNo">379</span>    @Override<a name="line.379"></a>
-<span class="sourceLineNo">380</span>    public void prepare(boolean reload) throws IOException {<a name="line.380"></a>
-<span class="sourceLineNo">381</span>      if (cancelled) return;<a name="line.381"></a>
-<span class="sourceLineNo">382</span><a name="line.382"></a>
-<span class="sourceLineNo">383</span>      if (Thread.interrupted()) {<a name="line.383"></a>
-<span class="sourceLineNo">384</span>        throw new InterruptedIOException();<a name="line.384"></a>
-<span class="sourceLineNo">385</span>      }<a name="line.385"></a>
-<span class="sourceLineNo">386</span><a name="line.386"></a>
-<span class="sourceLineNo">387</span>      callable.prepare(reload);<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    }<a name="line.388"></a>
-<span class="sourceLineNo">389</span><a name="line.389"></a>
-<span class="sourceLineNo">390</span>    @Override<a name="line.390"></a>
-<span class="sourceLineNo">391</span>    public void throwable(Throwable t, boolean retrying) {<a name="line.391"></a>
-<span class="sourceLineNo">392</span>      callable.throwable(t, retrying);<a name="line.392"></a>
-<span class="sourceLineNo">393</span>    }<a name="line.393"></a>
-<span class="sourceLineNo">394</span><a name="line.394"></a>
-<span class="sourceLineNo">395</span>    @Override<a name="line.395"></a>
-<span class="sourceLineNo">396</span>    public String getExceptionMessageAdditionalDetail() {<a name="line.396"></a>
-<span class="sourceLineNo">397</span>      return callable.getExceptionMessageAdditionalDetail();<a name="line.397"></a>
-<span class="sourceLineNo">398</span>    }<a name="line.398"></a>
-<span class="sourceLineNo">399</span><a name="line.399"></a>
-<span class="sourceLineNo">400</span>    @Override<a name="line.400"></a>
-<span class="sourceLineNo">401</span>    public long sleep(long pause, int tries) {<a name="line.401"></a>
-<span class="sourceLineNo">402</span>      return callable.sleep(pause, tries);<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    }<a name="line.403"></a>
-<span class="sourceLineNo">404</span><a name="line.404"></a>
-<span class="sourceLineNo">405</span>    @Override<a name="line.405"></a>
-<span class="sourceLineNo">406</span>    public void cancel() {<a name="line.406"></a>
-<span class="sourceLineNo">407</span>      cancelled = true;<a name="line.407"></a>
-<span class="sourceLineNo">408</span>      caller.cancel();<a name="line.408"></a>
-<span class="sourceLineNo">409</span>      if (callable.getRpcController() != null) {<a name="line.409"></a>
-<span class="sourceLineNo">410</span>        callable.getRpcController().startCancel();<a name="line.410"></a>
-<span class="sourceLineNo">411</span>      }<a name="line.411"></a>
-<span class="sourceLineNo">412</span>      someRPCcancelled = true;<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    }<a name="line.413"></a>
-<span class="sourceLineNo">414</span><a name="line.414"></a>
-<span class="sourceLineNo">415</span>    @Override<a name="line.415"></a>
-<span class="sourceLineNo">416</span>    public boolean isCancelled() {<a name="line.416"></a>
-<span class="sourceLineNo">417</span>      return cancelled;<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    }<a name="line.418"></a>
+<span class="sourceLineNo">354</span>    @Override<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    public Pair&lt;Result[], ScannerCallable&gt; call(int callTimeout) throws IOException {<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      // since the retries is done within the ResultBoundedCompletionService,<a name="line.356"></a>
+<span class="sourceLineNo">357</span>      // we don't invoke callWithRetries here<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      if (cancelled) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>        return null;<a name="line.359"></a>
+<span class="sourceLineNo">360</span>      }<a name="line.360"></a>
+<span class="sourceLineNo">361</span>      Result[] res = this.caller.callWithoutRetries(this.callable, callTimeout);<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      return new Pair&lt;Result[], ScannerCallable&gt;(res, this.callable);<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    }<a name="line.363"></a>
+<span class="sourceLineNo">364</span><a name="line.364"></a>
+<span class="sourceLineNo">365</span>    @Override<a name="line.365"></a>
+<span class="sourceLineNo">366</span>    public void prepare(boolean reload) throws IOException {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      if (cancelled) return;<a name="line.367"></a>
+<span class="sourceLineNo">368</span><a name="line.368"></a>
+<span class="sourceLineNo">369</span>      if (Thread.interrupted()) {<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        throw new InterruptedIOException();<a name="line.370"></a>
+<span class="sourceLineNo">371</span>      }<a name="line.371"></a>
+<span class="sourceLineNo">372</span><a name="line.372"></a>
+<span class="sourceLineNo">373</span>      callable.prepare(reload);<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    }<a name="line.374"></a>
+<span class="sourceLineNo">375</span><a name="line.375"></a>
+<span class="sourceLineNo">376</span>    @Override<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    public void throwable(Throwable t, boolean retrying) {<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      callable.throwable(t, retrying);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    }<a name="line.379"></a>
+<span class="sourceLineNo">380</span><a name="line.380"></a>
+<span class="sourceLineNo">381</span>    @Override<a name="line.381"></a>
+<span class="sourceLineNo">382</span>    public String getExceptionMessageAdditionalDetail() {<a name="line.382"></a>
+<span class="sourceLineNo">383</span>      return callable.getExceptionMessageAdditionalDetail();<a name="line.383"></a>
+<span class="sourceLineNo">384</span>    }<a name="line.384"></a>
+<span class="sourceLineNo">385</span><a name="line.385"></a>
+<span class="sourceLineNo">386</span>    @Override<a name="line.386"></a>
+<span class="sourceLineNo">387</span>    public long sleep(long pause, int tries) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>      return callable.sleep(pause, tries);<a name="line.388"></a>
+<span class="sourceLineNo">389</span>    }<a name="line.389"></a>
+<span class="sourceLineNo">390</span><a name="line.390"></a>
+<span class="sourceLineNo">391</span>    @Override<a name="line.391"></a>
+<span class="sourceLineNo">392</span>    public void cancel() {<a name="line.392"></a>
+<span class="sourceLineNo">393</span>      cancelled = true;<a name="line.393"></a>
+<span class="sourceLineNo">394</span>      caller.cancel();<a name="line.394"></a>
+<span class="sourceLineNo">395</span>      if (callable.getRpcController() != null) {<a name="line.395"></a>
+<span class="sourceLineNo">396</span>        callable.getRpcController().startCancel();<a name="line.396"></a>
+<span class="sourceLineNo">397</span>      }<a name="line.397"></a>
+<span class="sourceLineNo">398</span>      someRPCcancelled = true;<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    }<a name="line.399"></a>
+<span class="sourceLineNo">400</span><a name="line.400"></a>
+<span class="sourceLineNo">401</span>    @Override<a name="line.401"></a>
+<span class="sourceLineNo">402</span>    public boolean isCancelled() {<a name="line.402"></a>
+<span class="sourceLineNo">403</span>      return cancelled;<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    }<a name="line.404"></a>
+<span class="sourceLineNo">405</span>  }<a name="line.405"></a>
+<span class="sourceLineNo">406</span><a name="line.406"></a>
+<span class="sourceLineNo">407</span>  @Override<a name="line.407"></a>
+<span class="sourceLineNo">408</span>  public void prepare(boolean reload) throws IOException {<a name="line.408"></a>
+<span class="sourceLineNo">409</span>  }<a name="line.409"></a>
+<span class="sourceLineNo">410</span><a name="line.410"></a>
+<span class="sourceLineNo">411</span>  @Override<a name="line.411"></a>
+<span class="sourceLineNo">412</span>  public void throwable(Throwable t, boolean retrying) {<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    currentScannerCallable.throwable(t, retrying);<a name="line.413"></a>
+<span class="sourceLineNo">414</span>  }<a name="line.414"></a>
+<span class="sourceLineNo">415</span><a name="line.415"></a>
+<span class="sourceLineNo">416</span>  @Override<a name="line.416"></a>
+<span class="sourceLineNo">417</span>  public String getExceptionMessageAdditionalDetail() {<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    return currentScannerCallable.getExceptionMessageAdditionalDetail();<a name="line.418"></a>
 <span class="sourceLineNo">419</span>  }<a name="line.419"></a>
 <span class="sourceLineNo">420</span><a name="line.420"></a>
 <span class="sourceLineNo">421</span>  @Override<a name="line.421"></a>
-<span class="sourceLineNo">422</span>  public void prepare(boolean reload) throws IOException {<a name="line.422"></a>
-<span class="sourceLineNo">423</span>  }<a name="line.423"></a>
-<span class="sourceLineNo">424</span><a name="line.424"></a>
-<span class="sourceLineNo">425</span>  @Override<a name="line.425"></a>
-<span class="sourceLineNo">426</span>  public void throwable(Throwable t, boolean retrying) {<a name="line.426"></a>
-<span class="sourceLineNo">427</span>    currentScannerCallable.throwable(t, retrying);<a name="line.427"></a>
-<span class="sourceLineNo">428</span>  }<a name="line.428"></a>
-<span class="sourceLineNo">429</span><a name="line.429"></a>
-<span class="sourceLineNo">430</span>  @Override<a name="line.430"></a>
-<span class="sourceLineNo">431</span>  public String getExceptionMessageAdditionalDetail() {<a name="line.431"></a>
-<span class="sourceLineNo">432</span>    return currentScannerCallable.getExceptionMessageAdditionalDetail();<a name="line.432"></a>
-<span class="sourceLineNo">433</span>  }<a name="line.433"></a>
-<span class="sourceLineNo">434</span><a name="line.434"></a>
-<span class="sourceLineNo">435</span>  @Override<a name="line.435"></a>
-<span class="sourceLineNo">436</span>  public long sleep(long pause, int tries) {<a name="line.436"></a>
-<span class="sourceLineNo">437</span>    return currentScannerCallable.sleep(pause, tries);<a name="line.437"></a>
-<span class="sourceLineNo">438</span>  }<a name="line.438"></a>
-<span class="sourceLineNo">439</span>}<a name="line.439"></a>
+<span class="sourceLineNo">422</span>  public long sleep(long pause, int tries) {<a name="line.422"></a>
+<span class="sourceLineNo">423</span>    return currentScannerCallable.sleep(pause, tries);<a name="line.423"></a>
+<span class="sourceLineNo">424</span>  }<a name="line.424"></a>
+<span class="sourceLineNo">425</span>}<a name="line.425"></a>
 
 
 
