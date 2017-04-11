@@ -1,0 +1,195 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/**<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.ipc;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.util.Deque;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.concurrent.BlockingQueue;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.concurrent.ConcurrentLinkedDeque;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.util.concurrent.Semaphore;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import java.util.concurrent.atomic.AtomicInteger;<a name="line.24"></a>
+<span class="sourceLineNo">025</span><a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.conf.Configuration;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.Abortable;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.28"></a>
+<span class="sourceLineNo">029</span><a name="line.29"></a>
+<span class="sourceLineNo">030</span>/**<a name="line.30"></a>
+<span class="sourceLineNo">031</span> * Balanced queue executor with a fastpath. Because this is FIFO, it has no respect for<a name="line.31"></a>
+<span class="sourceLineNo">032</span> * ordering so a fast path skipping the queuing of Calls if an Handler is available, is possible.<a name="line.32"></a>
+<span class="sourceLineNo">033</span> * Just pass the Call direct to waiting Handler thread. Try to keep the hot Handlers bubbling<a name="line.33"></a>
+<span class="sourceLineNo">034</span> * rather than let them go cold and lose context. Idea taken from Apace Kudu (incubating). See<a name="line.34"></a>
+<span class="sourceLineNo">035</span> * https://gerrit.cloudera.org/#/c/2938/7/src/kudu/rpc/service_queue.h<a name="line.35"></a>
+<span class="sourceLineNo">036</span> */<a name="line.36"></a>
+<span class="sourceLineNo">037</span>@InterfaceAudience.Private<a name="line.37"></a>
+<span class="sourceLineNo">038</span>public class FastPathBalancedQueueRpcExecutor extends BalancedQueueRpcExecutor {<a name="line.38"></a>
+<span class="sourceLineNo">039</span>  // Depends on default behavior of BalancedQueueRpcExecutor being FIFO!<a name="line.39"></a>
+<span class="sourceLineNo">040</span><a name="line.40"></a>
+<span class="sourceLineNo">041</span>  /*<a name="line.41"></a>
+<span class="sourceLineNo">042</span>   * Stack of Handlers waiting for work.<a name="line.42"></a>
+<span class="sourceLineNo">043</span>   */<a name="line.43"></a>
+<span class="sourceLineNo">044</span>  private final Deque&lt;FastPathHandler&gt; fastPathHandlerStack = new ConcurrentLinkedDeque&lt;&gt;();<a name="line.44"></a>
+<span class="sourceLineNo">045</span><a name="line.45"></a>
+<span class="sourceLineNo">046</span>  public FastPathBalancedQueueRpcExecutor(final String name, final int handlerCount,<a name="line.46"></a>
+<span class="sourceLineNo">047</span>      final int maxQueueLength, final PriorityFunction priority, final Configuration conf,<a name="line.47"></a>
+<span class="sourceLineNo">048</span>      final Abortable abortable) {<a name="line.48"></a>
+<span class="sourceLineNo">049</span>    super(name, handlerCount, maxQueueLength, priority, conf, abortable);<a name="line.49"></a>
+<span class="sourceLineNo">050</span>  }<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>  public FastPathBalancedQueueRpcExecutor(final String name, final int handlerCount,<a name="line.52"></a>
+<span class="sourceLineNo">053</span>      final String callQueueType, final int maxQueueLength, final PriorityFunction priority,<a name="line.53"></a>
+<span class="sourceLineNo">054</span>      final Configuration conf, final Abortable abortable) {<a name="line.54"></a>
+<span class="sourceLineNo">055</span>    super(name, handlerCount, callQueueType, maxQueueLength, priority, conf, abortable);<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  }<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  @Override<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  protected Handler getHandler(String name, double handlerFailureThreshhold,<a name="line.59"></a>
+<span class="sourceLineNo">060</span>      BlockingQueue&lt;CallRunner&gt; q, AtomicInteger activeHandlerCount) {<a name="line.60"></a>
+<span class="sourceLineNo">061</span>    return new FastPathHandler(name, handlerFailureThreshhold, q, activeHandlerCount,<a name="line.61"></a>
+<span class="sourceLineNo">062</span>        fastPathHandlerStack);<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  }<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>  @Override<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  public boolean dispatch(CallRunner callTask) throws InterruptedException {<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    FastPathHandler handler = popReadyHandler();<a name="line.67"></a>
+<span class="sourceLineNo">068</span>    return handler != null? handler.loadCallRunner(callTask): super.dispatch(callTask);<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  }<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  /**<a name="line.71"></a>
+<span class="sourceLineNo">072</span>   * @return Pop a Handler instance if one available ready-to-go or else return null.<a name="line.72"></a>
+<span class="sourceLineNo">073</span>   */<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private FastPathHandler popReadyHandler() {<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    return this.fastPathHandlerStack.poll();<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  }<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  class FastPathHandler extends Handler {<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    // Below are for fast-path support. Push this Handler on to the fastPathHandlerStack Deque<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    // if an empty queue of CallRunners so we are available for direct handoff when one comes in.<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    final Deque&lt;FastPathHandler&gt; fastPathHandlerStack;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    // Semaphore to coordinate loading of fastpathed loadedTask and our running it.<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    private Semaphore semaphore = new Semaphore(0);<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    // The task we get when fast-pathing.<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    private CallRunner loadedCallRunner;<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>    FastPathHandler(String name, double handlerFailureThreshhold, BlockingQueue&lt;CallRunner&gt; q,<a name="line.87"></a>
+<span class="sourceLineNo">088</span>        final AtomicInteger activeHandlerCount,<a name="line.88"></a>
+<span class="sourceLineNo">089</span>        final Deque&lt;FastPathHandler&gt; fastPathHandlerStack) {<a name="line.89"></a>
+<span class="sourceLineNo">090</span>      super(name, handlerFailureThreshhold, q, activeHandlerCount);<a name="line.90"></a>
+<span class="sourceLineNo">091</span>      this.fastPathHandlerStack = fastPathHandlerStack;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    }<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>    protected CallRunner getCallRunner() throws InterruptedException {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      // Get a callrunner if one in the Q.<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      CallRunner cr = this.q.poll();<a name="line.96"></a>
+<span class="sourceLineNo">097</span>      if (cr == null) {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>        // Else, if a fastPathHandlerStack present and no callrunner in Q, register ourselves for<a name="line.98"></a>
+<span class="sourceLineNo">099</span>        // the fastpath handoff done via fastPathHandlerStack.<a name="line.99"></a>
+<span class="sourceLineNo">100</span>        if (this.fastPathHandlerStack != null) {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>          this.fastPathHandlerStack.push(this);<a name="line.101"></a>
+<span class="sourceLineNo">102</span>          this.semaphore.acquire();<a name="line.102"></a>
+<span class="sourceLineNo">103</span>          cr = this.loadedCallRunner;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>          this.loadedCallRunner = null;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>        } else {<a name="line.105"></a>
+<span class="sourceLineNo">106</span>          // No fastpath available. Block until a task comes available.<a name="line.106"></a>
+<span class="sourceLineNo">107</span>          cr = super.getCallRunner();<a name="line.107"></a>
+<span class="sourceLineNo">108</span>        }<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      }<a name="line.109"></a>
+<span class="sourceLineNo">110</span>      return cr;<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    }<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>    /**<a name="line.113"></a>
+<span class="sourceLineNo">114</span>     * @param task Task gotten via fastpath.<a name="line.114"></a>
+<span class="sourceLineNo">115</span>     * @return True if we successfully loaded our task<a name="line.115"></a>
+<span class="sourceLineNo">116</span>     */<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    boolean loadCallRunner(final CallRunner cr) {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      this.loadedCallRunner = cr;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      this.semaphore.release();<a name="line.119"></a>
+<span class="sourceLineNo">120</span>      return true;<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    }<a name="line.121"></a>
+<span class="sourceLineNo">122</span>  }<a name="line.122"></a>
+<span class="sourceLineNo">123</span>}<a name="line.123"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>

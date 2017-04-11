@@ -1,0 +1,413 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/**<a name="line.1"></a>
+<span class="sourceLineNo">002</span> *<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * or more contributor license agreements.  See the NOTICE file<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * distributed with this work for additional information<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * to you under the Apache License, Version 2.0 (the<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * "License"); you may not use this file except in compliance<a name="line.8"></a>
+<span class="sourceLineNo">009</span> * with the License.  You may obtain a copy of the License at<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.11"></a>
+<span class="sourceLineNo">012</span> *<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * Unless required by applicable law or agreed to in writing, software<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * See the License for the specific language governing permissions and<a name="line.16"></a>
+<span class="sourceLineNo">017</span> * limitations under the License.<a name="line.17"></a>
+<span class="sourceLineNo">018</span> */<a name="line.18"></a>
+<span class="sourceLineNo">019</span>package org.apache.hadoop.hbase.regionserver.compactions;<a name="line.19"></a>
+<span class="sourceLineNo">020</span><a name="line.20"></a>
+<span class="sourceLineNo">021</span>import com.google.common.annotations.VisibleForTesting;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import com.google.common.collect.Iterators;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import com.google.common.collect.Lists;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import com.google.common.collect.PeekingIterator;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import com.google.common.math.LongMath;<a name="line.25"></a>
+<span class="sourceLineNo">026</span><a name="line.26"></a>
+<span class="sourceLineNo">027</span>import java.io.IOException;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import java.util.ArrayList;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import java.util.Collection;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import java.util.Collections;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.List;<a name="line.31"></a>
+<span class="sourceLineNo">032</span><a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.commons.logging.Log;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.commons.logging.LogFactory;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.conf.Configuration;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.HBaseInterfaceAudience;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.HDFSBlocksDistribution;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.RSRpcServices;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.StoreConfigInformation;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.StoreFile;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.regionserver.StoreUtils;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.ReflectionUtils;<a name="line.45"></a>
+<span class="sourceLineNo">046</span><a name="line.46"></a>
+<span class="sourceLineNo">047</span>/**<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * HBASE-15181 This is a simple implementation of date-based tiered compaction similar to<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * Cassandra's for the following benefits:<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * &lt;ol&gt;<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * &lt;li&gt;Improve date-range-based scan by structuring store files in date-based tiered layout.&lt;/li&gt;<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * &lt;li&gt;Reduce compaction overhead.&lt;/li&gt;<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * &lt;li&gt;Improve TTL efficiency.&lt;/li&gt;<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * &lt;/ol&gt;<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * Perfect fit for the use cases that:<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * &lt;ol&gt;<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * &lt;li&gt;has mostly date-based data write and scan and a focus on the most recent data.&lt;/li&gt;<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * &lt;/ol&gt;<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * Out-of-order writes are handled gracefully. Time range overlapping among store files is tolerated<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * and the performance impact is minimized. Configuration can be set at hbase-site or overridden at<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * per-table or per-column-family level by hbase shell. Design spec is at<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * https://docs.google.com/document/d/1_AmlNb2N8Us1xICsTeGDLKIqL6T-oHoRLZ323MG_uy8/<a name="line.62"></a>
+<span class="sourceLineNo">063</span> */<a name="line.63"></a>
+<span class="sourceLineNo">064</span>@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)<a name="line.64"></a>
+<span class="sourceLineNo">065</span>public class DateTieredCompactionPolicy extends SortedCompactionPolicy {<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private static final Log LOG = LogFactory.getLog(DateTieredCompactionPolicy.class);<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private final RatioBasedCompactionPolicy compactionPolicyPerWindow;<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  private final CompactionWindowFactory windowFactory;<a name="line.71"></a>
+<span class="sourceLineNo">072</span><a name="line.72"></a>
+<span class="sourceLineNo">073</span>  public DateTieredCompactionPolicy(Configuration conf, StoreConfigInformation storeConfigInfo)<a name="line.73"></a>
+<span class="sourceLineNo">074</span>      throws IOException {<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    super(conf, storeConfigInfo);<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    try {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>      compactionPolicyPerWindow = ReflectionUtils.instantiateWithCustomCtor(<a name="line.77"></a>
+<span class="sourceLineNo">078</span>        comConf.getCompactionPolicyForDateTieredWindow(),<a name="line.78"></a>
+<span class="sourceLineNo">079</span>        new Class[] { Configuration.class, StoreConfigInformation.class },<a name="line.79"></a>
+<span class="sourceLineNo">080</span>        new Object[] { conf, storeConfigInfo });<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    } catch (Exception e) {<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      throw new IOException("Unable to load configured compaction policy '"<a name="line.82"></a>
+<span class="sourceLineNo">083</span>          + comConf.getCompactionPolicyForDateTieredWindow() + "'", e);<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    }<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    try {<a name="line.85"></a>
+<span class="sourceLineNo">086</span>      windowFactory = ReflectionUtils.instantiateWithCustomCtor(<a name="line.86"></a>
+<span class="sourceLineNo">087</span>        comConf.getDateTieredCompactionWindowFactory(),<a name="line.87"></a>
+<span class="sourceLineNo">088</span>        new Class[] { CompactionConfiguration.class }, new Object[] { comConf });<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    } catch (Exception e) {<a name="line.89"></a>
+<span class="sourceLineNo">090</span>      throw new IOException("Unable to load configured window factory '"<a name="line.90"></a>
+<span class="sourceLineNo">091</span>          + comConf.getDateTieredCompactionWindowFactory() + "'", e);<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    }<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  }<a name="line.93"></a>
+<span class="sourceLineNo">094</span><a name="line.94"></a>
+<span class="sourceLineNo">095</span>  /**<a name="line.95"></a>
+<span class="sourceLineNo">096</span>   * Heuristics for guessing whether we need minor compaction.<a name="line.96"></a>
+<span class="sourceLineNo">097</span>   */<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  @Override<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  @VisibleForTesting<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  public boolean needsCompaction(final Collection&lt;StoreFile&gt; storeFiles,<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      final List&lt;StoreFile&gt; filesCompacting) {<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    ArrayList&lt;StoreFile&gt; candidates = new ArrayList&lt;&gt;(storeFiles);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    try {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>      return !selectMinorCompaction(candidates, false, true).getFiles().isEmpty();<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    } catch (Exception e) {<a name="line.105"></a>
+<span class="sourceLineNo">106</span>      LOG.error("Can not check for compaction: ", e);<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      return false;<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    }<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  }<a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  public boolean shouldPerformMajorCompaction(final Collection&lt;StoreFile&gt; filesToCompact)<a name="line.111"></a>
+<span class="sourceLineNo">112</span>    throws IOException {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    long mcTime = getNextMajorCompactTime(filesToCompact);<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    if (filesToCompact == null || mcTime == 0) {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      if (LOG.isDebugEnabled()) {<a name="line.115"></a>
+<span class="sourceLineNo">116</span>        LOG.debug("filesToCompact: " + filesToCompact + " mcTime: " + mcTime);<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      }<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      return false;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    }<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>    // TODO: Use better method for determining stamp of last major (HBASE-2990)<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    long lowTimestamp = StoreUtils.getLowestTimestamp(filesToCompact);<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    long now = EnvironmentEdgeManager.currentTime();<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    if (lowTimestamp &lt;= 0L || lowTimestamp &gt;= (now - mcTime)) {<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      if (LOG.isDebugEnabled()) {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>        LOG.debug("lowTimestamp: " + lowTimestamp + " lowTimestamp: " + lowTimestamp + " now: " +<a name="line.126"></a>
+<span class="sourceLineNo">127</span>            now + " mcTime: " + mcTime); <a name="line.127"></a>
+<span class="sourceLineNo">128</span>      }<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      return false;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    }<a name="line.130"></a>
+<span class="sourceLineNo">131</span><a name="line.131"></a>
+<span class="sourceLineNo">132</span>    long cfTTL = this.storeConfigInfo.getStoreFileTtl();<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    HDFSBlocksDistribution hdfsBlocksDistribution = new HDFSBlocksDistribution();<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    List&lt;Long&gt; boundaries = getCompactBoundariesForMajor(filesToCompact, now);<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    boolean[] filesInWindow = new boolean[boundaries.size()];<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>    for (StoreFile file: filesToCompact) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      Long minTimestamp = file.getMinimumTimestamp();<a name="line.138"></a>
+<span class="sourceLineNo">139</span>      long oldest = (minTimestamp == null) ? Long.MIN_VALUE : now - minTimestamp.longValue();<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      if (cfTTL != Long.MAX_VALUE &amp;&amp; oldest &gt;= cfTTL) {<a name="line.140"></a>
+<span class="sourceLineNo">141</span>        LOG.debug("Major compaction triggered on store " + this<a name="line.141"></a>
+<span class="sourceLineNo">142</span>          + "; for TTL maintenance");<a name="line.142"></a>
+<span class="sourceLineNo">143</span>        return true;<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      }<a name="line.144"></a>
+<span class="sourceLineNo">145</span>      if (!file.isMajorCompaction() || file.isBulkLoadResult()) {<a name="line.145"></a>
+<span class="sourceLineNo">146</span>        LOG.debug("Major compaction triggered on store " + this<a name="line.146"></a>
+<span class="sourceLineNo">147</span>          + ", because there are new files and time since last major compaction "<a name="line.147"></a>
+<span class="sourceLineNo">148</span>          + (now - lowTimestamp) + "ms");<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        return true;<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      }<a name="line.150"></a>
+<span class="sourceLineNo">151</span><a name="line.151"></a>
+<span class="sourceLineNo">152</span>      int lowerWindowIndex = Collections.binarySearch(boundaries,<a name="line.152"></a>
+<span class="sourceLineNo">153</span>        minTimestamp == null ? (Long)Long.MAX_VALUE : minTimestamp);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      int upperWindowIndex = Collections.binarySearch(boundaries,<a name="line.154"></a>
+<span class="sourceLineNo">155</span>        file.getMaximumTimestamp() == null ? (Long)Long.MAX_VALUE : file.getMaximumTimestamp());<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      // Handle boundary conditions and negative values of binarySearch<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      lowerWindowIndex = (lowerWindowIndex &lt; 0) ? Math.abs(lowerWindowIndex + 2) : lowerWindowIndex;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      upperWindowIndex = (upperWindowIndex &lt; 0) ? Math.abs(upperWindowIndex + 2) : upperWindowIndex;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      if (lowerWindowIndex != upperWindowIndex) {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        LOG.debug("Major compaction triggered on store " + this + "; because file "<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          + file.getPath() + " has data with timestamps cross window boundaries");<a name="line.161"></a>
+<span class="sourceLineNo">162</span>        return true;<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      } else if (filesInWindow[upperWindowIndex]) {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>        LOG.debug("Major compaction triggered on store " + this +<a name="line.164"></a>
+<span class="sourceLineNo">165</span>          "; because there are more than one file in some windows");<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        return true;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      } else {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        filesInWindow[upperWindowIndex] = true;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      }<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      hdfsBlocksDistribution.add(file.getHDFSBlockDistribution());<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>    float blockLocalityIndex = hdfsBlocksDistribution<a name="line.173"></a>
+<span class="sourceLineNo">174</span>        .getBlockLocalityIndex(RSRpcServices.getHostname(comConf.conf, false));<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    if (blockLocalityIndex &lt; comConf.getMinLocalityToForceCompact()) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      LOG.debug("Major compaction triggered on store " + this<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        + "; to make hdfs blocks local, current blockLocalityIndex is "<a name="line.177"></a>
+<span class="sourceLineNo">178</span>        + blockLocalityIndex + " (min " + comConf.getMinLocalityToForceCompact() + ")");<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      return true;<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
+<span class="sourceLineNo">181</span><a name="line.181"></a>
+<span class="sourceLineNo">182</span>    LOG.debug("Skipping major compaction of " + this +<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      ", because the files are already major compacted");<a name="line.183"></a>
+<span class="sourceLineNo">184</span>    return false;<a name="line.184"></a>
+<span class="sourceLineNo">185</span>  }<a name="line.185"></a>
+<span class="sourceLineNo">186</span><a name="line.186"></a>
+<span class="sourceLineNo">187</span>  @Override<a name="line.187"></a>
+<span class="sourceLineNo">188</span>  protected CompactionRequest createCompactionRequest(ArrayList&lt;StoreFile&gt; candidateSelection,<a name="line.188"></a>
+<span class="sourceLineNo">189</span>    boolean tryingMajor, boolean mayUseOffPeak, boolean mayBeStuck) throws IOException {<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    CompactionRequest result = tryingMajor ? selectMajorCompaction(candidateSelection)<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      : selectMinorCompaction(candidateSelection, mayUseOffPeak, mayBeStuck);<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    if (LOG.isDebugEnabled()) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      LOG.debug("Generated compaction request: " + result);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    return result;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>  }<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>  public CompactionRequest selectMajorCompaction(ArrayList&lt;StoreFile&gt; candidateSelection) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    long now = EnvironmentEdgeManager.currentTime();<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    return new DateTieredCompactionRequest(candidateSelection,<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      this.getCompactBoundariesForMajor(candidateSelection, now));<a name="line.201"></a>
+<span class="sourceLineNo">202</span>  }<a name="line.202"></a>
+<span class="sourceLineNo">203</span><a name="line.203"></a>
+<span class="sourceLineNo">204</span>  /**<a name="line.204"></a>
+<span class="sourceLineNo">205</span>   * We receive store files sorted in ascending order by seqId then scan the list of files. If the<a name="line.205"></a>
+<span class="sourceLineNo">206</span>   * current file has a maxTimestamp older than last known maximum, treat this file as it carries<a name="line.206"></a>
+<span class="sourceLineNo">207</span>   * the last known maximum. This way both seqId and timestamp are in the same order. If files carry<a name="line.207"></a>
+<span class="sourceLineNo">208</span>   * the same maxTimestamps, they are ordered by seqId. We then reverse the list so they are ordered<a name="line.208"></a>
+<span class="sourceLineNo">209</span>   * by seqId and maxTimestamp in descending order and build the time windows. All the out-of-order<a name="line.209"></a>
+<span class="sourceLineNo">210</span>   * data into the same compaction windows, guaranteeing contiguous compaction based on sequence id.<a name="line.210"></a>
+<span class="sourceLineNo">211</span>   */<a name="line.211"></a>
+<span class="sourceLineNo">212</span>  public CompactionRequest selectMinorCompaction(ArrayList&lt;StoreFile&gt; candidateSelection,<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      boolean mayUseOffPeak, boolean mayBeStuck) throws IOException {<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    long now = EnvironmentEdgeManager.currentTime();<a name="line.214"></a>
+<span class="sourceLineNo">215</span>    long oldestToCompact = getOldestToCompact(comConf.getDateTieredMaxStoreFileAgeMillis(), now);<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>    List&lt;Pair&lt;StoreFile, Long&gt;&gt; storefileMaxTimestampPairs =<a name="line.217"></a>
+<span class="sourceLineNo">218</span>        Lists.newArrayListWithCapacity(candidateSelection.size());<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    long maxTimestampSeen = Long.MIN_VALUE;<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    for (StoreFile storeFile : candidateSelection) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>      // if there is out-of-order data,<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      // we put them in the same window as the last file in increasing order<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      maxTimestampSeen = Math.max(maxTimestampSeen,<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        storeFile.getMaximumTimestamp() == null? Long.MIN_VALUE : storeFile.getMaximumTimestamp());<a name="line.224"></a>
+<span class="sourceLineNo">225</span>      storefileMaxTimestampPairs.add(new Pair&lt;&gt;(storeFile, maxTimestampSeen));<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    }<a name="line.226"></a>
+<span class="sourceLineNo">227</span>    Collections.reverse(storefileMaxTimestampPairs);<a name="line.227"></a>
+<span class="sourceLineNo">228</span><a name="line.228"></a>
+<span class="sourceLineNo">229</span>    CompactionWindow window = getIncomingWindow(now);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    int minThreshold = comConf.getDateTieredIncomingWindowMin();<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    PeekingIterator&lt;Pair&lt;StoreFile, Long&gt;&gt; it =<a name="line.231"></a>
+<span class="sourceLineNo">232</span>        Iterators.peekingIterator(storefileMaxTimestampPairs.iterator());<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    while (it.hasNext()) {<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      if (window.compareToTimestamp(oldestToCompact) &lt; 0) {<a name="line.234"></a>
+<span class="sourceLineNo">235</span>        break;<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      }<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      int compResult = window.compareToTimestamp(it.peek().getSecond());<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      if (compResult &gt; 0) {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>        // If the file is too old for the window, switch to the next window<a name="line.239"></a>
+<span class="sourceLineNo">240</span>        window = window.nextEarlierWindow();<a name="line.240"></a>
+<span class="sourceLineNo">241</span>        minThreshold = comConf.getMinFilesToCompact();<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      } else {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>        // The file is within the target window<a name="line.243"></a>
+<span class="sourceLineNo">244</span>        ArrayList&lt;StoreFile&gt; fileList = Lists.newArrayList();<a name="line.244"></a>
+<span class="sourceLineNo">245</span>        // Add all files in the same window. For incoming window<a name="line.245"></a>
+<span class="sourceLineNo">246</span>        // we tolerate files with future data although it is sub-optimal<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        while (it.hasNext() &amp;&amp; window.compareToTimestamp(it.peek().getSecond()) &lt;= 0) {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>          fileList.add(it.next().getFirst());<a name="line.248"></a>
+<span class="sourceLineNo">249</span>        }<a name="line.249"></a>
+<span class="sourceLineNo">250</span>        if (fileList.size() &gt;= minThreshold) {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>          if (LOG.isDebugEnabled()) {<a name="line.251"></a>
+<span class="sourceLineNo">252</span>            LOG.debug("Processing files: " + fileList + " for window: " + window);<a name="line.252"></a>
+<span class="sourceLineNo">253</span>          }<a name="line.253"></a>
+<span class="sourceLineNo">254</span>          DateTieredCompactionRequest request = generateCompactionRequest(fileList, window,<a name="line.254"></a>
+<span class="sourceLineNo">255</span>            mayUseOffPeak, mayBeStuck, minThreshold);<a name="line.255"></a>
+<span class="sourceLineNo">256</span>          if (request != null) {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>            return request;<a name="line.257"></a>
+<span class="sourceLineNo">258</span>          }<a name="line.258"></a>
+<span class="sourceLineNo">259</span>        }<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      }<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    }<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    // A non-null file list is expected by HStore<a name="line.262"></a>
+<span class="sourceLineNo">263</span>    return new CompactionRequest(Collections.&lt;StoreFile&gt; emptyList());<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  }<a name="line.264"></a>
+<span class="sourceLineNo">265</span><a name="line.265"></a>
+<span class="sourceLineNo">266</span>  private DateTieredCompactionRequest generateCompactionRequest(ArrayList&lt;StoreFile&gt; storeFiles,<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      CompactionWindow window, boolean mayUseOffPeak, boolean mayBeStuck, int minThreshold)<a name="line.267"></a>
+<span class="sourceLineNo">268</span>      throws IOException {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>    // The files has to be in ascending order for ratio-based compaction to work right<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    // and removeExcessFile to exclude youngest files.<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    Collections.reverse(storeFiles);<a name="line.271"></a>
+<span class="sourceLineNo">272</span><a name="line.272"></a>
+<span class="sourceLineNo">273</span>    // Compact everything in the window if have more files than comConf.maxBlockingFiles<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    compactionPolicyPerWindow.setMinThreshold(minThreshold);<a name="line.274"></a>
+<span class="sourceLineNo">275</span>    ArrayList&lt;StoreFile&gt; storeFileSelection = mayBeStuck ? storeFiles<a name="line.275"></a>
+<span class="sourceLineNo">276</span>      : compactionPolicyPerWindow.applyCompactionPolicy(storeFiles, mayUseOffPeak, false);<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    if (storeFileSelection != null &amp;&amp; !storeFileSelection.isEmpty()) {<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      // If there is any file in the window excluded from compaction,<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      // only one file will be output from compaction.<a name="line.279"></a>
+<span class="sourceLineNo">280</span>      boolean singleOutput = storeFiles.size() != storeFileSelection.size() ||<a name="line.280"></a>
+<span class="sourceLineNo">281</span>        comConf.useDateTieredSingleOutputForMinorCompaction();<a name="line.281"></a>
+<span class="sourceLineNo">282</span>      List&lt;Long&gt; boundaries = getCompactionBoundariesForMinor(window, singleOutput);<a name="line.282"></a>
+<span class="sourceLineNo">283</span>      DateTieredCompactionRequest result = new DateTieredCompactionRequest(storeFileSelection,<a name="line.283"></a>
+<span class="sourceLineNo">284</span>        boundaries);<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      return result;<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    }<a name="line.286"></a>
+<span class="sourceLineNo">287</span>    return null;<a name="line.287"></a>
+<span class="sourceLineNo">288</span>  }<a name="line.288"></a>
+<span class="sourceLineNo">289</span><a name="line.289"></a>
+<span class="sourceLineNo">290</span>  /**<a name="line.290"></a>
+<span class="sourceLineNo">291</span>   * Return a list of boundaries for multiple compaction output<a name="line.291"></a>
+<span class="sourceLineNo">292</span>   *   in ascending order.<a name="line.292"></a>
+<span class="sourceLineNo">293</span>   */<a name="line.293"></a>
+<span class="sourceLineNo">294</span>  private List&lt;Long&gt; getCompactBoundariesForMajor(Collection&lt;StoreFile&gt; filesToCompact, long now) {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    long minTimestamp = Long.MAX_VALUE;<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    for (StoreFile file : filesToCompact) {<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      minTimestamp =<a name="line.297"></a>
+<span class="sourceLineNo">298</span>        Math.min(minTimestamp,<a name="line.298"></a>
+<span class="sourceLineNo">299</span>          file.getMinimumTimestamp() == null ? Long.MAX_VALUE : file.getMinimumTimestamp());<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    }<a name="line.300"></a>
+<span class="sourceLineNo">301</span><a name="line.301"></a>
+<span class="sourceLineNo">302</span>    List&lt;Long&gt; boundaries = new ArrayList&lt;&gt;();<a name="line.302"></a>
+<span class="sourceLineNo">303</span><a name="line.303"></a>
+<span class="sourceLineNo">304</span>    // Add startMillis of all windows between now and min timestamp<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    for (CompactionWindow window = getIncomingWindow(now);<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        window.compareToTimestamp(minTimestamp) &gt; 0;<a name="line.306"></a>
+<span class="sourceLineNo">307</span>        window = window.nextEarlierWindow()) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      boundaries.add(window.startMillis());<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    boundaries.add(Long.MIN_VALUE);<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    Collections.reverse(boundaries);<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    return boundaries;<a name="line.312"></a>
+<span class="sourceLineNo">313</span>  }<a name="line.313"></a>
+<span class="sourceLineNo">314</span><a name="line.314"></a>
+<span class="sourceLineNo">315</span>  /**<a name="line.315"></a>
+<span class="sourceLineNo">316</span>   * @return a list of boundaries for multiple compaction output from minTimestamp to maxTimestamp.<a name="line.316"></a>
+<span class="sourceLineNo">317</span>   */<a name="line.317"></a>
+<span class="sourceLineNo">318</span>  private static List&lt;Long&gt; getCompactionBoundariesForMinor(CompactionWindow window,<a name="line.318"></a>
+<span class="sourceLineNo">319</span>      boolean singleOutput) {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    List&lt;Long&gt; boundaries = new ArrayList&lt;&gt;();<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    boundaries.add(Long.MIN_VALUE);<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    if (!singleOutput) {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      boundaries.add(window.startMillis());<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    }<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    return boundaries;<a name="line.325"></a>
+<span class="sourceLineNo">326</span>  }<a name="line.326"></a>
+<span class="sourceLineNo">327</span><a name="line.327"></a>
+<span class="sourceLineNo">328</span>  private CompactionWindow getIncomingWindow(long now) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    return windowFactory.newIncomingWindow(now);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>  }<a name="line.330"></a>
+<span class="sourceLineNo">331</span><a name="line.331"></a>
+<span class="sourceLineNo">332</span>  private static long getOldestToCompact(long maxAgeMillis, long now) {<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    try {<a name="line.333"></a>
+<span class="sourceLineNo">334</span>      return LongMath.checkedSubtract(now, maxAgeMillis);<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    } catch (ArithmeticException ae) {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>      LOG.warn("Value for " + CompactionConfiguration.DATE_TIERED_MAX_AGE_MILLIS_KEY + ": "<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          + maxAgeMillis + ". All the files will be eligible for minor compaction.");<a name="line.337"></a>
+<span class="sourceLineNo">338</span>      return Long.MIN_VALUE;<a name="line.338"></a>
+<span class="sourceLineNo">339</span>    }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
+<span class="sourceLineNo">341</span>}<a name="line.341"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
