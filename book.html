@@ -26273,7 +26273,7 @@ handling multiple workloads:
 <div class="sect2">
 <h3 id="quota"><a class="anchor" href="#quota"></a>136.1. Quotas</h3>
 <div class="paragraph">
-<p>HBASE-11598 introduces quotas, which allow you to throttle requests based on
+<p>HBASE-11598 introduces RPC quotas, which allow you to throttle requests based on
 the following limits:</p>
 </div>
 <div class="olist arabic">
@@ -26489,6 +26489,103 @@ more queue/handlers to the incoming gets, which means that more gets can be proc
 at the same time and that fewer scans can be executed at the same time. A value of
 <code>0.9</code> will give more queue/handlers to scans, so the number of scans executed will
 increase and the number of gets will decrease.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="space-quotas"><a class="anchor" href="#space-quotas"></a>136.4. Space Quotas</h3>
+<div class="paragraph">
+<p><a href="https://issues.apache.org/jira/browse/HBASE-16961">HBASE-16961</a> introduces a new type of
+quotas for HBase to leverage: filesystem quotas. These "space" quotas limit the amount of space
+on the filesystem that HBase namespaces and tables can consume. If a user, malicious or ignorant,
+has the ability to write data into HBase, with enough time, that user can effectively crash HBase
+(or worse HDFS) by consuming all available space. When there is no filesystem space available,
+HBase crashes because it can no longer create/sync data to the write-ahead log.</p>
+</div>
+<div class="paragraph">
+<p>This feature allows a for a limit to be set on the size of a table or namespace. When a space quota is set
+on a namespace, the quota&#8217;s limit applies to the sum of usage of all tables in that namespace.
+When a table with a quota exists in a namespace with a quota, the table quota takes priority
+over the namespace quota. This allows for a scenario where a large limit can be placed on
+a collection of tables, but a single table in that collection can have a fine-grained limit set.</p>
+</div>
+<div class="paragraph">
+<p>The existing <code>set_quota</code> and <code>list_quota</code> HBase shell commands can be used to interact with
+space quotas. Space quotas are quotas with a <code>TYPE</code> of <code>SPACE</code> and have <code>LIMIT</code> and <code>POLICY</code>
+attributes. The <code>LIMIT</code> is a string that refers to the amount of space on the filesystem
+that the quota subject (e.g. the table or namespace) may consume. For example, valid values
+of <code>LIMIT</code> are <code>'10G'</code>, <code>'2T'</code>, or <code>'256M'</code>. The <code>POLICY</code> refers to the action that HBase will
+take when the quota subject&#8217;s usage exceeds the <code>LIMIT</code>. The following are valid <code>POLICY</code> values.</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>NO_INSERTS</code> - No new data may be written (e.g. <code>Put</code>, <code>Increment</code>, <code>Append</code>).</p>
+</li>
+<li>
+<p><code>NO_WRITES</code> - Same as <code>NO_INSERTS</code> but <code>Deletes</code> are also disallowed.</p>
+</li>
+<li>
+<p><code>NO_WRITES_COMPACTIONS</code> - Same as <code>NO_WRITES</code> but compactions are also disallowed.</p>
+</li>
+<li>
+<p><code>DISABLE</code> - The table(s) are disabled, preventing all read/write access.</p>
+</li>
+</ul>
+</div>
+<div class="listingblock">
+<div class="title">Setting simple space quotas</div>
+<div class="content">
+<pre># Sets a quota on the table 't1' with a limit of 1GB, disallowing Puts/Increments/Appends when the table exceeds 1GB
+hbase&gt; set_quota TYPE =&gt; SPACE, TABLE =&gt; 't1', LIMIT =&gt; '1G', POLICY =&gt; NO_INSERTS
+
+# Sets a quota on the namespace 'ns1' with a limit of 50TB, disallowing Puts/Increments/Appends/Deletes
+hbase&gt; set_quota TYPE =&gt; SPACE, NAMESPACE =&gt; 'ns1', LIMIT =&gt; '50T', POLICY =&gt; NO_WRITES
+
+# Sets a quota on the table 't3' with a limit of 2TB, disallowing any writes and compactions when the table exceeds 2TB.
+hbase&gt; set_quota TYPE =&gt; SPACE, TABLE =&gt; 't3', LIMIT =&gt; '2T', POLICY =&gt; NO_WRITES_COMPACTIONS
+
+# Sets a quota on the table 't2' with a limit of 50GB, disabling the table when it exceeds 50GB
+hbase&gt; set_quota TYPE =&gt; SPACE, TABLE =&gt; 't2', LIMIT =&gt; '50G', POLICY =&gt; DISABLE</pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Consider the following scenario to set up quotas on a namespace, overriding the quota on tables in that namespace</p>
+</div>
+<div class="listingblock">
+<div class="title">Table and Namespace space quotas</div>
+<div class="content">
+<pre>hbase&gt; create_namespace 'ns1'
+hbase&gt; create 'ns1:t1'
+hbase&gt; create 'ns1:t2'
+hbase&gt; create 'ns1:t3'
+hbase&gt; set_quota TYPE =&gt; SPACE, NAMESPACE =&gt; 'ns1', LIMIT =&gt; '100T', POLICY =&gt; NO_INSERTS
+hbase&gt; set_quota TYPE =&gt; SPACE, TABLE =&gt; 'ns1:t2', LIMIT =&gt; '200G', POLICY =&gt; NO_WRITES
+hbase&gt; set_quota TYPE =&gt; SPACE, TABLE =&gt; 'ns1:t3', LIMIT =&gt; '20T', POLICY =&gt; NO_WRITES</pre>
+</div>
+</div>
+<div class="paragraph">
+<p>In the above scenario, the tables in the namespace <code>ns1</code> will not be allowed to consume more than
+100TB of space on the filesystem among each other. The table 'ns1:t2' is only allowed to be 200GB in size, and will
+disallow all writes when the usage exceeds this limit. The table 'ns1:t3' is allowed to grow to 20TB in size
+and also will disallow all writes then the usage exceeds this limit. Because there is no table quota
+on 'ns1:t1', this table can grow up to 100TB, but only if 'ns1:t2' and 'ns1:t3' have a usage of zero bytes.
+Practically, it&#8217;s limit is 100TB less the current usage of 'ns1:t2' and 'ns1:t3'.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="ops.space.quota.deletion"><a class="anchor" href="#ops.space.quota.deletion"></a>136.5. Disabling Automatic Space Quota Deletion</h3>
+<div class="paragraph">
+<p>By default, if a table or namespace is deleted that has a space quota, the quota itself is
+also deleted. In some cases, it may be desirable for the space quota to not be automatically deleted.
+In these cases, the user may configure the system to not delete any space quota automatically via hbase-site.xml.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java">  &lt;property&gt;
+    &lt;name&gt;hbase.master.quota.observer.ignore&lt;/name&gt;
+    &lt;value&gt;<span class="predefined-constant">true</span>&lt;/value&gt;
+  &lt;/property&gt;</code></pre>
+</div>
 </div>
 </div>
 </div>
