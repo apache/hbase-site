@@ -46,361 +46,350 @@
 <span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.regionserver.ScanType;<a name="line.38"></a>
 <span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.querymatcher.DeleteTracker.DeleteResult;<a name="line.39"></a>
 <span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.40"></a>
-<span class="sourceLineNo">041</span><a name="line.41"></a>
-<span class="sourceLineNo">042</span>/**<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * The old query matcher implementation. Used to keep compatibility for coprocessor that could<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * overwrite the StoreScanner before compaction. Should be removed once we find a better way to do<a name="line.44"></a>
-<span class="sourceLineNo">045</span> * filtering during compaction.<a name="line.45"></a>
-<span class="sourceLineNo">046</span> */<a name="line.46"></a>
-<span class="sourceLineNo">047</span>@Deprecated<a name="line.47"></a>
-<span class="sourceLineNo">048</span>@InterfaceAudience.Private<a name="line.48"></a>
-<span class="sourceLineNo">049</span>public class LegacyScanQueryMatcher extends ScanQueryMatcher {<a name="line.49"></a>
-<span class="sourceLineNo">050</span><a name="line.50"></a>
-<span class="sourceLineNo">051</span>  private final TimeRange tr;<a name="line.51"></a>
-<span class="sourceLineNo">052</span><a name="line.52"></a>
-<span class="sourceLineNo">053</span>  private final Filter filter;<a name="line.53"></a>
-<span class="sourceLineNo">054</span><a name="line.54"></a>
-<span class="sourceLineNo">055</span>  /** Keeps track of deletes */<a name="line.55"></a>
-<span class="sourceLineNo">056</span>  private final DeleteTracker deletes;<a name="line.56"></a>
-<span class="sourceLineNo">057</span><a name="line.57"></a>
-<span class="sourceLineNo">058</span>  /**<a name="line.58"></a>
-<span class="sourceLineNo">059</span>   * The following three booleans define how we deal with deletes. There are three different<a name="line.59"></a>
-<span class="sourceLineNo">060</span>   * aspects:<a name="line.60"></a>
-<span class="sourceLineNo">061</span>   * &lt;ol&gt;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>   * &lt;li&gt;Whether to keep delete markers. This is used in compactions. Minor compactions always keep<a name="line.62"></a>
-<span class="sourceLineNo">063</span>   * delete markers.&lt;/li&gt;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>   * &lt;li&gt;Whether to keep deleted rows. This is also used in compactions, if the store is set to keep<a name="line.64"></a>
-<span class="sourceLineNo">065</span>   * deleted rows. This implies keeping the delete markers as well.&lt;/li&gt; In this case deleted rows<a name="line.65"></a>
-<span class="sourceLineNo">066</span>   * are subject to the normal max version and TTL/min version rules just like "normal" rows.<a name="line.66"></a>
-<span class="sourceLineNo">067</span>   * &lt;li&gt;Whether a scan can do time travel queries even before deleted marker to reach deleted<a name="line.67"></a>
-<span class="sourceLineNo">068</span>   * rows.&lt;/li&gt;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>   * &lt;/ol&gt;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>   */<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  /** whether to retain delete markers */<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private boolean retainDeletesInOutput;<a name="line.72"></a>
-<span class="sourceLineNo">073</span><a name="line.73"></a>
-<span class="sourceLineNo">074</span>  /** whether to return deleted rows */<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private final KeepDeletedCells keepDeletedCells;<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  // By default, when hbase.hstore.time.to.purge.deletes is 0ms, a delete<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  // marker is always removed during a major compaction. If set to non-zero<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // value then major compaction will try to keep a delete marker around for<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  // the given number of milliseconds. We want to keep the delete markers<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  // around a bit longer because old puts might appear out-of-order. For<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  // example, during log replication between two clusters.<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  //<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  // If the delete marker has lived longer than its column-family's TTL then<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  // the delete marker will be removed even if time.to.purge.deletes has not<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  // passed. This is because all the Puts that this delete marker can influence<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  // would have also expired. (Removing of delete markers on col family TTL will<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  // not happen if min-versions is set to non-zero)<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  //<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  // But, if time.to.purge.deletes has not expired then a delete<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  // marker will not be removed just because there are no Puts that it is<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  // currently influencing. This is because Puts, that this delete can<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  // influence. may appear out of order.<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  private final long timeToPurgeDeletes;<a name="line.94"></a>
-<span class="sourceLineNo">095</span><a name="line.95"></a>
-<span class="sourceLineNo">096</span>  /**<a name="line.96"></a>
-<span class="sourceLineNo">097</span>   * This variable shows whether there is an null column in the query. There always exists a null<a name="line.97"></a>
-<span class="sourceLineNo">098</span>   * column in the wildcard column query. There maybe exists a null column in the explicit column<a name="line.98"></a>
-<span class="sourceLineNo">099</span>   * query based on the first column.<a name="line.99"></a>
-<span class="sourceLineNo">100</span>   */<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private final boolean hasNullColumn;<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  /** readPoint over which the KVs are unconditionally included */<a name="line.103"></a>
-<span class="sourceLineNo">104</span>  private final long maxReadPointToTrackVersions;<a name="line.104"></a>
-<span class="sourceLineNo">105</span><a name="line.105"></a>
-<span class="sourceLineNo">106</span>  /**<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * Oldest put in any of the involved store files Used to decide whether it is ok to delete family<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   * delete marker of this store keeps deleted KVs.<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   */<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  protected final long earliestPutTs;<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  private final byte[] stopRow;<a name="line.112"></a>
-<span class="sourceLineNo">113</span><a name="line.113"></a>
-<span class="sourceLineNo">114</span>  private byte[] dropDeletesFromRow = null, dropDeletesToRow = null;<a name="line.114"></a>
-<span class="sourceLineNo">115</span><a name="line.115"></a>
-<span class="sourceLineNo">116</span>  private LegacyScanQueryMatcher(Scan scan, ScanInfo scanInfo, ColumnTracker columns,<a name="line.116"></a>
-<span class="sourceLineNo">117</span>      boolean hasNullColumn, DeleteTracker deletes, ScanType scanType, long readPointToUse,<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      long earliestPutTs, long oldestUnexpiredTS, long now) {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    super(createStartKeyFromRow(scan.getStartRow(), scanInfo), scanInfo, columns, oldestUnexpiredTS,<a name="line.119"></a>
-<span class="sourceLineNo">120</span>        now);<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    TimeRange timeRange = scan.getColumnFamilyTimeRange().get(scanInfo.getFamily());<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    if (timeRange == null) {<a name="line.122"></a>
-<span class="sourceLineNo">123</span>      this.tr = scan.getTimeRange();<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    } else {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>      this.tr = timeRange;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    }<a name="line.126"></a>
-<span class="sourceLineNo">127</span>    this.hasNullColumn = hasNullColumn;<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    this.deletes = deletes;<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    this.filter = scan.getFilter();<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    this.maxReadPointToTrackVersions = readPointToUse;<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    this.timeToPurgeDeletes = scanInfo.getTimeToPurgeDeletes();<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    this.earliestPutTs = earliestPutTs;<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>    /* how to deal with deletes */<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    this.keepDeletedCells = scanInfo.getKeepDeletedCells();<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    this.retainDeletesInOutput = scanType == ScanType.COMPACT_RETAIN_DELETES;<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    this.stopRow = scan.getStopRow();<a name="line.137"></a>
-<span class="sourceLineNo">138</span>  }<a name="line.138"></a>
-<span class="sourceLineNo">139</span><a name="line.139"></a>
-<span class="sourceLineNo">140</span>  private LegacyScanQueryMatcher(Scan scan, ScanInfo scanInfo, ColumnTracker columns,<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      boolean hasNullColumn, DeleteTracker deletes, ScanType scanType, long readPointToUse,<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      long earliestPutTs, long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow,<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      byte[] dropDeletesToRow) {<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    this(scan, scanInfo, columns, hasNullColumn, deletes, scanType, readPointToUse, earliestPutTs,<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        oldestUnexpiredTS, now);<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    this.dropDeletesFromRow = Preconditions.checkNotNull(dropDeletesFromRow);<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    this.dropDeletesToRow = Preconditions.checkNotNull(dropDeletesToRow);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>  }<a name="line.148"></a>
-<span class="sourceLineNo">149</span><a name="line.149"></a>
-<span class="sourceLineNo">150</span>  @Override<a name="line.150"></a>
-<span class="sourceLineNo">151</span>  public void beforeShipped() throws IOException {<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    super.beforeShipped();<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    deletes.beforeShipped();<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  }<a name="line.154"></a>
-<span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>  @Override<a name="line.156"></a>
-<span class="sourceLineNo">157</span>  public MatchCode match(Cell cell) throws IOException {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    if (filter != null &amp;&amp; filter.filterAllRemaining()) {<a name="line.158"></a>
-<span class="sourceLineNo">159</span>      return MatchCode.DONE_SCAN;<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    }<a name="line.160"></a>
-<span class="sourceLineNo">161</span>    MatchCode returnCode = preCheck(cell);<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    if (returnCode != null) {<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      return returnCode;<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    }<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    /*<a name="line.165"></a>
-<span class="sourceLineNo">166</span>     * The delete logic is pretty complicated now.<a name="line.166"></a>
-<span class="sourceLineNo">167</span>     * This is corroborated by the following:<a name="line.167"></a>
-<span class="sourceLineNo">168</span>     * 1. The store might be instructed to keep deleted rows around.<a name="line.168"></a>
-<span class="sourceLineNo">169</span>     * 2. A scan can optionally see past a delete marker now.<a name="line.169"></a>
-<span class="sourceLineNo">170</span>     * 3. If deleted rows are kept, we have to find out when we can<a name="line.170"></a>
-<span class="sourceLineNo">171</span>     *    remove the delete markers.<a name="line.171"></a>
-<span class="sourceLineNo">172</span>     * 4. Family delete markers are always first (regardless of their TS)<a name="line.172"></a>
-<span class="sourceLineNo">173</span>     * 5. Delete markers should not be counted as version<a name="line.173"></a>
-<span class="sourceLineNo">174</span>     * 6. Delete markers affect puts of the *same* TS<a name="line.174"></a>
-<span class="sourceLineNo">175</span>     * 7. Delete marker need to be version counted together with puts<a name="line.175"></a>
-<span class="sourceLineNo">176</span>     *    they affect<a name="line.176"></a>
-<span class="sourceLineNo">177</span>     */<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    long timestamp = cell.getTimestamp();<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    byte typeByte = cell.getTypeByte();<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    long mvccVersion = cell.getSequenceId();<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    if (CellUtil.isDelete(typeByte)) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      if (keepDeletedCells == KeepDeletedCells.FALSE<a name="line.182"></a>
-<span class="sourceLineNo">183</span>          || (keepDeletedCells == KeepDeletedCells.TTL &amp;&amp; timestamp &lt; oldestUnexpiredTS)) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>        // first ignore delete markers if the scanner can do so, and the<a name="line.184"></a>
-<span class="sourceLineNo">185</span>        // range does not include the marker<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        //<a name="line.186"></a>
-<span class="sourceLineNo">187</span>        // during flushes and compactions also ignore delete markers newer<a name="line.187"></a>
-<span class="sourceLineNo">188</span>        // than the readpoint of any open scanner, this prevents deleted<a name="line.188"></a>
-<span class="sourceLineNo">189</span>        // rows that could still be seen by a scanner from being collected<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        boolean includeDeleteMarker = tr.withinOrAfterTimeRange(timestamp);<a name="line.190"></a>
-<span class="sourceLineNo">191</span>        if (includeDeleteMarker &amp;&amp; mvccVersion &lt;= maxReadPointToTrackVersions) {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>          this.deletes.add(cell);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>        }<a name="line.193"></a>
-<span class="sourceLineNo">194</span>        // Can't early out now, because DelFam come before any other keys<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      }<a name="line.195"></a>
-<span class="sourceLineNo">196</span><a name="line.196"></a>
-<span class="sourceLineNo">197</span>      if (timeToPurgeDeletes &gt; 0<a name="line.197"></a>
-<span class="sourceLineNo">198</span>          &amp;&amp; (EnvironmentEdgeManager.currentTime() - timestamp) &lt;= timeToPurgeDeletes) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>        return MatchCode.INCLUDE;<a name="line.199"></a>
-<span class="sourceLineNo">200</span>      } else if (retainDeletesInOutput || mvccVersion &gt; maxReadPointToTrackVersions) {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>        // always include or it is not time yet to check whether it is OK<a name="line.201"></a>
-<span class="sourceLineNo">202</span>        // to purge deltes or not<a name="line.202"></a>
-<span class="sourceLineNo">203</span>        // if this is not a user scan (compaction), we can filter this deletemarker right here<a name="line.203"></a>
-<span class="sourceLineNo">204</span>        // otherwise (i.e. a "raw" scan) we fall through to normal version and timerange checking<a name="line.204"></a>
-<span class="sourceLineNo">205</span>        return MatchCode.INCLUDE;<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      } else if (keepDeletedCells == KeepDeletedCells.TRUE<a name="line.206"></a>
-<span class="sourceLineNo">207</span>          || (keepDeletedCells == KeepDeletedCells.TTL &amp;&amp; timestamp &gt;= oldestUnexpiredTS)) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        if (timestamp &lt; earliestPutTs) {<a name="line.208"></a>
-<span class="sourceLineNo">209</span>          // keeping delete rows, but there are no puts older than<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          // this delete in the store files.<a name="line.210"></a>
-<span class="sourceLineNo">211</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>        }<a name="line.212"></a>
-<span class="sourceLineNo">213</span>        // else: fall through and do version counting on the<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        // delete markers<a name="line.214"></a>
-<span class="sourceLineNo">215</span>      } else {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>        return MatchCode.SKIP;<a name="line.216"></a>
-<span class="sourceLineNo">217</span>      }<a name="line.217"></a>
-<span class="sourceLineNo">218</span>      // note the following next else if...<a name="line.218"></a>
-<span class="sourceLineNo">219</span>      // delete marker are not subject to other delete markers<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    } else if (!this.deletes.isEmpty()) {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>      DeleteResult deleteResult = deletes.isDeleted(cell);<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      switch (deleteResult) {<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        case FAMILY_DELETED:<a name="line.223"></a>
-<span class="sourceLineNo">224</span>        case COLUMN_DELETED:<a name="line.224"></a>
-<span class="sourceLineNo">225</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.225"></a>
-<span class="sourceLineNo">226</span>        case VERSION_DELETED:<a name="line.226"></a>
-<span class="sourceLineNo">227</span>        case FAMILY_VERSION_DELETED:<a name="line.227"></a>
-<span class="sourceLineNo">228</span>          return MatchCode.SKIP;<a name="line.228"></a>
-<span class="sourceLineNo">229</span>        case NOT_DELETED:<a name="line.229"></a>
-<span class="sourceLineNo">230</span>          break;<a name="line.230"></a>
-<span class="sourceLineNo">231</span>        default:<a name="line.231"></a>
-<span class="sourceLineNo">232</span>          throw new RuntimeException("UNEXPECTED");<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        }<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    }<a name="line.234"></a>
-<span class="sourceLineNo">235</span><a name="line.235"></a>
-<span class="sourceLineNo">236</span>    int timestampComparison = tr.compare(timestamp);<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    if (timestampComparison &gt;= 1) {<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      return MatchCode.SKIP;<a name="line.238"></a>
-<span class="sourceLineNo">239</span>    } else if (timestampComparison &lt;= -1) {<a name="line.239"></a>
-<span class="sourceLineNo">240</span>      return columns.getNextRowOrNextColumn(cell);<a name="line.240"></a>
-<span class="sourceLineNo">241</span>    }<a name="line.241"></a>
-<span class="sourceLineNo">242</span><a name="line.242"></a>
-<span class="sourceLineNo">243</span>    // STEP 1: Check if the column is part of the requested columns<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    MatchCode colChecker = columns.checkColumn(cell, typeByte);<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    if (colChecker == MatchCode.INCLUDE) {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>      ReturnCode filterResponse = ReturnCode.SKIP;<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      // STEP 2: Yes, the column is part of the requested columns. Check if filter is present<a name="line.247"></a>
-<span class="sourceLineNo">248</span>      if (filter != null) {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>        // STEP 3: Filter the key value and return if it filters out<a name="line.249"></a>
-<span class="sourceLineNo">250</span>        filterResponse = filter.filterKeyValue(cell);<a name="line.250"></a>
-<span class="sourceLineNo">251</span>        switch (filterResponse) {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>        case SKIP:<a name="line.252"></a>
-<span class="sourceLineNo">253</span>          return MatchCode.SKIP;<a name="line.253"></a>
-<span class="sourceLineNo">254</span>        case NEXT_COL:<a name="line.254"></a>
-<span class="sourceLineNo">255</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.255"></a>
-<span class="sourceLineNo">256</span>        case NEXT_ROW:<a name="line.256"></a>
-<span class="sourceLineNo">257</span>          return MatchCode.SEEK_NEXT_ROW;<a name="line.257"></a>
-<span class="sourceLineNo">258</span>        case SEEK_NEXT_USING_HINT:<a name="line.258"></a>
-<span class="sourceLineNo">259</span>          return MatchCode.SEEK_NEXT_USING_HINT;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>        default:<a name="line.260"></a>
-<span class="sourceLineNo">261</span>          //It means it is either include or include and seek next<a name="line.261"></a>
-<span class="sourceLineNo">262</span>          break;<a name="line.262"></a>
-<span class="sourceLineNo">263</span>        }<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      }<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      /*<a name="line.265"></a>
-<span class="sourceLineNo">266</span>       * STEP 4: Reaching this step means the column is part of the requested columns and either<a name="line.266"></a>
-<span class="sourceLineNo">267</span>       * the filter is null or the filter has returned INCLUDE or INCLUDE_AND_NEXT_COL response.<a name="line.267"></a>
-<span class="sourceLineNo">268</span>       * Now check the number of versions needed. This method call returns SKIP, INCLUDE,<a name="line.268"></a>
-<span class="sourceLineNo">269</span>       * INCLUDE_AND_SEEK_NEXT_ROW, INCLUDE_AND_SEEK_NEXT_COL.<a name="line.269"></a>
-<span class="sourceLineNo">270</span>       *<a name="line.270"></a>
-<span class="sourceLineNo">271</span>       * FilterResponse            ColumnChecker               Desired behavior<a name="line.271"></a>
-<span class="sourceLineNo">272</span>       * INCLUDE                   SKIP                        row has already been included, SKIP.<a name="line.272"></a>
-<span class="sourceLineNo">273</span>       * INCLUDE                   INCLUDE                     INCLUDE<a name="line.273"></a>
-<span class="sourceLineNo">274</span>       * INCLUDE                   INCLUDE_AND_SEEK_NEXT_COL   INCLUDE_AND_SEEK_NEXT_COL<a name="line.274"></a>
-<span class="sourceLineNo">275</span>       * INCLUDE                   INCLUDE_AND_SEEK_NEXT_ROW   INCLUDE_AND_SEEK_NEXT_ROW<a name="line.275"></a>
-<span class="sourceLineNo">276</span>       * INCLUDE_AND_SEEK_NEXT_COL SKIP                        row has already been included, SKIP.<a name="line.276"></a>
-<span class="sourceLineNo">277</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE                     INCLUDE_AND_SEEK_NEXT_COL<a name="line.277"></a>
-<span class="sourceLineNo">278</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE_AND_SEEK_NEXT_COL   INCLUDE_AND_SEEK_NEXT_COL<a name="line.278"></a>
-<span class="sourceLineNo">279</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE_AND_SEEK_NEXT_ROW   INCLUDE_AND_SEEK_NEXT_ROW<a name="line.279"></a>
-<span class="sourceLineNo">280</span>       *<a name="line.280"></a>
-<span class="sourceLineNo">281</span>       * In all the above scenarios, we return the column checker return value except for<a name="line.281"></a>
-<span class="sourceLineNo">282</span>       * FilterResponse (INCLUDE_AND_SEEK_NEXT_COL) and ColumnChecker(INCLUDE)<a name="line.282"></a>
-<span class="sourceLineNo">283</span>       */<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      colChecker = columns.checkVersions(cell, timestamp, typeByte,<a name="line.284"></a>
-<span class="sourceLineNo">285</span>          mvccVersion &gt; maxReadPointToTrackVersions);<a name="line.285"></a>
-<span class="sourceLineNo">286</span>      if (filterResponse == ReturnCode.INCLUDE_AND_SEEK_NEXT_ROW) {<a name="line.286"></a>
-<span class="sourceLineNo">287</span>        if (colChecker != MatchCode.SKIP) {<a name="line.287"></a>
-<span class="sourceLineNo">288</span>          return MatchCode.INCLUDE_AND_SEEK_NEXT_ROW;<a name="line.288"></a>
-<span class="sourceLineNo">289</span>        }<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        return MatchCode.SEEK_NEXT_ROW;<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      }<a name="line.291"></a>
-<span class="sourceLineNo">292</span>      return (filterResponse == ReturnCode.INCLUDE_AND_NEXT_COL &amp;&amp;<a name="line.292"></a>
-<span class="sourceLineNo">293</span>          colChecker == MatchCode.INCLUDE) ? MatchCode.INCLUDE_AND_SEEK_NEXT_COL<a name="line.293"></a>
-<span class="sourceLineNo">294</span>          : colChecker;<a name="line.294"></a>
-<span class="sourceLineNo">295</span>    }<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    return colChecker;<a name="line.296"></a>
-<span class="sourceLineNo">297</span>  }<a name="line.297"></a>
-<span class="sourceLineNo">298</span><a name="line.298"></a>
-<span class="sourceLineNo">299</span>  @Override<a name="line.299"></a>
-<span class="sourceLineNo">300</span>  public boolean hasNullColumnInQuery() {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    return hasNullColumn;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>  }<a name="line.302"></a>
-<span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>  /**<a name="line.304"></a>
-<span class="sourceLineNo">305</span>   * Handle partial-drop-deletes. As we match keys in order, when we have a range from which we can<a name="line.305"></a>
-<span class="sourceLineNo">306</span>   * drop deletes, we can set retainDeletesInOutput to false for the duration of this range only,<a name="line.306"></a>
-<span class="sourceLineNo">307</span>   * and maintain consistency.<a name="line.307"></a>
-<span class="sourceLineNo">308</span>   */<a name="line.308"></a>
-<span class="sourceLineNo">309</span>  private void checkPartialDropDeleteRange(Cell curCell) {<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    // If partial-drop-deletes are used, initially, dropDeletesFromRow and dropDeletesToRow<a name="line.310"></a>
-<span class="sourceLineNo">311</span>    // are both set, and the matcher is set to retain deletes. We assume ordered keys. When<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    // dropDeletesFromRow is leq current kv, we start dropping deletes and reset<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    // dropDeletesFromRow; thus the 2nd "if" starts to apply.<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    if ((dropDeletesFromRow != null)<a name="line.314"></a>
-<span class="sourceLineNo">315</span>        &amp;&amp; (Arrays.equals(dropDeletesFromRow, HConstants.EMPTY_START_ROW)<a name="line.315"></a>
-<span class="sourceLineNo">316</span>            || (CellComparator.COMPARATOR.compareRows(curCell, dropDeletesFromRow, 0,<a name="line.316"></a>
-<span class="sourceLineNo">317</span>              dropDeletesFromRow.length) &gt;= 0))) {<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      retainDeletesInOutput = false;<a name="line.318"></a>
-<span class="sourceLineNo">319</span>      dropDeletesFromRow = null;<a name="line.319"></a>
-<span class="sourceLineNo">320</span>    }<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    // If dropDeletesFromRow is null and dropDeletesToRow is set, we are inside the partial-<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    // drop-deletes range. When dropDeletesToRow is leq current kv, we stop dropping deletes,<a name="line.322"></a>
-<span class="sourceLineNo">323</span>    // and reset dropDeletesToRow so that we don't do any more compares.<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    if ((dropDeletesFromRow == null) &amp;&amp; (dropDeletesToRow != null)<a name="line.324"></a>
-<span class="sourceLineNo">325</span>        &amp;&amp; !Arrays.equals(dropDeletesToRow, HConstants.EMPTY_END_ROW) &amp;&amp; (CellComparator.COMPARATOR<a name="line.325"></a>
-<span class="sourceLineNo">326</span>            .compareRows(curCell, dropDeletesToRow, 0, dropDeletesToRow.length) &gt;= 0)) {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>      retainDeletesInOutput = true;<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      dropDeletesToRow = null;<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    }<a name="line.329"></a>
-<span class="sourceLineNo">330</span>  }<a name="line.330"></a>
-<span class="sourceLineNo">331</span><a name="line.331"></a>
-<span class="sourceLineNo">332</span>  @Override<a name="line.332"></a>
-<span class="sourceLineNo">333</span>  protected void reset() {<a name="line.333"></a>
-<span class="sourceLineNo">334</span>    checkPartialDropDeleteRange(currentRow);<a name="line.334"></a>
-<span class="sourceLineNo">335</span>  }<a name="line.335"></a>
-<span class="sourceLineNo">336</span><a name="line.336"></a>
-<span class="sourceLineNo">337</span>  @Override<a name="line.337"></a>
-<span class="sourceLineNo">338</span>  public boolean isUserScan() {<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    return false;<a name="line.339"></a>
-<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
-<span class="sourceLineNo">341</span><a name="line.341"></a>
-<span class="sourceLineNo">342</span>  @Override<a name="line.342"></a>
-<span class="sourceLineNo">343</span>  public boolean moreRowsMayExistAfter(Cell cell) {<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    if (this.stopRow == null || this.stopRow.length == 0) {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      return true;<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    }<a name="line.346"></a>
-<span class="sourceLineNo">347</span>    return rowComparator.compareRows(cell, stopRow, 0, stopRow.length) &lt; 0;<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  }<a name="line.348"></a>
-<span class="sourceLineNo">349</span><a name="line.349"></a>
-<span class="sourceLineNo">350</span>  @Override<a name="line.350"></a>
-<span class="sourceLineNo">351</span>  public Filter getFilter() {<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    return filter;<a name="line.352"></a>
-<span class="sourceLineNo">353</span>  }<a name="line.353"></a>
-<span class="sourceLineNo">354</span><a name="line.354"></a>
-<span class="sourceLineNo">355</span>  @Override<a name="line.355"></a>
-<span class="sourceLineNo">356</span>  public Cell getNextKeyHint(Cell cell) throws IOException {<a name="line.356"></a>
-<span class="sourceLineNo">357</span>    if (filter == null) {<a name="line.357"></a>
-<span class="sourceLineNo">358</span>      return null;<a name="line.358"></a>
-<span class="sourceLineNo">359</span>    } else {<a name="line.359"></a>
-<span class="sourceLineNo">360</span>      return filter.getNextCellHint(cell);<a name="line.360"></a>
-<span class="sourceLineNo">361</span>    }<a name="line.361"></a>
-<span class="sourceLineNo">362</span>  }<a name="line.362"></a>
-<span class="sourceLineNo">363</span><a name="line.363"></a>
-<span class="sourceLineNo">364</span>  public static LegacyScanQueryMatcher create(Scan scan, ScanInfo scanInfo,<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      NavigableSet&lt;byte[]&gt; columns, ScanType scanType, long readPointToUse, long earliestPutTs,<a name="line.365"></a>
-<span class="sourceLineNo">366</span>      long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow, byte[] dropDeletesToRow,<a name="line.366"></a>
-<span class="sourceLineNo">367</span>      RegionCoprocessorHost regionCoprocessorHost) throws IOException {<a name="line.367"></a>
-<span class="sourceLineNo">368</span>    int maxVersions = Math.min(scan.getMaxVersions(), scanInfo.getMaxVersions());<a name="line.368"></a>
-<span class="sourceLineNo">369</span>    boolean hasNullColumn;<a name="line.369"></a>
-<span class="sourceLineNo">370</span>    ColumnTracker columnTracker;<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    if (columns == null || columns.isEmpty()) {<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      // there is always a null column in the wildcard column query.<a name="line.372"></a>
-<span class="sourceLineNo">373</span>      hasNullColumn = true;<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      // use a specialized scan for wildcard column tracker.<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      columnTracker = new ScanWildcardColumnTracker(scanInfo.getMinVersions(), maxVersions,<a name="line.375"></a>
-<span class="sourceLineNo">376</span>          oldestUnexpiredTS);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    } else {<a name="line.377"></a>
-<span class="sourceLineNo">378</span>      // We can share the ExplicitColumnTracker, diff is we reset<a name="line.378"></a>
-<span class="sourceLineNo">379</span>      // between rows, not between storefiles.<a name="line.379"></a>
-<span class="sourceLineNo">380</span>      // whether there is null column in the explicit column query<a name="line.380"></a>
-<span class="sourceLineNo">381</span>      hasNullColumn = columns.first().length == 0;<a name="line.381"></a>
-<span class="sourceLineNo">382</span>      columnTracker = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,<a name="line.382"></a>
-<span class="sourceLineNo">383</span>          oldestUnexpiredTS);<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    }<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    DeleteTracker deletes = instantiateDeleteTracker(regionCoprocessorHost);<a name="line.385"></a>
-<span class="sourceLineNo">386</span>    if (dropDeletesFromRow == null) {<a name="line.386"></a>
-<span class="sourceLineNo">387</span>      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deletes,<a name="line.387"></a>
-<span class="sourceLineNo">388</span>          scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    } else {<a name="line.389"></a>
-<span class="sourceLineNo">390</span>      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deletes,<a name="line.390"></a>
-<span class="sourceLineNo">391</span>          scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now, dropDeletesFromRow,<a name="line.391"></a>
-<span class="sourceLineNo">392</span>          dropDeletesToRow);<a name="line.392"></a>
-<span class="sourceLineNo">393</span>    }<a name="line.393"></a>
-<span class="sourceLineNo">394</span>  }<a name="line.394"></a>
-<span class="sourceLineNo">395</span>}<a name="line.395"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.41"></a>
+<span class="sourceLineNo">042</span><a name="line.42"></a>
+<span class="sourceLineNo">043</span>/**<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * The old query matcher implementation. Used to keep compatibility for coprocessor that could<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * overwrite the StoreScanner before compaction. Should be removed once we find a better way to do<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * filtering during compaction.<a name="line.46"></a>
+<span class="sourceLineNo">047</span> */<a name="line.47"></a>
+<span class="sourceLineNo">048</span>@Deprecated<a name="line.48"></a>
+<span class="sourceLineNo">049</span>@InterfaceAudience.Private<a name="line.49"></a>
+<span class="sourceLineNo">050</span>public class LegacyScanQueryMatcher extends ScanQueryMatcher {<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>  private final TimeRange tr;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>  private final Filter filter;<a name="line.54"></a>
+<span class="sourceLineNo">055</span><a name="line.55"></a>
+<span class="sourceLineNo">056</span>  /** Keeps track of deletes */<a name="line.56"></a>
+<span class="sourceLineNo">057</span>  private final DeleteTracker deletes;<a name="line.57"></a>
+<span class="sourceLineNo">058</span><a name="line.58"></a>
+<span class="sourceLineNo">059</span>  /**<a name="line.59"></a>
+<span class="sourceLineNo">060</span>   * The following three booleans define how we deal with deletes. There are three different<a name="line.60"></a>
+<span class="sourceLineNo">061</span>   * aspects:<a name="line.61"></a>
+<span class="sourceLineNo">062</span>   * &lt;ol&gt;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>   * &lt;li&gt;Whether to keep delete markers. This is used in compactions. Minor compactions always keep<a name="line.63"></a>
+<span class="sourceLineNo">064</span>   * delete markers.&lt;/li&gt;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>   * &lt;li&gt;Whether to keep deleted rows. This is also used in compactions, if the store is set to keep<a name="line.65"></a>
+<span class="sourceLineNo">066</span>   * deleted rows. This implies keeping the delete markers as well.&lt;/li&gt; In this case deleted rows<a name="line.66"></a>
+<span class="sourceLineNo">067</span>   * are subject to the normal max version and TTL/min version rules just like "normal" rows.<a name="line.67"></a>
+<span class="sourceLineNo">068</span>   * &lt;li&gt;Whether a scan can do time travel queries even before deleted marker to reach deleted<a name="line.68"></a>
+<span class="sourceLineNo">069</span>   * rows.&lt;/li&gt;<a name="line.69"></a>
+<span class="sourceLineNo">070</span>   * &lt;/ol&gt;<a name="line.70"></a>
+<span class="sourceLineNo">071</span>   */<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  /** whether to retain delete markers */<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  private boolean retainDeletesInOutput;<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  /** whether to return deleted rows */<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private final KeepDeletedCells keepDeletedCells;<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  // By default, when hbase.hstore.time.to.purge.deletes is 0ms, a delete<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  // marker is always removed during a major compaction. If set to non-zero<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  // value then major compaction will try to keep a delete marker around for<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  // the given number of milliseconds. We want to keep the delete markers<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  // around a bit longer because old puts might appear out-of-order. For<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  // example, during log replication between two clusters.<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  //<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  // If the delete marker has lived longer than its column-family's TTL then<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  // the delete marker will be removed even if time.to.purge.deletes has not<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  // passed. This is because all the Puts that this delete marker can influence<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  // would have also expired. (Removing of delete markers on col family TTL will<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  // not happen if min-versions is set to non-zero)<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  //<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  // But, if time.to.purge.deletes has not expired then a delete<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  // marker will not be removed just because there are no Puts that it is<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  // currently influencing. This is because Puts, that this delete can<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  // influence. may appear out of order.<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  private final long timeToPurgeDeletes;<a name="line.95"></a>
+<span class="sourceLineNo">096</span><a name="line.96"></a>
+<span class="sourceLineNo">097</span>  /**<a name="line.97"></a>
+<span class="sourceLineNo">098</span>   * This variable shows whether there is an null column in the query. There always exists a null<a name="line.98"></a>
+<span class="sourceLineNo">099</span>   * column in the wildcard column query. There maybe exists a null column in the explicit column<a name="line.99"></a>
+<span class="sourceLineNo">100</span>   * query based on the first column.<a name="line.100"></a>
+<span class="sourceLineNo">101</span>   */<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  private final boolean hasNullColumn;<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  /** readPoint over which the KVs are unconditionally included */<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  private final long maxReadPointToTrackVersions;<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  /**<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   * Oldest put in any of the involved store files Used to decide whether it is ok to delete family<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   * delete marker of this store keeps deleted KVs.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   */<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  protected final long earliestPutTs;<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private final byte[] stopRow;<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>  private byte[] dropDeletesFromRow = null, dropDeletesToRow = null;<a name="line.115"></a>
+<span class="sourceLineNo">116</span><a name="line.116"></a>
+<span class="sourceLineNo">117</span>  private LegacyScanQueryMatcher(Scan scan, ScanInfo scanInfo, ColumnTracker columns,<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      boolean hasNullColumn, DeleteTracker deletes, ScanType scanType, long readPointToUse,<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      long earliestPutTs, long oldestUnexpiredTS, long now) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    super(createStartKeyFromRow(scan.getStartRow(), scanInfo), scanInfo, columns, oldestUnexpiredTS,<a name="line.120"></a>
+<span class="sourceLineNo">121</span>        now);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    TimeRange timeRange = scan.getColumnFamilyTimeRange().get(scanInfo.getFamily());<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    if (timeRange == null) {<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      this.tr = scan.getTimeRange();<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    } else {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      this.tr = timeRange;<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    }<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    this.hasNullColumn = hasNullColumn;<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    this.deletes = deletes;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    this.filter = scan.getFilter();<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    this.maxReadPointToTrackVersions = readPointToUse;<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    this.timeToPurgeDeletes = scanInfo.getTimeToPurgeDeletes();<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    this.earliestPutTs = earliestPutTs;<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>    /* how to deal with deletes */<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    this.keepDeletedCells = scanInfo.getKeepDeletedCells();<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    this.retainDeletesInOutput = scanType == ScanType.COMPACT_RETAIN_DELETES;<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    this.stopRow = scan.getStopRow();<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  }<a name="line.139"></a>
+<span class="sourceLineNo">140</span><a name="line.140"></a>
+<span class="sourceLineNo">141</span>  private LegacyScanQueryMatcher(Scan scan, ScanInfo scanInfo, ColumnTracker columns,<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      boolean hasNullColumn, DeleteTracker deletes, ScanType scanType, long readPointToUse,<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      long earliestPutTs, long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow,<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      byte[] dropDeletesToRow) {<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    this(scan, scanInfo, columns, hasNullColumn, deletes, scanType, readPointToUse, earliestPutTs,<a name="line.145"></a>
+<span class="sourceLineNo">146</span>        oldestUnexpiredTS, now);<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    this.dropDeletesFromRow = Preconditions.checkNotNull(dropDeletesFromRow);<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    this.dropDeletesToRow = Preconditions.checkNotNull(dropDeletesToRow);<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
+<span class="sourceLineNo">150</span><a name="line.150"></a>
+<span class="sourceLineNo">151</span>  @Override<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  public void beforeShipped() throws IOException {<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    super.beforeShipped();<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    deletes.beforeShipped();<a name="line.154"></a>
+<span class="sourceLineNo">155</span>  }<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>  @Override<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  public MatchCode match(Cell cell) throws IOException {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    if (filter != null &amp;&amp; filter.filterAllRemaining()) {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      return MatchCode.DONE_SCAN;<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    }<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    MatchCode returnCode = preCheck(cell);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    if (returnCode != null) {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      return returnCode;<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    }<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    /*<a name="line.166"></a>
+<span class="sourceLineNo">167</span>     * The delete logic is pretty complicated now.<a name="line.167"></a>
+<span class="sourceLineNo">168</span>     * This is corroborated by the following:<a name="line.168"></a>
+<span class="sourceLineNo">169</span>     * 1. The store might be instructed to keep deleted rows around.<a name="line.169"></a>
+<span class="sourceLineNo">170</span>     * 2. A scan can optionally see past a delete marker now.<a name="line.170"></a>
+<span class="sourceLineNo">171</span>     * 3. If deleted rows are kept, we have to find out when we can<a name="line.171"></a>
+<span class="sourceLineNo">172</span>     *    remove the delete markers.<a name="line.172"></a>
+<span class="sourceLineNo">173</span>     * 4. Family delete markers are always first (regardless of their TS)<a name="line.173"></a>
+<span class="sourceLineNo">174</span>     * 5. Delete markers should not be counted as version<a name="line.174"></a>
+<span class="sourceLineNo">175</span>     * 6. Delete markers affect puts of the *same* TS<a name="line.175"></a>
+<span class="sourceLineNo">176</span>     * 7. Delete marker need to be version counted together with puts<a name="line.176"></a>
+<span class="sourceLineNo">177</span>     *    they affect<a name="line.177"></a>
+<span class="sourceLineNo">178</span>     */<a name="line.178"></a>
+<span class="sourceLineNo">179</span>    long timestamp = cell.getTimestamp();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    byte typeByte = cell.getTypeByte();<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    long mvccVersion = cell.getSequenceId();<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    if (CellUtil.isDelete(typeByte)) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      if (keepDeletedCells == KeepDeletedCells.FALSE<a name="line.183"></a>
+<span class="sourceLineNo">184</span>          || (keepDeletedCells == KeepDeletedCells.TTL &amp;&amp; timestamp &lt; oldestUnexpiredTS)) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>        // first ignore delete markers if the scanner can do so, and the<a name="line.185"></a>
+<span class="sourceLineNo">186</span>        // range does not include the marker<a name="line.186"></a>
+<span class="sourceLineNo">187</span>        //<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        // during flushes and compactions also ignore delete markers newer<a name="line.188"></a>
+<span class="sourceLineNo">189</span>        // than the readpoint of any open scanner, this prevents deleted<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        // rows that could still be seen by a scanner from being collected<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        boolean includeDeleteMarker = tr.withinOrAfterTimeRange(timestamp);<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        if (includeDeleteMarker &amp;&amp; mvccVersion &lt;= maxReadPointToTrackVersions) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>          this.deletes.add(cell);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        // Can't early out now, because DelFam come before any other keys<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      }<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>      if (timeToPurgeDeletes &gt; 0<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          &amp;&amp; (EnvironmentEdgeManager.currentTime() - timestamp) &lt;= timeToPurgeDeletes) {<a name="line.199"></a>
+<span class="sourceLineNo">200</span>        return MatchCode.INCLUDE;<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      } else if (retainDeletesInOutput || mvccVersion &gt; maxReadPointToTrackVersions) {<a name="line.201"></a>
+<span class="sourceLineNo">202</span>        // always include or it is not time yet to check whether it is OK<a name="line.202"></a>
+<span class="sourceLineNo">203</span>        // to purge deltes or not<a name="line.203"></a>
+<span class="sourceLineNo">204</span>        // if this is not a user scan (compaction), we can filter this deletemarker right here<a name="line.204"></a>
+<span class="sourceLineNo">205</span>        // otherwise (i.e. a "raw" scan) we fall through to normal version and timerange checking<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        return MatchCode.INCLUDE;<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      } else if (keepDeletedCells == KeepDeletedCells.TRUE<a name="line.207"></a>
+<span class="sourceLineNo">208</span>          || (keepDeletedCells == KeepDeletedCells.TTL &amp;&amp; timestamp &gt;= oldestUnexpiredTS)) {<a name="line.208"></a>
+<span class="sourceLineNo">209</span>        if (timestamp &lt; earliestPutTs) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>          // keeping delete rows, but there are no puts older than<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          // this delete in the store files.<a name="line.211"></a>
+<span class="sourceLineNo">212</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        }<a name="line.213"></a>
+<span class="sourceLineNo">214</span>        // else: fall through and do version counting on the<a name="line.214"></a>
+<span class="sourceLineNo">215</span>        // delete markers<a name="line.215"></a>
+<span class="sourceLineNo">216</span>      } else {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        return MatchCode.SKIP;<a name="line.217"></a>
+<span class="sourceLineNo">218</span>      }<a name="line.218"></a>
+<span class="sourceLineNo">219</span>      // note the following next else if...<a name="line.219"></a>
+<span class="sourceLineNo">220</span>      // delete marker are not subject to other delete markers<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    } else if (!this.deletes.isEmpty()) {<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      DeleteResult deleteResult = deletes.isDeleted(cell);<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      switch (deleteResult) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        case FAMILY_DELETED:<a name="line.224"></a>
+<span class="sourceLineNo">225</span>        case COLUMN_DELETED:<a name="line.225"></a>
+<span class="sourceLineNo">226</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.226"></a>
+<span class="sourceLineNo">227</span>        case VERSION_DELETED:<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        case FAMILY_VERSION_DELETED:<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          return MatchCode.SKIP;<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        case NOT_DELETED:<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          break;<a name="line.231"></a>
+<span class="sourceLineNo">232</span>        default:<a name="line.232"></a>
+<span class="sourceLineNo">233</span>          throw new RuntimeException("UNEXPECTED");<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        }<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
+<span class="sourceLineNo">236</span><a name="line.236"></a>
+<span class="sourceLineNo">237</span>    int timestampComparison = tr.compare(timestamp);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    if (timestampComparison &gt;= 1) {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      return MatchCode.SKIP;<a name="line.239"></a>
+<span class="sourceLineNo">240</span>    } else if (timestampComparison &lt;= -1) {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      return columns.getNextRowOrNextColumn(cell);<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    }<a name="line.242"></a>
+<span class="sourceLineNo">243</span><a name="line.243"></a>
+<span class="sourceLineNo">244</span>    // STEP 1: Check if the column is part of the requested columns<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    MatchCode colChecker = columns.checkColumn(cell, typeByte);<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    if (colChecker == MatchCode.INCLUDE) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>      ReturnCode filterResponse = ReturnCode.SKIP;<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      // STEP 2: Yes, the column is part of the requested columns. Check if filter is present<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      if (filter != null) {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>        // STEP 3: Filter the key value and return if it filters out<a name="line.250"></a>
+<span class="sourceLineNo">251</span>        filterResponse = filter.filterKeyValue(cell);<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        switch (filterResponse) {<a name="line.252"></a>
+<span class="sourceLineNo">253</span>        case SKIP:<a name="line.253"></a>
+<span class="sourceLineNo">254</span>          return MatchCode.SKIP;<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        case NEXT_COL:<a name="line.255"></a>
+<span class="sourceLineNo">256</span>          return columns.getNextRowOrNextColumn(cell);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>        case NEXT_ROW:<a name="line.257"></a>
+<span class="sourceLineNo">258</span>          return MatchCode.SEEK_NEXT_ROW;<a name="line.258"></a>
+<span class="sourceLineNo">259</span>        case SEEK_NEXT_USING_HINT:<a name="line.259"></a>
+<span class="sourceLineNo">260</span>          return MatchCode.SEEK_NEXT_USING_HINT;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        default:<a name="line.261"></a>
+<span class="sourceLineNo">262</span>          //It means it is either include or include and seek next<a name="line.262"></a>
+<span class="sourceLineNo">263</span>          break;<a name="line.263"></a>
+<span class="sourceLineNo">264</span>        }<a name="line.264"></a>
+<span class="sourceLineNo">265</span>      }<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      /*<a name="line.266"></a>
+<span class="sourceLineNo">267</span>       * STEP 4: Reaching this step means the column is part of the requested columns and either<a name="line.267"></a>
+<span class="sourceLineNo">268</span>       * the filter is null or the filter has returned INCLUDE or INCLUDE_AND_NEXT_COL response.<a name="line.268"></a>
+<span class="sourceLineNo">269</span>       * Now check the number of versions needed. This method call returns SKIP, INCLUDE,<a name="line.269"></a>
+<span class="sourceLineNo">270</span>       * INCLUDE_AND_SEEK_NEXT_ROW, INCLUDE_AND_SEEK_NEXT_COL.<a name="line.270"></a>
+<span class="sourceLineNo">271</span>       *<a name="line.271"></a>
+<span class="sourceLineNo">272</span>       * FilterResponse            ColumnChecker               Desired behavior<a name="line.272"></a>
+<span class="sourceLineNo">273</span>       * INCLUDE                   SKIP                        row has already been included, SKIP.<a name="line.273"></a>
+<span class="sourceLineNo">274</span>       * INCLUDE                   INCLUDE                     INCLUDE<a name="line.274"></a>
+<span class="sourceLineNo">275</span>       * INCLUDE                   INCLUDE_AND_SEEK_NEXT_COL   INCLUDE_AND_SEEK_NEXT_COL<a name="line.275"></a>
+<span class="sourceLineNo">276</span>       * INCLUDE                   INCLUDE_AND_SEEK_NEXT_ROW   INCLUDE_AND_SEEK_NEXT_ROW<a name="line.276"></a>
+<span class="sourceLineNo">277</span>       * INCLUDE_AND_SEEK_NEXT_COL SKIP                        row has already been included, SKIP.<a name="line.277"></a>
+<span class="sourceLineNo">278</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE                     INCLUDE_AND_SEEK_NEXT_COL<a name="line.278"></a>
+<span class="sourceLineNo">279</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE_AND_SEEK_NEXT_COL   INCLUDE_AND_SEEK_NEXT_COL<a name="line.279"></a>
+<span class="sourceLineNo">280</span>       * INCLUDE_AND_SEEK_NEXT_COL INCLUDE_AND_SEEK_NEXT_ROW   INCLUDE_AND_SEEK_NEXT_ROW<a name="line.280"></a>
+<span class="sourceLineNo">281</span>       *<a name="line.281"></a>
+<span class="sourceLineNo">282</span>       * In all the above scenarios, we return the column checker return value except for<a name="line.282"></a>
+<span class="sourceLineNo">283</span>       * FilterResponse (INCLUDE_AND_SEEK_NEXT_COL) and ColumnChecker(INCLUDE)<a name="line.283"></a>
+<span class="sourceLineNo">284</span>       */<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      colChecker = columns.checkVersions(cell, timestamp, typeByte,<a name="line.285"></a>
+<span class="sourceLineNo">286</span>          mvccVersion &gt; maxReadPointToTrackVersions);<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      if (filterResponse == ReturnCode.INCLUDE_AND_SEEK_NEXT_ROW) {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        if (colChecker != MatchCode.SKIP) {<a name="line.288"></a>
+<span class="sourceLineNo">289</span>          return MatchCode.INCLUDE_AND_SEEK_NEXT_ROW;<a name="line.289"></a>
+<span class="sourceLineNo">290</span>        }<a name="line.290"></a>
+<span class="sourceLineNo">291</span>        return MatchCode.SEEK_NEXT_ROW;<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      }<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      return (filterResponse == ReturnCode.INCLUDE_AND_NEXT_COL &amp;&amp;<a name="line.293"></a>
+<span class="sourceLineNo">294</span>          colChecker == MatchCode.INCLUDE) ? MatchCode.INCLUDE_AND_SEEK_NEXT_COL<a name="line.294"></a>
+<span class="sourceLineNo">295</span>          : colChecker;<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    }<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    return colChecker;<a name="line.297"></a>
+<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>  @Override<a name="line.300"></a>
+<span class="sourceLineNo">301</span>  public boolean hasNullColumnInQuery() {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    return hasNullColumn;<a name="line.302"></a>
+<span class="sourceLineNo">303</span>  }<a name="line.303"></a>
+<span class="sourceLineNo">304</span><a name="line.304"></a>
+<span class="sourceLineNo">305</span>  /**<a name="line.305"></a>
+<span class="sourceLineNo">306</span>   * Handle partial-drop-deletes. As we match keys in order, when we have a range from which we can<a name="line.306"></a>
+<span class="sourceLineNo">307</span>   * drop deletes, we can set retainDeletesInOutput to false for the duration of this range only,<a name="line.307"></a>
+<span class="sourceLineNo">308</span>   * and maintain consistency.<a name="line.308"></a>
+<span class="sourceLineNo">309</span>   */<a name="line.309"></a>
+<span class="sourceLineNo">310</span>  private void checkPartialDropDeleteRange(Cell curCell) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    // If partial-drop-deletes are used, initially, dropDeletesFromRow and dropDeletesToRow<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    // are both set, and the matcher is set to retain deletes. We assume ordered keys. When<a name="line.312"></a>
+<span class="sourceLineNo">313</span>    // dropDeletesFromRow is leq current kv, we start dropping deletes and reset<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    // dropDeletesFromRow; thus the 2nd "if" starts to apply.<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    if ((dropDeletesFromRow != null)<a name="line.315"></a>
+<span class="sourceLineNo">316</span>        &amp;&amp; (Arrays.equals(dropDeletesFromRow, HConstants.EMPTY_START_ROW)<a name="line.316"></a>
+<span class="sourceLineNo">317</span>            || (CellComparator.COMPARATOR.compareRows(curCell, dropDeletesFromRow, 0,<a name="line.317"></a>
+<span class="sourceLineNo">318</span>              dropDeletesFromRow.length) &gt;= 0))) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>      retainDeletesInOutput = false;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>      dropDeletesFromRow = null;<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    }<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    // If dropDeletesFromRow is null and dropDeletesToRow is set, we are inside the partial-<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    // drop-deletes range. When dropDeletesToRow is leq current kv, we stop dropping deletes,<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    // and reset dropDeletesToRow so that we don't do any more compares.<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    if ((dropDeletesFromRow == null) &amp;&amp; (dropDeletesToRow != null)<a name="line.325"></a>
+<span class="sourceLineNo">326</span>        &amp;&amp; !Arrays.equals(dropDeletesToRow, HConstants.EMPTY_END_ROW) &amp;&amp; (CellComparator.COMPARATOR<a name="line.326"></a>
+<span class="sourceLineNo">327</span>            .compareRows(curCell, dropDeletesToRow, 0, dropDeletesToRow.length) &gt;= 0)) {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>      retainDeletesInOutput = true;<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      dropDeletesToRow = null;<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
+<span class="sourceLineNo">331</span>  }<a name="line.331"></a>
+<span class="sourceLineNo">332</span><a name="line.332"></a>
+<span class="sourceLineNo">333</span>  @Override<a name="line.333"></a>
+<span class="sourceLineNo">334</span>  protected void reset() {<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    checkPartialDropDeleteRange(currentRow);<a name="line.335"></a>
+<span class="sourceLineNo">336</span>  }<a name="line.336"></a>
+<span class="sourceLineNo">337</span><a name="line.337"></a>
+<span class="sourceLineNo">338</span>  @Override<a name="line.338"></a>
+<span class="sourceLineNo">339</span>  public boolean isUserScan() {<a name="line.339"></a>
+<span class="sourceLineNo">340</span>    return false;<a name="line.340"></a>
+<span class="sourceLineNo">341</span>  }<a name="line.341"></a>
+<span class="sourceLineNo">342</span><a name="line.342"></a>
+<span class="sourceLineNo">343</span>  @Override<a name="line.343"></a>
+<span class="sourceLineNo">344</span>  public boolean moreRowsMayExistAfter(Cell cell) {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>    if (this.stopRow == null || this.stopRow.length == 0) {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      return true;<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    }<a name="line.347"></a>
+<span class="sourceLineNo">348</span>    return rowComparator.compareRows(cell, stopRow, 0, stopRow.length) &lt; 0;<a name="line.348"></a>
+<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
+<span class="sourceLineNo">350</span><a name="line.350"></a>
+<span class="sourceLineNo">351</span>  @Override<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  public Filter getFilter() {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    return filter;<a name="line.353"></a>
+<span class="sourceLineNo">354</span>  }<a name="line.354"></a>
+<span class="sourceLineNo">355</span><a name="line.355"></a>
+<span class="sourceLineNo">356</span>  @Override<a name="line.356"></a>
+<span class="sourceLineNo">357</span>  public Cell getNextKeyHint(Cell cell) throws IOException {<a name="line.357"></a>
+<span class="sourceLineNo">358</span>    if (filter == null) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>      return null;<a name="line.359"></a>
+<span class="sourceLineNo">360</span>    } else {<a name="line.360"></a>
+<span class="sourceLineNo">361</span>      return filter.getNextCellHint(cell);<a name="line.361"></a>
+<span class="sourceLineNo">362</span>    }<a name="line.362"></a>
+<span class="sourceLineNo">363</span>  }<a name="line.363"></a>
+<span class="sourceLineNo">364</span><a name="line.364"></a>
+<span class="sourceLineNo">365</span>  public static LegacyScanQueryMatcher create(Scan scan, ScanInfo scanInfo,<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      NavigableSet&lt;byte[]&gt; columns, ScanType scanType, long readPointToUse, long earliestPutTs,<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow, byte[] dropDeletesToRow,<a name="line.367"></a>
+<span class="sourceLineNo">368</span>      RegionCoprocessorHost regionCoprocessorHost) throws IOException {<a name="line.368"></a>
+<span class="sourceLineNo">369</span>    boolean hasNullColumn =<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        !(columns != null &amp;&amp; columns.size() != 0 &amp;&amp; columns.first().length != 0);<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    Pair&lt;DeleteTracker, ColumnTracker&gt; trackers = getTrackers(regionCoprocessorHost, null,<a name="line.371"></a>
+<span class="sourceLineNo">372</span>        scanInfo, oldestUnexpiredTS, scan);<a name="line.372"></a>
+<span class="sourceLineNo">373</span>    DeleteTracker deleteTracker = trackers.getFirst();<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    ColumnTracker columnTracker = trackers.getSecond();<a name="line.374"></a>
+<span class="sourceLineNo">375</span>    if (dropDeletesFromRow == null) {<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deleteTracker,<a name="line.376"></a>
+<span class="sourceLineNo">377</span>          scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now);<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    } else {<a name="line.378"></a>
+<span class="sourceLineNo">379</span>      return new LegacyScanQueryMatcher(scan, scanInfo, columnTracker, hasNullColumn, deleteTracker,<a name="line.379"></a>
+<span class="sourceLineNo">380</span>          scanType, readPointToUse, earliestPutTs, oldestUnexpiredTS, now, dropDeletesFromRow,<a name="line.380"></a>
+<span class="sourceLineNo">381</span>          dropDeletesToRow);<a name="line.381"></a>
+<span class="sourceLineNo">382</span>    }<a name="line.382"></a>
+<span class="sourceLineNo">383</span>  }<a name="line.383"></a>
+<span class="sourceLineNo">384</span>}<a name="line.384"></a>
 
 
 
