@@ -61,516 +61,530 @@
 <span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.exceptions.ScannerResetException;<a name="line.53"></a>
 <span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.ipc.HBaseRpcController;<a name="line.54"></a>
 <span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.55"></a>
-<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.shaded.protobuf.RequestConverter;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.shaded.protobuf.ResponseConverter;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ClientService;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ClientService.Interface;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ScanRequest;<a name="line.60"></a>
-<span class="sourceLineNo">061</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ScanResponse;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.62"></a>
-<span class="sourceLineNo">063</span><a name="line.63"></a>
-<span class="sourceLineNo">064</span>/**<a name="line.64"></a>
-<span class="sourceLineNo">065</span> * Retry caller for scanning a region.<a name="line.65"></a>
-<span class="sourceLineNo">066</span> * &lt;p&gt;<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * We will modify the {@link Scan} object passed in directly. The upper layer should store the<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * reference of this object and use it to open new single region scanners.<a name="line.68"></a>
-<span class="sourceLineNo">069</span> */<a name="line.69"></a>
-<span class="sourceLineNo">070</span>@InterfaceAudience.Private<a name="line.70"></a>
-<span class="sourceLineNo">071</span>class AsyncScanSingleRegionRpcRetryingCaller {<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private static final Log LOG = LogFactory.getLog(AsyncScanSingleRegionRpcRetryingCaller.class);<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private final HashedWheelTimer retryTimer;<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  private final Scan scan;<a name="line.77"></a>
-<span class="sourceLineNo">078</span><a name="line.78"></a>
-<span class="sourceLineNo">079</span>  private final ScanMetrics scanMetrics;<a name="line.79"></a>
-<span class="sourceLineNo">080</span><a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private final long scannerId;<a name="line.81"></a>
-<span class="sourceLineNo">082</span><a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private final ScanResultCache resultCache;<a name="line.83"></a>
-<span class="sourceLineNo">084</span><a name="line.84"></a>
-<span class="sourceLineNo">085</span>  private final RawScanResultConsumer consumer;<a name="line.85"></a>
-<span class="sourceLineNo">086</span><a name="line.86"></a>
-<span class="sourceLineNo">087</span>  private final ClientService.Interface stub;<a name="line.87"></a>
-<span class="sourceLineNo">088</span><a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private final HRegionLocation loc;<a name="line.89"></a>
-<span class="sourceLineNo">090</span><a name="line.90"></a>
-<span class="sourceLineNo">091</span>  private final boolean regionServerRemote;<a name="line.91"></a>
-<span class="sourceLineNo">092</span><a name="line.92"></a>
-<span class="sourceLineNo">093</span>  private final long scannerLeaseTimeoutPeriodNs;<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>  private final long pauseNs;<a name="line.95"></a>
-<span class="sourceLineNo">096</span><a name="line.96"></a>
-<span class="sourceLineNo">097</span>  private final int maxAttempts;<a name="line.97"></a>
-<span class="sourceLineNo">098</span><a name="line.98"></a>
-<span class="sourceLineNo">099</span>  private final long scanTimeoutNs;<a name="line.99"></a>
-<span class="sourceLineNo">100</span><a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private final long rpcTimeoutNs;<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  private final int startLogErrorsCnt;<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  private final Runnable completeWhenNoMoreResultsInRegion;<a name="line.105"></a>
-<span class="sourceLineNo">106</span><a name="line.106"></a>
-<span class="sourceLineNo">107</span>  private final CompletableFuture&lt;Boolean&gt; future;<a name="line.107"></a>
-<span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  private final HBaseRpcController controller;<a name="line.109"></a>
-<span class="sourceLineNo">110</span><a name="line.110"></a>
-<span class="sourceLineNo">111</span>  private byte[] nextStartRowWhenError;<a name="line.111"></a>
-<span class="sourceLineNo">112</span><a name="line.112"></a>
-<span class="sourceLineNo">113</span>  private boolean includeNextStartRowWhenError;<a name="line.113"></a>
-<span class="sourceLineNo">114</span><a name="line.114"></a>
-<span class="sourceLineNo">115</span>  private long nextCallStartNs;<a name="line.115"></a>
-<span class="sourceLineNo">116</span><a name="line.116"></a>
-<span class="sourceLineNo">117</span>  private int tries;<a name="line.117"></a>
-<span class="sourceLineNo">118</span><a name="line.118"></a>
-<span class="sourceLineNo">119</span>  private final List&lt;RetriesExhaustedException.ThrowableWithExtraContext&gt; exceptions;<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  private long nextCallSeq = -1L;<a name="line.121"></a>
-<span class="sourceLineNo">122</span><a name="line.122"></a>
-<span class="sourceLineNo">123</span>  private enum ScanControllerState {<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    INITIALIZED, SUSPENDED, TERMINATED, DESTROYED<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  }<a name="line.125"></a>
-<span class="sourceLineNo">126</span><a name="line.126"></a>
-<span class="sourceLineNo">127</span>  // Since suspend and terminate should only be called within onNext or onHeartbeat(see the comments<a name="line.127"></a>
-<span class="sourceLineNo">128</span>  // of RawScanResultConsumer.onNext and onHeartbeat), we need to add some check to prevent invalid<a name="line.128"></a>
-<span class="sourceLineNo">129</span>  // usage. We use two things to prevent invalid usage:<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  // 1. Record the thread that construct the ScanControllerImpl instance. We will throw an<a name="line.130"></a>
-<span class="sourceLineNo">131</span>  // IllegalStateException if the caller thread is not this thread.<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  // 2. The ControllerState. The initial state is INITIALIZED, if you call suspend, the state will<a name="line.132"></a>
-<span class="sourceLineNo">133</span>  // be transformed to SUSPENDED, and if you call terminate, the state will be transformed to<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  // TERMINATED. And when we are back from onNext or onHeartbeat in the onComplete method, we will<a name="line.134"></a>
-<span class="sourceLineNo">135</span>  // call destroy to get the current state and set the state to DESTROYED. And when user calls<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  // suspend or terminate, we will check if the current state is INITIALIZED, if not we will throw<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  // an IllegalStateException. Notice that the DESTROYED state is necessary as you may not call<a name="line.137"></a>
-<span class="sourceLineNo">138</span>  // suspend or terminate so the state will still be INITIALIZED when back from onNext or<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  // onHeartbeat. We need another state to replace the INITIALIZED state to prevent the controller<a name="line.139"></a>
-<span class="sourceLineNo">140</span>  // to be used in the future.<a name="line.140"></a>
-<span class="sourceLineNo">141</span>  // Notice that, the public methods of this class is supposed to be called by upper layer only, and<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  // package private methods can only be called within the implementation of<a name="line.142"></a>
-<span class="sourceLineNo">143</span>  // AsyncScanSingleRegionRpcRetryingCaller.<a name="line.143"></a>
-<span class="sourceLineNo">144</span>  private final class ScanControllerImpl implements RawScanResultConsumer.ScanController {<a name="line.144"></a>
-<span class="sourceLineNo">145</span><a name="line.145"></a>
-<span class="sourceLineNo">146</span>    // Make sure the methods are only called in this thread.<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    private final Thread callerThread = Thread.currentThread();<a name="line.147"></a>
-<span class="sourceLineNo">148</span><a name="line.148"></a>
-<span class="sourceLineNo">149</span>    // INITIALIZED -&gt; SUSPENDED -&gt; DESTROYED<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    // INITIALIZED -&gt; TERMINATED -&gt; DESTROYED<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    // INITIALIZED -&gt; DESTROYED<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    // If the state is incorrect we will throw IllegalStateException.<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    private ScanControllerState state = ScanControllerState.INITIALIZED;<a name="line.153"></a>
-<span class="sourceLineNo">154</span><a name="line.154"></a>
-<span class="sourceLineNo">155</span>    private ScanResumerImpl resumer;<a name="line.155"></a>
-<span class="sourceLineNo">156</span><a name="line.156"></a>
-<span class="sourceLineNo">157</span>    private void preCheck() {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>      Preconditions.checkState(Thread.currentThread() == callerThread,<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        "The current thread is %s, expected thread is %s, " +<a name="line.159"></a>
-<span class="sourceLineNo">160</span>            "you should not call this method outside onNext or onHeartbeat",<a name="line.160"></a>
-<span class="sourceLineNo">161</span>        Thread.currentThread(), callerThread);<a name="line.161"></a>
-<span class="sourceLineNo">162</span>      Preconditions.checkState(state.equals(ScanControllerState.INITIALIZED),<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        "Invalid Stopper state %s", state);<a name="line.163"></a>
+<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.56"></a>
+<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.shaded.protobuf.RequestConverter;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.shaded.protobuf.ResponseConverter;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ClientService;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ClientService.Interface;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ScanRequest;<a name="line.61"></a>
+<span class="sourceLineNo">062</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos.ScanResponse;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>/**<a name="line.65"></a>
+<span class="sourceLineNo">066</span> * Retry caller for scanning a region.<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * &lt;p&gt;<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * We will modify the {@link Scan} object passed in directly. The upper layer should store the<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * reference of this object and use it to open new single region scanners.<a name="line.69"></a>
+<span class="sourceLineNo">070</span> */<a name="line.70"></a>
+<span class="sourceLineNo">071</span>@InterfaceAudience.Private<a name="line.71"></a>
+<span class="sourceLineNo">072</span>class AsyncScanSingleRegionRpcRetryingCaller {<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private static final Log LOG = LogFactory.getLog(AsyncScanSingleRegionRpcRetryingCaller.class);<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private final HashedWheelTimer retryTimer;<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private final Scan scan;<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>  private final ScanMetrics scanMetrics;<a name="line.80"></a>
+<span class="sourceLineNo">081</span><a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private final long scannerId;<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private final ScanResultCache resultCache;<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private final RawScanResultConsumer consumer;<a name="line.86"></a>
+<span class="sourceLineNo">087</span><a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private final ClientService.Interface stub;<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private final HRegionLocation loc;<a name="line.90"></a>
+<span class="sourceLineNo">091</span><a name="line.91"></a>
+<span class="sourceLineNo">092</span>  private final boolean regionServerRemote;<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>  private final long scannerLeaseTimeoutPeriodNs;<a name="line.94"></a>
+<span class="sourceLineNo">095</span><a name="line.95"></a>
+<span class="sourceLineNo">096</span>  private final long pauseNs;<a name="line.96"></a>
+<span class="sourceLineNo">097</span><a name="line.97"></a>
+<span class="sourceLineNo">098</span>  private final int maxAttempts;<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  private final long scanTimeoutNs;<a name="line.100"></a>
+<span class="sourceLineNo">101</span><a name="line.101"></a>
+<span class="sourceLineNo">102</span>  private final long rpcTimeoutNs;<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  private final int startLogErrorsCnt;<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  private final Runnable completeWhenNoMoreResultsInRegion;<a name="line.106"></a>
+<span class="sourceLineNo">107</span><a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private final CompletableFuture&lt;Boolean&gt; future;<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  private final HBaseRpcController controller;<a name="line.110"></a>
+<span class="sourceLineNo">111</span><a name="line.111"></a>
+<span class="sourceLineNo">112</span>  private byte[] nextStartRowWhenError;<a name="line.112"></a>
+<span class="sourceLineNo">113</span><a name="line.113"></a>
+<span class="sourceLineNo">114</span>  private boolean includeNextStartRowWhenError;<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  private long nextCallStartNs;<a name="line.116"></a>
+<span class="sourceLineNo">117</span><a name="line.117"></a>
+<span class="sourceLineNo">118</span>  private int tries;<a name="line.118"></a>
+<span class="sourceLineNo">119</span><a name="line.119"></a>
+<span class="sourceLineNo">120</span>  private final List&lt;RetriesExhaustedException.ThrowableWithExtraContext&gt; exceptions;<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  private long nextCallSeq = -1L;<a name="line.122"></a>
+<span class="sourceLineNo">123</span><a name="line.123"></a>
+<span class="sourceLineNo">124</span>  private enum ScanControllerState {<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    INITIALIZED, SUSPENDED, TERMINATED, DESTROYED<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  }<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  // Since suspend and terminate should only be called within onNext or onHeartbeat(see the comments<a name="line.128"></a>
+<span class="sourceLineNo">129</span>  // of RawScanResultConsumer.onNext and onHeartbeat), we need to add some check to prevent invalid<a name="line.129"></a>
+<span class="sourceLineNo">130</span>  // usage. We use two things to prevent invalid usage:<a name="line.130"></a>
+<span class="sourceLineNo">131</span>  // 1. Record the thread that construct the ScanControllerImpl instance. We will throw an<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  // IllegalStateException if the caller thread is not this thread.<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  // 2. The ControllerState. The initial state is INITIALIZED, if you call suspend, the state will<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  // be transformed to SUSPENDED, and if you call terminate, the state will be transformed to<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  // TERMINATED. And when we are back from onNext or onHeartbeat in the onComplete method, we will<a name="line.135"></a>
+<span class="sourceLineNo">136</span>  // call destroy to get the current state and set the state to DESTROYED. And when user calls<a name="line.136"></a>
+<span class="sourceLineNo">137</span>  // suspend or terminate, we will check if the current state is INITIALIZED, if not we will throw<a name="line.137"></a>
+<span class="sourceLineNo">138</span>  // an IllegalStateException. Notice that the DESTROYED state is necessary as you may not call<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  // suspend or terminate so the state will still be INITIALIZED when back from onNext or<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  // onHeartbeat. We need another state to replace the INITIALIZED state to prevent the controller<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  // to be used in the future.<a name="line.141"></a>
+<span class="sourceLineNo">142</span>  // Notice that, the public methods of this class is supposed to be called by upper layer only, and<a name="line.142"></a>
+<span class="sourceLineNo">143</span>  // package private methods can only be called within the implementation of<a name="line.143"></a>
+<span class="sourceLineNo">144</span>  // AsyncScanSingleRegionRpcRetryingCaller.<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  private final class ScanControllerImpl implements RawScanResultConsumer.ScanController {<a name="line.145"></a>
+<span class="sourceLineNo">146</span><a name="line.146"></a>
+<span class="sourceLineNo">147</span>    // Make sure the methods are only called in this thread.<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    private final Thread callerThread;<a name="line.148"></a>
+<span class="sourceLineNo">149</span><a name="line.149"></a>
+<span class="sourceLineNo">150</span>    private final Optional&lt;Cursor&gt; cursor;<a name="line.150"></a>
+<span class="sourceLineNo">151</span><a name="line.151"></a>
+<span class="sourceLineNo">152</span>    // INITIALIZED -&gt; SUSPENDED -&gt; DESTROYED<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    // INITIALIZED -&gt; TERMINATED -&gt; DESTROYED<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    // INITIALIZED -&gt; DESTROYED<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    // If the state is incorrect we will throw IllegalStateException.<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    private ScanControllerState state = ScanControllerState.INITIALIZED;<a name="line.156"></a>
+<span class="sourceLineNo">157</span><a name="line.157"></a>
+<span class="sourceLineNo">158</span>    private ScanResumerImpl resumer;<a name="line.158"></a>
+<span class="sourceLineNo">159</span><a name="line.159"></a>
+<span class="sourceLineNo">160</span>    public ScanControllerImpl(ScanResponse resp) {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      callerThread = Thread.currentThread();<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      cursor = resp.hasCursor() ? Optional.of(ProtobufUtil.toCursor(resp.getCursor()))<a name="line.162"></a>
+<span class="sourceLineNo">163</span>          : Optional.empty();<a name="line.163"></a>
 <span class="sourceLineNo">164</span>    }<a name="line.164"></a>
 <span class="sourceLineNo">165</span><a name="line.165"></a>
-<span class="sourceLineNo">166</span>    @Override<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    public ScanResumer suspend() {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      preCheck();<a name="line.168"></a>
-<span class="sourceLineNo">169</span>      state = ScanControllerState.SUSPENDED;<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      ScanResumerImpl resumer = new ScanResumerImpl();<a name="line.170"></a>
-<span class="sourceLineNo">171</span>      this.resumer = resumer;<a name="line.171"></a>
-<span class="sourceLineNo">172</span>      return resumer;<a name="line.172"></a>
+<span class="sourceLineNo">166</span>    private void preCheck() {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      Preconditions.checkState(Thread.currentThread() == callerThread,<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        "The current thread is %s, expected thread is %s, " +<a name="line.168"></a>
+<span class="sourceLineNo">169</span>            "you should not call this method outside onNext or onHeartbeat",<a name="line.169"></a>
+<span class="sourceLineNo">170</span>        Thread.currentThread(), callerThread);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      Preconditions.checkState(state.equals(ScanControllerState.INITIALIZED),<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        "Invalid Stopper state %s", state);<a name="line.172"></a>
 <span class="sourceLineNo">173</span>    }<a name="line.173"></a>
 <span class="sourceLineNo">174</span><a name="line.174"></a>
 <span class="sourceLineNo">175</span>    @Override<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    public void terminate() {<a name="line.176"></a>
+<span class="sourceLineNo">176</span>    public ScanResumer suspend() {<a name="line.176"></a>
 <span class="sourceLineNo">177</span>      preCheck();<a name="line.177"></a>
-<span class="sourceLineNo">178</span>      state = ScanControllerState.TERMINATED;<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    }<a name="line.179"></a>
-<span class="sourceLineNo">180</span><a name="line.180"></a>
-<span class="sourceLineNo">181</span>    // return the current state, and set the state to DESTROYED.<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    ScanControllerState destroy() {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      ScanControllerState state = this.state;<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      this.state = ScanControllerState.DESTROYED;<a name="line.184"></a>
-<span class="sourceLineNo">185</span>      return state;<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    }<a name="line.186"></a>
-<span class="sourceLineNo">187</span>  }<a name="line.187"></a>
-<span class="sourceLineNo">188</span><a name="line.188"></a>
-<span class="sourceLineNo">189</span>  private enum ScanResumerState {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>    INITIALIZED, SUSPENDED, RESUMED<a name="line.190"></a>
-<span class="sourceLineNo">191</span>  }<a name="line.191"></a>
-<span class="sourceLineNo">192</span><a name="line.192"></a>
-<span class="sourceLineNo">193</span>  // The resume method is allowed to be called in another thread so here we also use the<a name="line.193"></a>
-<span class="sourceLineNo">194</span>  // ResumerState to prevent race. The initial state is INITIALIZED, and in most cases, when back<a name="line.194"></a>
-<span class="sourceLineNo">195</span>  // from onNext or onHeartbeat, we will call the prepare method to change the state to SUSPENDED,<a name="line.195"></a>
-<span class="sourceLineNo">196</span>  // and when user calls resume method, we will change the state to RESUMED. But the resume method<a name="line.196"></a>
-<span class="sourceLineNo">197</span>  // could be called in other thread, and in fact, user could just do this:<a name="line.197"></a>
-<span class="sourceLineNo">198</span>  // controller.suspend().resume()<a name="line.198"></a>
-<span class="sourceLineNo">199</span>  // This is strange but valid. This means the scan could be resumed before we call the prepare<a name="line.199"></a>
-<span class="sourceLineNo">200</span>  // method to do the actual suspend work. So in the resume method, we will check if the state is<a name="line.200"></a>
-<span class="sourceLineNo">201</span>  // INTIALIZED, if it is, then we will just set the state to RESUMED and return. And in prepare<a name="line.201"></a>
-<span class="sourceLineNo">202</span>  // method, if the state is RESUMED already, we will just return an let the scan go on.<a name="line.202"></a>
-<span class="sourceLineNo">203</span>  // Notice that, the public methods of this class is supposed to be called by upper layer only, and<a name="line.203"></a>
-<span class="sourceLineNo">204</span>  // package private methods can only be called within the implementation of<a name="line.204"></a>
-<span class="sourceLineNo">205</span>  // AsyncScanSingleRegionRpcRetryingCaller.<a name="line.205"></a>
-<span class="sourceLineNo">206</span>  private final class ScanResumerImpl implements RawScanResultConsumer.ScanResumer {<a name="line.206"></a>
-<span class="sourceLineNo">207</span><a name="line.207"></a>
-<span class="sourceLineNo">208</span>    // INITIALIZED -&gt; SUSPENDED -&gt; RESUMED<a name="line.208"></a>
-<span class="sourceLineNo">209</span>    // INITIALIZED -&gt; RESUMED<a name="line.209"></a>
-<span class="sourceLineNo">210</span>    private ScanResumerState state = ScanResumerState.INITIALIZED;<a name="line.210"></a>
-<span class="sourceLineNo">211</span><a name="line.211"></a>
-<span class="sourceLineNo">212</span>    private ScanResponse resp;<a name="line.212"></a>
-<span class="sourceLineNo">213</span><a name="line.213"></a>
-<span class="sourceLineNo">214</span>    private int numberOfCompleteRows;<a name="line.214"></a>
-<span class="sourceLineNo">215</span><a name="line.215"></a>
-<span class="sourceLineNo">216</span>    // If the scan is suspended successfully, we need to do lease renewal to prevent it being closed<a name="line.216"></a>
-<span class="sourceLineNo">217</span>    // by RS due to lease expire. It is a one-time timer task so we need to schedule a new task<a name="line.217"></a>
-<span class="sourceLineNo">218</span>    // every time when the previous task is finished. There could also be race as the renewal is<a name="line.218"></a>
-<span class="sourceLineNo">219</span>    // executed in the timer thread, so we also need to check the state before lease renewal. If the<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    // state is RESUMED already, we will give up lease renewal and also not schedule the next lease<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    // renewal task.<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    private Timeout leaseRenewer;<a name="line.222"></a>
-<span class="sourceLineNo">223</span><a name="line.223"></a>
-<span class="sourceLineNo">224</span>    @Override<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    public void resume() {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      // just used to fix findbugs warnings. In fact, if resume is called before prepare, then we<a name="line.226"></a>
-<span class="sourceLineNo">227</span>      // just return at the first if condition without loading the resp and numValidResuls field. If<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      // resume is called after suspend, then it is also safe to just reference resp and<a name="line.228"></a>
-<span class="sourceLineNo">229</span>      // numValidResults after the synchronized block as no one will change it anymore.<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      ScanResponse localResp;<a name="line.230"></a>
-<span class="sourceLineNo">231</span>      int localNumberOfCompleteRows;<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      synchronized (this) {<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        if (state == ScanResumerState.INITIALIZED) {<a name="line.233"></a>
-<span class="sourceLineNo">234</span>          // user calls this method before we call prepare, so just set the state to<a name="line.234"></a>
-<span class="sourceLineNo">235</span>          // RESUMED, the implementation will just go on.<a name="line.235"></a>
-<span class="sourceLineNo">236</span>          state = ScanResumerState.RESUMED;<a name="line.236"></a>
-<span class="sourceLineNo">237</span>          return;<a name="line.237"></a>
-<span class="sourceLineNo">238</span>        }<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        if (state == ScanResumerState.RESUMED) {<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          // already resumed, give up.<a name="line.240"></a>
-<span class="sourceLineNo">241</span>          return;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>        }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>        state = ScanResumerState.RESUMED;<a name="line.243"></a>
-<span class="sourceLineNo">244</span>        if (leaseRenewer != null) {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>          leaseRenewer.cancel();<a name="line.245"></a>
-<span class="sourceLineNo">246</span>        }<a name="line.246"></a>
-<span class="sourceLineNo">247</span>        localResp = this.resp;<a name="line.247"></a>
-<span class="sourceLineNo">248</span>        localNumberOfCompleteRows = this.numberOfCompleteRows;<a name="line.248"></a>
-<span class="sourceLineNo">249</span>      }<a name="line.249"></a>
-<span class="sourceLineNo">250</span>      completeOrNext(localResp, localNumberOfCompleteRows);<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    }<a name="line.251"></a>
-<span class="sourceLineNo">252</span><a name="line.252"></a>
-<span class="sourceLineNo">253</span>    private void scheduleRenewLeaseTask() {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      leaseRenewer = retryTimer.newTimeout(t -&gt; tryRenewLease(), scannerLeaseTimeoutPeriodNs / 2,<a name="line.254"></a>
-<span class="sourceLineNo">255</span>        TimeUnit.NANOSECONDS);<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    }<a name="line.256"></a>
-<span class="sourceLineNo">257</span><a name="line.257"></a>
-<span class="sourceLineNo">258</span>    private synchronized void tryRenewLease() {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      // the scan has already been resumed, give up<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      if (state == ScanResumerState.RESUMED) {<a name="line.260"></a>
-<span class="sourceLineNo">261</span>        return;<a name="line.261"></a>
-<span class="sourceLineNo">262</span>      }<a name="line.262"></a>
-<span class="sourceLineNo">263</span>      renewLease();<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      // schedule the next renew lease task again as this is a one-time task.<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      scheduleRenewLeaseTask();<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    }<a name="line.266"></a>
-<span class="sourceLineNo">267</span><a name="line.267"></a>
-<span class="sourceLineNo">268</span>    // return false if the scan has already been resumed. See the comment above for ScanResumerImpl<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    // for more details.<a name="line.269"></a>
-<span class="sourceLineNo">270</span>    synchronized boolean prepare(ScanResponse resp, int numberOfCompleteRows) {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>      if (state == ScanResumerState.RESUMED) {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>        // user calls resume before we actually suspend the scan, just continue;<a name="line.272"></a>
-<span class="sourceLineNo">273</span>        return false;<a name="line.273"></a>
-<span class="sourceLineNo">274</span>      }<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      state = ScanResumerState.SUSPENDED;<a name="line.275"></a>
-<span class="sourceLineNo">276</span>      this.resp = resp;<a name="line.276"></a>
-<span class="sourceLineNo">277</span>      this.numberOfCompleteRows = numberOfCompleteRows;<a name="line.277"></a>
-<span class="sourceLineNo">278</span>      // if there are no more results in region then the scanner at RS side will be closed<a name="line.278"></a>
-<span class="sourceLineNo">279</span>      // automatically so we do not need to renew lease.<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      if (resp.getMoreResultsInRegion()) {<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        // schedule renew lease task<a name="line.281"></a>
-<span class="sourceLineNo">282</span>        scheduleRenewLeaseTask();<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      return true;<a name="line.284"></a>
-<span class="sourceLineNo">285</span>    }<a name="line.285"></a>
-<span class="sourceLineNo">286</span>  }<a name="line.286"></a>
-<span class="sourceLineNo">287</span><a name="line.287"></a>
-<span class="sourceLineNo">288</span>  public AsyncScanSingleRegionRpcRetryingCaller(HashedWheelTimer retryTimer,<a name="line.288"></a>
-<span class="sourceLineNo">289</span>      AsyncConnectionImpl conn, Scan scan, ScanMetrics scanMetrics, long scannerId,<a name="line.289"></a>
-<span class="sourceLineNo">290</span>      ScanResultCache resultCache, RawScanResultConsumer consumer, Interface stub,<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      HRegionLocation loc, boolean isRegionServerRemote, long scannerLeaseTimeoutPeriodNs,<a name="line.291"></a>
-<span class="sourceLineNo">292</span>      long pauseNs, int maxAttempts, long scanTimeoutNs, long rpcTimeoutNs, int startLogErrorsCnt) {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    this.retryTimer = retryTimer;<a name="line.293"></a>
-<span class="sourceLineNo">294</span>    this.scan = scan;<a name="line.294"></a>
-<span class="sourceLineNo">295</span>    this.scanMetrics = scanMetrics;<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    this.scannerId = scannerId;<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    this.resultCache = resultCache;<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    this.consumer = consumer;<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    this.stub = stub;<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    this.loc = loc;<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    this.regionServerRemote = isRegionServerRemote;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    this.scannerLeaseTimeoutPeriodNs = scannerLeaseTimeoutPeriodNs;<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    this.pauseNs = pauseNs;<a name="line.303"></a>
-<span class="sourceLineNo">304</span>    this.maxAttempts = maxAttempts;<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    this.scanTimeoutNs = scanTimeoutNs;<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    this.rpcTimeoutNs = rpcTimeoutNs;<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    this.startLogErrorsCnt = startLogErrorsCnt;<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    if (scan.isReversed()) {<a name="line.308"></a>
-<span class="sourceLineNo">309</span>      completeWhenNoMoreResultsInRegion = this::completeReversedWhenNoMoreResultsInRegion;<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    } else {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      completeWhenNoMoreResultsInRegion = this::completeWhenNoMoreResultsInRegion;<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    }<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    this.future = new CompletableFuture&lt;&gt;();<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    this.controller = conn.rpcControllerFactory.newController();<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    this.exceptions = new ArrayList&lt;&gt;();<a name="line.315"></a>
-<span class="sourceLineNo">316</span>  }<a name="line.316"></a>
-<span class="sourceLineNo">317</span><a name="line.317"></a>
-<span class="sourceLineNo">318</span>  private long elapsedMs() {<a name="line.318"></a>
-<span class="sourceLineNo">319</span>    return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - nextCallStartNs);<a name="line.319"></a>
-<span class="sourceLineNo">320</span>  }<a name="line.320"></a>
-<span class="sourceLineNo">321</span><a name="line.321"></a>
-<span class="sourceLineNo">322</span>  private long remainingTimeNs() {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>    return scanTimeoutNs - (System.nanoTime() - nextCallStartNs);<a name="line.323"></a>
-<span class="sourceLineNo">324</span>  }<a name="line.324"></a>
-<span class="sourceLineNo">325</span><a name="line.325"></a>
-<span class="sourceLineNo">326</span>  private void closeScanner() {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.327"></a>
-<span class="sourceLineNo">328</span>    resetController(controller, rpcTimeoutNs);<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    ScanRequest req = RequestConverter.buildScanRequest(this.scannerId, 0, true, false);<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    stub.scan(controller, req, resp -&gt; {<a name="line.330"></a>
-<span class="sourceLineNo">331</span>      if (controller.failed()) {<a name="line.331"></a>
-<span class="sourceLineNo">332</span>        LOG.warn("Call to " + loc.getServerName() + " for closing scanner id = " + scannerId +<a name="line.332"></a>
-<span class="sourceLineNo">333</span>            " for " + loc.getRegionInfo().getEncodedName() + " of " +<a name="line.333"></a>
-<span class="sourceLineNo">334</span>            loc.getRegionInfo().getTable() + " failed, ignore, probably already closed",<a name="line.334"></a>
-<span class="sourceLineNo">335</span>          controller.getFailed());<a name="line.335"></a>
-<span class="sourceLineNo">336</span>      }<a name="line.336"></a>
-<span class="sourceLineNo">337</span>    });<a name="line.337"></a>
+<span class="sourceLineNo">178</span>      state = ScanControllerState.SUSPENDED;<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      ScanResumerImpl resumer = new ScanResumerImpl();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>      this.resumer = resumer;<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      return resumer;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>    @Override<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    public void terminate() {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      preCheck();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      state = ScanControllerState.TERMINATED;<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    }<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>    // return the current state, and set the state to DESTROYED.<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    ScanControllerState destroy() {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      ScanControllerState state = this.state;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      this.state = ScanControllerState.DESTROYED;<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      return state;<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
+<span class="sourceLineNo">196</span><a name="line.196"></a>
+<span class="sourceLineNo">197</span>    @Override<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    public Optional&lt;Cursor&gt; cursor() {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>        return cursor;<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
+<span class="sourceLineNo">201</span>  }<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>  private enum ScanResumerState {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    INITIALIZED, SUSPENDED, RESUMED<a name="line.204"></a>
+<span class="sourceLineNo">205</span>  }<a name="line.205"></a>
+<span class="sourceLineNo">206</span><a name="line.206"></a>
+<span class="sourceLineNo">207</span>  // The resume method is allowed to be called in another thread so here we also use the<a name="line.207"></a>
+<span class="sourceLineNo">208</span>  // ResumerState to prevent race. The initial state is INITIALIZED, and in most cases, when back<a name="line.208"></a>
+<span class="sourceLineNo">209</span>  // from onNext or onHeartbeat, we will call the prepare method to change the state to SUSPENDED,<a name="line.209"></a>
+<span class="sourceLineNo">210</span>  // and when user calls resume method, we will change the state to RESUMED. But the resume method<a name="line.210"></a>
+<span class="sourceLineNo">211</span>  // could be called in other thread, and in fact, user could just do this:<a name="line.211"></a>
+<span class="sourceLineNo">212</span>  // controller.suspend().resume()<a name="line.212"></a>
+<span class="sourceLineNo">213</span>  // This is strange but valid. This means the scan could be resumed before we call the prepare<a name="line.213"></a>
+<span class="sourceLineNo">214</span>  // method to do the actual suspend work. So in the resume method, we will check if the state is<a name="line.214"></a>
+<span class="sourceLineNo">215</span>  // INTIALIZED, if it is, then we will just set the state to RESUMED and return. And in prepare<a name="line.215"></a>
+<span class="sourceLineNo">216</span>  // method, if the state is RESUMED already, we will just return an let the scan go on.<a name="line.216"></a>
+<span class="sourceLineNo">217</span>  // Notice that, the public methods of this class is supposed to be called by upper layer only, and<a name="line.217"></a>
+<span class="sourceLineNo">218</span>  // package private methods can only be called within the implementation of<a name="line.218"></a>
+<span class="sourceLineNo">219</span>  // AsyncScanSingleRegionRpcRetryingCaller.<a name="line.219"></a>
+<span class="sourceLineNo">220</span>  private final class ScanResumerImpl implements RawScanResultConsumer.ScanResumer {<a name="line.220"></a>
+<span class="sourceLineNo">221</span><a name="line.221"></a>
+<span class="sourceLineNo">222</span>    // INITIALIZED -&gt; SUSPENDED -&gt; RESUMED<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    // INITIALIZED -&gt; RESUMED<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    private ScanResumerState state = ScanResumerState.INITIALIZED;<a name="line.224"></a>
+<span class="sourceLineNo">225</span><a name="line.225"></a>
+<span class="sourceLineNo">226</span>    private ScanResponse resp;<a name="line.226"></a>
+<span class="sourceLineNo">227</span><a name="line.227"></a>
+<span class="sourceLineNo">228</span>    private int numberOfCompleteRows;<a name="line.228"></a>
+<span class="sourceLineNo">229</span><a name="line.229"></a>
+<span class="sourceLineNo">230</span>    // If the scan is suspended successfully, we need to do lease renewal to prevent it being closed<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    // by RS due to lease expire. It is a one-time timer task so we need to schedule a new task<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    // every time when the previous task is finished. There could also be race as the renewal is<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    // executed in the timer thread, so we also need to check the state before lease renewal. If the<a name="line.233"></a>
+<span class="sourceLineNo">234</span>    // state is RESUMED already, we will give up lease renewal and also not schedule the next lease<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    // renewal task.<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    private Timeout leaseRenewer;<a name="line.236"></a>
+<span class="sourceLineNo">237</span><a name="line.237"></a>
+<span class="sourceLineNo">238</span>    @Override<a name="line.238"></a>
+<span class="sourceLineNo">239</span>    public void resume() {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      // just used to fix findbugs warnings. In fact, if resume is called before prepare, then we<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      // just return at the first if condition without loading the resp and numValidResuls field. If<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      // resume is called after suspend, then it is also safe to just reference resp and<a name="line.242"></a>
+<span class="sourceLineNo">243</span>      // numValidResults after the synchronized block as no one will change it anymore.<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      ScanResponse localResp;<a name="line.244"></a>
+<span class="sourceLineNo">245</span>      int localNumberOfCompleteRows;<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      synchronized (this) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        if (state == ScanResumerState.INITIALIZED) {<a name="line.247"></a>
+<span class="sourceLineNo">248</span>          // user calls this method before we call prepare, so just set the state to<a name="line.248"></a>
+<span class="sourceLineNo">249</span>          // RESUMED, the implementation will just go on.<a name="line.249"></a>
+<span class="sourceLineNo">250</span>          state = ScanResumerState.RESUMED;<a name="line.250"></a>
+<span class="sourceLineNo">251</span>          return;<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        }<a name="line.252"></a>
+<span class="sourceLineNo">253</span>        if (state == ScanResumerState.RESUMED) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>          // already resumed, give up.<a name="line.254"></a>
+<span class="sourceLineNo">255</span>          return;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>        }<a name="line.256"></a>
+<span class="sourceLineNo">257</span>        state = ScanResumerState.RESUMED;<a name="line.257"></a>
+<span class="sourceLineNo">258</span>        if (leaseRenewer != null) {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>          leaseRenewer.cancel();<a name="line.259"></a>
+<span class="sourceLineNo">260</span>        }<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        localResp = this.resp;<a name="line.261"></a>
+<span class="sourceLineNo">262</span>        localNumberOfCompleteRows = this.numberOfCompleteRows;<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      }<a name="line.263"></a>
+<span class="sourceLineNo">264</span>      completeOrNext(localResp, localNumberOfCompleteRows);<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    }<a name="line.265"></a>
+<span class="sourceLineNo">266</span><a name="line.266"></a>
+<span class="sourceLineNo">267</span>    private void scheduleRenewLeaseTask() {<a name="line.267"></a>
+<span class="sourceLineNo">268</span>      leaseRenewer = retryTimer.newTimeout(t -&gt; tryRenewLease(), scannerLeaseTimeoutPeriodNs / 2,<a name="line.268"></a>
+<span class="sourceLineNo">269</span>        TimeUnit.NANOSECONDS);<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    }<a name="line.270"></a>
+<span class="sourceLineNo">271</span><a name="line.271"></a>
+<span class="sourceLineNo">272</span>    private synchronized void tryRenewLease() {<a name="line.272"></a>
+<span class="sourceLineNo">273</span>      // the scan has already been resumed, give up<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      if (state == ScanResumerState.RESUMED) {<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        return;<a name="line.275"></a>
+<span class="sourceLineNo">276</span>      }<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      renewLease();<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      // schedule the next renew lease task again as this is a one-time task.<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      scheduleRenewLeaseTask();<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    }<a name="line.280"></a>
+<span class="sourceLineNo">281</span><a name="line.281"></a>
+<span class="sourceLineNo">282</span>    // return false if the scan has already been resumed. See the comment above for ScanResumerImpl<a name="line.282"></a>
+<span class="sourceLineNo">283</span>    // for more details.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>    synchronized boolean prepare(ScanResponse resp, int numberOfCompleteRows) {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      if (state == ScanResumerState.RESUMED) {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>        // user calls resume before we actually suspend the scan, just continue;<a name="line.286"></a>
+<span class="sourceLineNo">287</span>        return false;<a name="line.287"></a>
+<span class="sourceLineNo">288</span>      }<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      state = ScanResumerState.SUSPENDED;<a name="line.289"></a>
+<span class="sourceLineNo">290</span>      this.resp = resp;<a name="line.290"></a>
+<span class="sourceLineNo">291</span>      this.numberOfCompleteRows = numberOfCompleteRows;<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      // if there are no more results in region then the scanner at RS side will be closed<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      // automatically so we do not need to renew lease.<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      if (resp.getMoreResultsInRegion()) {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        // schedule renew lease task<a name="line.295"></a>
+<span class="sourceLineNo">296</span>        scheduleRenewLeaseTask();<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      }<a name="line.297"></a>
+<span class="sourceLineNo">298</span>      return true;<a name="line.298"></a>
+<span class="sourceLineNo">299</span>    }<a name="line.299"></a>
+<span class="sourceLineNo">300</span>  }<a name="line.300"></a>
+<span class="sourceLineNo">301</span><a name="line.301"></a>
+<span class="sourceLineNo">302</span>  public AsyncScanSingleRegionRpcRetryingCaller(HashedWheelTimer retryTimer,<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      AsyncConnectionImpl conn, Scan scan, ScanMetrics scanMetrics, long scannerId,<a name="line.303"></a>
+<span class="sourceLineNo">304</span>      ScanResultCache resultCache, RawScanResultConsumer consumer, Interface stub,<a name="line.304"></a>
+<span class="sourceLineNo">305</span>      HRegionLocation loc, boolean isRegionServerRemote, long scannerLeaseTimeoutPeriodNs,<a name="line.305"></a>
+<span class="sourceLineNo">306</span>      long pauseNs, int maxAttempts, long scanTimeoutNs, long rpcTimeoutNs, int startLogErrorsCnt) {<a name="line.306"></a>
+<span class="sourceLineNo">307</span>    this.retryTimer = retryTimer;<a name="line.307"></a>
+<span class="sourceLineNo">308</span>    this.scan = scan;<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    this.scanMetrics = scanMetrics;<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    this.scannerId = scannerId;<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    this.resultCache = resultCache;<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    this.consumer = consumer;<a name="line.312"></a>
+<span class="sourceLineNo">313</span>    this.stub = stub;<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    this.loc = loc;<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    this.regionServerRemote = isRegionServerRemote;<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    this.scannerLeaseTimeoutPeriodNs = scannerLeaseTimeoutPeriodNs;<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    this.pauseNs = pauseNs;<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    this.maxAttempts = maxAttempts;<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    this.scanTimeoutNs = scanTimeoutNs;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    this.rpcTimeoutNs = rpcTimeoutNs;<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    this.startLogErrorsCnt = startLogErrorsCnt;<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    if (scan.isReversed()) {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      completeWhenNoMoreResultsInRegion = this::completeReversedWhenNoMoreResultsInRegion;<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    } else {<a name="line.324"></a>
+<span class="sourceLineNo">325</span>      completeWhenNoMoreResultsInRegion = this::completeWhenNoMoreResultsInRegion;<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    }<a name="line.326"></a>
+<span class="sourceLineNo">327</span>    this.future = new CompletableFuture&lt;&gt;();<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    this.controller = conn.rpcControllerFactory.newController();<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    this.exceptions = new ArrayList&lt;&gt;();<a name="line.329"></a>
+<span class="sourceLineNo">330</span>  }<a name="line.330"></a>
+<span class="sourceLineNo">331</span><a name="line.331"></a>
+<span class="sourceLineNo">332</span>  private long elapsedMs() {<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - nextCallStartNs);<a name="line.333"></a>
+<span class="sourceLineNo">334</span>  }<a name="line.334"></a>
+<span class="sourceLineNo">335</span><a name="line.335"></a>
+<span class="sourceLineNo">336</span>  private long remainingTimeNs() {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    return scanTimeoutNs - (System.nanoTime() - nextCallStartNs);<a name="line.337"></a>
 <span class="sourceLineNo">338</span>  }<a name="line.338"></a>
 <span class="sourceLineNo">339</span><a name="line.339"></a>
-<span class="sourceLineNo">340</span>  private void completeExceptionally(boolean closeScanner) {<a name="line.340"></a>
-<span class="sourceLineNo">341</span>    resultCache.clear();<a name="line.341"></a>
-<span class="sourceLineNo">342</span>    if (closeScanner) {<a name="line.342"></a>
-<span class="sourceLineNo">343</span>      closeScanner();<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    }<a name="line.344"></a>
-<span class="sourceLineNo">345</span>    future.completeExceptionally(new RetriesExhaustedException(tries - 1, exceptions));<a name="line.345"></a>
-<span class="sourceLineNo">346</span>  }<a name="line.346"></a>
-<span class="sourceLineNo">347</span><a name="line.347"></a>
-<span class="sourceLineNo">348</span>  private void completeNoMoreResults() {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    future.complete(false);<a name="line.349"></a>
-<span class="sourceLineNo">350</span>  }<a name="line.350"></a>
-<span class="sourceLineNo">351</span><a name="line.351"></a>
-<span class="sourceLineNo">352</span>  private void completeWithNextStartRow(byte[] row, boolean inclusive) {<a name="line.352"></a>
-<span class="sourceLineNo">353</span>    scan.withStartRow(row, inclusive);<a name="line.353"></a>
-<span class="sourceLineNo">354</span>    future.complete(true);<a name="line.354"></a>
-<span class="sourceLineNo">355</span>  }<a name="line.355"></a>
-<span class="sourceLineNo">356</span><a name="line.356"></a>
-<span class="sourceLineNo">357</span>  private void completeWhenError(boolean closeScanner) {<a name="line.357"></a>
-<span class="sourceLineNo">358</span>    incRPCRetriesMetrics(scanMetrics, closeScanner);<a name="line.358"></a>
-<span class="sourceLineNo">359</span>    resultCache.clear();<a name="line.359"></a>
-<span class="sourceLineNo">360</span>    if (closeScanner) {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      closeScanner();<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    }<a name="line.362"></a>
-<span class="sourceLineNo">363</span>    if (nextStartRowWhenError != null) {<a name="line.363"></a>
-<span class="sourceLineNo">364</span>      scan.withStartRow(nextStartRowWhenError, includeNextStartRowWhenError);<a name="line.364"></a>
-<span class="sourceLineNo">365</span>    }<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    future.complete(true);<a name="line.366"></a>
-<span class="sourceLineNo">367</span>  }<a name="line.367"></a>
-<span class="sourceLineNo">368</span><a name="line.368"></a>
-<span class="sourceLineNo">369</span>  private void onError(Throwable error) {<a name="line.369"></a>
-<span class="sourceLineNo">370</span>    error = translateException(error);<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    if (tries &gt; startLogErrorsCnt) {<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      LOG.warn("Call to " + loc.getServerName() + " for scanner id = " + scannerId + " for " +<a name="line.372"></a>
-<span class="sourceLineNo">373</span>          loc.getRegionInfo().getEncodedName() + " of " + loc.getRegionInfo().getTable() +<a name="line.373"></a>
-<span class="sourceLineNo">374</span>          " failed, , tries = " + tries + ", maxAttempts = " + maxAttempts + ", timeout = " +<a name="line.374"></a>
-<span class="sourceLineNo">375</span>          TimeUnit.NANOSECONDS.toMillis(scanTimeoutNs) + " ms, time elapsed = " + elapsedMs() +<a name="line.375"></a>
-<span class="sourceLineNo">376</span>          " ms",<a name="line.376"></a>
-<span class="sourceLineNo">377</span>        error);<a name="line.377"></a>
-<span class="sourceLineNo">378</span>    }<a name="line.378"></a>
-<span class="sourceLineNo">379</span>    boolean scannerClosed = error instanceof UnknownScannerException ||<a name="line.379"></a>
-<span class="sourceLineNo">380</span>        error instanceof NotServingRegionException || error instanceof RegionServerStoppedException;<a name="line.380"></a>
-<span class="sourceLineNo">381</span>    RetriesExhaustedException.ThrowableWithExtraContext qt =<a name="line.381"></a>
-<span class="sourceLineNo">382</span>        new RetriesExhaustedException.ThrowableWithExtraContext(error,<a name="line.382"></a>
-<span class="sourceLineNo">383</span>            EnvironmentEdgeManager.currentTime(), "");<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    exceptions.add(qt);<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    if (tries &gt;= maxAttempts) {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>      completeExceptionally(!scannerClosed);<a name="line.386"></a>
-<span class="sourceLineNo">387</span>      return;<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    }<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    long delayNs;<a name="line.389"></a>
-<span class="sourceLineNo">390</span>    if (scanTimeoutNs &gt; 0) {<a name="line.390"></a>
-<span class="sourceLineNo">391</span>      long maxDelayNs = remainingTimeNs() - SLEEP_DELTA_NS;<a name="line.391"></a>
-<span class="sourceLineNo">392</span>      if (maxDelayNs &lt;= 0) {<a name="line.392"></a>
-<span class="sourceLineNo">393</span>        completeExceptionally(!scannerClosed);<a name="line.393"></a>
-<span class="sourceLineNo">394</span>        return;<a name="line.394"></a>
-<span class="sourceLineNo">395</span>      }<a name="line.395"></a>
-<span class="sourceLineNo">396</span>      delayNs = Math.min(maxDelayNs, getPauseTime(pauseNs, tries - 1));<a name="line.396"></a>
-<span class="sourceLineNo">397</span>    } else {<a name="line.397"></a>
-<span class="sourceLineNo">398</span>      delayNs = getPauseTime(pauseNs, tries - 1);<a name="line.398"></a>
-<span class="sourceLineNo">399</span>    }<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    if (scannerClosed) {<a name="line.400"></a>
-<span class="sourceLineNo">401</span>      completeWhenError(false);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>      return;<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    }<a name="line.403"></a>
-<span class="sourceLineNo">404</span>    if (error instanceof OutOfOrderScannerNextException || error instanceof ScannerResetException) {<a name="line.404"></a>
-<span class="sourceLineNo">405</span>      completeWhenError(true);<a name="line.405"></a>
-<span class="sourceLineNo">406</span>      return;<a name="line.406"></a>
-<span class="sourceLineNo">407</span>    }<a name="line.407"></a>
-<span class="sourceLineNo">408</span>    if (error instanceof DoNotRetryIOException) {<a name="line.408"></a>
-<span class="sourceLineNo">409</span>      completeExceptionally(true);<a name="line.409"></a>
-<span class="sourceLineNo">410</span>      return;<a name="line.410"></a>
-<span class="sourceLineNo">411</span>    }<a name="line.411"></a>
-<span class="sourceLineNo">412</span>    tries++;<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    retryTimer.newTimeout(t -&gt; call(), delayNs, TimeUnit.NANOSECONDS);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>  }<a name="line.414"></a>
-<span class="sourceLineNo">415</span><a name="line.415"></a>
-<span class="sourceLineNo">416</span>  private void updateNextStartRowWhenError(Result result) {<a name="line.416"></a>
-<span class="sourceLineNo">417</span>    nextStartRowWhenError = result.getRow();<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    includeNextStartRowWhenError = result.mayHaveMoreCellsInRow();<a name="line.418"></a>
-<span class="sourceLineNo">419</span>  }<a name="line.419"></a>
-<span class="sourceLineNo">420</span><a name="line.420"></a>
-<span class="sourceLineNo">421</span>  private void completeWhenNoMoreResultsInRegion() {<a name="line.421"></a>
-<span class="sourceLineNo">422</span>    if (noMoreResultsForScan(scan, loc.getRegionInfo())) {<a name="line.422"></a>
-<span class="sourceLineNo">423</span>      completeNoMoreResults();<a name="line.423"></a>
-<span class="sourceLineNo">424</span>    } else {<a name="line.424"></a>
-<span class="sourceLineNo">425</span>      completeWithNextStartRow(loc.getRegionInfo().getEndKey(), true);<a name="line.425"></a>
-<span class="sourceLineNo">426</span>    }<a name="line.426"></a>
-<span class="sourceLineNo">427</span>  }<a name="line.427"></a>
-<span class="sourceLineNo">428</span><a name="line.428"></a>
-<span class="sourceLineNo">429</span>  private void completeReversedWhenNoMoreResultsInRegion() {<a name="line.429"></a>
-<span class="sourceLineNo">430</span>    if (noMoreResultsForReverseScan(scan, loc.getRegionInfo())) {<a name="line.430"></a>
-<span class="sourceLineNo">431</span>      completeNoMoreResults();<a name="line.431"></a>
-<span class="sourceLineNo">432</span>    } else {<a name="line.432"></a>
-<span class="sourceLineNo">433</span>      completeWithNextStartRow(loc.getRegionInfo().getStartKey(), false);<a name="line.433"></a>
-<span class="sourceLineNo">434</span>    }<a name="line.434"></a>
-<span class="sourceLineNo">435</span>  }<a name="line.435"></a>
-<span class="sourceLineNo">436</span><a name="line.436"></a>
-<span class="sourceLineNo">437</span>  private void completeOrNext(ScanResponse resp, int numberOfCompleteRows) {<a name="line.437"></a>
-<span class="sourceLineNo">438</span>    if (resp.hasMoreResults() &amp;&amp; !resp.getMoreResults()) {<a name="line.438"></a>
-<span class="sourceLineNo">439</span>      // RS tells us there is no more data for the whole scan<a name="line.439"></a>
-<span class="sourceLineNo">440</span>      completeNoMoreResults();<a name="line.440"></a>
-<span class="sourceLineNo">441</span>      return;<a name="line.441"></a>
-<span class="sourceLineNo">442</span>    }<a name="line.442"></a>
-<span class="sourceLineNo">443</span>    if (scan.getLimit() &gt; 0) {<a name="line.443"></a>
-<span class="sourceLineNo">444</span>      // The RS should have set the moreResults field in ScanResponse to false when we have reached<a name="line.444"></a>
-<span class="sourceLineNo">445</span>      // the limit, so we add an assert here.<a name="line.445"></a>
-<span class="sourceLineNo">446</span>      int newLimit = scan.getLimit() - numberOfCompleteRows;<a name="line.446"></a>
-<span class="sourceLineNo">447</span>      assert newLimit &gt; 0;<a name="line.447"></a>
-<span class="sourceLineNo">448</span>      scan.setLimit(newLimit);<a name="line.448"></a>
-<span class="sourceLineNo">449</span>    }<a name="line.449"></a>
-<span class="sourceLineNo">450</span>    // as in 2.0 this value will always be set<a name="line.450"></a>
-<span class="sourceLineNo">451</span>    if (!resp.getMoreResultsInRegion()) {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>      completeWhenNoMoreResultsInRegion.run();<a name="line.452"></a>
-<span class="sourceLineNo">453</span>      return;<a name="line.453"></a>
-<span class="sourceLineNo">454</span>    }<a name="line.454"></a>
-<span class="sourceLineNo">455</span>    next();<a name="line.455"></a>
-<span class="sourceLineNo">456</span>  }<a name="line.456"></a>
-<span class="sourceLineNo">457</span><a name="line.457"></a>
-<span class="sourceLineNo">458</span>  private void onComplete(HBaseRpcController controller, ScanResponse resp) {<a name="line.458"></a>
-<span class="sourceLineNo">459</span>    if (controller.failed()) {<a name="line.459"></a>
-<span class="sourceLineNo">460</span>      onError(controller.getFailed());<a name="line.460"></a>
-<span class="sourceLineNo">461</span>      return;<a name="line.461"></a>
-<span class="sourceLineNo">462</span>    }<a name="line.462"></a>
-<span class="sourceLineNo">463</span>    updateServerSideMetrics(scanMetrics, resp);<a name="line.463"></a>
-<span class="sourceLineNo">464</span>    boolean isHeartbeatMessage = resp.hasHeartbeatMessage() &amp;&amp; resp.getHeartbeatMessage();<a name="line.464"></a>
-<span class="sourceLineNo">465</span>    Result[] results;<a name="line.465"></a>
-<span class="sourceLineNo">466</span>    int numberOfCompleteRowsBefore = resultCache.numberOfCompleteRows();<a name="line.466"></a>
-<span class="sourceLineNo">467</span>    try {<a name="line.467"></a>
-<span class="sourceLineNo">468</span>      Result[] rawResults = ResponseConverter.getResults(controller.cellScanner(), resp);<a name="line.468"></a>
-<span class="sourceLineNo">469</span>      updateResultsMetrics(scanMetrics, rawResults, isHeartbeatMessage);<a name="line.469"></a>
-<span class="sourceLineNo">470</span>      results = resultCache.addAndGet(<a name="line.470"></a>
-<span class="sourceLineNo">471</span>        Optional.ofNullable(rawResults).orElse(ScanResultCache.EMPTY_RESULT_ARRAY),<a name="line.471"></a>
-<span class="sourceLineNo">472</span>        isHeartbeatMessage);<a name="line.472"></a>
-<span class="sourceLineNo">473</span>    } catch (IOException e) {<a name="line.473"></a>
-<span class="sourceLineNo">474</span>      // We can not retry here. The server has responded normally and the call sequence has been<a name="line.474"></a>
-<span class="sourceLineNo">475</span>      // increased so a new scan with the same call sequence will cause an<a name="line.475"></a>
-<span class="sourceLineNo">476</span>      // OutOfOrderScannerNextException. Let the upper layer open a new scanner.<a name="line.476"></a>
-<span class="sourceLineNo">477</span>      LOG.warn("decode scan response failed", e);<a name="line.477"></a>
-<span class="sourceLineNo">478</span>      completeWhenError(true);<a name="line.478"></a>
-<span class="sourceLineNo">479</span>      return;<a name="line.479"></a>
-<span class="sourceLineNo">480</span>    }<a name="line.480"></a>
-<span class="sourceLineNo">481</span><a name="line.481"></a>
-<span class="sourceLineNo">482</span>    ScanControllerImpl scanController = new ScanControllerImpl();<a name="line.482"></a>
-<span class="sourceLineNo">483</span>    if (results.length &gt; 0) {<a name="line.483"></a>
-<span class="sourceLineNo">484</span>      updateNextStartRowWhenError(results[results.length - 1]);<a name="line.484"></a>
-<span class="sourceLineNo">485</span>      consumer.onNext(results, scanController);<a name="line.485"></a>
-<span class="sourceLineNo">486</span>    } else if (resp.hasHeartbeatMessage() &amp;&amp; resp.getHeartbeatMessage()) {<a name="line.486"></a>
-<span class="sourceLineNo">487</span>      consumer.onHeartbeat(scanController);<a name="line.487"></a>
-<span class="sourceLineNo">488</span>    }<a name="line.488"></a>
-<span class="sourceLineNo">489</span>    ScanControllerState state = scanController.destroy();<a name="line.489"></a>
-<span class="sourceLineNo">490</span>    if (state == ScanControllerState.TERMINATED) {<a name="line.490"></a>
-<span class="sourceLineNo">491</span>      if (resp.getMoreResultsInRegion()) {<a name="line.491"></a>
-<span class="sourceLineNo">492</span>        // we have more results in region but user request to stop the scan, so we need to close the<a name="line.492"></a>
-<span class="sourceLineNo">493</span>        // scanner explicitly.<a name="line.493"></a>
-<span class="sourceLineNo">494</span>        closeScanner();<a name="line.494"></a>
-<span class="sourceLineNo">495</span>      }<a name="line.495"></a>
-<span class="sourceLineNo">496</span>      completeNoMoreResults();<a name="line.496"></a>
-<span class="sourceLineNo">497</span>      return;<a name="line.497"></a>
-<span class="sourceLineNo">498</span>    }<a name="line.498"></a>
-<span class="sourceLineNo">499</span>    int numberOfCompleteRows = resultCache.numberOfCompleteRows() - numberOfCompleteRowsBefore;<a name="line.499"></a>
-<span class="sourceLineNo">500</span>    if (state == ScanControllerState.SUSPENDED) {<a name="line.500"></a>
-<span class="sourceLineNo">501</span>      if (scanController.resumer.prepare(resp, numberOfCompleteRows)) {<a name="line.501"></a>
-<span class="sourceLineNo">502</span>        return;<a name="line.502"></a>
-<span class="sourceLineNo">503</span>      }<a name="line.503"></a>
-<span class="sourceLineNo">504</span>    }<a name="line.504"></a>
-<span class="sourceLineNo">505</span>    completeOrNext(resp, numberOfCompleteRows);<a name="line.505"></a>
-<span class="sourceLineNo">506</span>  }<a name="line.506"></a>
-<span class="sourceLineNo">507</span><a name="line.507"></a>
-<span class="sourceLineNo">508</span>  private void call() {<a name="line.508"></a>
-<span class="sourceLineNo">509</span>    // As we have a call sequence for scan, it is useless to have a different rpc timeout which is<a name="line.509"></a>
-<span class="sourceLineNo">510</span>    // less than the scan timeout. If the server does not respond in time(usually this will not<a name="line.510"></a>
-<span class="sourceLineNo">511</span>    // happen as we have heartbeat now), we will get an OutOfOrderScannerNextException when<a name="line.511"></a>
-<span class="sourceLineNo">512</span>    // resending the next request and the only way to fix this is to close the scanner and open a<a name="line.512"></a>
-<span class="sourceLineNo">513</span>    // new one.<a name="line.513"></a>
-<span class="sourceLineNo">514</span>    long callTimeoutNs;<a name="line.514"></a>
-<span class="sourceLineNo">515</span>    if (scanTimeoutNs &gt; 0) {<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      long remainingNs = scanTimeoutNs - (System.nanoTime() - nextCallStartNs);<a name="line.516"></a>
-<span class="sourceLineNo">517</span>      if (remainingNs &lt;= 0) {<a name="line.517"></a>
-<span class="sourceLineNo">518</span>        completeExceptionally(true);<a name="line.518"></a>
-<span class="sourceLineNo">519</span>        return;<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      }<a name="line.520"></a>
-<span class="sourceLineNo">521</span>      callTimeoutNs = remainingNs;<a name="line.521"></a>
-<span class="sourceLineNo">522</span>    } else {<a name="line.522"></a>
-<span class="sourceLineNo">523</span>      callTimeoutNs = 0L;<a name="line.523"></a>
-<span class="sourceLineNo">524</span>    }<a name="line.524"></a>
-<span class="sourceLineNo">525</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.525"></a>
-<span class="sourceLineNo">526</span>    if (tries &gt; 1) {<a name="line.526"></a>
-<span class="sourceLineNo">527</span>      incRPCRetriesMetrics(scanMetrics, regionServerRemote);<a name="line.527"></a>
-<span class="sourceLineNo">528</span>    }<a name="line.528"></a>
-<span class="sourceLineNo">529</span>    resetController(controller, callTimeoutNs);<a name="line.529"></a>
-<span class="sourceLineNo">530</span>    ScanRequest req = RequestConverter.buildScanRequest(scannerId, scan.getCaching(), false,<a name="line.530"></a>
-<span class="sourceLineNo">531</span>      nextCallSeq, false, false, scan.getLimit());<a name="line.531"></a>
-<span class="sourceLineNo">532</span>    stub.scan(controller, req, resp -&gt; onComplete(controller, resp));<a name="line.532"></a>
-<span class="sourceLineNo">533</span>  }<a name="line.533"></a>
-<span class="sourceLineNo">534</span><a name="line.534"></a>
-<span class="sourceLineNo">535</span>  private void next() {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    nextCallSeq++;<a name="line.536"></a>
-<span class="sourceLineNo">537</span>    tries = 1;<a name="line.537"></a>
-<span class="sourceLineNo">538</span>    exceptions.clear();<a name="line.538"></a>
-<span class="sourceLineNo">539</span>    nextCallStartNs = System.nanoTime();<a name="line.539"></a>
-<span class="sourceLineNo">540</span>    call();<a name="line.540"></a>
-<span class="sourceLineNo">541</span>  }<a name="line.541"></a>
-<span class="sourceLineNo">542</span><a name="line.542"></a>
-<span class="sourceLineNo">543</span>  private void renewLease() {<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    nextCallSeq++;<a name="line.545"></a>
-<span class="sourceLineNo">546</span>    resetController(controller, rpcTimeoutNs);<a name="line.546"></a>
-<span class="sourceLineNo">547</span>    ScanRequest req =<a name="line.547"></a>
-<span class="sourceLineNo">548</span>        RequestConverter.buildScanRequest(scannerId, 0, false, nextCallSeq, false, true, -1);<a name="line.548"></a>
-<span class="sourceLineNo">549</span>    stub.scan(controller, req, resp -&gt; {<a name="line.549"></a>
-<span class="sourceLineNo">550</span>    });<a name="line.550"></a>
-<span class="sourceLineNo">551</span>  }<a name="line.551"></a>
-<span class="sourceLineNo">552</span><a name="line.552"></a>
-<span class="sourceLineNo">553</span>  /**<a name="line.553"></a>
-<span class="sourceLineNo">554</span>   * Now we will also fetch some cells along with the scanner id when opening a scanner, so we also<a name="line.554"></a>
-<span class="sourceLineNo">555</span>   * need to process the ScanResponse for the open scanner request. The HBaseRpcController for the<a name="line.555"></a>
-<span class="sourceLineNo">556</span>   * open scanner request is also needed because we may have some data in the CellScanner which is<a name="line.556"></a>
-<span class="sourceLineNo">557</span>   * contained in the controller.<a name="line.557"></a>
-<span class="sourceLineNo">558</span>   * @return {@code true} if we should continue, otherwise {@code false}.<a name="line.558"></a>
-<span class="sourceLineNo">559</span>   */<a name="line.559"></a>
-<span class="sourceLineNo">560</span>  public CompletableFuture&lt;Boolean&gt; start(HBaseRpcController controller,<a name="line.560"></a>
-<span class="sourceLineNo">561</span>      ScanResponse respWhenOpen) {<a name="line.561"></a>
-<span class="sourceLineNo">562</span>    onComplete(controller, respWhenOpen);<a name="line.562"></a>
-<span class="sourceLineNo">563</span>    return future;<a name="line.563"></a>
-<span class="sourceLineNo">564</span>  }<a name="line.564"></a>
-<span class="sourceLineNo">565</span>}<a name="line.565"></a>
+<span class="sourceLineNo">340</span>  private void closeScanner() {<a name="line.340"></a>
+<span class="sourceLineNo">341</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.341"></a>
+<span class="sourceLineNo">342</span>    resetController(controller, rpcTimeoutNs);<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    ScanRequest req = RequestConverter.buildScanRequest(this.scannerId, 0, true, false);<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    stub.scan(controller, req, resp -&gt; {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      if (controller.failed()) {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        LOG.warn("Call to " + loc.getServerName() + " for closing scanner id = " + scannerId +<a name="line.346"></a>
+<span class="sourceLineNo">347</span>            " for " + loc.getRegionInfo().getEncodedName() + " of " +<a name="line.347"></a>
+<span class="sourceLineNo">348</span>            loc.getRegionInfo().getTable() + " failed, ignore, probably already closed",<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          controller.getFailed());<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    });<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  }<a name="line.352"></a>
+<span class="sourceLineNo">353</span><a name="line.353"></a>
+<span class="sourceLineNo">354</span>  private void completeExceptionally(boolean closeScanner) {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    resultCache.clear();<a name="line.355"></a>
+<span class="sourceLineNo">356</span>    if (closeScanner) {<a name="line.356"></a>
+<span class="sourceLineNo">357</span>      closeScanner();<a name="line.357"></a>
+<span class="sourceLineNo">358</span>    }<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    future.completeExceptionally(new RetriesExhaustedException(tries - 1, exceptions));<a name="line.359"></a>
+<span class="sourceLineNo">360</span>  }<a name="line.360"></a>
+<span class="sourceLineNo">361</span><a name="line.361"></a>
+<span class="sourceLineNo">362</span>  private void completeNoMoreResults() {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    future.complete(false);<a name="line.363"></a>
+<span class="sourceLineNo">364</span>  }<a name="line.364"></a>
+<span class="sourceLineNo">365</span><a name="line.365"></a>
+<span class="sourceLineNo">366</span>  private void completeWithNextStartRow(byte[] row, boolean inclusive) {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    scan.withStartRow(row, inclusive);<a name="line.367"></a>
+<span class="sourceLineNo">368</span>    future.complete(true);<a name="line.368"></a>
+<span class="sourceLineNo">369</span>  }<a name="line.369"></a>
+<span class="sourceLineNo">370</span><a name="line.370"></a>
+<span class="sourceLineNo">371</span>  private void completeWhenError(boolean closeScanner) {<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    incRPCRetriesMetrics(scanMetrics, closeScanner);<a name="line.372"></a>
+<span class="sourceLineNo">373</span>    resultCache.clear();<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    if (closeScanner) {<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      closeScanner();<a name="line.375"></a>
+<span class="sourceLineNo">376</span>    }<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    if (nextStartRowWhenError != null) {<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      scan.withStartRow(nextStartRowWhenError, includeNextStartRowWhenError);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    }<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    future.complete(true);<a name="line.380"></a>
+<span class="sourceLineNo">381</span>  }<a name="line.381"></a>
+<span class="sourceLineNo">382</span><a name="line.382"></a>
+<span class="sourceLineNo">383</span>  private void onError(Throwable error) {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>    error = translateException(error);<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    if (tries &gt; startLogErrorsCnt) {<a name="line.385"></a>
+<span class="sourceLineNo">386</span>      LOG.warn("Call to " + loc.getServerName() + " for scanner id = " + scannerId + " for " +<a name="line.386"></a>
+<span class="sourceLineNo">387</span>          loc.getRegionInfo().getEncodedName() + " of " + loc.getRegionInfo().getTable() +<a name="line.387"></a>
+<span class="sourceLineNo">388</span>          " failed, , tries = " + tries + ", maxAttempts = " + maxAttempts + ", timeout = " +<a name="line.388"></a>
+<span class="sourceLineNo">389</span>          TimeUnit.NANOSECONDS.toMillis(scanTimeoutNs) + " ms, time elapsed = " + elapsedMs() +<a name="line.389"></a>
+<span class="sourceLineNo">390</span>          " ms",<a name="line.390"></a>
+<span class="sourceLineNo">391</span>        error);<a name="line.391"></a>
+<span class="sourceLineNo">392</span>    }<a name="line.392"></a>
+<span class="sourceLineNo">393</span>    boolean scannerClosed = error instanceof UnknownScannerException ||<a name="line.393"></a>
+<span class="sourceLineNo">394</span>        error instanceof NotServingRegionException || error instanceof RegionServerStoppedException;<a name="line.394"></a>
+<span class="sourceLineNo">395</span>    RetriesExhaustedException.ThrowableWithExtraContext qt =<a name="line.395"></a>
+<span class="sourceLineNo">396</span>        new RetriesExhaustedException.ThrowableWithExtraContext(error,<a name="line.396"></a>
+<span class="sourceLineNo">397</span>            EnvironmentEdgeManager.currentTime(), "");<a name="line.397"></a>
+<span class="sourceLineNo">398</span>    exceptions.add(qt);<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    if (tries &gt;= maxAttempts) {<a name="line.399"></a>
+<span class="sourceLineNo">400</span>      completeExceptionally(!scannerClosed);<a name="line.400"></a>
+<span class="sourceLineNo">401</span>      return;<a name="line.401"></a>
+<span class="sourceLineNo">402</span>    }<a name="line.402"></a>
+<span class="sourceLineNo">403</span>    long delayNs;<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    if (scanTimeoutNs &gt; 0) {<a name="line.404"></a>
+<span class="sourceLineNo">405</span>      long maxDelayNs = remainingTimeNs() - SLEEP_DELTA_NS;<a name="line.405"></a>
+<span class="sourceLineNo">406</span>      if (maxDelayNs &lt;= 0) {<a name="line.406"></a>
+<span class="sourceLineNo">407</span>        completeExceptionally(!scannerClosed);<a name="line.407"></a>
+<span class="sourceLineNo">408</span>        return;<a name="line.408"></a>
+<span class="sourceLineNo">409</span>      }<a name="line.409"></a>
+<span class="sourceLineNo">410</span>      delayNs = Math.min(maxDelayNs, getPauseTime(pauseNs, tries - 1));<a name="line.410"></a>
+<span class="sourceLineNo">411</span>    } else {<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      delayNs = getPauseTime(pauseNs, tries - 1);<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    }<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    if (scannerClosed) {<a name="line.414"></a>
+<span class="sourceLineNo">415</span>      completeWhenError(false);<a name="line.415"></a>
+<span class="sourceLineNo">416</span>      return;<a name="line.416"></a>
+<span class="sourceLineNo">417</span>    }<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    if (error instanceof OutOfOrderScannerNextException || error instanceof ScannerResetException) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>      completeWhenError(true);<a name="line.419"></a>
+<span class="sourceLineNo">420</span>      return;<a name="line.420"></a>
+<span class="sourceLineNo">421</span>    }<a name="line.421"></a>
+<span class="sourceLineNo">422</span>    if (error instanceof DoNotRetryIOException) {<a name="line.422"></a>
+<span class="sourceLineNo">423</span>      completeExceptionally(true);<a name="line.423"></a>
+<span class="sourceLineNo">424</span>      return;<a name="line.424"></a>
+<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
+<span class="sourceLineNo">426</span>    tries++;<a name="line.426"></a>
+<span class="sourceLineNo">427</span>    retryTimer.newTimeout(t -&gt; call(), delayNs, TimeUnit.NANOSECONDS);<a name="line.427"></a>
+<span class="sourceLineNo">428</span>  }<a name="line.428"></a>
+<span class="sourceLineNo">429</span><a name="line.429"></a>
+<span class="sourceLineNo">430</span>  private void updateNextStartRowWhenError(Result result) {<a name="line.430"></a>
+<span class="sourceLineNo">431</span>    nextStartRowWhenError = result.getRow();<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    includeNextStartRowWhenError = result.mayHaveMoreCellsInRow();<a name="line.432"></a>
+<span class="sourceLineNo">433</span>  }<a name="line.433"></a>
+<span class="sourceLineNo">434</span><a name="line.434"></a>
+<span class="sourceLineNo">435</span>  private void completeWhenNoMoreResultsInRegion() {<a name="line.435"></a>
+<span class="sourceLineNo">436</span>    if (noMoreResultsForScan(scan, loc.getRegionInfo())) {<a name="line.436"></a>
+<span class="sourceLineNo">437</span>      completeNoMoreResults();<a name="line.437"></a>
+<span class="sourceLineNo">438</span>    } else {<a name="line.438"></a>
+<span class="sourceLineNo">439</span>      completeWithNextStartRow(loc.getRegionInfo().getEndKey(), true);<a name="line.439"></a>
+<span class="sourceLineNo">440</span>    }<a name="line.440"></a>
+<span class="sourceLineNo">441</span>  }<a name="line.441"></a>
+<span class="sourceLineNo">442</span><a name="line.442"></a>
+<span class="sourceLineNo">443</span>  private void completeReversedWhenNoMoreResultsInRegion() {<a name="line.443"></a>
+<span class="sourceLineNo">444</span>    if (noMoreResultsForReverseScan(scan, loc.getRegionInfo())) {<a name="line.444"></a>
+<span class="sourceLineNo">445</span>      completeNoMoreResults();<a name="line.445"></a>
+<span class="sourceLineNo">446</span>    } else {<a name="line.446"></a>
+<span class="sourceLineNo">447</span>      completeWithNextStartRow(loc.getRegionInfo().getStartKey(), false);<a name="line.447"></a>
+<span class="sourceLineNo">448</span>    }<a name="line.448"></a>
+<span class="sourceLineNo">449</span>  }<a name="line.449"></a>
+<span class="sourceLineNo">450</span><a name="line.450"></a>
+<span class="sourceLineNo">451</span>  private void completeOrNext(ScanResponse resp, int numberOfCompleteRows) {<a name="line.451"></a>
+<span class="sourceLineNo">452</span>    if (resp.hasMoreResults() &amp;&amp; !resp.getMoreResults()) {<a name="line.452"></a>
+<span class="sourceLineNo">453</span>      // RS tells us there is no more data for the whole scan<a name="line.453"></a>
+<span class="sourceLineNo">454</span>      completeNoMoreResults();<a name="line.454"></a>
+<span class="sourceLineNo">455</span>      return;<a name="line.455"></a>
+<span class="sourceLineNo">456</span>    }<a name="line.456"></a>
+<span class="sourceLineNo">457</span>    if (scan.getLimit() &gt; 0) {<a name="line.457"></a>
+<span class="sourceLineNo">458</span>      // The RS should have set the moreResults field in ScanResponse to false when we have reached<a name="line.458"></a>
+<span class="sourceLineNo">459</span>      // the limit, so we add an assert here.<a name="line.459"></a>
+<span class="sourceLineNo">460</span>      int newLimit = scan.getLimit() - numberOfCompleteRows;<a name="line.460"></a>
+<span class="sourceLineNo">461</span>      assert newLimit &gt; 0;<a name="line.461"></a>
+<span class="sourceLineNo">462</span>      scan.setLimit(newLimit);<a name="line.462"></a>
+<span class="sourceLineNo">463</span>    }<a name="line.463"></a>
+<span class="sourceLineNo">464</span>    // as in 2.0 this value will always be set<a name="line.464"></a>
+<span class="sourceLineNo">465</span>    if (!resp.getMoreResultsInRegion()) {<a name="line.465"></a>
+<span class="sourceLineNo">466</span>      completeWhenNoMoreResultsInRegion.run();<a name="line.466"></a>
+<span class="sourceLineNo">467</span>      return;<a name="line.467"></a>
+<span class="sourceLineNo">468</span>    }<a name="line.468"></a>
+<span class="sourceLineNo">469</span>    next();<a name="line.469"></a>
+<span class="sourceLineNo">470</span>  }<a name="line.470"></a>
+<span class="sourceLineNo">471</span><a name="line.471"></a>
+<span class="sourceLineNo">472</span>  private void onComplete(HBaseRpcController controller, ScanResponse resp) {<a name="line.472"></a>
+<span class="sourceLineNo">473</span>    if (controller.failed()) {<a name="line.473"></a>
+<span class="sourceLineNo">474</span>      onError(controller.getFailed());<a name="line.474"></a>
+<span class="sourceLineNo">475</span>      return;<a name="line.475"></a>
+<span class="sourceLineNo">476</span>    }<a name="line.476"></a>
+<span class="sourceLineNo">477</span>    updateServerSideMetrics(scanMetrics, resp);<a name="line.477"></a>
+<span class="sourceLineNo">478</span>    boolean isHeartbeatMessage = resp.hasHeartbeatMessage() &amp;&amp; resp.getHeartbeatMessage();<a name="line.478"></a>
+<span class="sourceLineNo">479</span>    Result[] results;<a name="line.479"></a>
+<span class="sourceLineNo">480</span>    int numberOfCompleteRowsBefore = resultCache.numberOfCompleteRows();<a name="line.480"></a>
+<span class="sourceLineNo">481</span>    try {<a name="line.481"></a>
+<span class="sourceLineNo">482</span>      Result[] rawResults = ResponseConverter.getResults(controller.cellScanner(), resp);<a name="line.482"></a>
+<span class="sourceLineNo">483</span>      updateResultsMetrics(scanMetrics, rawResults, isHeartbeatMessage);<a name="line.483"></a>
+<span class="sourceLineNo">484</span>      results = resultCache.addAndGet(<a name="line.484"></a>
+<span class="sourceLineNo">485</span>        Optional.ofNullable(rawResults).orElse(ScanResultCache.EMPTY_RESULT_ARRAY),<a name="line.485"></a>
+<span class="sourceLineNo">486</span>        isHeartbeatMessage);<a name="line.486"></a>
+<span class="sourceLineNo">487</span>    } catch (IOException e) {<a name="line.487"></a>
+<span class="sourceLineNo">488</span>      // We can not retry here. The server has responded normally and the call sequence has been<a name="line.488"></a>
+<span class="sourceLineNo">489</span>      // increased so a new scan with the same call sequence will cause an<a name="line.489"></a>
+<span class="sourceLineNo">490</span>      // OutOfOrderScannerNextException. Let the upper layer open a new scanner.<a name="line.490"></a>
+<span class="sourceLineNo">491</span>      LOG.warn("decode scan response failed", e);<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      completeWhenError(true);<a name="line.492"></a>
+<span class="sourceLineNo">493</span>      return;<a name="line.493"></a>
+<span class="sourceLineNo">494</span>    }<a name="line.494"></a>
+<span class="sourceLineNo">495</span><a name="line.495"></a>
+<span class="sourceLineNo">496</span>    ScanControllerImpl scanController = new ScanControllerImpl(resp);<a name="line.496"></a>
+<span class="sourceLineNo">497</span>    if (results.length &gt; 0) {<a name="line.497"></a>
+<span class="sourceLineNo">498</span>      updateNextStartRowWhenError(results[results.length - 1]);<a name="line.498"></a>
+<span class="sourceLineNo">499</span>      consumer.onNext(results, scanController);<a name="line.499"></a>
+<span class="sourceLineNo">500</span>    } else if (resp.hasHeartbeatMessage() &amp;&amp; resp.getHeartbeatMessage()) {<a name="line.500"></a>
+<span class="sourceLineNo">501</span>      consumer.onHeartbeat(scanController);<a name="line.501"></a>
+<span class="sourceLineNo">502</span>    }<a name="line.502"></a>
+<span class="sourceLineNo">503</span>    ScanControllerState state = scanController.destroy();<a name="line.503"></a>
+<span class="sourceLineNo">504</span>    if (state == ScanControllerState.TERMINATED) {<a name="line.504"></a>
+<span class="sourceLineNo">505</span>      if (resp.getMoreResultsInRegion()) {<a name="line.505"></a>
+<span class="sourceLineNo">506</span>        // we have more results in region but user request to stop the scan, so we need to close the<a name="line.506"></a>
+<span class="sourceLineNo">507</span>        // scanner explicitly.<a name="line.507"></a>
+<span class="sourceLineNo">508</span>        closeScanner();<a name="line.508"></a>
+<span class="sourceLineNo">509</span>      }<a name="line.509"></a>
+<span class="sourceLineNo">510</span>      completeNoMoreResults();<a name="line.510"></a>
+<span class="sourceLineNo">511</span>      return;<a name="line.511"></a>
+<span class="sourceLineNo">512</span>    }<a name="line.512"></a>
+<span class="sourceLineNo">513</span>    int numberOfCompleteRows = resultCache.numberOfCompleteRows() - numberOfCompleteRowsBefore;<a name="line.513"></a>
+<span class="sourceLineNo">514</span>    if (state == ScanControllerState.SUSPENDED) {<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      if (scanController.resumer.prepare(resp, numberOfCompleteRows)) {<a name="line.515"></a>
+<span class="sourceLineNo">516</span>        return;<a name="line.516"></a>
+<span class="sourceLineNo">517</span>      }<a name="line.517"></a>
+<span class="sourceLineNo">518</span>    }<a name="line.518"></a>
+<span class="sourceLineNo">519</span>    completeOrNext(resp, numberOfCompleteRows);<a name="line.519"></a>
+<span class="sourceLineNo">520</span>  }<a name="line.520"></a>
+<span class="sourceLineNo">521</span><a name="line.521"></a>
+<span class="sourceLineNo">522</span>  private void call() {<a name="line.522"></a>
+<span class="sourceLineNo">523</span>    // As we have a call sequence for scan, it is useless to have a different rpc timeout which is<a name="line.523"></a>
+<span class="sourceLineNo">524</span>    // less than the scan timeout. If the server does not respond in time(usually this will not<a name="line.524"></a>
+<span class="sourceLineNo">525</span>    // happen as we have heartbeat now), we will get an OutOfOrderScannerNextException when<a name="line.525"></a>
+<span class="sourceLineNo">526</span>    // resending the next request and the only way to fix this is to close the scanner and open a<a name="line.526"></a>
+<span class="sourceLineNo">527</span>    // new one.<a name="line.527"></a>
+<span class="sourceLineNo">528</span>    long callTimeoutNs;<a name="line.528"></a>
+<span class="sourceLineNo">529</span>    if (scanTimeoutNs &gt; 0) {<a name="line.529"></a>
+<span class="sourceLineNo">530</span>      long remainingNs = scanTimeoutNs - (System.nanoTime() - nextCallStartNs);<a name="line.530"></a>
+<span class="sourceLineNo">531</span>      if (remainingNs &lt;= 0) {<a name="line.531"></a>
+<span class="sourceLineNo">532</span>        completeExceptionally(true);<a name="line.532"></a>
+<span class="sourceLineNo">533</span>        return;<a name="line.533"></a>
+<span class="sourceLineNo">534</span>      }<a name="line.534"></a>
+<span class="sourceLineNo">535</span>      callTimeoutNs = remainingNs;<a name="line.535"></a>
+<span class="sourceLineNo">536</span>    } else {<a name="line.536"></a>
+<span class="sourceLineNo">537</span>      callTimeoutNs = 0L;<a name="line.537"></a>
+<span class="sourceLineNo">538</span>    }<a name="line.538"></a>
+<span class="sourceLineNo">539</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.539"></a>
+<span class="sourceLineNo">540</span>    if (tries &gt; 1) {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>      incRPCRetriesMetrics(scanMetrics, regionServerRemote);<a name="line.541"></a>
+<span class="sourceLineNo">542</span>    }<a name="line.542"></a>
+<span class="sourceLineNo">543</span>    resetController(controller, callTimeoutNs);<a name="line.543"></a>
+<span class="sourceLineNo">544</span>    ScanRequest req = RequestConverter.buildScanRequest(scannerId, scan.getCaching(), false,<a name="line.544"></a>
+<span class="sourceLineNo">545</span>      nextCallSeq, false, false, scan.getLimit());<a name="line.545"></a>
+<span class="sourceLineNo">546</span>    stub.scan(controller, req, resp -&gt; onComplete(controller, resp));<a name="line.546"></a>
+<span class="sourceLineNo">547</span>  }<a name="line.547"></a>
+<span class="sourceLineNo">548</span><a name="line.548"></a>
+<span class="sourceLineNo">549</span>  private void next() {<a name="line.549"></a>
+<span class="sourceLineNo">550</span>    nextCallSeq++;<a name="line.550"></a>
+<span class="sourceLineNo">551</span>    tries = 1;<a name="line.551"></a>
+<span class="sourceLineNo">552</span>    exceptions.clear();<a name="line.552"></a>
+<span class="sourceLineNo">553</span>    nextCallStartNs = System.nanoTime();<a name="line.553"></a>
+<span class="sourceLineNo">554</span>    call();<a name="line.554"></a>
+<span class="sourceLineNo">555</span>  }<a name="line.555"></a>
+<span class="sourceLineNo">556</span><a name="line.556"></a>
+<span class="sourceLineNo">557</span>  private void renewLease() {<a name="line.557"></a>
+<span class="sourceLineNo">558</span>    incRPCCallsMetrics(scanMetrics, regionServerRemote);<a name="line.558"></a>
+<span class="sourceLineNo">559</span>    nextCallSeq++;<a name="line.559"></a>
+<span class="sourceLineNo">560</span>    resetController(controller, rpcTimeoutNs);<a name="line.560"></a>
+<span class="sourceLineNo">561</span>    ScanRequest req =<a name="line.561"></a>
+<span class="sourceLineNo">562</span>        RequestConverter.buildScanRequest(scannerId, 0, false, nextCallSeq, false, true, -1);<a name="line.562"></a>
+<span class="sourceLineNo">563</span>    stub.scan(controller, req, resp -&gt; {<a name="line.563"></a>
+<span class="sourceLineNo">564</span>    });<a name="line.564"></a>
+<span class="sourceLineNo">565</span>  }<a name="line.565"></a>
+<span class="sourceLineNo">566</span><a name="line.566"></a>
+<span class="sourceLineNo">567</span>  /**<a name="line.567"></a>
+<span class="sourceLineNo">568</span>   * Now we will also fetch some cells along with the scanner id when opening a scanner, so we also<a name="line.568"></a>
+<span class="sourceLineNo">569</span>   * need to process the ScanResponse for the open scanner request. The HBaseRpcController for the<a name="line.569"></a>
+<span class="sourceLineNo">570</span>   * open scanner request is also needed because we may have some data in the CellScanner which is<a name="line.570"></a>
+<span class="sourceLineNo">571</span>   * contained in the controller.<a name="line.571"></a>
+<span class="sourceLineNo">572</span>   * @return {@code true} if we should continue, otherwise {@code false}.<a name="line.572"></a>
+<span class="sourceLineNo">573</span>   */<a name="line.573"></a>
+<span class="sourceLineNo">574</span>  public CompletableFuture&lt;Boolean&gt; start(HBaseRpcController controller,<a name="line.574"></a>
+<span class="sourceLineNo">575</span>      ScanResponse respWhenOpen) {<a name="line.575"></a>
+<span class="sourceLineNo">576</span>    onComplete(controller, respWhenOpen);<a name="line.576"></a>
+<span class="sourceLineNo">577</span>    return future;<a name="line.577"></a>
+<span class="sourceLineNo">578</span>  }<a name="line.578"></a>
+<span class="sourceLineNo">579</span>}<a name="line.579"></a>
 
 
 
