@@ -73,292 +73,293 @@
 <span class="sourceLineNo">065</span> * &lt;p&gt;<a name="line.65"></a>
 <span class="sourceLineNo">066</span> * Most operations are executed in handlers. Netty handler is always executed in the same<a name="line.66"></a>
 <span class="sourceLineNo">067</span> * thread(EventLoop) so no lock is needed.<a name="line.67"></a>
-<span class="sourceLineNo">068</span> */<a name="line.68"></a>
-<span class="sourceLineNo">069</span>@InterfaceAudience.Private<a name="line.69"></a>
-<span class="sourceLineNo">070</span>class NettyRpcConnection extends RpcConnection {<a name="line.70"></a>
-<span class="sourceLineNo">071</span><a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private static final Log LOG = LogFactory.getLog(NettyRpcConnection.class);<a name="line.72"></a>
-<span class="sourceLineNo">073</span><a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private static final ScheduledExecutorService RELOGIN_EXECUTOR =<a name="line.74"></a>
-<span class="sourceLineNo">075</span>      Executors.newSingleThreadScheduledExecutor(Threads.newDaemonThreadFactory("Relogin"));<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  private final NettyRpcClient rpcClient;<a name="line.77"></a>
-<span class="sourceLineNo">078</span><a name="line.78"></a>
-<span class="sourceLineNo">079</span>  private ByteBuf connectionHeaderPreamble;<a name="line.79"></a>
-<span class="sourceLineNo">080</span><a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private ByteBuf connectionHeaderWithLength;<a name="line.81"></a>
-<span class="sourceLineNo">082</span><a name="line.82"></a>
-<span class="sourceLineNo">083</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "IS2_INCONSISTENT_SYNC",<a name="line.83"></a>
-<span class="sourceLineNo">084</span>      justification = "connect is also under lock as notifyOnCancel will call our action directly")<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  private Channel channel;<a name="line.85"></a>
-<span class="sourceLineNo">086</span><a name="line.86"></a>
-<span class="sourceLineNo">087</span>  NettyRpcConnection(NettyRpcClient rpcClient, ConnectionId remoteId) throws IOException {<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    super(rpcClient.conf, AbstractRpcClient.WHEEL_TIMER, remoteId, rpcClient.clusterId,<a name="line.88"></a>
-<span class="sourceLineNo">089</span>        rpcClient.userProvider.isHBaseSecurityEnabled(), rpcClient.codec, rpcClient.compressor);<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    this.rpcClient = rpcClient;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    byte[] connectionHeaderPreamble = getConnectionHeaderPreamble();<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    this.connectionHeaderPreamble =<a name="line.92"></a>
-<span class="sourceLineNo">093</span>        Unpooled.directBuffer(connectionHeaderPreamble.length).writeBytes(connectionHeaderPreamble);<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    ConnectionHeader header = getConnectionHeader();<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    this.connectionHeaderWithLength = Unpooled.directBuffer(4 + header.getSerializedSize());<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    this.connectionHeaderWithLength.writeInt(header.getSerializedSize());<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    header.writeTo(new ByteBufOutputStream(this.connectionHeaderWithLength));<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  @Override<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  protected synchronized void callTimeout(Call call) {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    if (channel != null) {<a name="line.102"></a>
-<span class="sourceLineNo">103</span>      channel.pipeline().fireUserEventTriggered(new CallEvent(TIMEOUT, call));<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    }<a name="line.104"></a>
-<span class="sourceLineNo">105</span>  }<a name="line.105"></a>
-<span class="sourceLineNo">106</span><a name="line.106"></a>
-<span class="sourceLineNo">107</span>  @Override<a name="line.107"></a>
-<span class="sourceLineNo">108</span>  public synchronized boolean isActive() {<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    return channel != null;<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  }<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  private void shutdown0() {<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    if (channel != null) {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>      channel.close();<a name="line.114"></a>
-<span class="sourceLineNo">115</span>      channel = null;<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    }<a name="line.116"></a>
-<span class="sourceLineNo">117</span>  }<a name="line.117"></a>
-<span class="sourceLineNo">118</span><a name="line.118"></a>
-<span class="sourceLineNo">119</span>  @Override<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  public synchronized void shutdown() {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    shutdown0();<a name="line.121"></a>
-<span class="sourceLineNo">122</span>  }<a name="line.122"></a>
-<span class="sourceLineNo">123</span><a name="line.123"></a>
-<span class="sourceLineNo">124</span>  @Override<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  public synchronized void cleanupConnection() {<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    if (connectionHeaderPreamble != null) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      ReferenceCountUtil.safeRelease(connectionHeaderPreamble);<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    }<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    if (connectionHeaderWithLength != null) {<a name="line.129"></a>
-<span class="sourceLineNo">130</span>      ReferenceCountUtil.safeRelease(connectionHeaderWithLength);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    }<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  }<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>  private void established(Channel ch) throws IOException {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    ChannelPipeline p = ch.pipeline();<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    String addBeforeHandler = p.context(BufferCallBeforeInitHandler.class).name();<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    p.addBefore(addBeforeHandler, null,<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      new IdleStateHandler(0, rpcClient.minIdleTimeBeforeClose, 0, TimeUnit.MILLISECONDS));<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    p.addBefore(addBeforeHandler, null, new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE, 0, 4));<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    p.addBefore(addBeforeHandler, null,<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      new NettyRpcDuplexHandler(this, rpcClient.cellBlockBuilder, codec, compressor));<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    p.fireUserEventTriggered(BufferCallEvent.success());<a name="line.142"></a>
-<span class="sourceLineNo">143</span>  }<a name="line.143"></a>
-<span class="sourceLineNo">144</span><a name="line.144"></a>
-<span class="sourceLineNo">145</span>  private boolean reloginInProgress;<a name="line.145"></a>
-<span class="sourceLineNo">146</span><a name="line.146"></a>
-<span class="sourceLineNo">147</span>  private void scheduleRelogin(Throwable error) {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    if (error instanceof FallbackDisallowedException) {<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      return;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    }<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    synchronized (this) {<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      if (reloginInProgress) {<a name="line.152"></a>
-<span class="sourceLineNo">153</span>        return;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      }<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      reloginInProgress = true;<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      RELOGIN_EXECUTOR.schedule(new Runnable() {<a name="line.156"></a>
-<span class="sourceLineNo">157</span><a name="line.157"></a>
-<span class="sourceLineNo">158</span>        @Override<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        public void run() {<a name="line.159"></a>
-<span class="sourceLineNo">160</span>          try {<a name="line.160"></a>
-<span class="sourceLineNo">161</span>            if (shouldAuthenticateOverKrb()) {<a name="line.161"></a>
-<span class="sourceLineNo">162</span>              relogin();<a name="line.162"></a>
-<span class="sourceLineNo">163</span>            }<a name="line.163"></a>
-<span class="sourceLineNo">164</span>          } catch (IOException e) {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>            LOG.warn("relogin failed", e);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>          }<a name="line.166"></a>
-<span class="sourceLineNo">167</span>          synchronized (this) {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>            reloginInProgress = false;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>          }<a name="line.169"></a>
-<span class="sourceLineNo">170</span>        }<a name="line.170"></a>
-<span class="sourceLineNo">171</span>      }, ThreadLocalRandom.current().nextInt(reloginMaxBackoff), TimeUnit.MILLISECONDS);<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
-<span class="sourceLineNo">173</span>  }<a name="line.173"></a>
-<span class="sourceLineNo">174</span><a name="line.174"></a>
-<span class="sourceLineNo">175</span>  private void failInit(Channel ch, IOException e) {<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    synchronized (this) {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      // fail all pending calls<a name="line.177"></a>
-<span class="sourceLineNo">178</span>      ch.pipeline().fireUserEventTriggered(BufferCallEvent.fail(e));<a name="line.178"></a>
-<span class="sourceLineNo">179</span>      shutdown0();<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      return;<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
-<span class="sourceLineNo">182</span>  }<a name="line.182"></a>
-<span class="sourceLineNo">183</span><a name="line.183"></a>
-<span class="sourceLineNo">184</span>  private void saslNegotiate(final Channel ch) {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    UserGroupInformation ticket = getUGI();<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    if (ticket == null) {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>      failInit(ch, new FatalConnectionException("ticket/user is null"));<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      return;<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    }<a name="line.189"></a>
-<span class="sourceLineNo">190</span>    Promise&lt;Boolean&gt; saslPromise = ch.eventLoop().newPromise();<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    final NettyHBaseSaslRpcClientHandler saslHandler;<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    try {<a name="line.192"></a>
-<span class="sourceLineNo">193</span>      saslHandler = new NettyHBaseSaslRpcClientHandler(saslPromise, ticket, authMethod, token,<a name="line.193"></a>
-<span class="sourceLineNo">194</span>          serverPrincipal, rpcClient.fallbackAllowed, this.rpcClient.conf);<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    } catch (IOException e) {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      failInit(ch, e);<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      return;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    }<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    ch.pipeline().addFirst(new SaslChallengeDecoder(), saslHandler);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    saslPromise.addListener(new FutureListener&lt;Boolean&gt;() {<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>      @Override<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      public void operationComplete(Future&lt;Boolean&gt; future) throws Exception {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>        if (future.isSuccess()) {<a name="line.204"></a>
-<span class="sourceLineNo">205</span>          ChannelPipeline p = ch.pipeline();<a name="line.205"></a>
-<span class="sourceLineNo">206</span>          p.remove(SaslChallengeDecoder.class);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>          p.remove(NettyHBaseSaslRpcClientHandler.class);<a name="line.207"></a>
-<span class="sourceLineNo">208</span><a name="line.208"></a>
-<span class="sourceLineNo">209</span>          // check if negotiate with server for connection header is necessary<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          if (saslHandler.isNeedProcessConnectionHeader()) {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>            Promise&lt;Boolean&gt; connectionHeaderPromise = ch.eventLoop().newPromise();<a name="line.211"></a>
-<span class="sourceLineNo">212</span>            // create the handler to handle the connection header<a name="line.212"></a>
-<span class="sourceLineNo">213</span>            ChannelHandler chHandler = new NettyHBaseRpcConnectionHeaderHandler(<a name="line.213"></a>
-<span class="sourceLineNo">214</span>                connectionHeaderPromise, conf, connectionHeaderWithLength);<a name="line.214"></a>
-<span class="sourceLineNo">215</span><a name="line.215"></a>
-<span class="sourceLineNo">216</span>            // add ReadTimeoutHandler to deal with server doesn't response connection header<a name="line.216"></a>
-<span class="sourceLineNo">217</span>            // because of the different configuration in client side and server side<a name="line.217"></a>
-<span class="sourceLineNo">218</span>            p.addFirst(<a name="line.218"></a>
-<span class="sourceLineNo">219</span>              new ReadTimeoutHandler(RpcClient.DEFAULT_SOCKET_TIMEOUT_READ, TimeUnit.MILLISECONDS));<a name="line.219"></a>
-<span class="sourceLineNo">220</span>            p.addLast(chHandler);<a name="line.220"></a>
-<span class="sourceLineNo">221</span>            connectionHeaderPromise.addListener(new FutureListener&lt;Boolean&gt;() {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>              @Override<a name="line.222"></a>
-<span class="sourceLineNo">223</span>              public void operationComplete(Future&lt;Boolean&gt; future) throws Exception {<a name="line.223"></a>
-<span class="sourceLineNo">224</span>                if (future.isSuccess()) {<a name="line.224"></a>
-<span class="sourceLineNo">225</span>                  ChannelPipeline p = ch.pipeline();<a name="line.225"></a>
-<span class="sourceLineNo">226</span>                  p.remove(ReadTimeoutHandler.class);<a name="line.226"></a>
-<span class="sourceLineNo">227</span>                  p.remove(NettyHBaseRpcConnectionHeaderHandler.class);<a name="line.227"></a>
-<span class="sourceLineNo">228</span>                  // don't send connection header, NettyHbaseRpcConnectionHeaderHandler<a name="line.228"></a>
-<span class="sourceLineNo">229</span>                  // sent it already<a name="line.229"></a>
-<span class="sourceLineNo">230</span>                  established(ch);<a name="line.230"></a>
-<span class="sourceLineNo">231</span>                } else {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>                  final Throwable error = future.cause();<a name="line.232"></a>
-<span class="sourceLineNo">233</span>                  scheduleRelogin(error);<a name="line.233"></a>
-<span class="sourceLineNo">234</span>                  failInit(ch, toIOE(error));<a name="line.234"></a>
-<span class="sourceLineNo">235</span>                }<a name="line.235"></a>
-<span class="sourceLineNo">236</span>              }<a name="line.236"></a>
-<span class="sourceLineNo">237</span>            });<a name="line.237"></a>
-<span class="sourceLineNo">238</span>          } else {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>            // send the connection header to server<a name="line.239"></a>
-<span class="sourceLineNo">240</span>            ch.write(connectionHeaderWithLength.retainedDuplicate());<a name="line.240"></a>
-<span class="sourceLineNo">241</span>            established(ch);<a name="line.241"></a>
-<span class="sourceLineNo">242</span>          }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>        } else {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>          final Throwable error = future.cause();<a name="line.244"></a>
-<span class="sourceLineNo">245</span>          scheduleRelogin(error);<a name="line.245"></a>
-<span class="sourceLineNo">246</span>          failInit(ch, toIOE(error));<a name="line.246"></a>
-<span class="sourceLineNo">247</span>        }<a name="line.247"></a>
-<span class="sourceLineNo">248</span>      }<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    });<a name="line.249"></a>
-<span class="sourceLineNo">250</span>  }<a name="line.250"></a>
-<span class="sourceLineNo">251</span><a name="line.251"></a>
-<span class="sourceLineNo">252</span>  private void connect() {<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    if (LOG.isDebugEnabled()) {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      LOG.debug("Connecting to " + remoteId.address);<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
-<span class="sourceLineNo">256</span><a name="line.256"></a>
-<span class="sourceLineNo">257</span>    this.channel = new Bootstrap().group(rpcClient.group).channel(rpcClient.channelClass)<a name="line.257"></a>
-<span class="sourceLineNo">258</span>        .option(ChannelOption.TCP_NODELAY, rpcClient.isTcpNoDelay())<a name="line.258"></a>
-<span class="sourceLineNo">259</span>        .option(ChannelOption.SO_KEEPALIVE, rpcClient.tcpKeepAlive)<a name="line.259"></a>
-<span class="sourceLineNo">260</span>        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, rpcClient.connectTO)<a name="line.260"></a>
-<span class="sourceLineNo">261</span>        .handler(new BufferCallBeforeInitHandler()).localAddress(rpcClient.localAddr)<a name="line.261"></a>
-<span class="sourceLineNo">262</span>        .remoteAddress(remoteId.address).connect().addListener(new ChannelFutureListener() {<a name="line.262"></a>
-<span class="sourceLineNo">263</span><a name="line.263"></a>
-<span class="sourceLineNo">264</span>          @Override<a name="line.264"></a>
-<span class="sourceLineNo">265</span>          public void operationComplete(ChannelFuture future) throws Exception {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>            Channel ch = future.channel();<a name="line.266"></a>
-<span class="sourceLineNo">267</span>            if (!future.isSuccess()) {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>              failInit(ch, toIOE(future.cause()));<a name="line.268"></a>
-<span class="sourceLineNo">269</span>              rpcClient.failedServers.addToFailedServers(remoteId.address, future.cause());<a name="line.269"></a>
-<span class="sourceLineNo">270</span>              return;<a name="line.270"></a>
-<span class="sourceLineNo">271</span>            }<a name="line.271"></a>
-<span class="sourceLineNo">272</span>            ch.writeAndFlush(connectionHeaderPreamble.retainedDuplicate());<a name="line.272"></a>
-<span class="sourceLineNo">273</span>            if (useSasl) {<a name="line.273"></a>
-<span class="sourceLineNo">274</span>              saslNegotiate(ch);<a name="line.274"></a>
-<span class="sourceLineNo">275</span>            } else {<a name="line.275"></a>
-<span class="sourceLineNo">276</span>              // send the connection header to server<a name="line.276"></a>
-<span class="sourceLineNo">277</span>              ch.write(connectionHeaderWithLength.retainedDuplicate());<a name="line.277"></a>
-<span class="sourceLineNo">278</span>              established(ch);<a name="line.278"></a>
-<span class="sourceLineNo">279</span>            }<a name="line.279"></a>
-<span class="sourceLineNo">280</span>          }<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        }).channel();<a name="line.281"></a>
-<span class="sourceLineNo">282</span>  }<a name="line.282"></a>
-<span class="sourceLineNo">283</span><a name="line.283"></a>
-<span class="sourceLineNo">284</span>  private void write(Channel ch, final Call call) {<a name="line.284"></a>
-<span class="sourceLineNo">285</span>    ch.writeAndFlush(call).addListener(new ChannelFutureListener() {<a name="line.285"></a>
-<span class="sourceLineNo">286</span><a name="line.286"></a>
-<span class="sourceLineNo">287</span>      @Override<a name="line.287"></a>
-<span class="sourceLineNo">288</span>      public void operationComplete(ChannelFuture future) throws Exception {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>        // Fail the call if we failed to write it out. This usually because the channel is<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        // closed. This is needed because we may shutdown the channel inside event loop and<a name="line.290"></a>
-<span class="sourceLineNo">291</span>        // there may still be some pending calls in the event loop queue after us.<a name="line.291"></a>
-<span class="sourceLineNo">292</span>        if (!future.isSuccess()) {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>          call.setException(toIOE(future.cause()));<a name="line.293"></a>
-<span class="sourceLineNo">294</span>        }<a name="line.294"></a>
-<span class="sourceLineNo">295</span>      }<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    });<a name="line.296"></a>
-<span class="sourceLineNo">297</span>  }<a name="line.297"></a>
-<span class="sourceLineNo">298</span><a name="line.298"></a>
-<span class="sourceLineNo">299</span>  @Override<a name="line.299"></a>
-<span class="sourceLineNo">300</span>  public synchronized void sendRequest(final Call call, HBaseRpcController hrc) throws IOException {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    if (reloginInProgress) {<a name="line.301"></a>
-<span class="sourceLineNo">302</span>      throw new IOException("Can not send request because relogin is in progress.");<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    }<a name="line.303"></a>
-<span class="sourceLineNo">304</span>    hrc.notifyOnCancel(new RpcCallback&lt;Object&gt;() {<a name="line.304"></a>
-<span class="sourceLineNo">305</span><a name="line.305"></a>
-<span class="sourceLineNo">306</span>      @Override<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      public void run(Object parameter) {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>        setCancelled(call);<a name="line.308"></a>
-<span class="sourceLineNo">309</span>        synchronized (this) {<a name="line.309"></a>
-<span class="sourceLineNo">310</span>          if (channel != null) {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>            channel.pipeline().fireUserEventTriggered(new CallEvent(CANCELLED, call));<a name="line.311"></a>
-<span class="sourceLineNo">312</span>          }<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        }<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      }<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    }, new CancellationCallback() {<a name="line.315"></a>
-<span class="sourceLineNo">316</span><a name="line.316"></a>
-<span class="sourceLineNo">317</span>      @Override<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      public void run(boolean cancelled) throws IOException {<a name="line.318"></a>
-<span class="sourceLineNo">319</span>        if (cancelled) {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>          setCancelled(call);<a name="line.320"></a>
-<span class="sourceLineNo">321</span>        } else {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>          if (channel == null) {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>            connect();<a name="line.323"></a>
-<span class="sourceLineNo">324</span>          }<a name="line.324"></a>
-<span class="sourceLineNo">325</span>          scheduleTimeoutTask(call);<a name="line.325"></a>
-<span class="sourceLineNo">326</span>          final Channel ch = channel;<a name="line.326"></a>
-<span class="sourceLineNo">327</span>          // We must move the whole writeAndFlush call inside event loop otherwise there will be a<a name="line.327"></a>
-<span class="sourceLineNo">328</span>          // race condition.<a name="line.328"></a>
-<span class="sourceLineNo">329</span>          // In netty's DefaultChannelPipeline, it will find the first outbound handler in the<a name="line.329"></a>
-<span class="sourceLineNo">330</span>          // current thread and then schedule a task to event loop which will start the process from<a name="line.330"></a>
-<span class="sourceLineNo">331</span>          // that outbound handler. It is possible that the first handler is<a name="line.331"></a>
-<span class="sourceLineNo">332</span>          // BufferCallBeforeInitHandler when we call writeAndFlush here, but the connection is set<a name="line.332"></a>
-<span class="sourceLineNo">333</span>          // up at the same time so in the event loop thread we remove the<a name="line.333"></a>
-<span class="sourceLineNo">334</span>          // BufferCallBeforeInitHandler, and then our writeAndFlush task comes, still calls the<a name="line.334"></a>
-<span class="sourceLineNo">335</span>          // write method of BufferCallBeforeInitHandler.<a name="line.335"></a>
-<span class="sourceLineNo">336</span>          // This may be considered as a bug of netty, but anyway there is a work around so let's<a name="line.336"></a>
-<span class="sourceLineNo">337</span>          // fix it by ourselves first.<a name="line.337"></a>
-<span class="sourceLineNo">338</span>          if (ch.eventLoop().inEventLoop()) {<a name="line.338"></a>
-<span class="sourceLineNo">339</span>            write(ch, call);<a name="line.339"></a>
-<span class="sourceLineNo">340</span>          } else {<a name="line.340"></a>
-<span class="sourceLineNo">341</span>            ch.eventLoop().execute(new Runnable() {<a name="line.341"></a>
-<span class="sourceLineNo">342</span><a name="line.342"></a>
-<span class="sourceLineNo">343</span>              @Override<a name="line.343"></a>
-<span class="sourceLineNo">344</span>              public void run() {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>                write(ch, call);<a name="line.345"></a>
-<span class="sourceLineNo">346</span>              }<a name="line.346"></a>
-<span class="sourceLineNo">347</span>            });<a name="line.347"></a>
-<span class="sourceLineNo">348</span>          }<a name="line.348"></a>
-<span class="sourceLineNo">349</span>        }<a name="line.349"></a>
-<span class="sourceLineNo">350</span>      }<a name="line.350"></a>
-<span class="sourceLineNo">351</span>    });<a name="line.351"></a>
-<span class="sourceLineNo">352</span>  }<a name="line.352"></a>
-<span class="sourceLineNo">353</span>}<a name="line.353"></a>
+<span class="sourceLineNo">068</span> * @since 2.0.0<a name="line.68"></a>
+<span class="sourceLineNo">069</span> */<a name="line.69"></a>
+<span class="sourceLineNo">070</span>@InterfaceAudience.Private<a name="line.70"></a>
+<span class="sourceLineNo">071</span>class NettyRpcConnection extends RpcConnection {<a name="line.71"></a>
+<span class="sourceLineNo">072</span><a name="line.72"></a>
+<span class="sourceLineNo">073</span>  private static final Log LOG = LogFactory.getLog(NettyRpcConnection.class);<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private static final ScheduledExecutorService RELOGIN_EXECUTOR =<a name="line.75"></a>
+<span class="sourceLineNo">076</span>      Executors.newSingleThreadScheduledExecutor(Threads.newDaemonThreadFactory("Relogin"));<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private final NettyRpcClient rpcClient;<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>  private ByteBuf connectionHeaderPreamble;<a name="line.80"></a>
+<span class="sourceLineNo">081</span><a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private ByteBuf connectionHeaderWithLength;<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "IS2_INCONSISTENT_SYNC",<a name="line.84"></a>
+<span class="sourceLineNo">085</span>      justification = "connect is also under lock as notifyOnCancel will call our action directly")<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private Channel channel;<a name="line.86"></a>
+<span class="sourceLineNo">087</span><a name="line.87"></a>
+<span class="sourceLineNo">088</span>  NettyRpcConnection(NettyRpcClient rpcClient, ConnectionId remoteId) throws IOException {<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    super(rpcClient.conf, AbstractRpcClient.WHEEL_TIMER, remoteId, rpcClient.clusterId,<a name="line.89"></a>
+<span class="sourceLineNo">090</span>        rpcClient.userProvider.isHBaseSecurityEnabled(), rpcClient.codec, rpcClient.compressor);<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this.rpcClient = rpcClient;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    byte[] connectionHeaderPreamble = getConnectionHeaderPreamble();<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    this.connectionHeaderPreamble =<a name="line.93"></a>
+<span class="sourceLineNo">094</span>        Unpooled.directBuffer(connectionHeaderPreamble.length).writeBytes(connectionHeaderPreamble);<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    ConnectionHeader header = getConnectionHeader();<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    this.connectionHeaderWithLength = Unpooled.directBuffer(4 + header.getSerializedSize());<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    this.connectionHeaderWithLength.writeInt(header.getSerializedSize());<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    header.writeTo(new ByteBufOutputStream(this.connectionHeaderWithLength));<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  }<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  @Override<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  protected synchronized void callTimeout(Call call) {<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    if (channel != null) {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>      channel.pipeline().fireUserEventTriggered(new CallEvent(TIMEOUT, call));<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    }<a name="line.105"></a>
+<span class="sourceLineNo">106</span>  }<a name="line.106"></a>
+<span class="sourceLineNo">107</span><a name="line.107"></a>
+<span class="sourceLineNo">108</span>  @Override<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  public synchronized boolean isActive() {<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    return channel != null;<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  }<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private void shutdown0() {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    if (channel != null) {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      channel.close();<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      channel = null;<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    }<a name="line.117"></a>
+<span class="sourceLineNo">118</span>  }<a name="line.118"></a>
+<span class="sourceLineNo">119</span><a name="line.119"></a>
+<span class="sourceLineNo">120</span>  @Override<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  public synchronized void shutdown() {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    shutdown0();<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>  @Override<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  public synchronized void cleanupConnection() {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    if (connectionHeaderPreamble != null) {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      ReferenceCountUtil.safeRelease(connectionHeaderPreamble);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    }<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    if (connectionHeaderWithLength != null) {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      ReferenceCountUtil.safeRelease(connectionHeaderWithLength);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  }<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>  private void established(Channel ch) throws IOException {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    ChannelPipeline p = ch.pipeline();<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    String addBeforeHandler = p.context(BufferCallBeforeInitHandler.class).name();<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    p.addBefore(addBeforeHandler, null,<a name="line.138"></a>
+<span class="sourceLineNo">139</span>      new IdleStateHandler(0, rpcClient.minIdleTimeBeforeClose, 0, TimeUnit.MILLISECONDS));<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    p.addBefore(addBeforeHandler, null, new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE, 0, 4));<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    p.addBefore(addBeforeHandler, null,<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      new NettyRpcDuplexHandler(this, rpcClient.cellBlockBuilder, codec, compressor));<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    p.fireUserEventTriggered(BufferCallEvent.success());<a name="line.143"></a>
+<span class="sourceLineNo">144</span>  }<a name="line.144"></a>
+<span class="sourceLineNo">145</span><a name="line.145"></a>
+<span class="sourceLineNo">146</span>  private boolean reloginInProgress;<a name="line.146"></a>
+<span class="sourceLineNo">147</span><a name="line.147"></a>
+<span class="sourceLineNo">148</span>  private void scheduleRelogin(Throwable error) {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    if (error instanceof FallbackDisallowedException) {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      return;<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    }<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    synchronized (this) {<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      if (reloginInProgress) {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>        return;<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      }<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      reloginInProgress = true;<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      RELOGIN_EXECUTOR.schedule(new Runnable() {<a name="line.157"></a>
+<span class="sourceLineNo">158</span><a name="line.158"></a>
+<span class="sourceLineNo">159</span>        @Override<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        public void run() {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          try {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>            if (shouldAuthenticateOverKrb()) {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>              relogin();<a name="line.163"></a>
+<span class="sourceLineNo">164</span>            }<a name="line.164"></a>
+<span class="sourceLineNo">165</span>          } catch (IOException e) {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>            LOG.warn("relogin failed", e);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>          }<a name="line.167"></a>
+<span class="sourceLineNo">168</span>          synchronized (this) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>            reloginInProgress = false;<a name="line.169"></a>
+<span class="sourceLineNo">170</span>          }<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        }<a name="line.171"></a>
+<span class="sourceLineNo">172</span>      }, ThreadLocalRandom.current().nextInt(reloginMaxBackoff), TimeUnit.MILLISECONDS);<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    }<a name="line.173"></a>
+<span class="sourceLineNo">174</span>  }<a name="line.174"></a>
+<span class="sourceLineNo">175</span><a name="line.175"></a>
+<span class="sourceLineNo">176</span>  private void failInit(Channel ch, IOException e) {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    synchronized (this) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      // fail all pending calls<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      ch.pipeline().fireUserEventTriggered(BufferCallEvent.fail(e));<a name="line.179"></a>
+<span class="sourceLineNo">180</span>      shutdown0();<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      return;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    }<a name="line.182"></a>
+<span class="sourceLineNo">183</span>  }<a name="line.183"></a>
+<span class="sourceLineNo">184</span><a name="line.184"></a>
+<span class="sourceLineNo">185</span>  private void saslNegotiate(final Channel ch) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    UserGroupInformation ticket = getUGI();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>    if (ticket == null) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>      failInit(ch, new FatalConnectionException("ticket/user is null"));<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      return;<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    }<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    Promise&lt;Boolean&gt; saslPromise = ch.eventLoop().newPromise();<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    final NettyHBaseSaslRpcClientHandler saslHandler;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>    try {<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      saslHandler = new NettyHBaseSaslRpcClientHandler(saslPromise, ticket, authMethod, token,<a name="line.194"></a>
+<span class="sourceLineNo">195</span>          serverPrincipal, rpcClient.fallbackAllowed, this.rpcClient.conf);<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    } catch (IOException e) {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      failInit(ch, e);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      return;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    ch.pipeline().addFirst(new SaslChallengeDecoder(), saslHandler);<a name="line.200"></a>
+<span class="sourceLineNo">201</span>    saslPromise.addListener(new FutureListener&lt;Boolean&gt;() {<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>      @Override<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      public void operationComplete(Future&lt;Boolean&gt; future) throws Exception {<a name="line.204"></a>
+<span class="sourceLineNo">205</span>        if (future.isSuccess()) {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>          ChannelPipeline p = ch.pipeline();<a name="line.206"></a>
+<span class="sourceLineNo">207</span>          p.remove(SaslChallengeDecoder.class);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>          p.remove(NettyHBaseSaslRpcClientHandler.class);<a name="line.208"></a>
+<span class="sourceLineNo">209</span><a name="line.209"></a>
+<span class="sourceLineNo">210</span>          // check if negotiate with server for connection header is necessary<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          if (saslHandler.isNeedProcessConnectionHeader()) {<a name="line.211"></a>
+<span class="sourceLineNo">212</span>            Promise&lt;Boolean&gt; connectionHeaderPromise = ch.eventLoop().newPromise();<a name="line.212"></a>
+<span class="sourceLineNo">213</span>            // create the handler to handle the connection header<a name="line.213"></a>
+<span class="sourceLineNo">214</span>            ChannelHandler chHandler = new NettyHBaseRpcConnectionHeaderHandler(<a name="line.214"></a>
+<span class="sourceLineNo">215</span>                connectionHeaderPromise, conf, connectionHeaderWithLength);<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>            // add ReadTimeoutHandler to deal with server doesn't response connection header<a name="line.217"></a>
+<span class="sourceLineNo">218</span>            // because of the different configuration in client side and server side<a name="line.218"></a>
+<span class="sourceLineNo">219</span>            p.addFirst(<a name="line.219"></a>
+<span class="sourceLineNo">220</span>              new ReadTimeoutHandler(RpcClient.DEFAULT_SOCKET_TIMEOUT_READ, TimeUnit.MILLISECONDS));<a name="line.220"></a>
+<span class="sourceLineNo">221</span>            p.addLast(chHandler);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>            connectionHeaderPromise.addListener(new FutureListener&lt;Boolean&gt;() {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>              @Override<a name="line.223"></a>
+<span class="sourceLineNo">224</span>              public void operationComplete(Future&lt;Boolean&gt; future) throws Exception {<a name="line.224"></a>
+<span class="sourceLineNo">225</span>                if (future.isSuccess()) {<a name="line.225"></a>
+<span class="sourceLineNo">226</span>                  ChannelPipeline p = ch.pipeline();<a name="line.226"></a>
+<span class="sourceLineNo">227</span>                  p.remove(ReadTimeoutHandler.class);<a name="line.227"></a>
+<span class="sourceLineNo">228</span>                  p.remove(NettyHBaseRpcConnectionHeaderHandler.class);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>                  // don't send connection header, NettyHbaseRpcConnectionHeaderHandler<a name="line.229"></a>
+<span class="sourceLineNo">230</span>                  // sent it already<a name="line.230"></a>
+<span class="sourceLineNo">231</span>                  established(ch);<a name="line.231"></a>
+<span class="sourceLineNo">232</span>                } else {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>                  final Throwable error = future.cause();<a name="line.233"></a>
+<span class="sourceLineNo">234</span>                  scheduleRelogin(error);<a name="line.234"></a>
+<span class="sourceLineNo">235</span>                  failInit(ch, toIOE(error));<a name="line.235"></a>
+<span class="sourceLineNo">236</span>                }<a name="line.236"></a>
+<span class="sourceLineNo">237</span>              }<a name="line.237"></a>
+<span class="sourceLineNo">238</span>            });<a name="line.238"></a>
+<span class="sourceLineNo">239</span>          } else {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>            // send the connection header to server<a name="line.240"></a>
+<span class="sourceLineNo">241</span>            ch.write(connectionHeaderWithLength.retainedDuplicate());<a name="line.241"></a>
+<span class="sourceLineNo">242</span>            established(ch);<a name="line.242"></a>
+<span class="sourceLineNo">243</span>          }<a name="line.243"></a>
+<span class="sourceLineNo">244</span>        } else {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>          final Throwable error = future.cause();<a name="line.245"></a>
+<span class="sourceLineNo">246</span>          scheduleRelogin(error);<a name="line.246"></a>
+<span class="sourceLineNo">247</span>          failInit(ch, toIOE(error));<a name="line.247"></a>
+<span class="sourceLineNo">248</span>        }<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      }<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    });<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  }<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>  private void connect() {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    if (LOG.isDebugEnabled()) {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>      LOG.debug("Connecting to " + remoteId.address);<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    }<a name="line.256"></a>
+<span class="sourceLineNo">257</span><a name="line.257"></a>
+<span class="sourceLineNo">258</span>    this.channel = new Bootstrap().group(rpcClient.group).channel(rpcClient.channelClass)<a name="line.258"></a>
+<span class="sourceLineNo">259</span>        .option(ChannelOption.TCP_NODELAY, rpcClient.isTcpNoDelay())<a name="line.259"></a>
+<span class="sourceLineNo">260</span>        .option(ChannelOption.SO_KEEPALIVE, rpcClient.tcpKeepAlive)<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, rpcClient.connectTO)<a name="line.261"></a>
+<span class="sourceLineNo">262</span>        .handler(new BufferCallBeforeInitHandler()).localAddress(rpcClient.localAddr)<a name="line.262"></a>
+<span class="sourceLineNo">263</span>        .remoteAddress(remoteId.address).connect().addListener(new ChannelFutureListener() {<a name="line.263"></a>
+<span class="sourceLineNo">264</span><a name="line.264"></a>
+<span class="sourceLineNo">265</span>          @Override<a name="line.265"></a>
+<span class="sourceLineNo">266</span>          public void operationComplete(ChannelFuture future) throws Exception {<a name="line.266"></a>
+<span class="sourceLineNo">267</span>            Channel ch = future.channel();<a name="line.267"></a>
+<span class="sourceLineNo">268</span>            if (!future.isSuccess()) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>              failInit(ch, toIOE(future.cause()));<a name="line.269"></a>
+<span class="sourceLineNo">270</span>              rpcClient.failedServers.addToFailedServers(remoteId.address, future.cause());<a name="line.270"></a>
+<span class="sourceLineNo">271</span>              return;<a name="line.271"></a>
+<span class="sourceLineNo">272</span>            }<a name="line.272"></a>
+<span class="sourceLineNo">273</span>            ch.writeAndFlush(connectionHeaderPreamble.retainedDuplicate());<a name="line.273"></a>
+<span class="sourceLineNo">274</span>            if (useSasl) {<a name="line.274"></a>
+<span class="sourceLineNo">275</span>              saslNegotiate(ch);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>            } else {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>              // send the connection header to server<a name="line.277"></a>
+<span class="sourceLineNo">278</span>              ch.write(connectionHeaderWithLength.retainedDuplicate());<a name="line.278"></a>
+<span class="sourceLineNo">279</span>              established(ch);<a name="line.279"></a>
+<span class="sourceLineNo">280</span>            }<a name="line.280"></a>
+<span class="sourceLineNo">281</span>          }<a name="line.281"></a>
+<span class="sourceLineNo">282</span>        }).channel();<a name="line.282"></a>
+<span class="sourceLineNo">283</span>  }<a name="line.283"></a>
+<span class="sourceLineNo">284</span><a name="line.284"></a>
+<span class="sourceLineNo">285</span>  private void write(Channel ch, final Call call) {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    ch.writeAndFlush(call).addListener(new ChannelFutureListener() {<a name="line.286"></a>
+<span class="sourceLineNo">287</span><a name="line.287"></a>
+<span class="sourceLineNo">288</span>      @Override<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      public void operationComplete(ChannelFuture future) throws Exception {<a name="line.289"></a>
+<span class="sourceLineNo">290</span>        // Fail the call if we failed to write it out. This usually because the channel is<a name="line.290"></a>
+<span class="sourceLineNo">291</span>        // closed. This is needed because we may shutdown the channel inside event loop and<a name="line.291"></a>
+<span class="sourceLineNo">292</span>        // there may still be some pending calls in the event loop queue after us.<a name="line.292"></a>
+<span class="sourceLineNo">293</span>        if (!future.isSuccess()) {<a name="line.293"></a>
+<span class="sourceLineNo">294</span>          call.setException(toIOE(future.cause()));<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        }<a name="line.295"></a>
+<span class="sourceLineNo">296</span>      }<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    });<a name="line.297"></a>
+<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>  @Override<a name="line.300"></a>
+<span class="sourceLineNo">301</span>  public synchronized void sendRequest(final Call call, HBaseRpcController hrc) throws IOException {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    if (reloginInProgress) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      throw new IOException("Can not send request because relogin is in progress.");<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    }<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    hrc.notifyOnCancel(new RpcCallback&lt;Object&gt;() {<a name="line.305"></a>
+<span class="sourceLineNo">306</span><a name="line.306"></a>
+<span class="sourceLineNo">307</span>      @Override<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      public void run(Object parameter) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>        setCancelled(call);<a name="line.309"></a>
+<span class="sourceLineNo">310</span>        synchronized (this) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>          if (channel != null) {<a name="line.311"></a>
+<span class="sourceLineNo">312</span>            channel.pipeline().fireUserEventTriggered(new CallEvent(CANCELLED, call));<a name="line.312"></a>
+<span class="sourceLineNo">313</span>          }<a name="line.313"></a>
+<span class="sourceLineNo">314</span>        }<a name="line.314"></a>
+<span class="sourceLineNo">315</span>      }<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    }, new CancellationCallback() {<a name="line.316"></a>
+<span class="sourceLineNo">317</span><a name="line.317"></a>
+<span class="sourceLineNo">318</span>      @Override<a name="line.318"></a>
+<span class="sourceLineNo">319</span>      public void run(boolean cancelled) throws IOException {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>        if (cancelled) {<a name="line.320"></a>
+<span class="sourceLineNo">321</span>          setCancelled(call);<a name="line.321"></a>
+<span class="sourceLineNo">322</span>        } else {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>          if (channel == null) {<a name="line.323"></a>
+<span class="sourceLineNo">324</span>            connect();<a name="line.324"></a>
+<span class="sourceLineNo">325</span>          }<a name="line.325"></a>
+<span class="sourceLineNo">326</span>          scheduleTimeoutTask(call);<a name="line.326"></a>
+<span class="sourceLineNo">327</span>          final Channel ch = channel;<a name="line.327"></a>
+<span class="sourceLineNo">328</span>          // We must move the whole writeAndFlush call inside event loop otherwise there will be a<a name="line.328"></a>
+<span class="sourceLineNo">329</span>          // race condition.<a name="line.329"></a>
+<span class="sourceLineNo">330</span>          // In netty's DefaultChannelPipeline, it will find the first outbound handler in the<a name="line.330"></a>
+<span class="sourceLineNo">331</span>          // current thread and then schedule a task to event loop which will start the process from<a name="line.331"></a>
+<span class="sourceLineNo">332</span>          // that outbound handler. It is possible that the first handler is<a name="line.332"></a>
+<span class="sourceLineNo">333</span>          // BufferCallBeforeInitHandler when we call writeAndFlush here, but the connection is set<a name="line.333"></a>
+<span class="sourceLineNo">334</span>          // up at the same time so in the event loop thread we remove the<a name="line.334"></a>
+<span class="sourceLineNo">335</span>          // BufferCallBeforeInitHandler, and then our writeAndFlush task comes, still calls the<a name="line.335"></a>
+<span class="sourceLineNo">336</span>          // write method of BufferCallBeforeInitHandler.<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          // This may be considered as a bug of netty, but anyway there is a work around so let's<a name="line.337"></a>
+<span class="sourceLineNo">338</span>          // fix it by ourselves first.<a name="line.338"></a>
+<span class="sourceLineNo">339</span>          if (ch.eventLoop().inEventLoop()) {<a name="line.339"></a>
+<span class="sourceLineNo">340</span>            write(ch, call);<a name="line.340"></a>
+<span class="sourceLineNo">341</span>          } else {<a name="line.341"></a>
+<span class="sourceLineNo">342</span>            ch.eventLoop().execute(new Runnable() {<a name="line.342"></a>
+<span class="sourceLineNo">343</span><a name="line.343"></a>
+<span class="sourceLineNo">344</span>              @Override<a name="line.344"></a>
+<span class="sourceLineNo">345</span>              public void run() {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>                write(ch, call);<a name="line.346"></a>
+<span class="sourceLineNo">347</span>              }<a name="line.347"></a>
+<span class="sourceLineNo">348</span>            });<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          }<a name="line.349"></a>
+<span class="sourceLineNo">350</span>        }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>      }<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    });<a name="line.352"></a>
+<span class="sourceLineNo">353</span>  }<a name="line.353"></a>
+<span class="sourceLineNo">354</span>}<a name="line.354"></a>
 
 
 
