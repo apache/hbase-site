@@ -28,123 +28,123 @@
 <span class="sourceLineNo">020</span>package org.apache.hadoop.hbase.master.assignment;<a name="line.20"></a>
 <span class="sourceLineNo">021</span><a name="line.21"></a>
 <span class="sourceLineNo">022</span>import java.io.IOException;<a name="line.22"></a>
-<span class="sourceLineNo">023</span>import java.io.InputStream;<a name="line.23"></a>
-<span class="sourceLineNo">024</span>import java.io.OutputStream;<a name="line.24"></a>
-<span class="sourceLineNo">025</span><a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.commons.logging.Log;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.apache.commons.logging.LogFactory;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.ServerName;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.TableName;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.client.RetriesExhaustedException;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.client.TableState;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.exceptions.UnexpectedStateException;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.master.TableStateManager;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.master.assignment.RegionStates.RegionStateNode;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.master.procedure.RSProcedureDispatcher.RegionOpenOperation;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.procedure2.RemoteProcedureDispatcher.RemoteOperation;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.AssignRegionStateData;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.RegionTransitionState;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.46"></a>
-<span class="sourceLineNo">047</span><a name="line.47"></a>
-<span class="sourceLineNo">048</span>/**<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * Procedure that describe the assignment of a single region.<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * There can only be one RegionTransitionProcedure per region running at a time<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * since each procedure takes a lock on the region.<a name="line.51"></a>
-<span class="sourceLineNo">052</span> *<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * &lt;p&gt;The Assign starts by pushing the "assign" operation to the AssignmentManager<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * and then will go in a "waiting" state.<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * The AM will batch the "assign" requests and ask the Balancer where to put<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * the region (the various policies will be respected: retain, round-robin, random).<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * Once the AM and the balancer have found a place for the region the procedure<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * will be resumed and an "open region" request will be placed in the Remote Dispatcher<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * queue, and the procedure once again will go in a "waiting state".<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * The Remote Dispatcher will batch the various requests for that server and<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * they will be sent to the RS for execution.<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * The RS will complete the open operation by calling master.reportRegionStateTransition().<a name="line.62"></a>
-<span class="sourceLineNo">063</span> * The AM will intercept the transition report, and notify the procedure.<a name="line.63"></a>
-<span class="sourceLineNo">064</span> * The procedure will finish the assignment by publishing to new state on meta<a name="line.64"></a>
-<span class="sourceLineNo">065</span> * or it will retry the assignment.<a name="line.65"></a>
-<span class="sourceLineNo">066</span> *<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * &lt;p&gt;This procedure does not rollback when beyond the first<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * REGION_TRANSITION_QUEUE step; it will press on trying to assign in the face of<a name="line.68"></a>
-<span class="sourceLineNo">069</span> * failure. Should we ignore rollback calls to Assign/Unassign then? Or just<a name="line.69"></a>
-<span class="sourceLineNo">070</span> * remove rollback here?<a name="line.70"></a>
-<span class="sourceLineNo">071</span> */<a name="line.71"></a>
-<span class="sourceLineNo">072</span>@InterfaceAudience.Private<a name="line.72"></a>
-<span class="sourceLineNo">073</span>public class AssignProcedure extends RegionTransitionProcedure {<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private static final Log LOG = LogFactory.getLog(AssignProcedure.class);<a name="line.74"></a>
+<span class="sourceLineNo">023</span>import org.apache.commons.logging.Log;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.commons.logging.LogFactory;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.ServerName;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.TableName;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.classification.InterfaceAudience;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.client.RetriesExhaustedException;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.client.TableState;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.exceptions.UnexpectedStateException;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.master.TableStateManager;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.master.assignment.RegionStates.RegionStateNode;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.master.procedure.RSProcedureDispatcher.RegionOpenOperation;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.procedure2.ProcedureSuspendedException;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.procedure2.RemoteProcedureDispatcher.RemoteOperation;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.AssignRegionStateData;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.RegionTransitionState;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.44"></a>
+<span class="sourceLineNo">045</span><a name="line.45"></a>
+<span class="sourceLineNo">046</span>/**<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * Procedure that describe the assignment of a single region.<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * There can only be one RegionTransitionProcedure per region running at a time<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * since each procedure takes a lock on the region.<a name="line.49"></a>
+<span class="sourceLineNo">050</span> *<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * &lt;p&gt;The Assign starts by pushing the "assign" operation to the AssignmentManager<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * and then will go in a "waiting" state.<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * The AM will batch the "assign" requests and ask the Balancer where to put<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * the region (the various policies will be respected: retain, round-robin, random).<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * Once the AM and the balancer have found a place for the region the procedure<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * will be resumed and an "open region" request will be placed in the Remote Dispatcher<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * queue, and the procedure once again will go in a "waiting state".<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * The Remote Dispatcher will batch the various requests for that server and<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * they will be sent to the RS for execution.<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * The RS will complete the open operation by calling master.reportRegionStateTransition().<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * The AM will intercept the transition report, and notify the procedure.<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * The procedure will finish the assignment by publishing to new state on meta<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * or it will retry the assignment.<a name="line.63"></a>
+<span class="sourceLineNo">064</span> *<a name="line.64"></a>
+<span class="sourceLineNo">065</span> * &lt;p&gt;This procedure does not rollback when beyond the first<a name="line.65"></a>
+<span class="sourceLineNo">066</span> * REGION_TRANSITION_QUEUE step; it will press on trying to assign in the face of<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * failure. Should we ignore rollback calls to Assign/Unassign then? Or just<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * remove rollback here?<a name="line.68"></a>
+<span class="sourceLineNo">069</span> */<a name="line.69"></a>
+<span class="sourceLineNo">070</span>@InterfaceAudience.Private<a name="line.70"></a>
+<span class="sourceLineNo">071</span>public class AssignProcedure extends RegionTransitionProcedure {<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private static final Log LOG = LogFactory.getLog(AssignProcedure.class);<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private boolean forceNewPlan = false;<a name="line.74"></a>
 <span class="sourceLineNo">075</span><a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private boolean forceNewPlan = false;<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  /**<a name="line.78"></a>
-<span class="sourceLineNo">079</span>   * Gets set as desired target on move, merge, etc., when we want to go to a particular server.<a name="line.79"></a>
-<span class="sourceLineNo">080</span>   * We may not be able to respect this request but will try. When it is NOT set, then we ask<a name="line.80"></a>
-<span class="sourceLineNo">081</span>   * the balancer to assign. This value is used below in startTransition to set regionLocation if<a name="line.81"></a>
-<span class="sourceLineNo">082</span>   * non-null. Setting regionLocation in regionServerNode is how we override balancer setting<a name="line.82"></a>
-<span class="sourceLineNo">083</span>   * destination.<a name="line.83"></a>
-<span class="sourceLineNo">084</span>   */<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  protected volatile ServerName targetServer;<a name="line.85"></a>
-<span class="sourceLineNo">086</span><a name="line.86"></a>
-<span class="sourceLineNo">087</span>  public AssignProcedure() {<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    // Required by the Procedure framework to create the procedure on replay<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    super();<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  }<a name="line.90"></a>
-<span class="sourceLineNo">091</span><a name="line.91"></a>
-<span class="sourceLineNo">092</span>  public AssignProcedure(final HRegionInfo regionInfo) {<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    this(regionInfo, false);<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  }<a name="line.94"></a>
-<span class="sourceLineNo">095</span><a name="line.95"></a>
-<span class="sourceLineNo">096</span>  public AssignProcedure(final HRegionInfo regionInfo, final boolean forceNewPlan) {<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    super(regionInfo);<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    this.forceNewPlan = forceNewPlan;<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    this.targetServer = null;<a name="line.99"></a>
-<span class="sourceLineNo">100</span>  }<a name="line.100"></a>
-<span class="sourceLineNo">101</span><a name="line.101"></a>
-<span class="sourceLineNo">102</span>  public AssignProcedure(final HRegionInfo regionInfo, final ServerName destinationServer) {<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    super(regionInfo);<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    this.forceNewPlan = false;<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    this.targetServer = destinationServer;<a name="line.105"></a>
-<span class="sourceLineNo">106</span>  }<a name="line.106"></a>
-<span class="sourceLineNo">107</span><a name="line.107"></a>
-<span class="sourceLineNo">108</span>  @Override<a name="line.108"></a>
-<span class="sourceLineNo">109</span>  public TableOperationType getTableOperationType() {<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    return TableOperationType.REGION_ASSIGN;<a name="line.110"></a>
-<span class="sourceLineNo">111</span>  }<a name="line.111"></a>
-<span class="sourceLineNo">112</span><a name="line.112"></a>
-<span class="sourceLineNo">113</span>  @Override<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  protected boolean isRollbackSupported(final RegionTransitionState state) {<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    switch (state) {<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      case REGION_TRANSITION_QUEUE:<a name="line.116"></a>
-<span class="sourceLineNo">117</span>        return true;<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      default:<a name="line.118"></a>
-<span class="sourceLineNo">119</span>        return false;<a name="line.119"></a>
-<span class="sourceLineNo">120</span>    }<a name="line.120"></a>
-<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
-<span class="sourceLineNo">122</span><a name="line.122"></a>
-<span class="sourceLineNo">123</span>  @Override<a name="line.123"></a>
-<span class="sourceLineNo">124</span>  public void serializeStateData(final OutputStream stream) throws IOException {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    final AssignRegionStateData.Builder state = AssignRegionStateData.newBuilder()<a name="line.125"></a>
-<span class="sourceLineNo">126</span>        .setTransitionState(getTransitionState())<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        .setRegionInfo(HRegionInfo.convert(getRegionInfo()));<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    if (forceNewPlan) {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      state.setForceNewPlan(true);<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    }<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    if (this.targetServer != null) {<a name="line.131"></a>
-<span class="sourceLineNo">132</span>      state.setTargetServer(ProtobufUtil.toServerName(this.targetServer));<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    state.build().writeDelimitedTo(stream);<a name="line.134"></a>
-<span class="sourceLineNo">135</span>  }<a name="line.135"></a>
-<span class="sourceLineNo">136</span><a name="line.136"></a>
-<span class="sourceLineNo">137</span>  @Override<a name="line.137"></a>
-<span class="sourceLineNo">138</span>  public void deserializeStateData(final InputStream stream) throws IOException {<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    final AssignRegionStateData state = AssignRegionStateData.parseDelimitedFrom(stream);<a name="line.139"></a>
+<span class="sourceLineNo">076</span>  /**<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   * Gets set as desired target on move, merge, etc., when we want to go to a particular server.<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   * We may not be able to respect this request but will try. When it is NOT set, then we ask<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   * the balancer to assign. This value is used below in startTransition to set regionLocation if<a name="line.79"></a>
+<span class="sourceLineNo">080</span>   * non-null. Setting regionLocation in regionServerNode is how we override balancer setting<a name="line.80"></a>
+<span class="sourceLineNo">081</span>   * destination.<a name="line.81"></a>
+<span class="sourceLineNo">082</span>   */<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  protected volatile ServerName targetServer;<a name="line.83"></a>
+<span class="sourceLineNo">084</span><a name="line.84"></a>
+<span class="sourceLineNo">085</span>  public AssignProcedure() {<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    // Required by the Procedure framework to create the procedure on replay<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    super();<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  }<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  public AssignProcedure(final HRegionInfo regionInfo) {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this(regionInfo, false);<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  }<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>  public AssignProcedure(final HRegionInfo regionInfo, final boolean forceNewPlan) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    super(regionInfo);<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    this.forceNewPlan = forceNewPlan;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    this.targetServer = null;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  public AssignProcedure(final HRegionInfo regionInfo, final ServerName destinationServer) {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    super(regionInfo);<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    this.forceNewPlan = false;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    this.targetServer = destinationServer;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>  }<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  @Override<a name="line.106"></a>
+<span class="sourceLineNo">107</span>  public TableOperationType getTableOperationType() {<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    return TableOperationType.REGION_ASSIGN;<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  }<a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  @Override<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  protected boolean isRollbackSupported(final RegionTransitionState state) {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    switch (state) {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>      case REGION_TRANSITION_QUEUE:<a name="line.114"></a>
+<span class="sourceLineNo">115</span>        return true;<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      default:<a name="line.116"></a>
+<span class="sourceLineNo">117</span>        return false;<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    }<a name="line.118"></a>
+<span class="sourceLineNo">119</span>  }<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>  @Override<a name="line.121"></a>
+<span class="sourceLineNo">122</span>  protected void serializeStateData(ProcedureStateSerializer serializer)<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      throws IOException {<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    final AssignRegionStateData.Builder state = AssignRegionStateData.newBuilder()<a name="line.124"></a>
+<span class="sourceLineNo">125</span>        .setTransitionState(getTransitionState())<a name="line.125"></a>
+<span class="sourceLineNo">126</span>        .setRegionInfo(HRegionInfo.convert(getRegionInfo()));<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    if (forceNewPlan) {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      state.setForceNewPlan(true);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    }<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    if (this.targetServer != null) {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      state.setTargetServer(ProtobufUtil.toServerName(this.targetServer));<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    serializer.serialize(state.build());<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  @Override<a name="line.136"></a>
+<span class="sourceLineNo">137</span>  protected void deserializeStateData(ProcedureStateSerializer serializer)<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      throws IOException {<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    final AssignRegionStateData state = serializer.deserialize(AssignRegionStateData.class);<a name="line.139"></a>
 <span class="sourceLineNo">140</span>    setTransitionState(state.getTransitionState());<a name="line.140"></a>
 <span class="sourceLineNo">141</span>    setRegionInfo(HRegionInfo.convert(state.getRegionInfo()));<a name="line.141"></a>
 <span class="sourceLineNo">142</span>    forceNewPlan = state.getForceNewPlan();<a name="line.142"></a>
