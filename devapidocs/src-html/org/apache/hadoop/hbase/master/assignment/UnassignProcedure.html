@@ -28,254 +28,256 @@
 <span class="sourceLineNo">020</span>package org.apache.hadoop.hbase.master.assignment;<a name="line.20"></a>
 <span class="sourceLineNo">021</span><a name="line.21"></a>
 <span class="sourceLineNo">022</span>import java.io.IOException;<a name="line.22"></a>
-<span class="sourceLineNo">023</span>import org.apache.commons.logging.Log;<a name="line.23"></a>
-<span class="sourceLineNo">024</span>import org.apache.commons.logging.LogFactory;<a name="line.24"></a>
-<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.HConstants;<a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.26"></a>
+<span class="sourceLineNo">023</span><a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.commons.logging.Log;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.commons.logging.LogFactory;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.HConstants;<a name="line.26"></a>
 <span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.NotServingRegionException;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.ServerName;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.29"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.29"></a>
 <span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.exceptions.UnexpectedStateException;<a name="line.30"></a>
 <span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.master.assignment.RegionStates.RegionStateNode;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.master.procedure.ServerCrashException;<a name="line.34"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.master.assignment.RegionStates.RegionStateNode;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;<a name="line.34"></a>
 <span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.master.procedure.RSProcedureDispatcher.RegionCloseOperation;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.36"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.master.procedure.ServerCrashException;<a name="line.36"></a>
 <span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.procedure2.ProcedureMetrics;<a name="line.37"></a>
 <span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;<a name="line.38"></a>
 <span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.procedure2.RemoteProcedureDispatcher.RemoteOperation;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.RegionTransitionState;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.UnassignRegionStateData;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.RegionServerAbortedException;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.45"></a>
-<span class="sourceLineNo">046</span><a name="line.46"></a>
-<span class="sourceLineNo">047</span>/**<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * Procedure that describes the unassignment of a single region.<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * There can only be one RegionTransitionProcedure -- i.e. an assign or an unassign -- per region<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * running at a time, since each procedure takes a lock on the region.<a name="line.50"></a>
-<span class="sourceLineNo">051</span> *<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * &lt;p&gt;The Unassign starts by placing a "close region" request in the Remote Dispatcher<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * queue, and the procedure will then go into a "waiting state" (suspend).<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * The Remote Dispatcher will batch the various requests for that server and<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * they will be sent to the RS for execution.<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * The RS will complete the open operation by calling master.reportRegionStateTransition().<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * The AM will intercept the transition report, and notify this procedure.<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * The procedure will wakeup and finish the unassign by publishing its new state on meta.<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * &lt;p&gt;If we are unable to contact the remote regionserver whether because of ConnectException<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * or socket timeout, we will call expire on the server we were trying to contact. We will remain<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * in suspended state waiting for a wake up from the ServerCrashProcedure that is processing the<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * failed server. The basic idea is that if we notice a crashed server, then we have a<a name="line.62"></a>
-<span class="sourceLineNo">063</span> * responsibility; i.e. we should not let go of the region until we are sure the server that was<a name="line.63"></a>
-<span class="sourceLineNo">064</span> * hosting has had its crash processed. If we let go of the region before then, an assign might<a name="line.64"></a>
-<span class="sourceLineNo">065</span> * run before the logs have been split which would make for data loss.<a name="line.65"></a>
-<span class="sourceLineNo">066</span> *<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * &lt;p&gt;TODO: Rather than this tricky coordination between SCP and this Procedure, instead, work on<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * returning a SCP as our subprocedure; probably needs work on the framework to do this,<a name="line.68"></a>
-<span class="sourceLineNo">069</span> * especially if the SCP already created.<a name="line.69"></a>
-<span class="sourceLineNo">070</span> */<a name="line.70"></a>
-<span class="sourceLineNo">071</span>@InterfaceAudience.Private<a name="line.71"></a>
-<span class="sourceLineNo">072</span>public class UnassignProcedure extends RegionTransitionProcedure {<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private static final Log LOG = LogFactory.getLog(UnassignProcedure.class);<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  /**<a name="line.75"></a>
-<span class="sourceLineNo">076</span>   * Where to send the unassign RPC.<a name="line.76"></a>
-<span class="sourceLineNo">077</span>   */<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  protected volatile ServerName hostingServer;<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  /**<a name="line.79"></a>
-<span class="sourceLineNo">080</span>   * The Server we will subsequently assign the region too (can be null).<a name="line.80"></a>
-<span class="sourceLineNo">081</span>   */<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  protected volatile ServerName destinationServer;<a name="line.82"></a>
-<span class="sourceLineNo">083</span><a name="line.83"></a>
-<span class="sourceLineNo">084</span>  // TODO: should this be in a reassign procedure?<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  //       ...and keep unassign for 'disable' case?<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  private boolean force;<a name="line.86"></a>
-<span class="sourceLineNo">087</span><a name="line.87"></a>
-<span class="sourceLineNo">088</span>  public UnassignProcedure() {<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    // Required by the Procedure framework to create the procedure on replay<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    super();<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  }<a name="line.91"></a>
-<span class="sourceLineNo">092</span><a name="line.92"></a>
-<span class="sourceLineNo">093</span>  public UnassignProcedure(final HRegionInfo regionInfo,  final ServerName hostingServer,<a name="line.93"></a>
-<span class="sourceLineNo">094</span>                           final boolean force) {<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    this(regionInfo, hostingServer, null, force);<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  }<a name="line.96"></a>
-<span class="sourceLineNo">097</span><a name="line.97"></a>
-<span class="sourceLineNo">098</span>  public UnassignProcedure(final HRegionInfo regionInfo,<a name="line.98"></a>
-<span class="sourceLineNo">099</span>      final ServerName hostingServer, final ServerName destinationServer, final boolean force) {<a name="line.99"></a>
-<span class="sourceLineNo">100</span>    super(regionInfo);<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    this.hostingServer = hostingServer;<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    this.destinationServer = destinationServer;<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    this.force = force;<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>    // we don't need REGION_TRANSITION_QUEUE, we jump directly to sending the request<a name="line.105"></a>
-<span class="sourceLineNo">106</span>    setTransitionState(RegionTransitionState.REGION_TRANSITION_DISPATCH);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  }<a name="line.107"></a>
-<span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  @Override<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  public TableOperationType getTableOperationType() {<a name="line.110"></a>
-<span class="sourceLineNo">111</span>    return TableOperationType.REGION_UNASSIGN;<a name="line.111"></a>
-<span class="sourceLineNo">112</span>  }<a name="line.112"></a>
-<span class="sourceLineNo">113</span><a name="line.113"></a>
-<span class="sourceLineNo">114</span>  @Override<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  protected boolean isRollbackSupported(final RegionTransitionState state) {<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    switch (state) {<a name="line.116"></a>
-<span class="sourceLineNo">117</span>      case REGION_TRANSITION_QUEUE:<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      case REGION_TRANSITION_DISPATCH:<a name="line.118"></a>
-<span class="sourceLineNo">119</span>        return true;<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      default:<a name="line.120"></a>
-<span class="sourceLineNo">121</span>        return false;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    }<a name="line.122"></a>
-<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>  @Override<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  protected void serializeStateData(ProcedureStateSerializer serializer)<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      throws IOException {<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    UnassignRegionStateData.Builder state = UnassignRegionStateData.newBuilder()<a name="line.128"></a>
-<span class="sourceLineNo">129</span>        .setTransitionState(getTransitionState())<a name="line.129"></a>
-<span class="sourceLineNo">130</span>        .setHostingServer(ProtobufUtil.toServerName(this.hostingServer))<a name="line.130"></a>
-<span class="sourceLineNo">131</span>        .setRegionInfo(HRegionInfo.convert(getRegionInfo()));<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    if (this.destinationServer != null) {<a name="line.132"></a>
-<span class="sourceLineNo">133</span>      state.setDestinationServer(ProtobufUtil.toServerName(destinationServer));<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    }<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    if (force) {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      state.setForce(true);<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    }<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    serializer.serialize(state.build());<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  }<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>  @Override<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  protected void deserializeStateData(ProcedureStateSerializer serializer)<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      throws IOException {<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    final UnassignRegionStateData state =<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        serializer.deserialize(UnassignRegionStateData.class);<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    setTransitionState(state.getTransitionState());<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    setRegionInfo(HRegionInfo.convert(state.getRegionInfo()));<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    this.hostingServer = ProtobufUtil.toServerName(state.getHostingServer());<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    force = state.getForce();<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    if (state.hasDestinationServer()) {<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      this.destinationServer = ProtobufUtil.toServerName(state.getDestinationServer());<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    }<a name="line.152"></a>
-<span class="sourceLineNo">153</span>  }<a name="line.153"></a>
-<span class="sourceLineNo">154</span><a name="line.154"></a>
-<span class="sourceLineNo">155</span>  @Override<a name="line.155"></a>
-<span class="sourceLineNo">156</span>  protected boolean startTransition(final MasterProcedureEnv env, final RegionStateNode regionNode) {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    // nothing to do here. we skip the step in the constructor<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    // by jumping to REGION_TRANSITION_DISPATCH<a name="line.158"></a>
-<span class="sourceLineNo">159</span>    throw new UnsupportedOperationException();<a name="line.159"></a>
-<span class="sourceLineNo">160</span>  }<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>  @Override<a name="line.162"></a>
-<span class="sourceLineNo">163</span>  protected boolean updateTransition(final MasterProcedureEnv env, final RegionStateNode regionNode)<a name="line.163"></a>
-<span class="sourceLineNo">164</span>        throws IOException {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    // if the region is already closed or offline we can't do much...<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    if (regionNode.isInState(State.CLOSED, State.OFFLINE)) {<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      LOG.info("Not unassigned " + this + "; " + regionNode.toShortString());<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      return false;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    }<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>    // if we haven't started the operation yet, we can abort<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    if (aborted.get() &amp;&amp; regionNode.isInState(State.OPEN)) {<a name="line.172"></a>
-<span class="sourceLineNo">173</span>      setAbortFailure(getClass().getSimpleName(), "abort requested");<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      return false;<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    }<a name="line.175"></a>
-<span class="sourceLineNo">176</span><a name="line.176"></a>
-<span class="sourceLineNo">177</span>    // Mark the region as CLOSING.<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    env.getAssignmentManager().markRegionAsClosing(regionNode);<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>    // Add the close region operation the the server dispatch queue.<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    if (!addToRemoteDispatcher(env, regionNode.getRegionLocation())) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      // If addToRemoteDispatcher fails, it calls the callback #remoteCallFailed.<a name="line.182"></a>
-<span class="sourceLineNo">183</span>    }<a name="line.183"></a>
-<span class="sourceLineNo">184</span><a name="line.184"></a>
-<span class="sourceLineNo">185</span>    // Return true to keep the procedure running.<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    return true;<a name="line.186"></a>
-<span class="sourceLineNo">187</span>  }<a name="line.187"></a>
-<span class="sourceLineNo">188</span><a name="line.188"></a>
-<span class="sourceLineNo">189</span>  @Override<a name="line.189"></a>
-<span class="sourceLineNo">190</span>  protected void finishTransition(final MasterProcedureEnv env, final RegionStateNode regionNode)<a name="line.190"></a>
-<span class="sourceLineNo">191</span>      throws IOException {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    env.getAssignmentManager().markRegionAsClosed(regionNode);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>  }<a name="line.193"></a>
-<span class="sourceLineNo">194</span><a name="line.194"></a>
-<span class="sourceLineNo">195</span>  @Override<a name="line.195"></a>
-<span class="sourceLineNo">196</span>  public RemoteOperation remoteCallBuild(final MasterProcedureEnv env, final ServerName serverName) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    assert serverName.equals(getRegionState(env).getRegionLocation());<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    return new RegionCloseOperation(this, getRegionInfo(), this.destinationServer);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>  }<a name="line.199"></a>
-<span class="sourceLineNo">200</span><a name="line.200"></a>
-<span class="sourceLineNo">201</span>  @Override<a name="line.201"></a>
-<span class="sourceLineNo">202</span>  protected void reportTransition(final MasterProcedureEnv env, final RegionStateNode regionNode,<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      final TransitionCode code, final long seqId) throws UnexpectedStateException {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    switch (code) {<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      case CLOSED:<a name="line.205"></a>
-<span class="sourceLineNo">206</span>        setTransitionState(RegionTransitionState.REGION_TRANSITION_FINISH);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>        break;<a name="line.207"></a>
-<span class="sourceLineNo">208</span>      default:<a name="line.208"></a>
-<span class="sourceLineNo">209</span>        throw new UnexpectedStateException(String.format(<a name="line.209"></a>
-<span class="sourceLineNo">210</span>          "Received report unexpected transition state=%s for region=%s server=%s, expected CLOSED.",<a name="line.210"></a>
-<span class="sourceLineNo">211</span>          code, regionNode.getRegionInfo(), regionNode.getRegionLocation()));<a name="line.211"></a>
-<span class="sourceLineNo">212</span>    }<a name="line.212"></a>
-<span class="sourceLineNo">213</span>  }<a name="line.213"></a>
-<span class="sourceLineNo">214</span><a name="line.214"></a>
-<span class="sourceLineNo">215</span>  @Override<a name="line.215"></a>
-<span class="sourceLineNo">216</span>  protected boolean remoteCallFailed(final MasterProcedureEnv env, final RegionStateNode regionNode,<a name="line.216"></a>
-<span class="sourceLineNo">217</span>      final IOException exception) {<a name="line.217"></a>
-<span class="sourceLineNo">218</span>    // TODO: Is there on-going rpc to cleanup?<a name="line.218"></a>
-<span class="sourceLineNo">219</span>    if (exception instanceof ServerCrashException) {<a name="line.219"></a>
-<span class="sourceLineNo">220</span>      // This exception comes from ServerCrashProcedure after log splitting.<a name="line.220"></a>
-<span class="sourceLineNo">221</span>      // SCP found this region as a RIT. Its call into here says it is ok to let this procedure go<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      // on to a complete close now. This will release lock on this region so subsequent action on<a name="line.222"></a>
-<span class="sourceLineNo">223</span>      // region can succeed; e.g. the assign that follows this unassign when a move (w/o wait on SCP<a name="line.223"></a>
-<span class="sourceLineNo">224</span>      // the assign could run w/o logs being split so data loss).<a name="line.224"></a>
-<span class="sourceLineNo">225</span>      try {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>        reportTransition(env, regionNode, TransitionCode.CLOSED, HConstants.NO_SEQNUM);<a name="line.226"></a>
-<span class="sourceLineNo">227</span>      } catch (UnexpectedStateException e) {<a name="line.227"></a>
-<span class="sourceLineNo">228</span>        // Should never happen.<a name="line.228"></a>
-<span class="sourceLineNo">229</span>        throw new RuntimeException(e);<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      }<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    } else if (exception instanceof RegionServerAbortedException ||<a name="line.231"></a>
-<span class="sourceLineNo">232</span>        exception instanceof RegionServerStoppedException ||<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        exception instanceof ServerNotRunningYetException) {<a name="line.233"></a>
-<span class="sourceLineNo">234</span>      // TODO<a name="line.234"></a>
-<span class="sourceLineNo">235</span>      // RS is aborting, we cannot offline the region since the region may need to do WAL<a name="line.235"></a>
-<span class="sourceLineNo">236</span>      // recovery. Until we see the RS expiration, we should retry.<a name="line.236"></a>
-<span class="sourceLineNo">237</span>      // TODO: This should be suspend like the below where we call expire on server?<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      LOG.info("Ignoring; waiting on ServerCrashProcedure", exception);<a name="line.238"></a>
-<span class="sourceLineNo">239</span>    } else if (exception instanceof NotServingRegionException) {<a name="line.239"></a>
-<span class="sourceLineNo">240</span>      LOG.info("IS THIS OK? ANY LOGS TO REPLAY; ACTING AS THOUGH ALL GOOD " + regionNode,<a name="line.240"></a>
-<span class="sourceLineNo">241</span>        exception);<a name="line.241"></a>
-<span class="sourceLineNo">242</span>      setTransitionState(RegionTransitionState.REGION_TRANSITION_FINISH);<a name="line.242"></a>
-<span class="sourceLineNo">243</span>    } else {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>      LOG.warn("Expiring server " + this + "; " + regionNode.toShortString() +<a name="line.244"></a>
-<span class="sourceLineNo">245</span>        ", exception=" + exception);<a name="line.245"></a>
-<span class="sourceLineNo">246</span>      env.getMasterServices().getServerManager().expireServer(regionNode.getRegionLocation());<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      // Return false so this procedure stays in suspended state. It will be woken up by a<a name="line.247"></a>
-<span class="sourceLineNo">248</span>      // ServerCrashProcedure when it notices this RIT.<a name="line.248"></a>
-<span class="sourceLineNo">249</span>      // TODO: Add a SCP as a new subprocedure that we now come to depend on.<a name="line.249"></a>
-<span class="sourceLineNo">250</span>      return false;<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    }<a name="line.251"></a>
-<span class="sourceLineNo">252</span>    return true;<a name="line.252"></a>
-<span class="sourceLineNo">253</span>  }<a name="line.253"></a>
-<span class="sourceLineNo">254</span><a name="line.254"></a>
-<span class="sourceLineNo">255</span>  @Override<a name="line.255"></a>
-<span class="sourceLineNo">256</span>  public void toStringClassDetails(StringBuilder sb) {<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    super.toStringClassDetails(sb);<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    sb.append(", server=").append(this.hostingServer);<a name="line.258"></a>
-<span class="sourceLineNo">259</span>  }<a name="line.259"></a>
-<span class="sourceLineNo">260</span><a name="line.260"></a>
-<span class="sourceLineNo">261</span>  @Override<a name="line.261"></a>
-<span class="sourceLineNo">262</span>  public ServerName getServer(final MasterProcedureEnv env) {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>    return this.hostingServer;<a name="line.263"></a>
-<span class="sourceLineNo">264</span>  }<a name="line.264"></a>
-<span class="sourceLineNo">265</span><a name="line.265"></a>
-<span class="sourceLineNo">266</span>  @Override<a name="line.266"></a>
-<span class="sourceLineNo">267</span>  protected ProcedureMetrics getProcedureMetrics(MasterProcedureEnv env) {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    return env.getAssignmentManager().getAssignmentManagerMetrics().getUnassignProcMetrics();<a name="line.268"></a>
-<span class="sourceLineNo">269</span>  }<a name="line.269"></a>
-<span class="sourceLineNo">270</span>}<a name="line.270"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.RegionServerAbortedException;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.42"></a>
+<span class="sourceLineNo">043</span><a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.RegionTransitionState;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.UnassignRegionStateData;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.47"></a>
+<span class="sourceLineNo">048</span><a name="line.48"></a>
+<span class="sourceLineNo">049</span>/**<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * Procedure that describes the unassignment of a single region.<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * There can only be one RegionTransitionProcedure -- i.e. an assign or an unassign -- per region<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * running at a time, since each procedure takes a lock on the region.<a name="line.52"></a>
+<span class="sourceLineNo">053</span> *<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * &lt;p&gt;The Unassign starts by placing a "close region" request in the Remote Dispatcher<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * queue, and the procedure will then go into a "waiting state" (suspend).<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * The Remote Dispatcher will batch the various requests for that server and<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * they will be sent to the RS for execution.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * The RS will complete the open operation by calling master.reportRegionStateTransition().<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * The AM will intercept the transition report, and notify this procedure.<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * The procedure will wakeup and finish the unassign by publishing its new state on meta.<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * &lt;p&gt;If we are unable to contact the remote regionserver whether because of ConnectException<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * or socket timeout, we will call expire on the server we were trying to contact. We will remain<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * in suspended state waiting for a wake up from the ServerCrashProcedure that is processing the<a name="line.63"></a>
+<span class="sourceLineNo">064</span> * failed server. The basic idea is that if we notice a crashed server, then we have a<a name="line.64"></a>
+<span class="sourceLineNo">065</span> * responsibility; i.e. we should not let go of the region until we are sure the server that was<a name="line.65"></a>
+<span class="sourceLineNo">066</span> * hosting has had its crash processed. If we let go of the region before then, an assign might<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * run before the logs have been split which would make for data loss.<a name="line.67"></a>
+<span class="sourceLineNo">068</span> *<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * &lt;p&gt;TODO: Rather than this tricky coordination between SCP and this Procedure, instead, work on<a name="line.69"></a>
+<span class="sourceLineNo">070</span> * returning a SCP as our subprocedure; probably needs work on the framework to do this,<a name="line.70"></a>
+<span class="sourceLineNo">071</span> * especially if the SCP already created.<a name="line.71"></a>
+<span class="sourceLineNo">072</span> */<a name="line.72"></a>
+<span class="sourceLineNo">073</span>@InterfaceAudience.Private<a name="line.73"></a>
+<span class="sourceLineNo">074</span>public class UnassignProcedure extends RegionTransitionProcedure {<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private static final Log LOG = LogFactory.getLog(UnassignProcedure.class);<a name="line.75"></a>
+<span class="sourceLineNo">076</span><a name="line.76"></a>
+<span class="sourceLineNo">077</span>  /**<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   * Where to send the unassign RPC.<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   */<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  protected volatile ServerName hostingServer;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  /**<a name="line.81"></a>
+<span class="sourceLineNo">082</span>   * The Server we will subsequently assign the region too (can be null).<a name="line.82"></a>
+<span class="sourceLineNo">083</span>   */<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  protected volatile ServerName destinationServer;<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  // TODO: should this be in a reassign procedure?<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  //       ...and keep unassign for 'disable' case?<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private boolean force;<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  public UnassignProcedure() {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    // Required by the Procedure framework to create the procedure on replay<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    super();<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  }<a name="line.93"></a>
+<span class="sourceLineNo">094</span><a name="line.94"></a>
+<span class="sourceLineNo">095</span>  public UnassignProcedure(final RegionInfo regionInfo,  final ServerName hostingServer,<a name="line.95"></a>
+<span class="sourceLineNo">096</span>                           final boolean force) {<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    this(regionInfo, hostingServer, null, force);<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  public UnassignProcedure(final RegionInfo regionInfo,<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      final ServerName hostingServer, final ServerName destinationServer, final boolean force) {<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    super(regionInfo);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    this.hostingServer = hostingServer;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    this.destinationServer = destinationServer;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    this.force = force;<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>    // we don't need REGION_TRANSITION_QUEUE, we jump directly to sending the request<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    setTransitionState(RegionTransitionState.REGION_TRANSITION_DISPATCH);<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  }<a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  @Override<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  public TableOperationType getTableOperationType() {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    return TableOperationType.REGION_UNASSIGN;<a name="line.113"></a>
+<span class="sourceLineNo">114</span>  }<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  @Override<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  protected boolean isRollbackSupported(final RegionTransitionState state) {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    switch (state) {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      case REGION_TRANSITION_QUEUE:<a name="line.119"></a>
+<span class="sourceLineNo">120</span>      case REGION_TRANSITION_DISPATCH:<a name="line.120"></a>
+<span class="sourceLineNo">121</span>        return true;<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      default:<a name="line.122"></a>
+<span class="sourceLineNo">123</span>        return false;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    }<a name="line.124"></a>
+<span class="sourceLineNo">125</span>  }<a name="line.125"></a>
+<span class="sourceLineNo">126</span><a name="line.126"></a>
+<span class="sourceLineNo">127</span>  @Override<a name="line.127"></a>
+<span class="sourceLineNo">128</span>  protected void serializeStateData(ProcedureStateSerializer serializer)<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      throws IOException {<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    UnassignRegionStateData.Builder state = UnassignRegionStateData.newBuilder()<a name="line.130"></a>
+<span class="sourceLineNo">131</span>        .setTransitionState(getTransitionState())<a name="line.131"></a>
+<span class="sourceLineNo">132</span>        .setHostingServer(ProtobufUtil.toServerName(this.hostingServer))<a name="line.132"></a>
+<span class="sourceLineNo">133</span>        .setRegionInfo(ProtobufUtil.toRegionInfo(getRegionInfo()));<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    if (this.destinationServer != null) {<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      state.setDestinationServer(ProtobufUtil.toServerName(destinationServer));<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    }<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    if (force) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      state.setForce(true);<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    }<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    serializer.serialize(state.build());<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>  @Override<a name="line.143"></a>
+<span class="sourceLineNo">144</span>  protected void deserializeStateData(ProcedureStateSerializer serializer)<a name="line.144"></a>
+<span class="sourceLineNo">145</span>      throws IOException {<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    final UnassignRegionStateData state =<a name="line.146"></a>
+<span class="sourceLineNo">147</span>        serializer.deserialize(UnassignRegionStateData.class);<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    setTransitionState(state.getTransitionState());<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    setRegionInfo(ProtobufUtil.toRegionInfo(state.getRegionInfo()));<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    this.hostingServer = ProtobufUtil.toServerName(state.getHostingServer());<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    force = state.getForce();<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    if (state.hasDestinationServer()) {<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      this.destinationServer = ProtobufUtil.toServerName(state.getDestinationServer());<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    }<a name="line.154"></a>
+<span class="sourceLineNo">155</span>  }<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>  @Override<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  protected boolean startTransition(final MasterProcedureEnv env, final RegionStateNode regionNode) {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    // nothing to do here. we skip the step in the constructor<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    // by jumping to REGION_TRANSITION_DISPATCH<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    throw new UnsupportedOperationException();<a name="line.161"></a>
+<span class="sourceLineNo">162</span>  }<a name="line.162"></a>
+<span class="sourceLineNo">163</span><a name="line.163"></a>
+<span class="sourceLineNo">164</span>  @Override<a name="line.164"></a>
+<span class="sourceLineNo">165</span>  protected boolean updateTransition(final MasterProcedureEnv env, final RegionStateNode regionNode)<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        throws IOException {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    // if the region is already closed or offline we can't do much...<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    if (regionNode.isInState(State.CLOSED, State.OFFLINE)) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      LOG.info("Not unassigned " + this + "; " + regionNode.toShortString());<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      return false;<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>    // if we haven't started the operation yet, we can abort<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    if (aborted.get() &amp;&amp; regionNode.isInState(State.OPEN)) {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      setAbortFailure(getClass().getSimpleName(), "abort requested");<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      return false;<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    }<a name="line.177"></a>
+<span class="sourceLineNo">178</span><a name="line.178"></a>
+<span class="sourceLineNo">179</span>    // Mark the region as CLOSING.<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    env.getAssignmentManager().markRegionAsClosing(regionNode);<a name="line.180"></a>
+<span class="sourceLineNo">181</span><a name="line.181"></a>
+<span class="sourceLineNo">182</span>    // Add the close region operation the the server dispatch queue.<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    if (!addToRemoteDispatcher(env, regionNode.getRegionLocation())) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      // If addToRemoteDispatcher fails, it calls the callback #remoteCallFailed.<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    }<a name="line.185"></a>
+<span class="sourceLineNo">186</span><a name="line.186"></a>
+<span class="sourceLineNo">187</span>    // Return true to keep the procedure running.<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    return true;<a name="line.188"></a>
+<span class="sourceLineNo">189</span>  }<a name="line.189"></a>
+<span class="sourceLineNo">190</span><a name="line.190"></a>
+<span class="sourceLineNo">191</span>  @Override<a name="line.191"></a>
+<span class="sourceLineNo">192</span>  protected void finishTransition(final MasterProcedureEnv env, final RegionStateNode regionNode)<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      throws IOException {<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    env.getAssignmentManager().markRegionAsClosed(regionNode);<a name="line.194"></a>
+<span class="sourceLineNo">195</span>  }<a name="line.195"></a>
+<span class="sourceLineNo">196</span><a name="line.196"></a>
+<span class="sourceLineNo">197</span>  @Override<a name="line.197"></a>
+<span class="sourceLineNo">198</span>  public RemoteOperation remoteCallBuild(final MasterProcedureEnv env, final ServerName serverName) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    assert serverName.equals(getRegionState(env).getRegionLocation());<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    return new RegionCloseOperation(this, getRegionInfo(), this.destinationServer);<a name="line.200"></a>
+<span class="sourceLineNo">201</span>  }<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>  @Override<a name="line.203"></a>
+<span class="sourceLineNo">204</span>  protected void reportTransition(final MasterProcedureEnv env, final RegionStateNode regionNode,<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      final TransitionCode code, final long seqId) throws UnexpectedStateException {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>    switch (code) {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      case CLOSED:<a name="line.207"></a>
+<span class="sourceLineNo">208</span>        setTransitionState(RegionTransitionState.REGION_TRANSITION_FINISH);<a name="line.208"></a>
+<span class="sourceLineNo">209</span>        break;<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      default:<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        throw new UnexpectedStateException(String.format(<a name="line.211"></a>
+<span class="sourceLineNo">212</span>          "Received report unexpected transition state=%s for region=%s server=%s, expected CLOSED.",<a name="line.212"></a>
+<span class="sourceLineNo">213</span>          code, regionNode.getRegionInfo(), regionNode.getRegionLocation()));<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    }<a name="line.214"></a>
+<span class="sourceLineNo">215</span>  }<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>  @Override<a name="line.217"></a>
+<span class="sourceLineNo">218</span>  protected boolean remoteCallFailed(final MasterProcedureEnv env, final RegionStateNode regionNode,<a name="line.218"></a>
+<span class="sourceLineNo">219</span>      final IOException exception) {<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    // TODO: Is there on-going rpc to cleanup?<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    if (exception instanceof ServerCrashException) {<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      // This exception comes from ServerCrashProcedure after log splitting.<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      // SCP found this region as a RIT. Its call into here says it is ok to let this procedure go<a name="line.223"></a>
+<span class="sourceLineNo">224</span>      // on to a complete close now. This will release lock on this region so subsequent action on<a name="line.224"></a>
+<span class="sourceLineNo">225</span>      // region can succeed; e.g. the assign that follows this unassign when a move (w/o wait on SCP<a name="line.225"></a>
+<span class="sourceLineNo">226</span>      // the assign could run w/o logs being split so data loss).<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      try {<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        reportTransition(env, regionNode, TransitionCode.CLOSED, HConstants.NO_SEQNUM);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>      } catch (UnexpectedStateException e) {<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        // Should never happen.<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        throw new RuntimeException(e);<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      }<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    } else if (exception instanceof RegionServerAbortedException ||<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        exception instanceof RegionServerStoppedException ||<a name="line.234"></a>
+<span class="sourceLineNo">235</span>        exception instanceof ServerNotRunningYetException) {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      // TODO<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      // RS is aborting, we cannot offline the region since the region may need to do WAL<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      // recovery. Until we see the RS expiration, we should retry.<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      // TODO: This should be suspend like the below where we call expire on server?<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      LOG.info("Ignoring; waiting on ServerCrashProcedure", exception);<a name="line.240"></a>
+<span class="sourceLineNo">241</span>    } else if (exception instanceof NotServingRegionException) {<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      LOG.info("IS THIS OK? ANY LOGS TO REPLAY; ACTING AS THOUGH ALL GOOD " + regionNode,<a name="line.242"></a>
+<span class="sourceLineNo">243</span>        exception);<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      setTransitionState(RegionTransitionState.REGION_TRANSITION_FINISH);<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    } else {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      LOG.warn("Expiring server " + this + "; " + regionNode.toShortString() +<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        ", exception=" + exception);<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      env.getMasterServices().getServerManager().expireServer(regionNode.getRegionLocation());<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      // Return false so this procedure stays in suspended state. It will be woken up by a<a name="line.249"></a>
+<span class="sourceLineNo">250</span>      // ServerCrashProcedure when it notices this RIT.<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      // TODO: Add a SCP as a new subprocedure that we now come to depend on.<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      return false;<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    return true;<a name="line.254"></a>
+<span class="sourceLineNo">255</span>  }<a name="line.255"></a>
+<span class="sourceLineNo">256</span><a name="line.256"></a>
+<span class="sourceLineNo">257</span>  @Override<a name="line.257"></a>
+<span class="sourceLineNo">258</span>  public void toStringClassDetails(StringBuilder sb) {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    super.toStringClassDetails(sb);<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    sb.append(", server=").append(this.hostingServer);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>  }<a name="line.261"></a>
+<span class="sourceLineNo">262</span><a name="line.262"></a>
+<span class="sourceLineNo">263</span>  @Override<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  public ServerName getServer(final MasterProcedureEnv env) {<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    return this.hostingServer;<a name="line.265"></a>
+<span class="sourceLineNo">266</span>  }<a name="line.266"></a>
+<span class="sourceLineNo">267</span><a name="line.267"></a>
+<span class="sourceLineNo">268</span>  @Override<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  protected ProcedureMetrics getProcedureMetrics(MasterProcedureEnv env) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    return env.getAssignmentManager().getAssignmentManagerMetrics().getUnassignProcMetrics();<a name="line.270"></a>
+<span class="sourceLineNo">271</span>  }<a name="line.271"></a>
+<span class="sourceLineNo">272</span>}<a name="line.272"></a>
 
 
 

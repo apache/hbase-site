@@ -27,172 +27,172 @@
 <span class="sourceLineNo">019</span><a name="line.19"></a>
 <span class="sourceLineNo">020</span>package org.apache.hadoop.hbase.master.assignment;<a name="line.20"></a>
 <span class="sourceLineNo">021</span><a name="line.21"></a>
-<span class="sourceLineNo">022</span>import org.apache.commons.logging.Log;<a name="line.22"></a>
-<span class="sourceLineNo">023</span>import org.apache.commons.logging.LogFactory;<a name="line.23"></a>
-<span class="sourceLineNo">024</span>import org.apache.hadoop.hbase.HConstants;<a name="line.24"></a>
-<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.HRegionInfo;<a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.ServerName;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.TableName;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.exceptions.UnexpectedStateException;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.master.RegionState;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.procedure2.ProcedureEvent;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.35"></a>
-<span class="sourceLineNo">036</span><a name="line.36"></a>
-<span class="sourceLineNo">037</span>import java.util.ArrayList;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import java.util.Arrays;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import java.util.Collection;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import java.util.Collections;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import java.util.Comparator;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import java.util.HashMap;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import java.util.HashSet;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import java.util.Iterator;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import java.util.List;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import java.util.Map;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import java.util.Set;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import java.util.SortedSet;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import java.util.TreeSet;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import java.util.concurrent.ConcurrentHashMap;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import java.util.concurrent.ConcurrentSkipListMap;<a name="line.51"></a>
-<span class="sourceLineNo">052</span><a name="line.52"></a>
-<span class="sourceLineNo">053</span>/**<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * RegionStates contains a set of Maps that describes the in-memory state of the AM, with<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * the regions available in the system, the region in transition, the offline regions and<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * the servers holding regions.<a name="line.56"></a>
-<span class="sourceLineNo">057</span> */<a name="line.57"></a>
-<span class="sourceLineNo">058</span>@InterfaceAudience.Private<a name="line.58"></a>
-<span class="sourceLineNo">059</span>public class RegionStates {<a name="line.59"></a>
-<span class="sourceLineNo">060</span>  private static final Log LOG = LogFactory.getLog(RegionStates.class);<a name="line.60"></a>
-<span class="sourceLineNo">061</span><a name="line.61"></a>
-<span class="sourceLineNo">062</span>  protected static final State[] STATES_EXPECTED_ON_OPEN = new State[] {<a name="line.62"></a>
-<span class="sourceLineNo">063</span>    State.OFFLINE, State.CLOSED,      // disable/offline<a name="line.63"></a>
-<span class="sourceLineNo">064</span>    State.SPLITTING, State.SPLIT,     // ServerCrashProcedure<a name="line.64"></a>
-<span class="sourceLineNo">065</span>    State.OPENING, State.FAILED_OPEN, // already in-progress (retrying)<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  };<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>  protected static final State[] STATES_EXPECTED_ON_CLOSE = new State[] {<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    State.SPLITTING, State.SPLIT, // ServerCrashProcedure<a name="line.69"></a>
-<span class="sourceLineNo">070</span>    State.OPEN,                   // enabled/open<a name="line.70"></a>
-<span class="sourceLineNo">071</span>    State.CLOSING                 // already in-progress (retrying)<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  };<a name="line.72"></a>
-<span class="sourceLineNo">073</span><a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private static class AssignmentProcedureEvent extends ProcedureEvent&lt;HRegionInfo&gt; {<a name="line.74"></a>
-<span class="sourceLineNo">075</span>    public AssignmentProcedureEvent(final HRegionInfo regionInfo) {<a name="line.75"></a>
-<span class="sourceLineNo">076</span>      super(regionInfo);<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    }<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  }<a name="line.78"></a>
-<span class="sourceLineNo">079</span><a name="line.79"></a>
-<span class="sourceLineNo">080</span>  private static class ServerReportEvent extends ProcedureEvent&lt;ServerName&gt; {<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    public ServerReportEvent(final ServerName serverName) {<a name="line.81"></a>
-<span class="sourceLineNo">082</span>      super(serverName);<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    }<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  }<a name="line.84"></a>
-<span class="sourceLineNo">085</span><a name="line.85"></a>
-<span class="sourceLineNo">086</span>  /**<a name="line.86"></a>
-<span class="sourceLineNo">087</span>   * Current Region State.<a name="line.87"></a>
-<span class="sourceLineNo">088</span>   * In-memory only. Not persisted.<a name="line.88"></a>
-<span class="sourceLineNo">089</span>   */<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  // Mutable/Immutable? Changes have to be synchronized or not?<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  // Data members are volatile which seems to say multi-threaded access is fine.<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  // In the below we do check and set but the check state could change before<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  // we do the set because no synchronization....which seems dodgy. Clear up<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  // understanding here... how many threads accessing? Do locks make it so one<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  // thread at a time working on a single Region's RegionStateNode? Lets presume<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  // so for now. Odd is that elsewhere in this RegionStates, we synchronize on<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  // the RegionStateNode instance. TODO.<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  public static class RegionStateNode implements Comparable&lt;RegionStateNode&gt; {<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    private final HRegionInfo regionInfo;<a name="line.99"></a>
-<span class="sourceLineNo">100</span>    private final ProcedureEvent&lt;?&gt; event;<a name="line.100"></a>
-<span class="sourceLineNo">101</span><a name="line.101"></a>
-<span class="sourceLineNo">102</span>    private volatile RegionTransitionProcedure procedure = null;<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    private volatile ServerName regionLocation = null;<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    private volatile ServerName lastHost = null;<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    /**<a name="line.105"></a>
-<span class="sourceLineNo">106</span>     * A Region-in-Transition (RIT) moves through states.<a name="line.106"></a>
-<span class="sourceLineNo">107</span>     * See {@link State} for complete list. A Region that<a name="line.107"></a>
-<span class="sourceLineNo">108</span>     * is opened moves from OFFLINE =&gt; OPENING =&gt; OPENED.<a name="line.108"></a>
-<span class="sourceLineNo">109</span>     */<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    private volatile State state = State.OFFLINE;<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>    /**<a name="line.112"></a>
-<span class="sourceLineNo">113</span>     * Updated whenever a call to {@link #setRegionLocation(ServerName)}<a name="line.113"></a>
-<span class="sourceLineNo">114</span>     * or {@link #setState(State, State...)}.<a name="line.114"></a>
-<span class="sourceLineNo">115</span>     */<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    private volatile long lastUpdate = 0;<a name="line.116"></a>
-<span class="sourceLineNo">117</span><a name="line.117"></a>
-<span class="sourceLineNo">118</span>    private volatile long openSeqNum = HConstants.NO_SEQNUM;<a name="line.118"></a>
-<span class="sourceLineNo">119</span><a name="line.119"></a>
-<span class="sourceLineNo">120</span>    public RegionStateNode(final HRegionInfo regionInfo) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      this.regionInfo = regionInfo;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      this.event = new AssignmentProcedureEvent(regionInfo);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    }<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>    public boolean setState(final State update, final State... expected) {<a name="line.125"></a>
-<span class="sourceLineNo">126</span>      final boolean expectedState = isInState(expected);<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      if (expectedState) {<a name="line.127"></a>
-<span class="sourceLineNo">128</span>        this.state = update;<a name="line.128"></a>
-<span class="sourceLineNo">129</span>        this.lastUpdate = EnvironmentEdgeManager.currentTime();<a name="line.129"></a>
-<span class="sourceLineNo">130</span>      }<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      return expectedState;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>    /**<a name="line.134"></a>
-<span class="sourceLineNo">135</span>     * Put region into OFFLINE mode (set state and clear location).<a name="line.135"></a>
-<span class="sourceLineNo">136</span>     * @return Last recorded server deploy<a name="line.136"></a>
-<span class="sourceLineNo">137</span>     */<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    public ServerName offline() {<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      setState(State.OFFLINE);<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      return setRegionLocation(null);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    }<a name="line.141"></a>
-<span class="sourceLineNo">142</span><a name="line.142"></a>
-<span class="sourceLineNo">143</span>    /**<a name="line.143"></a>
-<span class="sourceLineNo">144</span>     * Set new {@link State} but only if currently in &lt;code&gt;expected&lt;/code&gt; State<a name="line.144"></a>
-<span class="sourceLineNo">145</span>     * (if not, throw {@link UnexpectedStateException}.<a name="line.145"></a>
-<span class="sourceLineNo">146</span>     */<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    public State transitionState(final State update, final State... expected)<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    throws UnexpectedStateException {<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      if (!setState(update, expected)) {<a name="line.149"></a>
-<span class="sourceLineNo">150</span>        throw new UnexpectedStateException("Expected " + Arrays.toString(expected) +<a name="line.150"></a>
-<span class="sourceLineNo">151</span>          " so could move to " + update + " but current state=" + getState());<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      }<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      return update;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    }<a name="line.154"></a>
-<span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>    public boolean isInState(final State... expected) {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      if (expected != null &amp;&amp; expected.length &gt; 0) {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>        boolean expectedState = false;<a name="line.158"></a>
-<span class="sourceLineNo">159</span>        for (int i = 0; i &lt; expected.length; ++i) {<a name="line.159"></a>
-<span class="sourceLineNo">160</span>          expectedState |= (getState() == expected[i]);<a name="line.160"></a>
-<span class="sourceLineNo">161</span>        }<a name="line.161"></a>
-<span class="sourceLineNo">162</span>        return expectedState;<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      }<a name="line.163"></a>
-<span class="sourceLineNo">164</span>      return true;<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    }<a name="line.165"></a>
-<span class="sourceLineNo">166</span><a name="line.166"></a>
-<span class="sourceLineNo">167</span>    public boolean isStuck() {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      return isInState(State.FAILED_OPEN) &amp;&amp; getProcedure() != null;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    }<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>    public boolean isInTransition() {<a name="line.171"></a>
-<span class="sourceLineNo">172</span>      return getProcedure() != null;<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    }<a name="line.173"></a>
-<span class="sourceLineNo">174</span><a name="line.174"></a>
-<span class="sourceLineNo">175</span>    public long getLastUpdate() {<a name="line.175"></a>
-<span class="sourceLineNo">176</span>      return procedure != null ? procedure.getLastUpdate() : lastUpdate;<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    }<a name="line.177"></a>
-<span class="sourceLineNo">178</span><a name="line.178"></a>
-<span class="sourceLineNo">179</span>    public void setLastHost(final ServerName serverName) {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      this.lastHost = serverName;<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
-<span class="sourceLineNo">182</span><a name="line.182"></a>
-<span class="sourceLineNo">183</span>    public void setOpenSeqNum(final long seqId) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      this.openSeqNum = seqId;<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    }<a name="line.185"></a>
-<span class="sourceLineNo">186</span><a name="line.186"></a>
-<span class="sourceLineNo">187</span>    <a name="line.187"></a>
+<span class="sourceLineNo">022</span>import java.util.ArrayList;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.util.Arrays;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import java.util.Collection;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import java.util.Collections;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import java.util.Comparator;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import java.util.HashMap;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import java.util.HashSet;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import java.util.Iterator;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import java.util.List;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.Map;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import java.util.Set;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import java.util.SortedSet;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import java.util.TreeSet;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import java.util.concurrent.ConcurrentHashMap;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import java.util.concurrent.ConcurrentSkipListMap;<a name="line.36"></a>
+<span class="sourceLineNo">037</span><a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.commons.logging.Log;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.commons.logging.LogFactory;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.HConstants;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.ServerName;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.TableName;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.exceptions.UnexpectedStateException;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.master.RegionState;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.master.RegionState.State;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.procedure2.ProcedureEvent;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>/**<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * RegionStates contains a set of Maps that describes the in-memory state of the AM, with<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * the regions available in the system, the region in transition, the offline regions and<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * the servers holding regions.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> */<a name="line.58"></a>
+<span class="sourceLineNo">059</span>@InterfaceAudience.Private<a name="line.59"></a>
+<span class="sourceLineNo">060</span>public class RegionStates {<a name="line.60"></a>
+<span class="sourceLineNo">061</span>  private static final Log LOG = LogFactory.getLog(RegionStates.class);<a name="line.61"></a>
+<span class="sourceLineNo">062</span><a name="line.62"></a>
+<span class="sourceLineNo">063</span>  protected static final State[] STATES_EXPECTED_ON_OPEN = new State[] {<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    State.OFFLINE, State.CLOSED,      // disable/offline<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    State.SPLITTING, State.SPLIT,     // ServerCrashProcedure<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    State.OPENING, State.FAILED_OPEN, // already in-progress (retrying)<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  };<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  protected static final State[] STATES_EXPECTED_ON_CLOSE = new State[] {<a name="line.69"></a>
+<span class="sourceLineNo">070</span>    State.SPLITTING, State.SPLIT, // ServerCrashProcedure<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    State.OPEN,                   // enabled/open<a name="line.71"></a>
+<span class="sourceLineNo">072</span>    State.CLOSING                 // already in-progress (retrying)<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  };<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private static class AssignmentProcedureEvent extends ProcedureEvent&lt;RegionInfo&gt; {<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    public AssignmentProcedureEvent(final RegionInfo regionInfo) {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>      super(regionInfo);<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    }<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  }<a name="line.79"></a>
+<span class="sourceLineNo">080</span><a name="line.80"></a>
+<span class="sourceLineNo">081</span>  private static class ServerReportEvent extends ProcedureEvent&lt;ServerName&gt; {<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    public ServerReportEvent(final ServerName serverName) {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>      super(serverName);<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    }<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  }<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>  /**<a name="line.87"></a>
+<span class="sourceLineNo">088</span>   * Current Region State.<a name="line.88"></a>
+<span class="sourceLineNo">089</span>   * In-memory only. Not persisted.<a name="line.89"></a>
+<span class="sourceLineNo">090</span>   */<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  // Mutable/Immutable? Changes have to be synchronized or not?<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  // Data members are volatile which seems to say multi-threaded access is fine.<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  // In the below we do check and set but the check state could change before<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  // we do the set because no synchronization....which seems dodgy. Clear up<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  // understanding here... how many threads accessing? Do locks make it so one<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  // thread at a time working on a single Region's RegionStateNode? Lets presume<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  // so for now. Odd is that elsewhere in this RegionStates, we synchronize on<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  // the RegionStateNode instance. TODO.<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  public static class RegionStateNode implements Comparable&lt;RegionStateNode&gt; {<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    private final RegionInfo regionInfo;<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    private final ProcedureEvent&lt;?&gt; event;<a name="line.101"></a>
+<span class="sourceLineNo">102</span><a name="line.102"></a>
+<span class="sourceLineNo">103</span>    private volatile RegionTransitionProcedure procedure = null;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    private volatile ServerName regionLocation = null;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    private volatile ServerName lastHost = null;<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    /**<a name="line.106"></a>
+<span class="sourceLineNo">107</span>     * A Region-in-Transition (RIT) moves through states.<a name="line.107"></a>
+<span class="sourceLineNo">108</span>     * See {@link State} for complete list. A Region that<a name="line.108"></a>
+<span class="sourceLineNo">109</span>     * is opened moves from OFFLINE =&gt; OPENING =&gt; OPENED.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>     */<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    private volatile State state = State.OFFLINE;<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>    /**<a name="line.113"></a>
+<span class="sourceLineNo">114</span>     * Updated whenever a call to {@link #setRegionLocation(ServerName)}<a name="line.114"></a>
+<span class="sourceLineNo">115</span>     * or {@link #setState(State, State...)}.<a name="line.115"></a>
+<span class="sourceLineNo">116</span>     */<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    private volatile long lastUpdate = 0;<a name="line.117"></a>
+<span class="sourceLineNo">118</span><a name="line.118"></a>
+<span class="sourceLineNo">119</span>    private volatile long openSeqNum = HConstants.NO_SEQNUM;<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>    public RegionStateNode(final RegionInfo regionInfo) {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      this.regionInfo = regionInfo;<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      this.event = new AssignmentProcedureEvent(regionInfo);<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    }<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>    public boolean setState(final State update, final State... expected) {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      final boolean expectedState = isInState(expected);<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      if (expectedState) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>        this.state = update;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>        this.lastUpdate = EnvironmentEdgeManager.currentTime();<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      }<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      return expectedState;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>    /**<a name="line.135"></a>
+<span class="sourceLineNo">136</span>     * Put region into OFFLINE mode (set state and clear location).<a name="line.136"></a>
+<span class="sourceLineNo">137</span>     * @return Last recorded server deploy<a name="line.137"></a>
+<span class="sourceLineNo">138</span>     */<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    public ServerName offline() {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      setState(State.OFFLINE);<a name="line.140"></a>
+<span class="sourceLineNo">141</span>      return setRegionLocation(null);<a name="line.141"></a>
+<span class="sourceLineNo">142</span>    }<a name="line.142"></a>
+<span class="sourceLineNo">143</span><a name="line.143"></a>
+<span class="sourceLineNo">144</span>    /**<a name="line.144"></a>
+<span class="sourceLineNo">145</span>     * Set new {@link State} but only if currently in &lt;code&gt;expected&lt;/code&gt; State<a name="line.145"></a>
+<span class="sourceLineNo">146</span>     * (if not, throw {@link UnexpectedStateException}.<a name="line.146"></a>
+<span class="sourceLineNo">147</span>     */<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    public State transitionState(final State update, final State... expected)<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    throws UnexpectedStateException {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      if (!setState(update, expected)) {<a name="line.150"></a>
+<span class="sourceLineNo">151</span>        throw new UnexpectedStateException("Expected " + Arrays.toString(expected) +<a name="line.151"></a>
+<span class="sourceLineNo">152</span>          " so could move to " + update + " but current state=" + getState());<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      }<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      return update;<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    }<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>    public boolean isInState(final State... expected) {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      if (expected != null &amp;&amp; expected.length &gt; 0) {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>        boolean expectedState = false;<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        for (int i = 0; i &lt; expected.length; ++i) {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          expectedState |= (getState() == expected[i]);<a name="line.161"></a>
+<span class="sourceLineNo">162</span>        }<a name="line.162"></a>
+<span class="sourceLineNo">163</span>        return expectedState;<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      }<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      return true;<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    }<a name="line.166"></a>
+<span class="sourceLineNo">167</span><a name="line.167"></a>
+<span class="sourceLineNo">168</span>    public boolean isStuck() {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      return isInState(State.FAILED_OPEN) &amp;&amp; getProcedure() != null;<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
+<span class="sourceLineNo">171</span><a name="line.171"></a>
+<span class="sourceLineNo">172</span>    public boolean isInTransition() {<a name="line.172"></a>
+<span class="sourceLineNo">173</span>      return getProcedure() != null;<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    }<a name="line.174"></a>
+<span class="sourceLineNo">175</span><a name="line.175"></a>
+<span class="sourceLineNo">176</span>    public long getLastUpdate() {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      return procedure != null ? procedure.getLastUpdate() : lastUpdate;<a name="line.177"></a>
+<span class="sourceLineNo">178</span>    }<a name="line.178"></a>
+<span class="sourceLineNo">179</span><a name="line.179"></a>
+<span class="sourceLineNo">180</span>    public void setLastHost(final ServerName serverName) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>      this.lastHost = serverName;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>    public void setOpenSeqNum(final long seqId) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      this.openSeqNum = seqId;<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    }<a name="line.186"></a>
+<span class="sourceLineNo">187</span><a name="line.187"></a>
 <span class="sourceLineNo">188</span>    public ServerName setRegionLocation(final ServerName serverName) {<a name="line.188"></a>
 <span class="sourceLineNo">189</span>      ServerName lastRegionLocation = this.regionLocation;<a name="line.189"></a>
 <span class="sourceLineNo">190</span>      if (LOG.isTraceEnabled() &amp;&amp; serverName == null) {<a name="line.190"></a>
@@ -227,7 +227,7 @@
 <span class="sourceLineNo">219</span>      return event;<a name="line.219"></a>
 <span class="sourceLineNo">220</span>    }<a name="line.220"></a>
 <span class="sourceLineNo">221</span><a name="line.221"></a>
-<span class="sourceLineNo">222</span>    public HRegionInfo getRegionInfo() {<a name="line.222"></a>
+<span class="sourceLineNo">222</span>    public RegionInfo getRegionInfo() {<a name="line.222"></a>
 <span class="sourceLineNo">223</span>      return regionInfo;<a name="line.223"></a>
 <span class="sourceLineNo">224</span>    }<a name="line.224"></a>
 <span class="sourceLineNo">225</span><a name="line.225"></a>
@@ -263,9 +263,9 @@
 <span class="sourceLineNo">255</span><a name="line.255"></a>
 <span class="sourceLineNo">256</span>    @Override<a name="line.256"></a>
 <span class="sourceLineNo">257</span>    public int compareTo(final RegionStateNode other) {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>      // NOTE: HRegionInfo sort by table first, so we are relying on that.<a name="line.258"></a>
+<span class="sourceLineNo">258</span>      // NOTE: RegionInfo sort by table first, so we are relying on that.<a name="line.258"></a>
 <span class="sourceLineNo">259</span>      // we have a TestRegionState#testOrderedByTable() that check for that.<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      return getRegionInfo().compareTo(other.getRegionInfo());<a name="line.260"></a>
+<span class="sourceLineNo">260</span>      return RegionInfo.COMPARATOR.compare(getRegionInfo(), other.getRegionInfo());<a name="line.260"></a>
 <span class="sourceLineNo">261</span>    }<a name="line.261"></a>
 <span class="sourceLineNo">262</span><a name="line.262"></a>
 <span class="sourceLineNo">263</span>    @Override<a name="line.263"></a>
@@ -284,7 +284,7 @@
 <span class="sourceLineNo">276</span>    public String toString() {<a name="line.276"></a>
 <span class="sourceLineNo">277</span>      return toDescriptiveString();<a name="line.277"></a>
 <span class="sourceLineNo">278</span>    }<a name="line.278"></a>
-<span class="sourceLineNo">279</span> <a name="line.279"></a>
+<span class="sourceLineNo">279</span><a name="line.279"></a>
 <span class="sourceLineNo">280</span>    public String toShortString() {<a name="line.280"></a>
 <span class="sourceLineNo">281</span>      // rit= is the current Region-In-Transition State -- see State enum.<a name="line.281"></a>
 <span class="sourceLineNo">282</span>      return String.format("rit=%s, location=%s", getState(), getRegionLocation());<a name="line.282"></a>
@@ -303,7 +303,7 @@
 <span class="sourceLineNo">295</span>    @Override<a name="line.295"></a>
 <span class="sourceLineNo">296</span>    public int compare(final RegionState l, final RegionState r) {<a name="line.296"></a>
 <span class="sourceLineNo">297</span>      int stampCmp = Long.compare(l.getStamp(), r.getStamp());<a name="line.297"></a>
-<span class="sourceLineNo">298</span>      return stampCmp != 0 ? stampCmp : l.getRegion().compareTo(r.getRegion());<a name="line.298"></a>
+<span class="sourceLineNo">298</span>      return stampCmp != 0 ? stampCmp : RegionInfo.COMPARATOR.compare(l.getRegion(), r.getRegion());<a name="line.298"></a>
 <span class="sourceLineNo">299</span>    }<a name="line.299"></a>
 <span class="sourceLineNo">300</span>  }<a name="line.300"></a>
 <span class="sourceLineNo">301</span><a name="line.301"></a>
@@ -365,8 +365,8 @@
 <span class="sourceLineNo">357</span>      return regions.size();<a name="line.357"></a>
 <span class="sourceLineNo">358</span>    }<a name="line.358"></a>
 <span class="sourceLineNo">359</span><a name="line.359"></a>
-<span class="sourceLineNo">360</span>    public ArrayList&lt;HRegionInfo&gt; getRegionInfoList() {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      ArrayList&lt;HRegionInfo&gt; hris = new ArrayList&lt;HRegionInfo&gt;(regions.size());<a name="line.361"></a>
+<span class="sourceLineNo">360</span>    public ArrayList&lt;RegionInfo&gt; getRegionInfoList() {<a name="line.360"></a>
+<span class="sourceLineNo">361</span>      ArrayList&lt;RegionInfo&gt; hris = new ArrayList&lt;RegionInfo&gt;(regions.size());<a name="line.361"></a>
 <span class="sourceLineNo">362</span>      for (RegionStateNode region: regions) {<a name="line.362"></a>
 <span class="sourceLineNo">363</span>        hris.add(region.getRegionInfo());<a name="line.363"></a>
 <span class="sourceLineNo">364</span>      }<a name="line.364"></a>
@@ -409,20 +409,20 @@
 <span class="sourceLineNo">401</span><a name="line.401"></a>
 <span class="sourceLineNo">402</span>  // TODO: Replace the ConcurrentSkipListMaps<a name="line.402"></a>
 <span class="sourceLineNo">403</span>  /**<a name="line.403"></a>
-<span class="sourceLineNo">404</span>   * RegionName -- i.e. HRegionInfo.getRegionName() -- as bytes to {@link RegionStateNode}<a name="line.404"></a>
+<span class="sourceLineNo">404</span>   * RegionName -- i.e. RegionInfo.getRegionName() -- as bytes to {@link RegionStateNode}<a name="line.404"></a>
 <span class="sourceLineNo">405</span>   */<a name="line.405"></a>
 <span class="sourceLineNo">406</span>  private final ConcurrentSkipListMap&lt;byte[], RegionStateNode&gt; regionsMap =<a name="line.406"></a>
 <span class="sourceLineNo">407</span>      new ConcurrentSkipListMap&lt;byte[], RegionStateNode&gt;(Bytes.BYTES_COMPARATOR);<a name="line.407"></a>
 <span class="sourceLineNo">408</span><a name="line.408"></a>
-<span class="sourceLineNo">409</span>  private final ConcurrentSkipListMap&lt;HRegionInfo, RegionStateNode&gt; regionInTransition =<a name="line.409"></a>
-<span class="sourceLineNo">410</span>    new ConcurrentSkipListMap&lt;HRegionInfo, RegionStateNode&gt;();<a name="line.410"></a>
+<span class="sourceLineNo">409</span>  private final ConcurrentSkipListMap&lt;RegionInfo, RegionStateNode&gt; regionInTransition =<a name="line.409"></a>
+<span class="sourceLineNo">410</span>    new ConcurrentSkipListMap&lt;RegionInfo, RegionStateNode&gt;(RegionInfo.COMPARATOR);<a name="line.410"></a>
 <span class="sourceLineNo">411</span><a name="line.411"></a>
 <span class="sourceLineNo">412</span>  /**<a name="line.412"></a>
 <span class="sourceLineNo">413</span>   * Regions marked as offline on a read of hbase:meta. Unused or at least, once<a name="line.413"></a>
 <span class="sourceLineNo">414</span>   * offlined, regions have no means of coming on line again. TODO.<a name="line.414"></a>
 <span class="sourceLineNo">415</span>   */<a name="line.415"></a>
-<span class="sourceLineNo">416</span>  private final ConcurrentSkipListMap&lt;HRegionInfo, RegionStateNode&gt; regionOffline =<a name="line.416"></a>
-<span class="sourceLineNo">417</span>    new ConcurrentSkipListMap&lt;HRegionInfo, RegionStateNode&gt;();<a name="line.417"></a>
+<span class="sourceLineNo">416</span>  private final ConcurrentSkipListMap&lt;RegionInfo, RegionStateNode&gt; regionOffline =<a name="line.416"></a>
+<span class="sourceLineNo">417</span>    new ConcurrentSkipListMap&lt;RegionInfo, RegionStateNode&gt;();<a name="line.417"></a>
 <span class="sourceLineNo">418</span><a name="line.418"></a>
 <span class="sourceLineNo">419</span>  private final ConcurrentSkipListMap&lt;byte[], RegionFailedOpen&gt; regionFailedOpen =<a name="line.419"></a>
 <span class="sourceLineNo">420</span>    new ConcurrentSkipListMap&lt;byte[], RegionFailedOpen&gt;(Bytes.BYTES_COMPARATOR);<a name="line.420"></a>
@@ -440,7 +440,7 @@
 <span class="sourceLineNo">432</span>  }<a name="line.432"></a>
 <span class="sourceLineNo">433</span><a name="line.433"></a>
 <span class="sourceLineNo">434</span>  @VisibleForTesting<a name="line.434"></a>
-<span class="sourceLineNo">435</span>  public boolean isRegionInRegionStates(final HRegionInfo hri) {<a name="line.435"></a>
+<span class="sourceLineNo">435</span>  public boolean isRegionInRegionStates(final RegionInfo hri) {<a name="line.435"></a>
 <span class="sourceLineNo">436</span>    return (regionsMap.containsKey(hri.getRegionName()) || regionInTransition.containsKey(hri)<a name="line.436"></a>
 <span class="sourceLineNo">437</span>        || regionOffline.containsKey(hri));<a name="line.437"></a>
 <span class="sourceLineNo">438</span>  }<a name="line.438"></a>
@@ -448,13 +448,13 @@
 <span class="sourceLineNo">440</span>  // ==========================================================================<a name="line.440"></a>
 <span class="sourceLineNo">441</span>  //  RegionStateNode helpers<a name="line.441"></a>
 <span class="sourceLineNo">442</span>  // ==========================================================================<a name="line.442"></a>
-<span class="sourceLineNo">443</span>  protected RegionStateNode createRegionNode(final HRegionInfo regionInfo) {<a name="line.443"></a>
+<span class="sourceLineNo">443</span>  protected RegionStateNode createRegionNode(final RegionInfo regionInfo) {<a name="line.443"></a>
 <span class="sourceLineNo">444</span>    RegionStateNode newNode = new RegionStateNode(regionInfo);<a name="line.444"></a>
 <span class="sourceLineNo">445</span>    RegionStateNode oldNode = regionsMap.putIfAbsent(regionInfo.getRegionName(), newNode);<a name="line.445"></a>
 <span class="sourceLineNo">446</span>    return oldNode != null ? oldNode : newNode;<a name="line.446"></a>
 <span class="sourceLineNo">447</span>  }<a name="line.447"></a>
 <span class="sourceLineNo">448</span><a name="line.448"></a>
-<span class="sourceLineNo">449</span>  protected RegionStateNode getOrCreateRegionNode(final HRegionInfo regionInfo) {<a name="line.449"></a>
+<span class="sourceLineNo">449</span>  protected RegionStateNode getOrCreateRegionNode(final RegionInfo regionInfo) {<a name="line.449"></a>
 <span class="sourceLineNo">450</span>    RegionStateNode node = regionsMap.get(regionInfo.getRegionName());<a name="line.450"></a>
 <span class="sourceLineNo">451</span>    return node != null ? node : createRegionNode(regionInfo);<a name="line.451"></a>
 <span class="sourceLineNo">452</span>  }<a name="line.452"></a>
@@ -463,7 +463,7 @@
 <span class="sourceLineNo">455</span>    return regionsMap.get(regionName);<a name="line.455"></a>
 <span class="sourceLineNo">456</span>  }<a name="line.456"></a>
 <span class="sourceLineNo">457</span><a name="line.457"></a>
-<span class="sourceLineNo">458</span>  protected RegionStateNode getRegionNode(final HRegionInfo regionInfo) {<a name="line.458"></a>
+<span class="sourceLineNo">458</span>  protected RegionStateNode getRegionNode(final RegionInfo regionInfo) {<a name="line.458"></a>
 <span class="sourceLineNo">459</span>    return getRegionNodeFromName(regionInfo.getRegionName());<a name="line.459"></a>
 <span class="sourceLineNo">460</span>  }<a name="line.460"></a>
 <span class="sourceLineNo">461</span><a name="line.461"></a>
@@ -477,7 +477,7 @@
 <span class="sourceLineNo">469</span>    return null;<a name="line.469"></a>
 <span class="sourceLineNo">470</span>  }<a name="line.470"></a>
 <span class="sourceLineNo">471</span><a name="line.471"></a>
-<span class="sourceLineNo">472</span>  public void deleteRegion(final HRegionInfo regionInfo) {<a name="line.472"></a>
+<span class="sourceLineNo">472</span>  public void deleteRegion(final RegionInfo regionInfo) {<a name="line.472"></a>
 <span class="sourceLineNo">473</span>    regionsMap.remove(regionInfo.getRegionName());<a name="line.473"></a>
 <span class="sourceLineNo">474</span>    // Remove from the offline regions map too if there.<a name="line.474"></a>
 <span class="sourceLineNo">475</span>    if (this.regionOffline.containsKey(regionInfo)) {<a name="line.475"></a>
@@ -504,8 +504,8 @@
 <span class="sourceLineNo">496</span>    return regions;<a name="line.496"></a>
 <span class="sourceLineNo">497</span>  }<a name="line.497"></a>
 <span class="sourceLineNo">498</span><a name="line.498"></a>
-<span class="sourceLineNo">499</span>  ArrayList&lt;HRegionInfo&gt; getTableRegionsInfo(final TableName tableName) {<a name="line.499"></a>
-<span class="sourceLineNo">500</span>    final ArrayList&lt;HRegionInfo&gt; regions = new ArrayList&lt;HRegionInfo&gt;();<a name="line.500"></a>
+<span class="sourceLineNo">499</span>  ArrayList&lt;RegionInfo&gt; getTableRegionsInfo(final TableName tableName) {<a name="line.499"></a>
+<span class="sourceLineNo">500</span>    final ArrayList&lt;RegionInfo&gt; regions = new ArrayList&lt;RegionInfo&gt;();<a name="line.500"></a>
 <span class="sourceLineNo">501</span>    for (RegionStateNode node: regionsMap.tailMap(tableName.getName()).values()) {<a name="line.501"></a>
 <span class="sourceLineNo">502</span>      if (!node.getTable().equals(tableName)) break;<a name="line.502"></a>
 <span class="sourceLineNo">503</span>      regions.add(node.getRegionInfo());<a name="line.503"></a>
@@ -528,7 +528,7 @@
 <span class="sourceLineNo">520</span>  // ==========================================================================<a name="line.520"></a>
 <span class="sourceLineNo">521</span>  //  RegionState helpers<a name="line.521"></a>
 <span class="sourceLineNo">522</span>  // ==========================================================================<a name="line.522"></a>
-<span class="sourceLineNo">523</span>  public RegionState getRegionState(final HRegionInfo regionInfo) {<a name="line.523"></a>
+<span class="sourceLineNo">523</span>  public RegionState getRegionState(final RegionInfo regionInfo) {<a name="line.523"></a>
 <span class="sourceLineNo">524</span>    return createRegionState(getRegionNode(regionInfo));<a name="line.524"></a>
 <span class="sourceLineNo">525</span>  }<a name="line.525"></a>
 <span class="sourceLineNo">526</span><a name="line.526"></a>
@@ -550,13 +550,13 @@
 <span class="sourceLineNo">542</span>    return !getTableRegionStates(tableName).isEmpty();<a name="line.542"></a>
 <span class="sourceLineNo">543</span>  }<a name="line.543"></a>
 <span class="sourceLineNo">544</span><a name="line.544"></a>
-<span class="sourceLineNo">545</span>  public List&lt;HRegionInfo&gt; getRegionsOfTable(final TableName table) {<a name="line.545"></a>
+<span class="sourceLineNo">545</span>  public List&lt;RegionInfo&gt; getRegionsOfTable(final TableName table) {<a name="line.545"></a>
 <span class="sourceLineNo">546</span>    return getRegionsOfTable(table, false);<a name="line.546"></a>
 <span class="sourceLineNo">547</span>  }<a name="line.547"></a>
 <span class="sourceLineNo">548</span><a name="line.548"></a>
-<span class="sourceLineNo">549</span>  List&lt;HRegionInfo&gt; getRegionsOfTable(final TableName table, final boolean offline) {<a name="line.549"></a>
+<span class="sourceLineNo">549</span>  List&lt;RegionInfo&gt; getRegionsOfTable(final TableName table, final boolean offline) {<a name="line.549"></a>
 <span class="sourceLineNo">550</span>    final ArrayList&lt;RegionStateNode&gt; nodes = getTableRegionStateNodes(table);<a name="line.550"></a>
-<span class="sourceLineNo">551</span>    final ArrayList&lt;HRegionInfo&gt; hris = new ArrayList&lt;HRegionInfo&gt;(nodes.size());<a name="line.551"></a>
+<span class="sourceLineNo">551</span>    final ArrayList&lt;RegionInfo&gt; hris = new ArrayList&lt;RegionInfo&gt;(nodes.size());<a name="line.551"></a>
 <span class="sourceLineNo">552</span>    for (RegionStateNode node: nodes) {<a name="line.552"></a>
 <span class="sourceLineNo">553</span>      if (include(node, offline)) hris.add(node.getRegionInfo());<a name="line.553"></a>
 <span class="sourceLineNo">554</span>    }<a name="line.554"></a>
@@ -575,7 +575,7 @@
 <span class="sourceLineNo">567</span>    }<a name="line.567"></a>
 <span class="sourceLineNo">568</span>    if (node.isInState(State.SPLIT)) return false;<a name="line.568"></a>
 <span class="sourceLineNo">569</span>    if (node.isInState(State.OFFLINE) &amp;&amp; !offline) return false;<a name="line.569"></a>
-<span class="sourceLineNo">570</span>    final HRegionInfo hri = node.getRegionInfo();<a name="line.570"></a>
+<span class="sourceLineNo">570</span>    final RegionInfo hri = node.getRegionInfo();<a name="line.570"></a>
 <span class="sourceLineNo">571</span>    return (!hri.isOffline() &amp;&amp; !hri.isSplit()) ||<a name="line.571"></a>
 <span class="sourceLineNo">572</span>        ((hri.isOffline() || hri.isSplit()) &amp;&amp; offline);<a name="line.572"></a>
 <span class="sourceLineNo">573</span>  }<a name="line.573"></a>
@@ -583,9 +583,9 @@
 <span class="sourceLineNo">575</span>  /**<a name="line.575"></a>
 <span class="sourceLineNo">576</span>   * Returns the set of regions hosted by the specified server<a name="line.576"></a>
 <span class="sourceLineNo">577</span>   * @param serverName the server we are interested in<a name="line.577"></a>
-<span class="sourceLineNo">578</span>   * @return set of HRegionInfo hosted by the specified server<a name="line.578"></a>
+<span class="sourceLineNo">578</span>   * @return set of RegionInfo hosted by the specified server<a name="line.578"></a>
 <span class="sourceLineNo">579</span>   */<a name="line.579"></a>
-<span class="sourceLineNo">580</span>  public List&lt;HRegionInfo&gt; getServerRegionInfoSet(final ServerName serverName) {<a name="line.580"></a>
+<span class="sourceLineNo">580</span>  public List&lt;RegionInfo&gt; getServerRegionInfoSet(final ServerName serverName) {<a name="line.580"></a>
 <span class="sourceLineNo">581</span>    final ServerStateNode serverInfo = getServerNode(serverName);<a name="line.581"></a>
 <span class="sourceLineNo">582</span>    if (serverInfo == null) return Collections.emptyList();<a name="line.582"></a>
 <span class="sourceLineNo">583</span><a name="line.583"></a>
@@ -611,7 +611,7 @@
 <span class="sourceLineNo">603</span>    }<a name="line.603"></a>
 <span class="sourceLineNo">604</span>  }<a name="line.604"></a>
 <span class="sourceLineNo">605</span><a name="line.605"></a>
-<span class="sourceLineNo">606</span>  public void logSplit(final HRegionInfo regionInfo) {<a name="line.606"></a>
+<span class="sourceLineNo">606</span>  public void logSplit(final RegionInfo regionInfo) {<a name="line.606"></a>
 <span class="sourceLineNo">607</span>    final RegionStateNode regionNode = getRegionNode(regionInfo);<a name="line.607"></a>
 <span class="sourceLineNo">608</span>    synchronized (regionNode) {<a name="line.608"></a>
 <span class="sourceLineNo">609</span>      regionNode.setState(State.SPLIT);<a name="line.609"></a>
@@ -619,7 +619,7 @@
 <span class="sourceLineNo">611</span>  }<a name="line.611"></a>
 <span class="sourceLineNo">612</span><a name="line.612"></a>
 <span class="sourceLineNo">613</span>  @VisibleForTesting<a name="line.613"></a>
-<span class="sourceLineNo">614</span>  public void updateRegionState(final HRegionInfo regionInfo, final State state) {<a name="line.614"></a>
+<span class="sourceLineNo">614</span>  public void updateRegionState(final RegionInfo regionInfo, final State state) {<a name="line.614"></a>
 <span class="sourceLineNo">615</span>    final RegionStateNode regionNode = getOrCreateRegionNode(regionInfo);<a name="line.615"></a>
 <span class="sourceLineNo">616</span>    synchronized (regionNode) {<a name="line.616"></a>
 <span class="sourceLineNo">617</span>      regionNode.setState(state);<a name="line.617"></a>
@@ -629,8 +629,8 @@
 <span class="sourceLineNo">621</span>  // ============================================================================================<a name="line.621"></a>
 <span class="sourceLineNo">622</span>  //  TODO:<a name="line.622"></a>
 <span class="sourceLineNo">623</span>  // ============================================================================================<a name="line.623"></a>
-<span class="sourceLineNo">624</span>  public List&lt;HRegionInfo&gt; getAssignedRegions() {<a name="line.624"></a>
-<span class="sourceLineNo">625</span>    final List&lt;HRegionInfo&gt; result = new ArrayList&lt;HRegionInfo&gt;();<a name="line.625"></a>
+<span class="sourceLineNo">624</span>  public List&lt;RegionInfo&gt; getAssignedRegions() {<a name="line.624"></a>
+<span class="sourceLineNo">625</span>    final List&lt;RegionInfo&gt; result = new ArrayList&lt;RegionInfo&gt;();<a name="line.625"></a>
 <span class="sourceLineNo">626</span>    for (RegionStateNode node: regionsMap.values()) {<a name="line.626"></a>
 <span class="sourceLineNo">627</span>      if (!node.isInTransition()) {<a name="line.627"></a>
 <span class="sourceLineNo">628</span>        result.add(node.getRegionInfo());<a name="line.628"></a>
@@ -639,7 +639,7 @@
 <span class="sourceLineNo">631</span>    return result;<a name="line.631"></a>
 <span class="sourceLineNo">632</span>  }<a name="line.632"></a>
 <span class="sourceLineNo">633</span><a name="line.633"></a>
-<span class="sourceLineNo">634</span>  public boolean isRegionInState(final HRegionInfo regionInfo, final State... state) {<a name="line.634"></a>
+<span class="sourceLineNo">634</span>  public boolean isRegionInState(final RegionInfo regionInfo, final State... state) {<a name="line.634"></a>
 <span class="sourceLineNo">635</span>    final RegionStateNode region = getRegionNode(regionInfo);<a name="line.635"></a>
 <span class="sourceLineNo">636</span>    if (region != null) {<a name="line.636"></a>
 <span class="sourceLineNo">637</span>      synchronized (region) {<a name="line.637"></a>
@@ -649,21 +649,21 @@
 <span class="sourceLineNo">641</span>    return false;<a name="line.641"></a>
 <span class="sourceLineNo">642</span>  }<a name="line.642"></a>
 <span class="sourceLineNo">643</span><a name="line.643"></a>
-<span class="sourceLineNo">644</span>  public boolean isRegionOnline(final HRegionInfo regionInfo) {<a name="line.644"></a>
+<span class="sourceLineNo">644</span>  public boolean isRegionOnline(final RegionInfo regionInfo) {<a name="line.644"></a>
 <span class="sourceLineNo">645</span>    return isRegionInState(regionInfo, State.OPEN);<a name="line.645"></a>
 <span class="sourceLineNo">646</span>  }<a name="line.646"></a>
 <span class="sourceLineNo">647</span><a name="line.647"></a>
 <span class="sourceLineNo">648</span>  /**<a name="line.648"></a>
 <span class="sourceLineNo">649</span>   * @return True if region is offline (In OFFLINE or CLOSED state).<a name="line.649"></a>
 <span class="sourceLineNo">650</span>   */<a name="line.650"></a>
-<span class="sourceLineNo">651</span>  public boolean isRegionOffline(final HRegionInfo regionInfo) {<a name="line.651"></a>
+<span class="sourceLineNo">651</span>  public boolean isRegionOffline(final RegionInfo regionInfo) {<a name="line.651"></a>
 <span class="sourceLineNo">652</span>    return isRegionInState(regionInfo, State.OFFLINE, State.CLOSED);<a name="line.652"></a>
 <span class="sourceLineNo">653</span>  }<a name="line.653"></a>
 <span class="sourceLineNo">654</span><a name="line.654"></a>
-<span class="sourceLineNo">655</span>  public Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt; getSnapShotOfAssignment(<a name="line.655"></a>
-<span class="sourceLineNo">656</span>      final Collection&lt;HRegionInfo&gt; regions) {<a name="line.656"></a>
-<span class="sourceLineNo">657</span>    final Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt; result = new HashMap&lt;ServerName, List&lt;HRegionInfo&gt;&gt;();<a name="line.657"></a>
-<span class="sourceLineNo">658</span>    for (HRegionInfo hri: regions) {<a name="line.658"></a>
+<span class="sourceLineNo">655</span>  public Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; getSnapShotOfAssignment(<a name="line.655"></a>
+<span class="sourceLineNo">656</span>      final Collection&lt;RegionInfo&gt; regions) {<a name="line.656"></a>
+<span class="sourceLineNo">657</span>    final Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; result = new HashMap&lt;ServerName, List&lt;RegionInfo&gt;&gt;();<a name="line.657"></a>
+<span class="sourceLineNo">658</span>    for (RegionInfo hri: regions) {<a name="line.658"></a>
 <span class="sourceLineNo">659</span>      final RegionStateNode node = getRegionNode(hri);<a name="line.659"></a>
 <span class="sourceLineNo">660</span>      if (node == null) continue;<a name="line.660"></a>
 <span class="sourceLineNo">661</span><a name="line.661"></a>
@@ -671,9 +671,9 @@
 <span class="sourceLineNo">663</span>      final ServerName serverName = node.getRegionLocation();<a name="line.663"></a>
 <span class="sourceLineNo">664</span>      if (serverName == null) continue;<a name="line.664"></a>
 <span class="sourceLineNo">665</span><a name="line.665"></a>
-<span class="sourceLineNo">666</span>      List&lt;HRegionInfo&gt; serverRegions = result.get(serverName);<a name="line.666"></a>
+<span class="sourceLineNo">666</span>      List&lt;RegionInfo&gt; serverRegions = result.get(serverName);<a name="line.666"></a>
 <span class="sourceLineNo">667</span>      if (serverRegions == null) {<a name="line.667"></a>
-<span class="sourceLineNo">668</span>        serverRegions = new ArrayList&lt;HRegionInfo&gt;();<a name="line.668"></a>
+<span class="sourceLineNo">668</span>        serverRegions = new ArrayList&lt;RegionInfo&gt;();<a name="line.668"></a>
 <span class="sourceLineNo">669</span>        result.put(serverName, serverRegions);<a name="line.669"></a>
 <span class="sourceLineNo">670</span>      }<a name="line.670"></a>
 <span class="sourceLineNo">671</span><a name="line.671"></a>
@@ -682,20 +682,20 @@
 <span class="sourceLineNo">674</span>    return result;<a name="line.674"></a>
 <span class="sourceLineNo">675</span>  }<a name="line.675"></a>
 <span class="sourceLineNo">676</span><a name="line.676"></a>
-<span class="sourceLineNo">677</span>  public Map&lt;HRegionInfo, ServerName&gt; getRegionAssignments() {<a name="line.677"></a>
-<span class="sourceLineNo">678</span>    final HashMap&lt;HRegionInfo, ServerName&gt; assignments = new HashMap&lt;HRegionInfo, ServerName&gt;();<a name="line.678"></a>
+<span class="sourceLineNo">677</span>  public Map&lt;RegionInfo, ServerName&gt; getRegionAssignments() {<a name="line.677"></a>
+<span class="sourceLineNo">678</span>    final HashMap&lt;RegionInfo, ServerName&gt; assignments = new HashMap&lt;RegionInfo, ServerName&gt;();<a name="line.678"></a>
 <span class="sourceLineNo">679</span>    for (RegionStateNode node: regionsMap.values()) {<a name="line.679"></a>
 <span class="sourceLineNo">680</span>      assignments.put(node.getRegionInfo(), node.getRegionLocation());<a name="line.680"></a>
 <span class="sourceLineNo">681</span>    }<a name="line.681"></a>
 <span class="sourceLineNo">682</span>    return assignments;<a name="line.682"></a>
 <span class="sourceLineNo">683</span>  }<a name="line.683"></a>
 <span class="sourceLineNo">684</span><a name="line.684"></a>
-<span class="sourceLineNo">685</span>  public Map&lt;RegionState.State, List&lt;HRegionInfo&gt;&gt; getRegionByStateOfTable(TableName tableName) {<a name="line.685"></a>
+<span class="sourceLineNo">685</span>  public Map&lt;RegionState.State, List&lt;RegionInfo&gt;&gt; getRegionByStateOfTable(TableName tableName) {<a name="line.685"></a>
 <span class="sourceLineNo">686</span>    final State[] states = State.values();<a name="line.686"></a>
-<span class="sourceLineNo">687</span>    final Map&lt;RegionState.State, List&lt;HRegionInfo&gt;&gt; tableRegions =<a name="line.687"></a>
-<span class="sourceLineNo">688</span>        new HashMap&lt;State, List&lt;HRegionInfo&gt;&gt;(states.length);<a name="line.688"></a>
+<span class="sourceLineNo">687</span>    final Map&lt;RegionState.State, List&lt;RegionInfo&gt;&gt; tableRegions =<a name="line.687"></a>
+<span class="sourceLineNo">688</span>        new HashMap&lt;State, List&lt;RegionInfo&gt;&gt;(states.length);<a name="line.688"></a>
 <span class="sourceLineNo">689</span>    for (int i = 0; i &lt; states.length; ++i) {<a name="line.689"></a>
-<span class="sourceLineNo">690</span>      tableRegions.put(states[i], new ArrayList&lt;HRegionInfo&gt;());<a name="line.690"></a>
+<span class="sourceLineNo">690</span>      tableRegions.put(states[i], new ArrayList&lt;RegionInfo&gt;());<a name="line.690"></a>
 <span class="sourceLineNo">691</span>    }<a name="line.691"></a>
 <span class="sourceLineNo">692</span><a name="line.692"></a>
 <span class="sourceLineNo">693</span>    for (RegionStateNode node: regionsMap.values()) {<a name="line.693"></a>
@@ -706,7 +706,7 @@
 <span class="sourceLineNo">698</span>    return tableRegions;<a name="line.698"></a>
 <span class="sourceLineNo">699</span>  }<a name="line.699"></a>
 <span class="sourceLineNo">700</span><a name="line.700"></a>
-<span class="sourceLineNo">701</span>  public ServerName getRegionServerOfRegion(final HRegionInfo regionInfo) {<a name="line.701"></a>
+<span class="sourceLineNo">701</span>  public ServerName getRegionServerOfRegion(final RegionInfo regionInfo) {<a name="line.701"></a>
 <span class="sourceLineNo">702</span>    final RegionStateNode region = getRegionNode(regionInfo);<a name="line.702"></a>
 <span class="sourceLineNo">703</span>    if (region != null) {<a name="line.703"></a>
 <span class="sourceLineNo">704</span>      synchronized (region) {<a name="line.704"></a>
@@ -725,29 +725,29 @@
 <span class="sourceLineNo">717</span>   * @param forceByCluster a flag to force to aggregate the server-load to the cluster level<a name="line.717"></a>
 <span class="sourceLineNo">718</span>   * @return A clone of current assignments by table.<a name="line.718"></a>
 <span class="sourceLineNo">719</span>   */<a name="line.719"></a>
-<span class="sourceLineNo">720</span>  public Map&lt;TableName, Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt;&gt; getAssignmentsByTable(<a name="line.720"></a>
+<span class="sourceLineNo">720</span>  public Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; getAssignmentsByTable(<a name="line.720"></a>
 <span class="sourceLineNo">721</span>      final boolean forceByCluster) {<a name="line.721"></a>
 <span class="sourceLineNo">722</span>    if (!forceByCluster) return getAssignmentsByTable();<a name="line.722"></a>
 <span class="sourceLineNo">723</span><a name="line.723"></a>
-<span class="sourceLineNo">724</span>    final HashMap&lt;ServerName, List&lt;HRegionInfo&gt;&gt; ensemble =<a name="line.724"></a>
-<span class="sourceLineNo">725</span>      new HashMap&lt;ServerName, List&lt;HRegionInfo&gt;&gt;(serverMap.size());<a name="line.725"></a>
+<span class="sourceLineNo">724</span>    final HashMap&lt;ServerName, List&lt;RegionInfo&gt;&gt; ensemble =<a name="line.724"></a>
+<span class="sourceLineNo">725</span>      new HashMap&lt;ServerName, List&lt;RegionInfo&gt;&gt;(serverMap.size());<a name="line.725"></a>
 <span class="sourceLineNo">726</span>    for (ServerStateNode serverNode: serverMap.values()) {<a name="line.726"></a>
 <span class="sourceLineNo">727</span>      ensemble.put(serverNode.getServerName(), serverNode.getRegionInfoList());<a name="line.727"></a>
 <span class="sourceLineNo">728</span>    }<a name="line.728"></a>
 <span class="sourceLineNo">729</span><a name="line.729"></a>
 <span class="sourceLineNo">730</span>    // TODO: can we use Collections.singletonMap(HConstants.ENSEMBLE_TABLE_NAME, ensemble)?<a name="line.730"></a>
-<span class="sourceLineNo">731</span>    final Map&lt;TableName, Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt;&gt; result =<a name="line.731"></a>
-<span class="sourceLineNo">732</span>      new HashMap&lt;TableName, Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt;&gt;(1);<a name="line.732"></a>
+<span class="sourceLineNo">731</span>    final Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; result =<a name="line.731"></a>
+<span class="sourceLineNo">732</span>      new HashMap&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;(1);<a name="line.732"></a>
 <span class="sourceLineNo">733</span>    result.put(HConstants.ENSEMBLE_TABLE_NAME, ensemble);<a name="line.733"></a>
 <span class="sourceLineNo">734</span>    return result;<a name="line.734"></a>
 <span class="sourceLineNo">735</span>  }<a name="line.735"></a>
 <span class="sourceLineNo">736</span><a name="line.736"></a>
-<span class="sourceLineNo">737</span>  public Map&lt;TableName, Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt;&gt; getAssignmentsByTable() {<a name="line.737"></a>
-<span class="sourceLineNo">738</span>    final Map&lt;TableName, Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt;&gt; result = new HashMap&lt;&gt;();<a name="line.738"></a>
+<span class="sourceLineNo">737</span>  public Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; getAssignmentsByTable() {<a name="line.737"></a>
+<span class="sourceLineNo">738</span>    final Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; result = new HashMap&lt;&gt;();<a name="line.738"></a>
 <span class="sourceLineNo">739</span>    for (RegionStateNode node: regionsMap.values()) {<a name="line.739"></a>
-<span class="sourceLineNo">740</span>      Map&lt;ServerName, List&lt;HRegionInfo&gt;&gt; tableResult = result.get(node.getTable());<a name="line.740"></a>
+<span class="sourceLineNo">740</span>      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; tableResult = result.get(node.getTable());<a name="line.740"></a>
 <span class="sourceLineNo">741</span>      if (tableResult == null) {<a name="line.741"></a>
-<span class="sourceLineNo">742</span>        tableResult = new HashMap&lt;ServerName, List&lt;HRegionInfo&gt;&gt;();<a name="line.742"></a>
+<span class="sourceLineNo">742</span>        tableResult = new HashMap&lt;ServerName, List&lt;RegionInfo&gt;&gt;();<a name="line.742"></a>
 <span class="sourceLineNo">743</span>        result.put(node.getTable(), tableResult);<a name="line.743"></a>
 <span class="sourceLineNo">744</span>      }<a name="line.744"></a>
 <span class="sourceLineNo">745</span><a name="line.745"></a>
@@ -756,9 +756,9 @@
 <span class="sourceLineNo">748</span>        LOG.info("Skipping, no server for " + node);<a name="line.748"></a>
 <span class="sourceLineNo">749</span>        continue;<a name="line.749"></a>
 <span class="sourceLineNo">750</span>      }<a name="line.750"></a>
-<span class="sourceLineNo">751</span>      List&lt;HRegionInfo&gt; serverResult = tableResult.get(serverName);<a name="line.751"></a>
+<span class="sourceLineNo">751</span>      List&lt;RegionInfo&gt; serverResult = tableResult.get(serverName);<a name="line.751"></a>
 <span class="sourceLineNo">752</span>      if (serverResult == null) {<a name="line.752"></a>
-<span class="sourceLineNo">753</span>        serverResult = new ArrayList&lt;HRegionInfo&gt;();<a name="line.753"></a>
+<span class="sourceLineNo">753</span>        serverResult = new ArrayList&lt;RegionInfo&gt;();<a name="line.753"></a>
 <span class="sourceLineNo">754</span>        tableResult.put(serverName, serverResult);<a name="line.754"></a>
 <span class="sourceLineNo">755</span>      }<a name="line.755"></a>
 <span class="sourceLineNo">756</span><a name="line.756"></a>
@@ -788,7 +788,7 @@
 <span class="sourceLineNo">780</span>    return !regionInTransition.isEmpty();<a name="line.780"></a>
 <span class="sourceLineNo">781</span>  }<a name="line.781"></a>
 <span class="sourceLineNo">782</span><a name="line.782"></a>
-<span class="sourceLineNo">783</span>  public boolean isRegionInTransition(final HRegionInfo regionInfo) {<a name="line.783"></a>
+<span class="sourceLineNo">783</span>  public boolean isRegionInTransition(final RegionInfo regionInfo) {<a name="line.783"></a>
 <span class="sourceLineNo">784</span>    final RegionStateNode node = regionInTransition.get(regionInfo);<a name="line.784"></a>
 <span class="sourceLineNo">785</span>    return node != null ? node.isInTransition() : false;<a name="line.785"></a>
 <span class="sourceLineNo">786</span>  }<a name="line.786"></a>
@@ -796,13 +796,13 @@
 <span class="sourceLineNo">788</span>  /**<a name="line.788"></a>
 <span class="sourceLineNo">789</span>   * @return If a procedure-in-transition for &lt;code&gt;hri&lt;/code&gt;, return it else null.<a name="line.789"></a>
 <span class="sourceLineNo">790</span>   */<a name="line.790"></a>
-<span class="sourceLineNo">791</span>  public RegionTransitionProcedure getRegionTransitionProcedure(final HRegionInfo hri) {<a name="line.791"></a>
+<span class="sourceLineNo">791</span>  public RegionTransitionProcedure getRegionTransitionProcedure(final RegionInfo hri) {<a name="line.791"></a>
 <span class="sourceLineNo">792</span>    RegionStateNode node = regionInTransition.get(hri);<a name="line.792"></a>
 <span class="sourceLineNo">793</span>    if (node == null) return null;<a name="line.793"></a>
 <span class="sourceLineNo">794</span>    return node.getProcedure();<a name="line.794"></a>
 <span class="sourceLineNo">795</span>  }<a name="line.795"></a>
 <span class="sourceLineNo">796</span><a name="line.796"></a>
-<span class="sourceLineNo">797</span>  public RegionState getRegionTransitionState(final HRegionInfo hri) {<a name="line.797"></a>
+<span class="sourceLineNo">797</span>  public RegionState getRegionTransitionState(final RegionInfo hri) {<a name="line.797"></a>
 <span class="sourceLineNo">798</span>    RegionStateNode node = regionInTransition.get(hri);<a name="line.798"></a>
 <span class="sourceLineNo">799</span>    if (node == null) return null;<a name="line.799"></a>
 <span class="sourceLineNo">800</span><a name="line.800"></a>
@@ -848,7 +848,7 @@
 <span class="sourceLineNo">840</span>  }<a name="line.840"></a>
 <span class="sourceLineNo">841</span><a name="line.841"></a>
 <span class="sourceLineNo">842</span>  // TODO: Unused.<a name="line.842"></a>
-<span class="sourceLineNo">843</span>  public void removeFromOfflineRegions(final HRegionInfo regionInfo) {<a name="line.843"></a>
+<span class="sourceLineNo">843</span>  public void removeFromOfflineRegions(final RegionInfo regionInfo) {<a name="line.843"></a>
 <span class="sourceLineNo">844</span>    regionOffline.remove(regionInfo);<a name="line.844"></a>
 <span class="sourceLineNo">845</span>  }<a name="line.845"></a>
 <span class="sourceLineNo">846</span><a name="line.846"></a>
@@ -869,7 +869,7 @@
 <span class="sourceLineNo">861</span>      return regionNode;<a name="line.861"></a>
 <span class="sourceLineNo">862</span>    }<a name="line.862"></a>
 <span class="sourceLineNo">863</span><a name="line.863"></a>
-<span class="sourceLineNo">864</span>    public HRegionInfo getRegionInfo() {<a name="line.864"></a>
+<span class="sourceLineNo">864</span>    public RegionInfo getRegionInfo() {<a name="line.864"></a>
 <span class="sourceLineNo">865</span>      return regionNode.getRegionInfo();<a name="line.865"></a>
 <span class="sourceLineNo">866</span>    }<a name="line.866"></a>
 <span class="sourceLineNo">867</span><a name="line.867"></a>
@@ -901,11 +901,11 @@
 <span class="sourceLineNo">893</span>    return node;<a name="line.893"></a>
 <span class="sourceLineNo">894</span>  }<a name="line.894"></a>
 <span class="sourceLineNo">895</span><a name="line.895"></a>
-<span class="sourceLineNo">896</span>  public RegionFailedOpen getFailedOpen(final HRegionInfo regionInfo) {<a name="line.896"></a>
+<span class="sourceLineNo">896</span>  public RegionFailedOpen getFailedOpen(final RegionInfo regionInfo) {<a name="line.896"></a>
 <span class="sourceLineNo">897</span>    return regionFailedOpen.get(regionInfo.getRegionName());<a name="line.897"></a>
 <span class="sourceLineNo">898</span>  }<a name="line.898"></a>
 <span class="sourceLineNo">899</span><a name="line.899"></a>
-<span class="sourceLineNo">900</span>  public void removeFromFailedOpen(final HRegionInfo regionInfo) {<a name="line.900"></a>
+<span class="sourceLineNo">900</span>  public void removeFromFailedOpen(final RegionInfo regionInfo) {<a name="line.900"></a>
 <span class="sourceLineNo">901</span>    regionFailedOpen.remove(regionInfo.getRegionName());<a name="line.901"></a>
 <span class="sourceLineNo">902</span>  }<a name="line.902"></a>
 <span class="sourceLineNo">903</span><a name="line.903"></a>
