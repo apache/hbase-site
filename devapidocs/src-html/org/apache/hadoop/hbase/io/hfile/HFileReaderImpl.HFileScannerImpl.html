@@ -42,838 +42,838 @@
 <span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.ByteBufferKeyOnlyKeyValue;<a name="line.34"></a>
 <span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.Cell;<a name="line.35"></a>
 <span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.CellComparator;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.HConstants;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.ByteBufferKeyValue;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.SizeCachedKeyValue;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.SizeCachedNoTagsKeyValue;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.fs.HFileSystem;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.io.compress.Compression;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.io.crypto.Cipher;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.io.crypto.Encryption;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.io.encoding.DataBlockEncoder;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.io.encoding.HFileBlockDecodingContext;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.io.hfile.HFile.FileInfo;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.nio.ByteBuff;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.regionserver.KeyValueScanner;<a name="line.54"></a>
-<span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.security.EncryptionUtil;<a name="line.55"></a>
-<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.util.ByteBufferUtils;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.util.IdLock;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.util.ObjectIntPair;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>import org.apache.hadoop.io.WritableUtils;<a name="line.60"></a>
-<span class="sourceLineNo">061</span>import org.apache.htrace.Trace;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>import org.apache.htrace.TraceScope;<a name="line.62"></a>
-<span class="sourceLineNo">063</span><a name="line.63"></a>
-<span class="sourceLineNo">064</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.64"></a>
-<span class="sourceLineNo">065</span><a name="line.65"></a>
-<span class="sourceLineNo">066</span>/**<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * Implementation that can handle all hfile versions of {@link HFile.Reader}.<a name="line.67"></a>
-<span class="sourceLineNo">068</span> */<a name="line.68"></a>
-<span class="sourceLineNo">069</span>@InterfaceAudience.Private<a name="line.69"></a>
-<span class="sourceLineNo">070</span>@edu.umd.cs.findbugs.annotations.SuppressWarnings(value="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD")<a name="line.70"></a>
-<span class="sourceLineNo">071</span>public class HFileReaderImpl implements HFile.Reader, Configurable {<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  // This class is HFileReaderV3 + HFileReaderV2 + AbstractHFileReader all squashed together into<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  // one file.  Ditto for all the HFileReader.ScannerV? implementations. I was running up against<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  // the MaxInlineLevel limit because too many tiers involved reading from an hfile. Was also hard<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  // to navigate the source code when so many classes participating in read.<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private static final Log LOG = LogFactory.getLog(HFileReaderImpl.class);<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  /** Data block index reader keeping the root data index in memory */<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  private HFileBlockIndex.CellBasedKeyBlockIndexReader dataBlockIndexReader;<a name="line.79"></a>
-<span class="sourceLineNo">080</span><a name="line.80"></a>
-<span class="sourceLineNo">081</span>  /** Meta block index reader -- always single level */<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  private HFileBlockIndex.ByteArrayKeyBlockIndexReader metaBlockIndexReader;<a name="line.82"></a>
-<span class="sourceLineNo">083</span><a name="line.83"></a>
-<span class="sourceLineNo">084</span>  private final FixedFileTrailer trailer;<a name="line.84"></a>
-<span class="sourceLineNo">085</span><a name="line.85"></a>
-<span class="sourceLineNo">086</span>  /** Filled when we read in the trailer. */<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  private final Compression.Algorithm compressAlgo;<a name="line.87"></a>
-<span class="sourceLineNo">088</span><a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private final boolean primaryReplicaReader;<a name="line.89"></a>
-<span class="sourceLineNo">090</span><a name="line.90"></a>
-<span class="sourceLineNo">091</span>  /**<a name="line.91"></a>
-<span class="sourceLineNo">092</span>   * What kind of data block encoding should be used while reading, writing,<a name="line.92"></a>
-<span class="sourceLineNo">093</span>   * and handling cache.<a name="line.93"></a>
-<span class="sourceLineNo">094</span>   */<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  private HFileDataBlockEncoder dataBlockEncoder = NoOpDataBlockEncoder.INSTANCE;<a name="line.95"></a>
-<span class="sourceLineNo">096</span><a name="line.96"></a>
-<span class="sourceLineNo">097</span>  /** Last key in the file. Filled in when we read in the file info */<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  private Cell lastKeyCell = null;<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  /** Average key length read from file info */<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private int avgKeyLen = -1;<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  /** Average value length read from file info */<a name="line.103"></a>
-<span class="sourceLineNo">104</span>  private int avgValueLen = -1;<a name="line.104"></a>
-<span class="sourceLineNo">105</span><a name="line.105"></a>
-<span class="sourceLineNo">106</span>  /** Key comparator */<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  private CellComparator comparator = CellComparator.COMPARATOR;<a name="line.107"></a>
-<span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  /** Size of this file. */<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  private final long fileSize;<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  /** Block cache configuration. */<a name="line.112"></a>
-<span class="sourceLineNo">113</span>  private final CacheConfig cacheConf;<a name="line.113"></a>
-<span class="sourceLineNo">114</span><a name="line.114"></a>
-<span class="sourceLineNo">115</span>  /** Path of file */<a name="line.115"></a>
-<span class="sourceLineNo">116</span>  private final Path path;<a name="line.116"></a>
-<span class="sourceLineNo">117</span><a name="line.117"></a>
-<span class="sourceLineNo">118</span>  /** File name to be used for block names */<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  private final String name;<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  private FileInfo fileInfo;<a name="line.121"></a>
-<span class="sourceLineNo">122</span><a name="line.122"></a>
-<span class="sourceLineNo">123</span>  private Configuration conf;<a name="line.123"></a>
-<span class="sourceLineNo">124</span><a name="line.124"></a>
-<span class="sourceLineNo">125</span>  private HFileContext hfileContext;<a name="line.125"></a>
-<span class="sourceLineNo">126</span><a name="line.126"></a>
-<span class="sourceLineNo">127</span>  /** Filesystem-level block reader. */<a name="line.127"></a>
-<span class="sourceLineNo">128</span>  private HFileBlock.FSReader fsBlockReader;<a name="line.128"></a>
-<span class="sourceLineNo">129</span><a name="line.129"></a>
-<span class="sourceLineNo">130</span>  /**<a name="line.130"></a>
-<span class="sourceLineNo">131</span>   * A "sparse lock" implementation allowing to lock on a particular block<a name="line.131"></a>
-<span class="sourceLineNo">132</span>   * identified by offset. The purpose of this is to avoid two clients loading<a name="line.132"></a>
-<span class="sourceLineNo">133</span>   * the same block, and have all but one client wait to get the block from the<a name="line.133"></a>
-<span class="sourceLineNo">134</span>   * cache.<a name="line.134"></a>
-<span class="sourceLineNo">135</span>   */<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  private IdLock offsetLock = new IdLock();<a name="line.136"></a>
-<span class="sourceLineNo">137</span><a name="line.137"></a>
-<span class="sourceLineNo">138</span>  /**<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   * Blocks read from the load-on-open section, excluding data root index, meta<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * index, and file info.<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   */<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  private List&lt;HFileBlock&gt; loadOnOpenBlocks = new ArrayList&lt;&gt;();<a name="line.142"></a>
-<span class="sourceLineNo">143</span><a name="line.143"></a>
-<span class="sourceLineNo">144</span>  /** Minimum minor version supported by this HFile format */<a name="line.144"></a>
-<span class="sourceLineNo">145</span>  static final int MIN_MINOR_VERSION = 0;<a name="line.145"></a>
-<span class="sourceLineNo">146</span><a name="line.146"></a>
-<span class="sourceLineNo">147</span>  /** Maximum minor version supported by this HFile format */<a name="line.147"></a>
-<span class="sourceLineNo">148</span>  // We went to version 2 when we moved to pb'ing fileinfo and the trailer on<a name="line.148"></a>
-<span class="sourceLineNo">149</span>  // the file. This version can read Writables version 1.<a name="line.149"></a>
-<span class="sourceLineNo">150</span>  static final int MAX_MINOR_VERSION = 3;<a name="line.150"></a>
-<span class="sourceLineNo">151</span><a name="line.151"></a>
-<span class="sourceLineNo">152</span>  /**<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   * We can read files whose major version is v2 IFF their minor version is at least 3.<a name="line.153"></a>
-<span class="sourceLineNo">154</span>   */<a name="line.154"></a>
-<span class="sourceLineNo">155</span>  private static final int MIN_V2_MINOR_VERSION_WITH_PB = 3;<a name="line.155"></a>
-<span class="sourceLineNo">156</span><a name="line.156"></a>
-<span class="sourceLineNo">157</span>  /** Minor versions starting with this number have faked index key */<a name="line.157"></a>
-<span class="sourceLineNo">158</span>  static final int MINOR_VERSION_WITH_FAKED_KEY = 3;<a name="line.158"></a>
-<span class="sourceLineNo">159</span><a name="line.159"></a>
-<span class="sourceLineNo">160</span>  @VisibleForTesting<a name="line.160"></a>
-<span class="sourceLineNo">161</span>  @Deprecated<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  public HFileReaderImpl(Path path, FixedFileTrailer trailer, FSDataInputStreamWrapper fsdis,<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      long fileSize, CacheConfig cacheConf, HFileSystem hfs, Configuration conf)<a name="line.163"></a>
-<span class="sourceLineNo">164</span>      throws IOException {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    this(path, trailer, fsdis, fileSize, cacheConf, hfs, true, conf);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>  }<a name="line.166"></a>
-<span class="sourceLineNo">167</span><a name="line.167"></a>
-<span class="sourceLineNo">168</span>  /**<a name="line.168"></a>
-<span class="sourceLineNo">169</span>   * Opens a HFile. You must load the index before you can use it by calling<a name="line.169"></a>
-<span class="sourceLineNo">170</span>   * {@link #loadFileInfo()}.<a name="line.170"></a>
-<span class="sourceLineNo">171</span>   * @param path<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   *          Path to HFile.<a name="line.172"></a>
-<span class="sourceLineNo">173</span>   * @param trailer<a name="line.173"></a>
-<span class="sourceLineNo">174</span>   *          File trailer.<a name="line.174"></a>
-<span class="sourceLineNo">175</span>   * @param fsdis<a name="line.175"></a>
-<span class="sourceLineNo">176</span>   *          input stream.<a name="line.176"></a>
-<span class="sourceLineNo">177</span>   * @param fileSize<a name="line.177"></a>
-<span class="sourceLineNo">178</span>   *          Length of the stream.<a name="line.178"></a>
-<span class="sourceLineNo">179</span>   * @param cacheConf<a name="line.179"></a>
-<span class="sourceLineNo">180</span>   *          Cache configuration.<a name="line.180"></a>
-<span class="sourceLineNo">181</span>   * @param hfs<a name="line.181"></a>
-<span class="sourceLineNo">182</span>   *          The file system.<a name="line.182"></a>
-<span class="sourceLineNo">183</span>   * @param conf<a name="line.183"></a>
-<span class="sourceLineNo">184</span>   *          Configuration<a name="line.184"></a>
-<span class="sourceLineNo">185</span>   */<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD")<a name="line.186"></a>
-<span class="sourceLineNo">187</span>  public HFileReaderImpl(Path path, FixedFileTrailer trailer, FSDataInputStreamWrapper fsdis,<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      long fileSize, CacheConfig cacheConf, HFileSystem hfs, boolean primaryReplicaReader,<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      Configuration conf) throws IOException {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>    this.trailer = trailer;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    this.compressAlgo = trailer.getCompressionCodec();<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    this.cacheConf = cacheConf;<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    this.fileSize = fileSize;<a name="line.193"></a>
-<span class="sourceLineNo">194</span>    this.path = path;<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    this.name = path.getName();<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    this.conf = conf;<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    this.primaryReplicaReader = primaryReplicaReader;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    checkFileVersion();<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    this.hfileContext = createHFileContext(fsdis, fileSize, hfs, path, trailer);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    this.fsBlockReader = new HFileBlock.FSReaderImpl(fsdis, fileSize, hfs, path, hfileContext);<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>    // Comparator class name is stored in the trailer in version 2.<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    comparator = trailer.createComparator();<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    dataBlockIndexReader = new HFileBlockIndex.CellBasedKeyBlockIndexReader(comparator,<a name="line.204"></a>
-<span class="sourceLineNo">205</span>        trailer.getNumDataIndexLevels(), this);<a name="line.205"></a>
-<span class="sourceLineNo">206</span>    metaBlockIndexReader = new HFileBlockIndex.ByteArrayKeyBlockIndexReader(1);<a name="line.206"></a>
-<span class="sourceLineNo">207</span><a name="line.207"></a>
-<span class="sourceLineNo">208</span>    // Parse load-on-open data.<a name="line.208"></a>
-<span class="sourceLineNo">209</span><a name="line.209"></a>
-<span class="sourceLineNo">210</span>    HFileBlock.BlockIterator blockIter = fsBlockReader.blockRange(<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        trailer.getLoadOnOpenDataOffset(),<a name="line.211"></a>
-<span class="sourceLineNo">212</span>        fileSize - trailer.getTrailerSize());<a name="line.212"></a>
-<span class="sourceLineNo">213</span><a name="line.213"></a>
-<span class="sourceLineNo">214</span>    // Data index. We also read statistics about the block index written after<a name="line.214"></a>
-<span class="sourceLineNo">215</span>    // the root level.<a name="line.215"></a>
-<span class="sourceLineNo">216</span>    dataBlockIndexReader.readMultiLevelIndexRoot(<a name="line.216"></a>
-<span class="sourceLineNo">217</span>        blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX),<a name="line.217"></a>
-<span class="sourceLineNo">218</span>        trailer.getDataIndexCount());<a name="line.218"></a>
-<span class="sourceLineNo">219</span><a name="line.219"></a>
-<span class="sourceLineNo">220</span>    // Meta index.<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    metaBlockIndexReader.readRootIndex(<a name="line.221"></a>
-<span class="sourceLineNo">222</span>        blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX),<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        trailer.getMetaIndexCount());<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>    // File info<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    fileInfo = new FileInfo();<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    fileInfo.read(blockIter.nextBlockWithBlockType(BlockType.FILE_INFO).getByteStream());<a name="line.227"></a>
-<span class="sourceLineNo">228</span>    byte[] creationTimeBytes = fileInfo.get(FileInfo.CREATE_TIME_TS);<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    this.hfileContext.setFileCreateTime(creationTimeBytes == null?  0:<a name="line.229"></a>
-<span class="sourceLineNo">230</span>        Bytes.toLong(creationTimeBytes));<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    if (fileInfo.get(FileInfo.LASTKEY) != null) {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      lastKeyCell = new KeyValue.KeyOnlyKeyValue(fileInfo.get(FileInfo.LASTKEY));<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    avgKeyLen = Bytes.toInt(fileInfo.get(FileInfo.AVG_KEY_LEN));<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    avgValueLen = Bytes.toInt(fileInfo.get(FileInfo.AVG_VALUE_LEN));<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    byte [] keyValueFormatVersion = fileInfo.get(HFileWriterImpl.KEY_VALUE_VERSION);<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    includesMemstoreTS = keyValueFormatVersion != null &amp;&amp;<a name="line.237"></a>
-<span class="sourceLineNo">238</span>        Bytes.toInt(keyValueFormatVersion) == HFileWriterImpl.KEY_VALUE_VER_WITH_MEMSTORE;<a name="line.238"></a>
-<span class="sourceLineNo">239</span>    fsBlockReader.setIncludesMemStoreTS(includesMemstoreTS);<a name="line.239"></a>
-<span class="sourceLineNo">240</span>    if (includesMemstoreTS) {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>      decodeMemstoreTS = Bytes.toLong(fileInfo.get(HFileWriterImpl.MAX_MEMSTORE_TS_KEY)) &gt; 0;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>    }<a name="line.242"></a>
-<span class="sourceLineNo">243</span><a name="line.243"></a>
-<span class="sourceLineNo">244</span>    // Read data block encoding algorithm name from file info.<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    dataBlockEncoder = HFileDataBlockEncoderImpl.createFromFileInfo(fileInfo);<a name="line.245"></a>
-<span class="sourceLineNo">246</span>    fsBlockReader.setDataBlockEncoder(dataBlockEncoder);<a name="line.246"></a>
-<span class="sourceLineNo">247</span><a name="line.247"></a>
-<span class="sourceLineNo">248</span>    // Store all other load-on-open blocks for further consumption.<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    HFileBlock b;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    while ((b = blockIter.nextBlock()) != null) {<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      loadOnOpenBlocks.add(b);<a name="line.251"></a>
-<span class="sourceLineNo">252</span>    }<a name="line.252"></a>
-<span class="sourceLineNo">253</span><a name="line.253"></a>
-<span class="sourceLineNo">254</span>    // Prefetch file blocks upon open if requested<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    if (cacheConf.shouldPrefetchOnOpen()) {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>      PrefetchExecutor.request(path, new Runnable() {<a name="line.256"></a>
-<span class="sourceLineNo">257</span>        public void run() {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>          long offset = 0;<a name="line.258"></a>
-<span class="sourceLineNo">259</span>          long end = 0;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>          try {<a name="line.260"></a>
-<span class="sourceLineNo">261</span>            end = getTrailer().getLoadOnOpenDataOffset();<a name="line.261"></a>
-<span class="sourceLineNo">262</span>            if (LOG.isTraceEnabled()) {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>              LOG.trace("Prefetch start " + getPathOffsetEndStr(path, offset, end));<a name="line.263"></a>
-<span class="sourceLineNo">264</span>            }<a name="line.264"></a>
-<span class="sourceLineNo">265</span>            // TODO: Could we use block iterator in here? Would that get stuff into the cache?<a name="line.265"></a>
-<span class="sourceLineNo">266</span>            HFileBlock prevBlock = null;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>            while (offset &lt; end) {<a name="line.267"></a>
-<span class="sourceLineNo">268</span>              if (Thread.interrupted()) {<a name="line.268"></a>
-<span class="sourceLineNo">269</span>                break;<a name="line.269"></a>
-<span class="sourceLineNo">270</span>              }<a name="line.270"></a>
-<span class="sourceLineNo">271</span>              // Perhaps we got our block from cache? Unlikely as this may be, if it happens, then<a name="line.271"></a>
-<span class="sourceLineNo">272</span>              // the internal-to-hfileblock thread local which holds the overread that gets the<a name="line.272"></a>
-<span class="sourceLineNo">273</span>              // next header, will not have happened...so, pass in the onDiskSize gotten from the<a name="line.273"></a>
-<span class="sourceLineNo">274</span>              // cached block. This 'optimization' triggers extremely rarely I'd say.<a name="line.274"></a>
-<span class="sourceLineNo">275</span>              long onDiskSize = prevBlock != null? prevBlock.getNextBlockOnDiskSize(): -1;<a name="line.275"></a>
-<span class="sourceLineNo">276</span>              HFileBlock block = readBlock(offset, onDiskSize, true, false, false, false,<a name="line.276"></a>
-<span class="sourceLineNo">277</span>                  null, null);<a name="line.277"></a>
-<span class="sourceLineNo">278</span>              // Need not update the current block. Ideally here the readBlock won't find the<a name="line.278"></a>
-<span class="sourceLineNo">279</span>              // block in cache. We call this readBlock so that block data is read from FS and<a name="line.279"></a>
-<span class="sourceLineNo">280</span>              // cached in BC. So there is no reference count increment that happens here.<a name="line.280"></a>
-<span class="sourceLineNo">281</span>              // The return will ideally be a noop because the block is not of MemoryType SHARED.<a name="line.281"></a>
-<span class="sourceLineNo">282</span>              returnBlock(block);<a name="line.282"></a>
-<span class="sourceLineNo">283</span>              prevBlock = block;<a name="line.283"></a>
-<span class="sourceLineNo">284</span>              offset += block.getOnDiskSizeWithHeader();<a name="line.284"></a>
-<span class="sourceLineNo">285</span>            }<a name="line.285"></a>
-<span class="sourceLineNo">286</span>          } catch (IOException e) {<a name="line.286"></a>
-<span class="sourceLineNo">287</span>            // IOExceptions are probably due to region closes (relocation, etc.)<a name="line.287"></a>
-<span class="sourceLineNo">288</span>            if (LOG.isTraceEnabled()) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>              LOG.trace("Prefetch " + getPathOffsetEndStr(path, offset, end), e);<a name="line.289"></a>
-<span class="sourceLineNo">290</span>            }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>          } catch (NullPointerException e) {<a name="line.291"></a>
-<span class="sourceLineNo">292</span>            LOG.warn("Stream moved/closed or prefetch cancelled?" +<a name="line.292"></a>
-<span class="sourceLineNo">293</span>                getPathOffsetEndStr(path, offset, end), e);<a name="line.293"></a>
-<span class="sourceLineNo">294</span>          } catch (Exception e) {<a name="line.294"></a>
-<span class="sourceLineNo">295</span>            // Other exceptions are interesting<a name="line.295"></a>
-<span class="sourceLineNo">296</span>            LOG.warn("Prefetch " + getPathOffsetEndStr(path, offset, end), e);<a name="line.296"></a>
-<span class="sourceLineNo">297</span>          } finally {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>            PrefetchExecutor.complete(path);<a name="line.298"></a>
-<span class="sourceLineNo">299</span>          }<a name="line.299"></a>
-<span class="sourceLineNo">300</span>        }<a name="line.300"></a>
-<span class="sourceLineNo">301</span>      });<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    }<a name="line.302"></a>
-<span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>    byte[] tmp = fileInfo.get(FileInfo.MAX_TAGS_LEN);<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    // max tag length is not present in the HFile means tags were not at all written to file.<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    if (tmp != null) {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      hfileContext.setIncludesTags(true);<a name="line.307"></a>
-<span class="sourceLineNo">308</span>      tmp = fileInfo.get(FileInfo.TAGS_COMPRESSED);<a name="line.308"></a>
-<span class="sourceLineNo">309</span>      if (tmp != null &amp;&amp; Bytes.toBoolean(tmp)) {<a name="line.309"></a>
-<span class="sourceLineNo">310</span>        hfileContext.setCompressTags(true);<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      }<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    }<a name="line.312"></a>
-<span class="sourceLineNo">313</span>  }<a name="line.313"></a>
-<span class="sourceLineNo">314</span><a name="line.314"></a>
-<span class="sourceLineNo">315</span>  private static String getPathOffsetEndStr(final Path path, final long offset, final long end) {<a name="line.315"></a>
-<span class="sourceLineNo">316</span>    return "path=" + path.toString() + ", offset=" + offset + ", end=" + end;<a name="line.316"></a>
-<span class="sourceLineNo">317</span>  }<a name="line.317"></a>
-<span class="sourceLineNo">318</span><a name="line.318"></a>
-<span class="sourceLineNo">319</span>  /**<a name="line.319"></a>
-<span class="sourceLineNo">320</span>   * File version check is a little sloppy. We read v3 files but can also read v2 files if their<a name="line.320"></a>
-<span class="sourceLineNo">321</span>   * content has been pb'd; files written with 0.98.<a name="line.321"></a>
-<span class="sourceLineNo">322</span>   */<a name="line.322"></a>
-<span class="sourceLineNo">323</span>  private void checkFileVersion() {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    int majorVersion = trailer.getMajorVersion();<a name="line.324"></a>
-<span class="sourceLineNo">325</span>    if (majorVersion == getMajorVersion()) return;<a name="line.325"></a>
-<span class="sourceLineNo">326</span>    int minorVersion = trailer.getMinorVersion();<a name="line.326"></a>
-<span class="sourceLineNo">327</span>    if (majorVersion == 2 &amp;&amp; minorVersion &gt;= MIN_V2_MINOR_VERSION_WITH_PB) return;<a name="line.327"></a>
-<span class="sourceLineNo">328</span>    // We can read v3 or v2 versions of hfile.<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    throw new IllegalArgumentException("Invalid HFile version: major=" +<a name="line.329"></a>
-<span class="sourceLineNo">330</span>      trailer.getMajorVersion() + ", minor=" + trailer.getMinorVersion() + ": expected at least " +<a name="line.330"></a>
-<span class="sourceLineNo">331</span>      "major=2 and minor=" + MAX_MINOR_VERSION);<a name="line.331"></a>
-<span class="sourceLineNo">332</span>  }<a name="line.332"></a>
-<span class="sourceLineNo">333</span><a name="line.333"></a>
-<span class="sourceLineNo">334</span>  @SuppressWarnings("serial")<a name="line.334"></a>
-<span class="sourceLineNo">335</span>  public static class BlockIndexNotLoadedException extends IllegalStateException {<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    public BlockIndexNotLoadedException() {<a name="line.336"></a>
-<span class="sourceLineNo">337</span>      // Add a message in case anyone relies on it as opposed to class name.<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      super("Block index not loaded");<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    }<a name="line.339"></a>
-<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
-<span class="sourceLineNo">341</span><a name="line.341"></a>
-<span class="sourceLineNo">342</span>  private Optional&lt;String&gt; toStringFirstKey() {<a name="line.342"></a>
-<span class="sourceLineNo">343</span>    return getFirstKey().map(CellUtil::getCellKeyAsString);<a name="line.343"></a>
-<span class="sourceLineNo">344</span>  }<a name="line.344"></a>
-<span class="sourceLineNo">345</span><a name="line.345"></a>
-<span class="sourceLineNo">346</span>  private Optional&lt;String&gt; toStringLastKey() {<a name="line.346"></a>
-<span class="sourceLineNo">347</span>    return getLastKey().map(CellUtil::getCellKeyAsString);<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  }<a name="line.348"></a>
-<span class="sourceLineNo">349</span><a name="line.349"></a>
-<span class="sourceLineNo">350</span>  @Override<a name="line.350"></a>
-<span class="sourceLineNo">351</span>  public String toString() {<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    return "reader=" + path.toString() +<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        (!isFileInfoLoaded()? "":<a name="line.353"></a>
-<span class="sourceLineNo">354</span>          ", compression=" + compressAlgo.getName() +<a name="line.354"></a>
-<span class="sourceLineNo">355</span>          ", cacheConf=" + cacheConf +<a name="line.355"></a>
-<span class="sourceLineNo">356</span>          ", firstKey=" + toStringFirstKey() +<a name="line.356"></a>
-<span class="sourceLineNo">357</span>          ", lastKey=" + toStringLastKey()) +<a name="line.357"></a>
-<span class="sourceLineNo">358</span>          ", avgKeyLen=" + avgKeyLen +<a name="line.358"></a>
-<span class="sourceLineNo">359</span>          ", avgValueLen=" + avgValueLen +<a name="line.359"></a>
-<span class="sourceLineNo">360</span>          ", entries=" + trailer.getEntryCount() +<a name="line.360"></a>
-<span class="sourceLineNo">361</span>          ", length=" + fileSize;<a name="line.361"></a>
-<span class="sourceLineNo">362</span>  }<a name="line.362"></a>
-<span class="sourceLineNo">363</span><a name="line.363"></a>
-<span class="sourceLineNo">364</span>  @Override<a name="line.364"></a>
-<span class="sourceLineNo">365</span>  public long length() {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    return fileSize;<a name="line.366"></a>
-<span class="sourceLineNo">367</span>  }<a name="line.367"></a>
-<span class="sourceLineNo">368</span><a name="line.368"></a>
-<span class="sourceLineNo">369</span>  @Override<a name="line.369"></a>
-<span class="sourceLineNo">370</span>  public void returnBlock(HFileBlock block) {<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    BlockCache blockCache = this.cacheConf.getBlockCache();<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    if (blockCache != null &amp;&amp; block != null) {<a name="line.372"></a>
-<span class="sourceLineNo">373</span>      BlockCacheKey cacheKey = new BlockCacheKey(this.getFileContext().getHFileName(),<a name="line.373"></a>
-<span class="sourceLineNo">374</span>          block.getOffset(), this.isPrimaryReplicaReader(), block.getBlockType());<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      blockCache.returnBlock(cacheKey, block);<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    }<a name="line.376"></a>
-<span class="sourceLineNo">377</span>  }<a name="line.377"></a>
-<span class="sourceLineNo">378</span>  /**<a name="line.378"></a>
-<span class="sourceLineNo">379</span>   * @return the first key in the file. May be null if file has no entries. Note<a name="line.379"></a>
-<span class="sourceLineNo">380</span>   *         that this is not the first row key, but rather the byte form of the<a name="line.380"></a>
-<span class="sourceLineNo">381</span>   *         first KeyValue.<a name="line.381"></a>
-<span class="sourceLineNo">382</span>   */<a name="line.382"></a>
-<span class="sourceLineNo">383</span>  @Override<a name="line.383"></a>
-<span class="sourceLineNo">384</span>  public Optional&lt;Cell&gt; getFirstKey() {<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    if (dataBlockIndexReader == null) {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>      throw new BlockIndexNotLoadedException();<a name="line.386"></a>
-<span class="sourceLineNo">387</span>    }<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    return dataBlockIndexReader.isEmpty() ? Optional.empty()<a name="line.388"></a>
-<span class="sourceLineNo">389</span>        : Optional.of(dataBlockIndexReader.getRootBlockKey(0));<a name="line.389"></a>
-<span class="sourceLineNo">390</span>  }<a name="line.390"></a>
-<span class="sourceLineNo">391</span><a name="line.391"></a>
-<span class="sourceLineNo">392</span>  /**<a name="line.392"></a>
-<span class="sourceLineNo">393</span>   * TODO left from {@link HFile} version 1: move this to StoreFile after Ryan's<a name="line.393"></a>
-<span class="sourceLineNo">394</span>   * patch goes in to eliminate {@link KeyValue} here.<a name="line.394"></a>
-<span class="sourceLineNo">395</span>   *<a name="line.395"></a>
-<span class="sourceLineNo">396</span>   * @return the first row key, or null if the file is empty.<a name="line.396"></a>
-<span class="sourceLineNo">397</span>   */<a name="line.397"></a>
-<span class="sourceLineNo">398</span>  @Override<a name="line.398"></a>
-<span class="sourceLineNo">399</span>  public Optional&lt;byte[]&gt; getFirstRowKey() {<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    // We have to copy the row part to form the row key alone<a name="line.400"></a>
-<span class="sourceLineNo">401</span>    return getFirstKey().map(CellUtil::cloneRow);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>  }<a name="line.402"></a>
-<span class="sourceLineNo">403</span><a name="line.403"></a>
-<span class="sourceLineNo">404</span>  /**<a name="line.404"></a>
-<span class="sourceLineNo">405</span>   * TODO left from {@link HFile} version 1: move this to StoreFile after<a name="line.405"></a>
-<span class="sourceLineNo">406</span>   * Ryan's patch goes in to eliminate {@link KeyValue} here.<a name="line.406"></a>
-<span class="sourceLineNo">407</span>   *<a name="line.407"></a>
-<span class="sourceLineNo">408</span>   * @return the last row key, or null if the file is empty.<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   */<a name="line.409"></a>
-<span class="sourceLineNo">410</span>  @Override<a name="line.410"></a>
-<span class="sourceLineNo">411</span>  public Optional&lt;byte[]&gt; getLastRowKey() {<a name="line.411"></a>
-<span class="sourceLineNo">412</span>    // We have to copy the row part to form the row key alone<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    return getLastKey().map(CellUtil::cloneRow);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>  }<a name="line.414"></a>
-<span class="sourceLineNo">415</span><a name="line.415"></a>
-<span class="sourceLineNo">416</span>  /** @return number of KV entries in this HFile */<a name="line.416"></a>
-<span class="sourceLineNo">417</span>  @Override<a name="line.417"></a>
-<span class="sourceLineNo">418</span>  public long getEntries() {<a name="line.418"></a>
-<span class="sourceLineNo">419</span>    return trailer.getEntryCount();<a name="line.419"></a>
-<span class="sourceLineNo">420</span>  }<a name="line.420"></a>
-<span class="sourceLineNo">421</span><a name="line.421"></a>
-<span class="sourceLineNo">422</span>  /** @return comparator */<a name="line.422"></a>
-<span class="sourceLineNo">423</span>  @Override<a name="line.423"></a>
-<span class="sourceLineNo">424</span>  public CellComparator getComparator() {<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    return comparator;<a name="line.425"></a>
-<span class="sourceLineNo">426</span>  }<a name="line.426"></a>
-<span class="sourceLineNo">427</span><a name="line.427"></a>
-<span class="sourceLineNo">428</span>  /** @return compression algorithm */<a name="line.428"></a>
-<span class="sourceLineNo">429</span>  @Override<a name="line.429"></a>
-<span class="sourceLineNo">430</span>  public Compression.Algorithm getCompressionAlgorithm() {<a name="line.430"></a>
-<span class="sourceLineNo">431</span>    return compressAlgo;<a name="line.431"></a>
-<span class="sourceLineNo">432</span>  }<a name="line.432"></a>
-<span class="sourceLineNo">433</span><a name="line.433"></a>
-<span class="sourceLineNo">434</span>  /**<a name="line.434"></a>
-<span class="sourceLineNo">435</span>   * @return the total heap size of data and meta block indexes in bytes. Does<a name="line.435"></a>
-<span class="sourceLineNo">436</span>   *         not take into account non-root blocks of a multilevel data index.<a name="line.436"></a>
-<span class="sourceLineNo">437</span>   */<a name="line.437"></a>
-<span class="sourceLineNo">438</span>  public long indexSize() {<a name="line.438"></a>
-<span class="sourceLineNo">439</span>    return (dataBlockIndexReader != null ? dataBlockIndexReader.heapSize() : 0)<a name="line.439"></a>
-<span class="sourceLineNo">440</span>        + ((metaBlockIndexReader != null) ? metaBlockIndexReader.heapSize()<a name="line.440"></a>
-<span class="sourceLineNo">441</span>            : 0);<a name="line.441"></a>
-<span class="sourceLineNo">442</span>  }<a name="line.442"></a>
-<span class="sourceLineNo">443</span><a name="line.443"></a>
-<span class="sourceLineNo">444</span>  @Override<a name="line.444"></a>
-<span class="sourceLineNo">445</span>  public String getName() {<a name="line.445"></a>
-<span class="sourceLineNo">446</span>    return name;<a name="line.446"></a>
-<span class="sourceLineNo">447</span>  }<a name="line.447"></a>
-<span class="sourceLineNo">448</span><a name="line.448"></a>
-<span class="sourceLineNo">449</span>  @Override<a name="line.449"></a>
-<span class="sourceLineNo">450</span>  public HFileBlockIndex.BlockIndexReader getDataBlockIndexReader() {<a name="line.450"></a>
-<span class="sourceLineNo">451</span>    return dataBlockIndexReader;<a name="line.451"></a>
-<span class="sourceLineNo">452</span>  }<a name="line.452"></a>
-<span class="sourceLineNo">453</span><a name="line.453"></a>
-<span class="sourceLineNo">454</span>  @Override<a name="line.454"></a>
-<span class="sourceLineNo">455</span>  public FixedFileTrailer getTrailer() {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>    return trailer;<a name="line.456"></a>
-<span class="sourceLineNo">457</span>  }<a name="line.457"></a>
-<span class="sourceLineNo">458</span><a name="line.458"></a>
-<span class="sourceLineNo">459</span>  @Override<a name="line.459"></a>
-<span class="sourceLineNo">460</span>  public boolean isPrimaryReplicaReader() {<a name="line.460"></a>
-<span class="sourceLineNo">461</span>    return primaryReplicaReader;<a name="line.461"></a>
-<span class="sourceLineNo">462</span>  }<a name="line.462"></a>
-<span class="sourceLineNo">463</span><a name="line.463"></a>
-<span class="sourceLineNo">464</span>  @Override<a name="line.464"></a>
-<span class="sourceLineNo">465</span>  public FileInfo loadFileInfo() throws IOException {<a name="line.465"></a>
-<span class="sourceLineNo">466</span>    return fileInfo;<a name="line.466"></a>
-<span class="sourceLineNo">467</span>  }<a name="line.467"></a>
-<span class="sourceLineNo">468</span><a name="line.468"></a>
-<span class="sourceLineNo">469</span>  /**<a name="line.469"></a>
-<span class="sourceLineNo">470</span>   * An exception thrown when an operation requiring a scanner to be seeked<a name="line.470"></a>
-<span class="sourceLineNo">471</span>   * is invoked on a scanner that is not seeked.<a name="line.471"></a>
-<span class="sourceLineNo">472</span>   */<a name="line.472"></a>
-<span class="sourceLineNo">473</span>  @SuppressWarnings("serial")<a name="line.473"></a>
-<span class="sourceLineNo">474</span>  public static class NotSeekedException extends IllegalStateException {<a name="line.474"></a>
-<span class="sourceLineNo">475</span>    public NotSeekedException() {<a name="line.475"></a>
-<span class="sourceLineNo">476</span>      super("Not seeked to a key/value");<a name="line.476"></a>
-<span class="sourceLineNo">477</span>    }<a name="line.477"></a>
-<span class="sourceLineNo">478</span>  }<a name="line.478"></a>
-<span class="sourceLineNo">479</span><a name="line.479"></a>
-<span class="sourceLineNo">480</span>  protected static class HFileScannerImpl implements HFileScanner {<a name="line.480"></a>
-<span class="sourceLineNo">481</span>    private ByteBuff blockBuffer;<a name="line.481"></a>
-<span class="sourceLineNo">482</span>    protected final boolean cacheBlocks;<a name="line.482"></a>
-<span class="sourceLineNo">483</span>    protected final boolean pread;<a name="line.483"></a>
-<span class="sourceLineNo">484</span>    protected final boolean isCompaction;<a name="line.484"></a>
-<span class="sourceLineNo">485</span>    private int currKeyLen;<a name="line.485"></a>
-<span class="sourceLineNo">486</span>    private int currValueLen;<a name="line.486"></a>
-<span class="sourceLineNo">487</span>    private int currMemstoreTSLen;<a name="line.487"></a>
-<span class="sourceLineNo">488</span>    private long currMemstoreTS;<a name="line.488"></a>
-<span class="sourceLineNo">489</span>    // Updated but never read?<a name="line.489"></a>
-<span class="sourceLineNo">490</span>    protected AtomicInteger blockFetches = new AtomicInteger(0);<a name="line.490"></a>
-<span class="sourceLineNo">491</span>    protected final HFile.Reader reader;<a name="line.491"></a>
-<span class="sourceLineNo">492</span>    private int currTagsLen;<a name="line.492"></a>
-<span class="sourceLineNo">493</span>    // buffer backed keyonlyKV<a name="line.493"></a>
-<span class="sourceLineNo">494</span>    private ByteBufferKeyOnlyKeyValue bufBackedKeyOnlyKv = new ByteBufferKeyOnlyKeyValue();<a name="line.494"></a>
-<span class="sourceLineNo">495</span>    // A pair for reusing in blockSeek() so that we don't garbage lot of objects<a name="line.495"></a>
-<span class="sourceLineNo">496</span>    final ObjectIntPair&lt;ByteBuffer&gt; pair = new ObjectIntPair&lt;&gt;();<a name="line.496"></a>
-<span class="sourceLineNo">497</span><a name="line.497"></a>
-<span class="sourceLineNo">498</span>    /**<a name="line.498"></a>
-<span class="sourceLineNo">499</span>     * The next indexed key is to keep track of the indexed key of the next data block.<a name="line.499"></a>
-<span class="sourceLineNo">500</span>     * If the nextIndexedKey is HConstants.NO_NEXT_INDEXED_KEY, it means that the<a name="line.500"></a>
-<span class="sourceLineNo">501</span>     * current data block is the last data block.<a name="line.501"></a>
-<span class="sourceLineNo">502</span>     *<a name="line.502"></a>
-<span class="sourceLineNo">503</span>     * If the nextIndexedKey is null, it means the nextIndexedKey has not been loaded yet.<a name="line.503"></a>
-<span class="sourceLineNo">504</span>     */<a name="line.504"></a>
-<span class="sourceLineNo">505</span>    protected Cell nextIndexedKey;<a name="line.505"></a>
-<span class="sourceLineNo">506</span>    // Current block being used<a name="line.506"></a>
-<span class="sourceLineNo">507</span>    protected HFileBlock curBlock;<a name="line.507"></a>
-<span class="sourceLineNo">508</span>    // Previous blocks that were used in the course of the read<a name="line.508"></a>
-<span class="sourceLineNo">509</span>    protected final ArrayList&lt;HFileBlock&gt; prevBlocks = new ArrayList&lt;&gt;();<a name="line.509"></a>
-<span class="sourceLineNo">510</span><a name="line.510"></a>
-<span class="sourceLineNo">511</span>    public HFileScannerImpl(final HFile.Reader reader, final boolean cacheBlocks,<a name="line.511"></a>
-<span class="sourceLineNo">512</span>        final boolean pread, final boolean isCompaction) {<a name="line.512"></a>
-<span class="sourceLineNo">513</span>      this.reader = reader;<a name="line.513"></a>
-<span class="sourceLineNo">514</span>      this.cacheBlocks = cacheBlocks;<a name="line.514"></a>
-<span class="sourceLineNo">515</span>      this.pread = pread;<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      this.isCompaction = isCompaction;<a name="line.516"></a>
-<span class="sourceLineNo">517</span>    }<a name="line.517"></a>
-<span class="sourceLineNo">518</span><a name="line.518"></a>
-<span class="sourceLineNo">519</span>    void updateCurrBlockRef(HFileBlock block) {<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      if (block != null &amp;&amp; this.curBlock != null &amp;&amp;<a name="line.520"></a>
-<span class="sourceLineNo">521</span>          block.getOffset() == this.curBlock.getOffset()) {<a name="line.521"></a>
-<span class="sourceLineNo">522</span>        return;<a name="line.522"></a>
-<span class="sourceLineNo">523</span>      }<a name="line.523"></a>
-<span class="sourceLineNo">524</span>      // We don't have to keep ref to EXCLUSIVE type of block<a name="line.524"></a>
-<span class="sourceLineNo">525</span>      if (this.curBlock != null &amp;&amp; this.curBlock.usesSharedMemory()) {<a name="line.525"></a>
-<span class="sourceLineNo">526</span>        prevBlocks.add(this.curBlock);<a name="line.526"></a>
-<span class="sourceLineNo">527</span>      }<a name="line.527"></a>
-<span class="sourceLineNo">528</span>      this.curBlock = block;<a name="line.528"></a>
-<span class="sourceLineNo">529</span>    }<a name="line.529"></a>
-<span class="sourceLineNo">530</span><a name="line.530"></a>
-<span class="sourceLineNo">531</span>    void reset() {<a name="line.531"></a>
-<span class="sourceLineNo">532</span>      // We don't have to keep ref to EXCLUSIVE type of block<a name="line.532"></a>
-<span class="sourceLineNo">533</span>      if (this.curBlock != null &amp;&amp; this.curBlock.usesSharedMemory()) {<a name="line.533"></a>
-<span class="sourceLineNo">534</span>        this.prevBlocks.add(this.curBlock);<a name="line.534"></a>
-<span class="sourceLineNo">535</span>      }<a name="line.535"></a>
-<span class="sourceLineNo">536</span>      this.curBlock = null;<a name="line.536"></a>
-<span class="sourceLineNo">537</span>    }<a name="line.537"></a>
-<span class="sourceLineNo">538</span><a name="line.538"></a>
-<span class="sourceLineNo">539</span>    private void returnBlockToCache(HFileBlock block) {<a name="line.539"></a>
-<span class="sourceLineNo">540</span>      if (LOG.isTraceEnabled()) {<a name="line.540"></a>
-<span class="sourceLineNo">541</span>        LOG.trace("Returning the block : " + block);<a name="line.541"></a>
-<span class="sourceLineNo">542</span>      }<a name="line.542"></a>
-<span class="sourceLineNo">543</span>      this.reader.returnBlock(block);<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    }<a name="line.544"></a>
-<span class="sourceLineNo">545</span><a name="line.545"></a>
-<span class="sourceLineNo">546</span>    private void returnBlocks(boolean returnAll) {<a name="line.546"></a>
-<span class="sourceLineNo">547</span>      for (int i = 0; i &lt; this.prevBlocks.size(); i++) {<a name="line.547"></a>
-<span class="sourceLineNo">548</span>        returnBlockToCache(this.prevBlocks.get(i));<a name="line.548"></a>
-<span class="sourceLineNo">549</span>      }<a name="line.549"></a>
-<span class="sourceLineNo">550</span>      this.prevBlocks.clear();<a name="line.550"></a>
-<span class="sourceLineNo">551</span>      if (returnAll &amp;&amp; this.curBlock != null) {<a name="line.551"></a>
-<span class="sourceLineNo">552</span>        returnBlockToCache(this.curBlock);<a name="line.552"></a>
-<span class="sourceLineNo">553</span>        this.curBlock = null;<a name="line.553"></a>
-<span class="sourceLineNo">554</span>      }<a name="line.554"></a>
-<span class="sourceLineNo">555</span>    }<a name="line.555"></a>
-<span class="sourceLineNo">556</span>    @Override<a name="line.556"></a>
-<span class="sourceLineNo">557</span>    public boolean isSeeked(){<a name="line.557"></a>
-<span class="sourceLineNo">558</span>      return blockBuffer != null;<a name="line.558"></a>
-<span class="sourceLineNo">559</span>    }<a name="line.559"></a>
-<span class="sourceLineNo">560</span><a name="line.560"></a>
-<span class="sourceLineNo">561</span>    @Override<a name="line.561"></a>
-<span class="sourceLineNo">562</span>    public String toString() {<a name="line.562"></a>
-<span class="sourceLineNo">563</span>      return "HFileScanner for reader " + String.valueOf(getReader());<a name="line.563"></a>
-<span class="sourceLineNo">564</span>    }<a name="line.564"></a>
-<span class="sourceLineNo">565</span><a name="line.565"></a>
-<span class="sourceLineNo">566</span>    protected void assertSeeked() {<a name="line.566"></a>
-<span class="sourceLineNo">567</span>      if (!isSeeked())<a name="line.567"></a>
-<span class="sourceLineNo">568</span>        throw new NotSeekedException();<a name="line.568"></a>
-<span class="sourceLineNo">569</span>    }<a name="line.569"></a>
-<span class="sourceLineNo">570</span><a name="line.570"></a>
-<span class="sourceLineNo">571</span>    @Override<a name="line.571"></a>
-<span class="sourceLineNo">572</span>    public HFile.Reader getReader() {<a name="line.572"></a>
-<span class="sourceLineNo">573</span>      return reader;<a name="line.573"></a>
-<span class="sourceLineNo">574</span>    }<a name="line.574"></a>
-<span class="sourceLineNo">575</span><a name="line.575"></a>
-<span class="sourceLineNo">576</span>    // From non encoded HFiles, we always read back KeyValue or its descendant.(Note: When HFile<a name="line.576"></a>
-<span class="sourceLineNo">577</span>    // block is in DBB, it will be OffheapKV). So all parts of the Cell is in a contiguous<a name="line.577"></a>
-<span class="sourceLineNo">578</span>    // array/buffer. How many bytes we should wrap to make the KV is what this method returns.<a name="line.578"></a>
-<span class="sourceLineNo">579</span>    private int getKVBufSize() {<a name="line.579"></a>
-<span class="sourceLineNo">580</span>      int kvBufSize = KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen;<a name="line.580"></a>
-<span class="sourceLineNo">581</span>      if (currTagsLen &gt; 0) {<a name="line.581"></a>
-<span class="sourceLineNo">582</span>        kvBufSize += Bytes.SIZEOF_SHORT + currTagsLen;<a name="line.582"></a>
-<span class="sourceLineNo">583</span>      }<a name="line.583"></a>
-<span class="sourceLineNo">584</span>      return kvBufSize;<a name="line.584"></a>
-<span class="sourceLineNo">585</span>    }<a name="line.585"></a>
-<span class="sourceLineNo">586</span><a name="line.586"></a>
-<span class="sourceLineNo">587</span>    @Override<a name="line.587"></a>
-<span class="sourceLineNo">588</span>    public void close() {<a name="line.588"></a>
-<span class="sourceLineNo">589</span>      if (!pread) {<a name="line.589"></a>
-<span class="sourceLineNo">590</span>        // For seek + pread stream socket should be closed when the scanner is closed. HBASE-9393<a name="line.590"></a>
-<span class="sourceLineNo">591</span>        reader.unbufferStream();<a name="line.591"></a>
-<span class="sourceLineNo">592</span>      }<a name="line.592"></a>
-<span class="sourceLineNo">593</span>      this.returnBlocks(true);<a name="line.593"></a>
-<span class="sourceLineNo">594</span>    }<a name="line.594"></a>
-<span class="sourceLineNo">595</span><a name="line.595"></a>
-<span class="sourceLineNo">596</span>    // Returns the #bytes in HFile for the current cell. Used to skip these many bytes in current<a name="line.596"></a>
-<span class="sourceLineNo">597</span>    // HFile block's buffer so as to position to the next cell.<a name="line.597"></a>
-<span class="sourceLineNo">598</span>    private int getCurCellSerializedSize() {<a name="line.598"></a>
-<span class="sourceLineNo">599</span>      int curCellSize =  KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen<a name="line.599"></a>
-<span class="sourceLineNo">600</span>          + currMemstoreTSLen;<a name="line.600"></a>
-<span class="sourceLineNo">601</span>      if (this.reader.getFileContext().isIncludesTags()) {<a name="line.601"></a>
-<span class="sourceLineNo">602</span>        curCellSize += Bytes.SIZEOF_SHORT + currTagsLen;<a name="line.602"></a>
-<span class="sourceLineNo">603</span>      }<a name="line.603"></a>
-<span class="sourceLineNo">604</span>      return curCellSize;<a name="line.604"></a>
-<span class="sourceLineNo">605</span>    }<a name="line.605"></a>
-<span class="sourceLineNo">606</span><a name="line.606"></a>
-<span class="sourceLineNo">607</span>    protected void readKeyValueLen() {<a name="line.607"></a>
-<span class="sourceLineNo">608</span>      // This is a hot method. We go out of our way to make this method short so it can be<a name="line.608"></a>
-<span class="sourceLineNo">609</span>      // inlined and is not too big to compile. We also manage position in ByteBuffer ourselves<a name="line.609"></a>
-<span class="sourceLineNo">610</span>      // because it is faster than going via range-checked ByteBuffer methods or going through a<a name="line.610"></a>
-<span class="sourceLineNo">611</span>      // byte buffer array a byte at a time.<a name="line.611"></a>
-<span class="sourceLineNo">612</span>      // Get a long at a time rather than read two individual ints. In micro-benchmarking, even<a name="line.612"></a>
-<span class="sourceLineNo">613</span>      // with the extra bit-fiddling, this is order-of-magnitude faster than getting two ints.<a name="line.613"></a>
-<span class="sourceLineNo">614</span>      // Trying to imitate what was done - need to profile if this is better or<a name="line.614"></a>
-<span class="sourceLineNo">615</span>      // earlier way is better by doing mark and reset?<a name="line.615"></a>
-<span class="sourceLineNo">616</span>      // But ensure that you read long instead of two ints<a name="line.616"></a>
-<span class="sourceLineNo">617</span>      long ll = blockBuffer.getLongAfterPosition(0);<a name="line.617"></a>
-<span class="sourceLineNo">618</span>      // Read top half as an int of key length and bottom int as value length<a name="line.618"></a>
-<span class="sourceLineNo">619</span>      this.currKeyLen = (int)(ll &gt;&gt; Integer.SIZE);<a name="line.619"></a>
-<span class="sourceLineNo">620</span>      this.currValueLen = (int)(Bytes.MASK_FOR_LOWER_INT_IN_LONG ^ ll);<a name="line.620"></a>
-<span class="sourceLineNo">621</span>      checkKeyValueLen();<a name="line.621"></a>
-<span class="sourceLineNo">622</span>      // Move position past the key and value lengths and then beyond the key and value<a name="line.622"></a>
-<span class="sourceLineNo">623</span>      int p = (Bytes.SIZEOF_LONG + currKeyLen + currValueLen);<a name="line.623"></a>
-<span class="sourceLineNo">624</span>      if (reader.getFileContext().isIncludesTags()) {<a name="line.624"></a>
-<span class="sourceLineNo">625</span>        // Tags length is a short.<a name="line.625"></a>
-<span class="sourceLineNo">626</span>        this.currTagsLen = blockBuffer.getShortAfterPosition(p);<a name="line.626"></a>
-<span class="sourceLineNo">627</span>        checkTagsLen();<a name="line.627"></a>
-<span class="sourceLineNo">628</span>        p += (Bytes.SIZEOF_SHORT + currTagsLen);<a name="line.628"></a>
-<span class="sourceLineNo">629</span>      }<a name="line.629"></a>
-<span class="sourceLineNo">630</span>      readMvccVersion(p);<a name="line.630"></a>
-<span class="sourceLineNo">631</span>    }<a name="line.631"></a>
-<span class="sourceLineNo">632</span><a name="line.632"></a>
-<span class="sourceLineNo">633</span>    private final void checkTagsLen() {<a name="line.633"></a>
-<span class="sourceLineNo">634</span>      if (checkLen(this.currTagsLen)) {<a name="line.634"></a>
-<span class="sourceLineNo">635</span>        throw new IllegalStateException("Invalid currTagsLen " + this.currTagsLen +<a name="line.635"></a>
-<span class="sourceLineNo">636</span>          ". Block offset: " + curBlock.getOffset() + ", block length: " +<a name="line.636"></a>
-<span class="sourceLineNo">637</span>            this.blockBuffer.limit() +<a name="line.637"></a>
-<span class="sourceLineNo">638</span>          ", position: " + this.blockBuffer.position() + " (without header).");<a name="line.638"></a>
-<span class="sourceLineNo">639</span>      }<a name="line.639"></a>
-<span class="sourceLineNo">640</span>    }<a name="line.640"></a>
-<span class="sourceLineNo">641</span><a name="line.641"></a>
-<span class="sourceLineNo">642</span>    /**<a name="line.642"></a>
-<span class="sourceLineNo">643</span>     * Read mvcc. Does checks to see if we even need to read the mvcc at all.<a name="line.643"></a>
-<span class="sourceLineNo">644</span>     * @param offsetFromPos<a name="line.644"></a>
-<span class="sourceLineNo">645</span>     */<a name="line.645"></a>
-<span class="sourceLineNo">646</span>    protected void readMvccVersion(final int offsetFromPos) {<a name="line.646"></a>
-<span class="sourceLineNo">647</span>      // See if we even need to decode mvcc.<a name="line.647"></a>
-<span class="sourceLineNo">648</span>      if (!this.reader.shouldIncludeMemStoreTS()) return;<a name="line.648"></a>
-<span class="sourceLineNo">649</span>      if (!this.reader.isDecodeMemStoreTS()) {<a name="line.649"></a>
-<span class="sourceLineNo">650</span>        currMemstoreTS = 0;<a name="line.650"></a>
-<span class="sourceLineNo">651</span>        currMemstoreTSLen = 1;<a name="line.651"></a>
-<span class="sourceLineNo">652</span>        return;<a name="line.652"></a>
-<span class="sourceLineNo">653</span>      }<a name="line.653"></a>
-<span class="sourceLineNo">654</span>      _readMvccVersion(offsetFromPos);<a name="line.654"></a>
-<span class="sourceLineNo">655</span>    }<a name="line.655"></a>
-<span class="sourceLineNo">656</span><a name="line.656"></a>
-<span class="sourceLineNo">657</span>    /**<a name="line.657"></a>
-<span class="sourceLineNo">658</span>     * Actually do the mvcc read. Does no checks.<a name="line.658"></a>
-<span class="sourceLineNo">659</span>     * @param offsetFromPos<a name="line.659"></a>
-<span class="sourceLineNo">660</span>     */<a name="line.660"></a>
-<span class="sourceLineNo">661</span>    private void _readMvccVersion(int offsetFromPos) {<a name="line.661"></a>
-<span class="sourceLineNo">662</span>      // This is Bytes#bytesToVint inlined so can save a few instructions in this hot method; i.e.<a name="line.662"></a>
-<span class="sourceLineNo">663</span>      // previous if one-byte vint, we'd redo the vint call to find int size.<a name="line.663"></a>
-<span class="sourceLineNo">664</span>      // Also the method is kept small so can be inlined.<a name="line.664"></a>
-<span class="sourceLineNo">665</span>      byte firstByte = blockBuffer.getByteAfterPosition(offsetFromPos);<a name="line.665"></a>
-<span class="sourceLineNo">666</span>      int len = WritableUtils.decodeVIntSize(firstByte);<a name="line.666"></a>
-<span class="sourceLineNo">667</span>      if (len == 1) {<a name="line.667"></a>
-<span class="sourceLineNo">668</span>        this.currMemstoreTS = firstByte;<a name="line.668"></a>
-<span class="sourceLineNo">669</span>      } else {<a name="line.669"></a>
-<span class="sourceLineNo">670</span>        int remaining = len -1;<a name="line.670"></a>
-<span class="sourceLineNo">671</span>        long i = 0;<a name="line.671"></a>
-<span class="sourceLineNo">672</span>        offsetFromPos++;<a name="line.672"></a>
-<span class="sourceLineNo">673</span>        if (remaining &gt;= Bytes.SIZEOF_INT) {<a name="line.673"></a>
-<span class="sourceLineNo">674</span>          // The int read has to be converted to unsigned long so the &amp; op<a name="line.674"></a>
-<span class="sourceLineNo">675</span>          i = (blockBuffer.getIntAfterPosition(offsetFromPos) &amp; 0x00000000ffffffffL);<a name="line.675"></a>
-<span class="sourceLineNo">676</span>          remaining -= Bytes.SIZEOF_INT;<a name="line.676"></a>
-<span class="sourceLineNo">677</span>          offsetFromPos += Bytes.SIZEOF_INT;<a name="line.677"></a>
-<span class="sourceLineNo">678</span>        }<a name="line.678"></a>
-<span class="sourceLineNo">679</span>        if (remaining &gt;= Bytes.SIZEOF_SHORT) {<a name="line.679"></a>
-<span class="sourceLineNo">680</span>          short s = blockBuffer.getShortAfterPosition(offsetFromPos);<a name="line.680"></a>
-<span class="sourceLineNo">681</span>          i = i &lt;&lt; 16;<a name="line.681"></a>
-<span class="sourceLineNo">682</span>          i = i | (s &amp; 0xFFFF);<a name="line.682"></a>
-<span class="sourceLineNo">683</span>          remaining -= Bytes.SIZEOF_SHORT;<a name="line.683"></a>
-<span class="sourceLineNo">684</span>          offsetFromPos += Bytes.SIZEOF_SHORT;<a name="line.684"></a>
-<span class="sourceLineNo">685</span>        }<a name="line.685"></a>
-<span class="sourceLineNo">686</span>        for (int idx = 0; idx &lt; remaining; idx++) {<a name="line.686"></a>
-<span class="sourceLineNo">687</span>          byte b = blockBuffer.getByteAfterPosition(offsetFromPos + idx);<a name="line.687"></a>
-<span class="sourceLineNo">688</span>          i = i &lt;&lt; 8;<a name="line.688"></a>
-<span class="sourceLineNo">689</span>          i = i | (b &amp; 0xFF);<a name="line.689"></a>
-<span class="sourceLineNo">690</span>        }<a name="line.690"></a>
-<span class="sourceLineNo">691</span>        currMemstoreTS = (WritableUtils.isNegativeVInt(firstByte) ? ~i : i);<a name="line.691"></a>
-<span class="sourceLineNo">692</span>      }<a name="line.692"></a>
-<span class="sourceLineNo">693</span>      this.currMemstoreTSLen = len;<a name="line.693"></a>
-<span class="sourceLineNo">694</span>    }<a name="line.694"></a>
-<span class="sourceLineNo">695</span><a name="line.695"></a>
-<span class="sourceLineNo">696</span>    /**<a name="line.696"></a>
-<span class="sourceLineNo">697</span>     * Within a loaded block, seek looking for the last key that is smaller than<a name="line.697"></a>
-<span class="sourceLineNo">698</span>     * (or equal to?) the key we are interested in.<a name="line.698"></a>
-<span class="sourceLineNo">699</span>     * A note on the seekBefore: if you have seekBefore = true, AND the first<a name="line.699"></a>
-<span class="sourceLineNo">700</span>     * key in the block = key, then you'll get thrown exceptions. The caller has<a name="line.700"></a>
-<span class="sourceLineNo">701</span>     * to check for that case and load the previous block as appropriate.<a name="line.701"></a>
-<span class="sourceLineNo">702</span>     * @param key<a name="line.702"></a>
-<span class="sourceLineNo">703</span>     *          the key to find<a name="line.703"></a>
-<span class="sourceLineNo">704</span>     * @param seekBefore<a name="line.704"></a>
-<span class="sourceLineNo">705</span>     *          find the key before the given key in case of exact match.<a name="line.705"></a>
-<span class="sourceLineNo">706</span>     * @return 0 in case of an exact key match, 1 in case of an inexact match,<a name="line.706"></a>
-<span class="sourceLineNo">707</span>     *         -2 in case of an inexact match and furthermore, the input key<a name="line.707"></a>
-<span class="sourceLineNo">708</span>     *         less than the first key of current block(e.g. using a faked index<a name="line.708"></a>
-<span class="sourceLineNo">709</span>     *         key)<a name="line.709"></a>
-<span class="sourceLineNo">710</span>     */<a name="line.710"></a>
-<span class="sourceLineNo">711</span>    protected int blockSeek(Cell key, boolean seekBefore) {<a name="line.711"></a>
-<span class="sourceLineNo">712</span>      int klen, vlen, tlen = 0;<a name="line.712"></a>
-<span class="sourceLineNo">713</span>      int lastKeyValueSize = -1;<a name="line.713"></a>
-<span class="sourceLineNo">714</span>      int offsetFromPos;<a name="line.714"></a>
-<span class="sourceLineNo">715</span>      do {<a name="line.715"></a>
-<span class="sourceLineNo">716</span>        offsetFromPos = 0;<a name="line.716"></a>
-<span class="sourceLineNo">717</span>        // Better to ensure that we use the BB Utils here<a name="line.717"></a>
-<span class="sourceLineNo">718</span>        long ll = blockBuffer.getLongAfterPosition(offsetFromPos);<a name="line.718"></a>
-<span class="sourceLineNo">719</span>        klen = (int)(ll &gt;&gt; Integer.SIZE);<a name="line.719"></a>
-<span class="sourceLineNo">720</span>        vlen = (int)(Bytes.MASK_FOR_LOWER_INT_IN_LONG ^ ll);<a name="line.720"></a>
-<span class="sourceLineNo">721</span>        if (checkKeyLen(klen) || checkLen(vlen)) {<a name="line.721"></a>
-<span class="sourceLineNo">722</span>          throw new IllegalStateException("Invalid klen " + klen + " or vlen "<a name="line.722"></a>
-<span class="sourceLineNo">723</span>              + vlen + ". Block offset: "<a name="line.723"></a>
-<span class="sourceLineNo">724</span>              + curBlock.getOffset() + ", block length: " + blockBuffer.limit() + ", position: "<a name="line.724"></a>
-<span class="sourceLineNo">725</span>              + blockBuffer.position() + " (without header).");<a name="line.725"></a>
-<span class="sourceLineNo">726</span>        }<a name="line.726"></a>
-<span class="sourceLineNo">727</span>        offsetFromPos += Bytes.SIZEOF_LONG;<a name="line.727"></a>
-<span class="sourceLineNo">728</span>        blockBuffer.asSubByteBuffer(blockBuffer.position() + offsetFromPos, klen, pair);<a name="line.728"></a>
-<span class="sourceLineNo">729</span>        bufBackedKeyOnlyKv.setKey(pair.getFirst(), pair.getSecond(), klen);<a name="line.729"></a>
-<span class="sourceLineNo">730</span>        int comp = reader.getComparator().compareKeyIgnoresMvcc(key, bufBackedKeyOnlyKv);<a name="line.730"></a>
-<span class="sourceLineNo">731</span>        offsetFromPos += klen + vlen;<a name="line.731"></a>
-<span class="sourceLineNo">732</span>        if (this.reader.getFileContext().isIncludesTags()) {<a name="line.732"></a>
-<span class="sourceLineNo">733</span>          // Read short as unsigned, high byte first<a name="line.733"></a>
-<span class="sourceLineNo">734</span>          tlen = ((blockBuffer.getByteAfterPosition(offsetFromPos) &amp; 0xff) &lt;&lt; 8)<a name="line.734"></a>
-<span class="sourceLineNo">735</span>              ^ (blockBuffer.getByteAfterPosition(offsetFromPos + 1) &amp; 0xff);<a name="line.735"></a>
-<span class="sourceLineNo">736</span>          if (checkLen(tlen)) {<a name="line.736"></a>
-<span class="sourceLineNo">737</span>            throw new IllegalStateException("Invalid tlen " + tlen + ". Block offset: "<a name="line.737"></a>
-<span class="sourceLineNo">738</span>                + curBlock.getOffset() + ", block length: " + blockBuffer.limit() + ", position: "<a name="line.738"></a>
-<span class="sourceLineNo">739</span>                + blockBuffer.position() + " (without header).");<a name="line.739"></a>
-<span class="sourceLineNo">740</span>          }<a name="line.740"></a>
-<span class="sourceLineNo">741</span>          // add the two bytes read for the tags.<a name="line.741"></a>
-<span class="sourceLineNo">742</span>          offsetFromPos += tlen + (Bytes.SIZEOF_SHORT);<a name="line.742"></a>
-<span class="sourceLineNo">743</span>        }<a name="line.743"></a>
-<span class="sourceLineNo">744</span>        if (this.reader.shouldIncludeMemStoreTS()) {<a name="line.744"></a>
-<span class="sourceLineNo">745</span>          // Directly read the mvcc based on current position<a name="line.745"></a>
-<span class="sourceLineNo">746</span>          readMvccVersion(offsetFromPos);<a name="line.746"></a>
-<span class="sourceLineNo">747</span>        }<a name="line.747"></a>
-<span class="sourceLineNo">748</span>        if (comp == 0) {<a name="line.748"></a>
-<span class="sourceLineNo">749</span>          if (seekBefore) {<a name="line.749"></a>
-<span class="sourceLineNo">750</span>            if (lastKeyValueSize &lt; 0) {<a name="line.750"></a>
-<span class="sourceLineNo">751</span>              throw new IllegalStateException("blockSeek with seekBefore "<a name="line.751"></a>
-<span class="sourceLineNo">752</span>                  + "at the first key of the block: key=" + CellUtil.getCellKeyAsString(key)<a name="line.752"></a>
-<span class="sourceLineNo">753</span>                  + ", blockOffset=" + curBlock.getOffset() + ", onDiskSize="<a name="line.753"></a>
-<span class="sourceLineNo">754</span>                  + curBlock.getOnDiskSizeWithHeader());<a name="line.754"></a>
-<span class="sourceLineNo">755</span>            }<a name="line.755"></a>
-<span class="sourceLineNo">756</span>            blockBuffer.moveBack(lastKeyValueSize);<a name="line.756"></a>
-<span class="sourceLineNo">757</span>            readKeyValueLen();<a name="line.757"></a>
-<span class="sourceLineNo">758</span>            return 1; // non exact match.<a name="line.758"></a>
-<span class="sourceLineNo">759</span>          }<a name="line.759"></a>
-<span class="sourceLineNo">760</span>          currKeyLen = klen;<a name="line.760"></a>
-<span class="sourceLineNo">761</span>          currValueLen = vlen;<a name="line.761"></a>
-<span class="sourceLineNo">762</span>          currTagsLen = tlen;<a name="line.762"></a>
-<span class="sourceLineNo">763</span>          return 0; // indicate exact match<a name="line.763"></a>
-<span class="sourceLineNo">764</span>        } else if (comp &lt; 0) {<a name="line.764"></a>
-<span class="sourceLineNo">765</span>          if (lastKeyValueSize &gt; 0) {<a name="line.765"></a>
-<span class="sourceLineNo">766</span>            blockBuffer.moveBack(lastKeyValueSize);<a name="line.766"></a>
-<span class="sourceLineNo">767</span>          }<a name="line.767"></a>
-<span class="sourceLineNo">768</span>          readKeyValueLen();<a name="line.768"></a>
-<span class="sourceLineNo">769</span>          if (lastKeyValueSize == -1 &amp;&amp; blockBuffer.position() == 0) {<a name="line.769"></a>
-<span class="sourceLineNo">770</span>            return HConstants.INDEX_KEY_MAGIC;<a name="line.770"></a>
-<span class="sourceLineNo">771</span>          }<a name="line.771"></a>
-<span class="sourceLineNo">772</span>          return 1;<a name="line.772"></a>
-<span class="sourceLineNo">773</span>        }<a name="line.773"></a>
-<span class="sourceLineNo">774</span>        // The size of this key/value tuple, including key/value length fields.<a name="line.774"></a>
-<span class="sourceLineNo">775</span>        lastKeyValueSize = klen + vlen + currMemstoreTSLen + KEY_VALUE_LEN_SIZE;<a name="line.775"></a>
-<span class="sourceLineNo">776</span>        // include tag length also if tags included with KV<a name="line.776"></a>
-<span class="sourceLineNo">777</span>        if (reader.getFileContext().isIncludesTags()) {<a name="line.777"></a>
-<span class="sourceLineNo">778</span>          lastKeyValueSize += tlen + Bytes.SIZEOF_SHORT;<a name="line.778"></a>
-<span class="sourceLineNo">779</span>        }<a name="line.779"></a>
-<span class="sourceLineNo">780</span>        blockBuffer.skip(lastKeyValueSize);<a name="line.780"></a>
-<span class="sourceLineNo">781</span>      } while (blockBuffer.hasRemaining());<a name="line.781"></a>
-<span class="sourceLineNo">782</span><a name="line.782"></a>
-<span class="sourceLineNo">783</span>      // Seek to the last key we successfully read. This will happen if this is<a name="line.783"></a>
-<span class="sourceLineNo">784</span>      // the last key/value pair in the file, in which case the following call<a name="line.784"></a>
-<span class="sourceLineNo">785</span>      // to next() has to return false.<a name="line.785"></a>
-<span class="sourceLineNo">786</span>      blockBuffer.moveBack(lastKeyValueSize);<a name="line.786"></a>
-<span class="sourceLineNo">787</span>      readKeyValueLen();<a name="line.787"></a>
-<span class="sourceLineNo">788</span>      return 1; // didn't exactly find it.<a name="line.788"></a>
-<span class="sourceLineNo">789</span>    }<a name="line.789"></a>
-<span class="sourceLineNo">790</span><a name="line.790"></a>
-<span class="sourceLineNo">791</span>    @Override<a name="line.791"></a>
-<span class="sourceLineNo">792</span>    public Cell getNextIndexedKey() {<a name="line.792"></a>
-<span class="sourceLineNo">793</span>      return nextIndexedKey;<a name="line.793"></a>
-<span class="sourceLineNo">794</span>    }<a name="line.794"></a>
-<span class="sourceLineNo">795</span><a name="line.795"></a>
-<span class="sourceLineNo">796</span>    @Override<a name="line.796"></a>
-<span class="sourceLineNo">797</span>    public int seekTo(Cell key) throws IOException {<a name="line.797"></a>
-<span class="sourceLineNo">798</span>      return seekTo(key, true);<a name="line.798"></a>
-<span class="sourceLineNo">799</span>    }<a name="line.799"></a>
-<span class="sourceLineNo">800</span><a name="line.800"></a>
-<span class="sourceLineNo">801</span>    @Override<a name="line.801"></a>
-<span class="sourceLineNo">802</span>    public int reseekTo(Cell key) throws IOException {<a name="line.802"></a>
-<span class="sourceLineNo">803</span>      int compared;<a name="line.803"></a>
-<span class="sourceLineNo">804</span>      if (isSeeked()) {<a name="line.804"></a>
-<span class="sourceLineNo">805</span>        compared = compareKey(reader.getComparator(), key);<a name="line.805"></a>
-<span class="sourceLineNo">806</span>        if (compared &lt; 1) {<a name="line.806"></a>
-<span class="sourceLineNo">807</span>          // If the required key is less than or equal to current key, then<a name="line.807"></a>
-<span class="sourceLineNo">808</span>          // don't do anything.<a name="line.808"></a>
-<span class="sourceLineNo">809</span>          return compared;<a name="line.809"></a>
-<span class="sourceLineNo">810</span>        } else {<a name="line.810"></a>
-<span class="sourceLineNo">811</span>          // The comparison with no_next_index_key has to be checked<a name="line.811"></a>
-<span class="sourceLineNo">812</span>          if (this.nextIndexedKey != null &amp;&amp;<a name="line.812"></a>
-<span class="sourceLineNo">813</span>              (this.nextIndexedKey == KeyValueScanner.NO_NEXT_INDEXED_KEY || reader<a name="line.813"></a>
-<span class="sourceLineNo">814</span>              .getComparator().compareKeyIgnoresMvcc(key, nextIndexedKey) &lt; 0)) {<a name="line.814"></a>
-<span class="sourceLineNo">815</span>            // The reader shall continue to scan the current data block instead<a name="line.815"></a>
-<span class="sourceLineNo">816</span>            // of querying the<a name="line.816"></a>
-<span class="sourceLineNo">817</span>            // block index as long as it knows the target key is strictly<a name="line.817"></a>
-<span class="sourceLineNo">818</span>            // smaller than<a name="line.818"></a>
-<span class="sourceLineNo">819</span>            // the next indexed key or the current data block is the last data<a name="line.819"></a>
-<span class="sourceLineNo">820</span>            // block.<a name="line.820"></a>
-<span class="sourceLineNo">821</span>            return loadBlockAndSeekToKey(this.curBlock, nextIndexedKey, false, key,<a name="line.821"></a>
-<span class="sourceLineNo">822</span>                false);<a name="line.822"></a>
-<span class="sourceLineNo">823</span>          }<a name="line.823"></a>
-<span class="sourceLineNo">824</span><a name="line.824"></a>
-<span class="sourceLineNo">825</span>        }<a name="line.825"></a>
-<span class="sourceLineNo">826</span>      }<a name="line.826"></a>
-<span class="sourceLineNo">827</span>      // Don't rewind on a reseek operation, because reseek implies that we are<a name="line.827"></a>
-<span class="sourceLineNo">828</span>      // always going forward in the file.<a name="line.828"></a>
-<span class="sourceLineNo">829</span>      return seekTo(key, false);<a name="line.829"></a>
-<span class="sourceLineNo">830</span>    }<a name="line.830"></a>
-<span class="sourceLineNo">831</span><a name="line.831"></a>
-<span class="sourceLineNo">832</span>    /**<a name="line.832"></a>
-<span class="sourceLineNo">833</span>     * An internal API function. Seek to the given key, optionally rewinding to<a name="line.833"></a>
-<span class="sourceLineNo">834</span>     * the first key of the block before doing the seek.<a name="line.834"></a>
-<span class="sourceLineNo">835</span>     *<a name="line.835"></a>
-<span class="sourceLineNo">836</span>     * @param key - a cell representing the key that we need to fetch<a name="line.836"></a>
-<span class="sourceLineNo">837</span>     * @param rewind whether to rewind to the first key of the block before<a name="line.837"></a>
-<span class="sourceLineNo">838</span>     *        doing the seek. If this is false, we are assuming we never go<a name="line.838"></a>
-<span class="sourceLineNo">839</span>     *        back, otherwise the result is undefined.<a name="line.839"></a>
-<span class="sourceLineNo">840</span>     * @return -1 if the key is earlier than the first key of the file,<a name="line.840"></a>
-<span class="sourceLineNo">841</span>     *         0 if we are at the given key, 1 if we are past the given key<a name="line.841"></a>
-<span class="sourceLineNo">842</span>     *         -2 if the key is earlier than the first key of the file while<a name="line.842"></a>
-<span class="sourceLineNo">843</span>     *         using a faked index key<a name="line.843"></a>
-<span class="sourceLineNo">844</span>     * @throws IOException<a name="line.844"></a>
-<span class="sourceLineNo">845</span>     */<a name="line.845"></a>
-<span class="sourceLineNo">846</span>    public int seekTo(Cell key, boolean rewind) throws IOException {<a name="line.846"></a>
-<span class="sourceLineNo">847</span>      HFileBlockIndex.BlockIndexReader indexReader = reader.getDataBlockIndexReader();<a name="line.847"></a>
-<span class="sourceLineNo">848</span>      BlockWithScanInfo blockWithScanInfo = indexReader.loadDataBlockWithScanInfo(key, curBlock,<a name="line.848"></a>
-<span class="sourceLineNo">849</span>          cacheBlocks, pread, isCompaction, getEffectiveDataBlockEncoding());<a name="line.849"></a>
-<span class="sourceLineNo">850</span>      if (blockWithScanInfo == null || blockWithScanInfo.getHFileBlock() == null) {<a name="line.850"></a>
-<span class="sourceLineNo">851</span>        // This happens if the key e.g. falls before the beginning of the<a name="line.851"></a>
-<span class="sourceLineNo">852</span>        // file.<a name="line.852"></a>
-<span class="sourceLineNo">853</span>        return -1;<a name="line.853"></a>
-<span class="sourceLineNo">854</span>      }<a name="line.854"></a>
-<span class="sourceLineNo">855</span>      return loadBlockAndSeekToKey(blockWithScanInfo.getHFileBlock(),<a name="line.855"></a>
-<span class="sourceLineNo">856</span>          blockWithScanInfo.getNextIndexedKey(), rewind, key, false);<a name="line.856"></a>
-<span class="sourceLineNo">857</span>    }<a name="line.857"></a>
-<span class="sourceLineNo">858</span><a name="line.858"></a>
-<span class="sourceLineNo">859</span>    @Override<a name="line.859"></a>
-<span class="sourceLineNo">860</span>    public boolean seekBefore(Cell key) throws IOException {<a name="line.860"></a>
-<span class="sourceLineNo">861</span>      HFileBlock seekToBlock = reader.getDataBlockIndexReader().seekToDataBlock(key, curBlock,<a name="line.861"></a>
-<span class="sourceLineNo">862</span>          cacheBlocks, pread, isCompaction, reader.getEffectiveEncodingInCache(isCompaction));<a name="line.862"></a>
-<span class="sourceLineNo">863</span>      if (seekToBlock == null) {<a name="line.863"></a>
-<span class="sourceLineNo">864</span>        return false;<a name="line.864"></a>
-<span class="sourceLineNo">865</span>      }<a name="line.865"></a>
-<span class="sourceLineNo">866</span>      Cell firstKey = getFirstKeyCellInBlock(seekToBlock);<a name="line.866"></a>
-<span class="sourceLineNo">867</span>      if (reader.getComparator()<a name="line.867"></a>
-<span class="sourceLineNo">868</span>           .compareKeyIgnoresMvcc(firstKey, key) &gt;= 0) {<a name="line.868"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.CellComparatorImpl;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.HConstants;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.ByteBufferKeyValue;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.SizeCachedKeyValue;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.SizeCachedNoTagsKeyValue;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.fs.HFileSystem;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.io.compress.Compression;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.io.crypto.Cipher;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.io.crypto.Encryption;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.io.encoding.DataBlockEncoder;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.io.encoding.HFileBlockDecodingContext;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.io.hfile.HFile.FileInfo;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.nio.ByteBuff;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.regionserver.KeyValueScanner;<a name="line.55"></a>
+<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.security.EncryptionUtil;<a name="line.56"></a>
+<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.util.ByteBufferUtils;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.util.IdLock;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>import org.apache.hadoop.hbase.util.ObjectIntPair;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>import org.apache.hadoop.io.WritableUtils;<a name="line.61"></a>
+<span class="sourceLineNo">062</span>import org.apache.htrace.Trace;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>import org.apache.htrace.TraceScope;<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>/**<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * Implementation that can handle all hfile versions of {@link HFile.Reader}.<a name="line.68"></a>
+<span class="sourceLineNo">069</span> */<a name="line.69"></a>
+<span class="sourceLineNo">070</span>@InterfaceAudience.Private<a name="line.70"></a>
+<span class="sourceLineNo">071</span>@edu.umd.cs.findbugs.annotations.SuppressWarnings(value="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD")<a name="line.71"></a>
+<span class="sourceLineNo">072</span>public class HFileReaderImpl implements HFile.Reader, Configurable {<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  // This class is HFileReaderV3 + HFileReaderV2 + AbstractHFileReader all squashed together into<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  // one file.  Ditto for all the HFileReader.ScannerV? implementations. I was running up against<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  // the MaxInlineLevel limit because too many tiers involved reading from an hfile. Was also hard<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  // to navigate the source code when so many classes participating in read.<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private static final Log LOG = LogFactory.getLog(HFileReaderImpl.class);<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>  /** Data block index reader keeping the root data index in memory */<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  private HFileBlockIndex.CellBasedKeyBlockIndexReader dataBlockIndexReader;<a name="line.80"></a>
+<span class="sourceLineNo">081</span><a name="line.81"></a>
+<span class="sourceLineNo">082</span>  /** Meta block index reader -- always single level */<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private HFileBlockIndex.ByteArrayKeyBlockIndexReader metaBlockIndexReader;<a name="line.83"></a>
+<span class="sourceLineNo">084</span><a name="line.84"></a>
+<span class="sourceLineNo">085</span>  private final FixedFileTrailer trailer;<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>  /** Filled when we read in the trailer. */<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private final Compression.Algorithm compressAlgo;<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private final boolean primaryReplicaReader;<a name="line.90"></a>
+<span class="sourceLineNo">091</span><a name="line.91"></a>
+<span class="sourceLineNo">092</span>  /**<a name="line.92"></a>
+<span class="sourceLineNo">093</span>   * What kind of data block encoding should be used while reading, writing,<a name="line.93"></a>
+<span class="sourceLineNo">094</span>   * and handling cache.<a name="line.94"></a>
+<span class="sourceLineNo">095</span>   */<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  private HFileDataBlockEncoder dataBlockEncoder = NoOpDataBlockEncoder.INSTANCE;<a name="line.96"></a>
+<span class="sourceLineNo">097</span><a name="line.97"></a>
+<span class="sourceLineNo">098</span>  /** Last key in the file. Filled in when we read in the file info */<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  private Cell lastKeyCell = null;<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  /** Average key length read from file info */<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  private int avgKeyLen = -1;<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  /** Average value length read from file info */<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  private int avgValueLen = -1;<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  /** Key comparator */<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private CellComparator comparator = CellComparatorImpl.COMPARATOR;<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  /** Size of this file. */<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  private final long fileSize;<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  /** Block cache configuration. */<a name="line.113"></a>
+<span class="sourceLineNo">114</span>  private final CacheConfig cacheConf;<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  /** Path of file */<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  private final Path path;<a name="line.117"></a>
+<span class="sourceLineNo">118</span><a name="line.118"></a>
+<span class="sourceLineNo">119</span>  /** File name to be used for block names */<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  private final String name;<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  private FileInfo fileInfo;<a name="line.122"></a>
+<span class="sourceLineNo">123</span><a name="line.123"></a>
+<span class="sourceLineNo">124</span>  private Configuration conf;<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>  private HFileContext hfileContext;<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  /** Filesystem-level block reader. */<a name="line.128"></a>
+<span class="sourceLineNo">129</span>  private HFileBlock.FSReader fsBlockReader;<a name="line.129"></a>
+<span class="sourceLineNo">130</span><a name="line.130"></a>
+<span class="sourceLineNo">131</span>  /**<a name="line.131"></a>
+<span class="sourceLineNo">132</span>   * A "sparse lock" implementation allowing to lock on a particular block<a name="line.132"></a>
+<span class="sourceLineNo">133</span>   * identified by offset. The purpose of this is to avoid two clients loading<a name="line.133"></a>
+<span class="sourceLineNo">134</span>   * the same block, and have all but one client wait to get the block from the<a name="line.134"></a>
+<span class="sourceLineNo">135</span>   * cache.<a name="line.135"></a>
+<span class="sourceLineNo">136</span>   */<a name="line.136"></a>
+<span class="sourceLineNo">137</span>  private IdLock offsetLock = new IdLock();<a name="line.137"></a>
+<span class="sourceLineNo">138</span><a name="line.138"></a>
+<span class="sourceLineNo">139</span>  /**<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   * Blocks read from the load-on-open section, excluding data root index, meta<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   * index, and file info.<a name="line.141"></a>
+<span class="sourceLineNo">142</span>   */<a name="line.142"></a>
+<span class="sourceLineNo">143</span>  private List&lt;HFileBlock&gt; loadOnOpenBlocks = new ArrayList&lt;&gt;();<a name="line.143"></a>
+<span class="sourceLineNo">144</span><a name="line.144"></a>
+<span class="sourceLineNo">145</span>  /** Minimum minor version supported by this HFile format */<a name="line.145"></a>
+<span class="sourceLineNo">146</span>  static final int MIN_MINOR_VERSION = 0;<a name="line.146"></a>
+<span class="sourceLineNo">147</span><a name="line.147"></a>
+<span class="sourceLineNo">148</span>  /** Maximum minor version supported by this HFile format */<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  // We went to version 2 when we moved to pb'ing fileinfo and the trailer on<a name="line.149"></a>
+<span class="sourceLineNo">150</span>  // the file. This version can read Writables version 1.<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  static final int MAX_MINOR_VERSION = 3;<a name="line.151"></a>
+<span class="sourceLineNo">152</span><a name="line.152"></a>
+<span class="sourceLineNo">153</span>  /**<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   * We can read files whose major version is v2 IFF their minor version is at least 3.<a name="line.154"></a>
+<span class="sourceLineNo">155</span>   */<a name="line.155"></a>
+<span class="sourceLineNo">156</span>  private static final int MIN_V2_MINOR_VERSION_WITH_PB = 3;<a name="line.156"></a>
+<span class="sourceLineNo">157</span><a name="line.157"></a>
+<span class="sourceLineNo">158</span>  /** Minor versions starting with this number have faked index key */<a name="line.158"></a>
+<span class="sourceLineNo">159</span>  static final int MINOR_VERSION_WITH_FAKED_KEY = 3;<a name="line.159"></a>
+<span class="sourceLineNo">160</span><a name="line.160"></a>
+<span class="sourceLineNo">161</span>  @VisibleForTesting<a name="line.161"></a>
+<span class="sourceLineNo">162</span>  @Deprecated<a name="line.162"></a>
+<span class="sourceLineNo">163</span>  public HFileReaderImpl(Path path, FixedFileTrailer trailer, FSDataInputStreamWrapper fsdis,<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      long fileSize, CacheConfig cacheConf, HFileSystem hfs, Configuration conf)<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      throws IOException {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    this(path, trailer, fsdis, fileSize, cacheConf, hfs, true, conf);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>  }<a name="line.167"></a>
+<span class="sourceLineNo">168</span><a name="line.168"></a>
+<span class="sourceLineNo">169</span>  /**<a name="line.169"></a>
+<span class="sourceLineNo">170</span>   * Opens a HFile. You must load the index before you can use it by calling<a name="line.170"></a>
+<span class="sourceLineNo">171</span>   * {@link #loadFileInfo()}.<a name="line.171"></a>
+<span class="sourceLineNo">172</span>   * @param path<a name="line.172"></a>
+<span class="sourceLineNo">173</span>   *          Path to HFile.<a name="line.173"></a>
+<span class="sourceLineNo">174</span>   * @param trailer<a name="line.174"></a>
+<span class="sourceLineNo">175</span>   *          File trailer.<a name="line.175"></a>
+<span class="sourceLineNo">176</span>   * @param fsdis<a name="line.176"></a>
+<span class="sourceLineNo">177</span>   *          input stream.<a name="line.177"></a>
+<span class="sourceLineNo">178</span>   * @param fileSize<a name="line.178"></a>
+<span class="sourceLineNo">179</span>   *          Length of the stream.<a name="line.179"></a>
+<span class="sourceLineNo">180</span>   * @param cacheConf<a name="line.180"></a>
+<span class="sourceLineNo">181</span>   *          Cache configuration.<a name="line.181"></a>
+<span class="sourceLineNo">182</span>   * @param hfs<a name="line.182"></a>
+<span class="sourceLineNo">183</span>   *          The file system.<a name="line.183"></a>
+<span class="sourceLineNo">184</span>   * @param conf<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   *          Configuration<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   */<a name="line.186"></a>
+<span class="sourceLineNo">187</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD")<a name="line.187"></a>
+<span class="sourceLineNo">188</span>  public HFileReaderImpl(Path path, FixedFileTrailer trailer, FSDataInputStreamWrapper fsdis,<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      long fileSize, CacheConfig cacheConf, HFileSystem hfs, boolean primaryReplicaReader,<a name="line.189"></a>
+<span class="sourceLineNo">190</span>      Configuration conf) throws IOException {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    this.trailer = trailer;<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    this.compressAlgo = trailer.getCompressionCodec();<a name="line.192"></a>
+<span class="sourceLineNo">193</span>    this.cacheConf = cacheConf;<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    this.fileSize = fileSize;<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    this.path = path;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    this.name = path.getName();<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    this.conf = conf;<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    this.primaryReplicaReader = primaryReplicaReader;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    checkFileVersion();<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    this.hfileContext = createHFileContext(fsdis, fileSize, hfs, path, trailer);<a name="line.200"></a>
+<span class="sourceLineNo">201</span>    this.fsBlockReader = new HFileBlock.FSReaderImpl(fsdis, fileSize, hfs, path, hfileContext);<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>    // Comparator class name is stored in the trailer in version 2.<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    comparator = trailer.createComparator();<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    dataBlockIndexReader = new HFileBlockIndex.CellBasedKeyBlockIndexReader(comparator,<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        trailer.getNumDataIndexLevels(), this);<a name="line.206"></a>
+<span class="sourceLineNo">207</span>    metaBlockIndexReader = new HFileBlockIndex.ByteArrayKeyBlockIndexReader(1);<a name="line.207"></a>
+<span class="sourceLineNo">208</span><a name="line.208"></a>
+<span class="sourceLineNo">209</span>    // Parse load-on-open data.<a name="line.209"></a>
+<span class="sourceLineNo">210</span><a name="line.210"></a>
+<span class="sourceLineNo">211</span>    HFileBlock.BlockIterator blockIter = fsBlockReader.blockRange(<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        trailer.getLoadOnOpenDataOffset(),<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        fileSize - trailer.getTrailerSize());<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>    // Data index. We also read statistics about the block index written after<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    // the root level.<a name="line.216"></a>
+<span class="sourceLineNo">217</span>    dataBlockIndexReader.readMultiLevelIndexRoot(<a name="line.217"></a>
+<span class="sourceLineNo">218</span>        blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX),<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        trailer.getDataIndexCount());<a name="line.219"></a>
+<span class="sourceLineNo">220</span><a name="line.220"></a>
+<span class="sourceLineNo">221</span>    // Meta index.<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    metaBlockIndexReader.readRootIndex(<a name="line.222"></a>
+<span class="sourceLineNo">223</span>        blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX),<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        trailer.getMetaIndexCount());<a name="line.224"></a>
+<span class="sourceLineNo">225</span><a name="line.225"></a>
+<span class="sourceLineNo">226</span>    // File info<a name="line.226"></a>
+<span class="sourceLineNo">227</span>    fileInfo = new FileInfo();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    fileInfo.read(blockIter.nextBlockWithBlockType(BlockType.FILE_INFO).getByteStream());<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    byte[] creationTimeBytes = fileInfo.get(FileInfo.CREATE_TIME_TS);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    this.hfileContext.setFileCreateTime(creationTimeBytes == null?  0:<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        Bytes.toLong(creationTimeBytes));<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    if (fileInfo.get(FileInfo.LASTKEY) != null) {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>      lastKeyCell = new KeyValue.KeyOnlyKeyValue(fileInfo.get(FileInfo.LASTKEY));<a name="line.233"></a>
+<span class="sourceLineNo">234</span>    }<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    avgKeyLen = Bytes.toInt(fileInfo.get(FileInfo.AVG_KEY_LEN));<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    avgValueLen = Bytes.toInt(fileInfo.get(FileInfo.AVG_VALUE_LEN));<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    byte [] keyValueFormatVersion = fileInfo.get(HFileWriterImpl.KEY_VALUE_VERSION);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    includesMemstoreTS = keyValueFormatVersion != null &amp;&amp;<a name="line.238"></a>
+<span class="sourceLineNo">239</span>        Bytes.toInt(keyValueFormatVersion) == HFileWriterImpl.KEY_VALUE_VER_WITH_MEMSTORE;<a name="line.239"></a>
+<span class="sourceLineNo">240</span>    fsBlockReader.setIncludesMemStoreTS(includesMemstoreTS);<a name="line.240"></a>
+<span class="sourceLineNo">241</span>    if (includesMemstoreTS) {<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      decodeMemstoreTS = Bytes.toLong(fileInfo.get(HFileWriterImpl.MAX_MEMSTORE_TS_KEY)) &gt; 0;<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    }<a name="line.243"></a>
+<span class="sourceLineNo">244</span><a name="line.244"></a>
+<span class="sourceLineNo">245</span>    // Read data block encoding algorithm name from file info.<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    dataBlockEncoder = HFileDataBlockEncoderImpl.createFromFileInfo(fileInfo);<a name="line.246"></a>
+<span class="sourceLineNo">247</span>    fsBlockReader.setDataBlockEncoder(dataBlockEncoder);<a name="line.247"></a>
+<span class="sourceLineNo">248</span><a name="line.248"></a>
+<span class="sourceLineNo">249</span>    // Store all other load-on-open blocks for further consumption.<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    HFileBlock b;<a name="line.250"></a>
+<span class="sourceLineNo">251</span>    while ((b = blockIter.nextBlock()) != null) {<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      loadOnOpenBlocks.add(b);<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
+<span class="sourceLineNo">254</span><a name="line.254"></a>
+<span class="sourceLineNo">255</span>    // Prefetch file blocks upon open if requested<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    if (cacheConf.shouldPrefetchOnOpen()) {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      PrefetchExecutor.request(path, new Runnable() {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>        public void run() {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>          long offset = 0;<a name="line.259"></a>
+<span class="sourceLineNo">260</span>          long end = 0;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>          try {<a name="line.261"></a>
+<span class="sourceLineNo">262</span>            end = getTrailer().getLoadOnOpenDataOffset();<a name="line.262"></a>
+<span class="sourceLineNo">263</span>            if (LOG.isTraceEnabled()) {<a name="line.263"></a>
+<span class="sourceLineNo">264</span>              LOG.trace("Prefetch start " + getPathOffsetEndStr(path, offset, end));<a name="line.264"></a>
+<span class="sourceLineNo">265</span>            }<a name="line.265"></a>
+<span class="sourceLineNo">266</span>            // TODO: Could we use block iterator in here? Would that get stuff into the cache?<a name="line.266"></a>
+<span class="sourceLineNo">267</span>            HFileBlock prevBlock = null;<a name="line.267"></a>
+<span class="sourceLineNo">268</span>            while (offset &lt; end) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>              if (Thread.interrupted()) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>                break;<a name="line.270"></a>
+<span class="sourceLineNo">271</span>              }<a name="line.271"></a>
+<span class="sourceLineNo">272</span>              // Perhaps we got our block from cache? Unlikely as this may be, if it happens, then<a name="line.272"></a>
+<span class="sourceLineNo">273</span>              // the internal-to-hfileblock thread local which holds the overread that gets the<a name="line.273"></a>
+<span class="sourceLineNo">274</span>              // next header, will not have happened...so, pass in the onDiskSize gotten from the<a name="line.274"></a>
+<span class="sourceLineNo">275</span>              // cached block. This 'optimization' triggers extremely rarely I'd say.<a name="line.275"></a>
+<span class="sourceLineNo">276</span>              long onDiskSize = prevBlock != null? prevBlock.getNextBlockOnDiskSize(): -1;<a name="line.276"></a>
+<span class="sourceLineNo">277</span>              HFileBlock block = readBlock(offset, onDiskSize, true, false, false, false,<a name="line.277"></a>
+<span class="sourceLineNo">278</span>                  null, null);<a name="line.278"></a>
+<span class="sourceLineNo">279</span>              // Need not update the current block. Ideally here the readBlock won't find the<a name="line.279"></a>
+<span class="sourceLineNo">280</span>              // block in cache. We call this readBlock so that block data is read from FS and<a name="line.280"></a>
+<span class="sourceLineNo">281</span>              // cached in BC. So there is no reference count increment that happens here.<a name="line.281"></a>
+<span class="sourceLineNo">282</span>              // The return will ideally be a noop because the block is not of MemoryType SHARED.<a name="line.282"></a>
+<span class="sourceLineNo">283</span>              returnBlock(block);<a name="line.283"></a>
+<span class="sourceLineNo">284</span>              prevBlock = block;<a name="line.284"></a>
+<span class="sourceLineNo">285</span>              offset += block.getOnDiskSizeWithHeader();<a name="line.285"></a>
+<span class="sourceLineNo">286</span>            }<a name="line.286"></a>
+<span class="sourceLineNo">287</span>          } catch (IOException e) {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>            // IOExceptions are probably due to region closes (relocation, etc.)<a name="line.288"></a>
+<span class="sourceLineNo">289</span>            if (LOG.isTraceEnabled()) {<a name="line.289"></a>
+<span class="sourceLineNo">290</span>              LOG.trace("Prefetch " + getPathOffsetEndStr(path, offset, end), e);<a name="line.290"></a>
+<span class="sourceLineNo">291</span>            }<a name="line.291"></a>
+<span class="sourceLineNo">292</span>          } catch (NullPointerException e) {<a name="line.292"></a>
+<span class="sourceLineNo">293</span>            LOG.warn("Stream moved/closed or prefetch cancelled?" +<a name="line.293"></a>
+<span class="sourceLineNo">294</span>                getPathOffsetEndStr(path, offset, end), e);<a name="line.294"></a>
+<span class="sourceLineNo">295</span>          } catch (Exception e) {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>            // Other exceptions are interesting<a name="line.296"></a>
+<span class="sourceLineNo">297</span>            LOG.warn("Prefetch " + getPathOffsetEndStr(path, offset, end), e);<a name="line.297"></a>
+<span class="sourceLineNo">298</span>          } finally {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>            PrefetchExecutor.complete(path);<a name="line.299"></a>
+<span class="sourceLineNo">300</span>          }<a name="line.300"></a>
+<span class="sourceLineNo">301</span>        }<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      });<a name="line.302"></a>
+<span class="sourceLineNo">303</span>    }<a name="line.303"></a>
+<span class="sourceLineNo">304</span><a name="line.304"></a>
+<span class="sourceLineNo">305</span>    byte[] tmp = fileInfo.get(FileInfo.MAX_TAGS_LEN);<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    // max tag length is not present in the HFile means tags were not at all written to file.<a name="line.306"></a>
+<span class="sourceLineNo">307</span>    if (tmp != null) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      hfileContext.setIncludesTags(true);<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      tmp = fileInfo.get(FileInfo.TAGS_COMPRESSED);<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      if (tmp != null &amp;&amp; Bytes.toBoolean(tmp)) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>        hfileContext.setCompressTags(true);<a name="line.311"></a>
+<span class="sourceLineNo">312</span>      }<a name="line.312"></a>
+<span class="sourceLineNo">313</span>    }<a name="line.313"></a>
+<span class="sourceLineNo">314</span>  }<a name="line.314"></a>
+<span class="sourceLineNo">315</span><a name="line.315"></a>
+<span class="sourceLineNo">316</span>  private static String getPathOffsetEndStr(final Path path, final long offset, final long end) {<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    return "path=" + path.toString() + ", offset=" + offset + ", end=" + end;<a name="line.317"></a>
+<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
+<span class="sourceLineNo">319</span><a name="line.319"></a>
+<span class="sourceLineNo">320</span>  /**<a name="line.320"></a>
+<span class="sourceLineNo">321</span>   * File version check is a little sloppy. We read v3 files but can also read v2 files if their<a name="line.321"></a>
+<span class="sourceLineNo">322</span>   * content has been pb'd; files written with 0.98.<a name="line.322"></a>
+<span class="sourceLineNo">323</span>   */<a name="line.323"></a>
+<span class="sourceLineNo">324</span>  private void checkFileVersion() {<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    int majorVersion = trailer.getMajorVersion();<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    if (majorVersion == getMajorVersion()) return;<a name="line.326"></a>
+<span class="sourceLineNo">327</span>    int minorVersion = trailer.getMinorVersion();<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    if (majorVersion == 2 &amp;&amp; minorVersion &gt;= MIN_V2_MINOR_VERSION_WITH_PB) return;<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    // We can read v3 or v2 versions of hfile.<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    throw new IllegalArgumentException("Invalid HFile version: major=" +<a name="line.330"></a>
+<span class="sourceLineNo">331</span>      trailer.getMajorVersion() + ", minor=" + trailer.getMinorVersion() + ": expected at least " +<a name="line.331"></a>
+<span class="sourceLineNo">332</span>      "major=2 and minor=" + MAX_MINOR_VERSION);<a name="line.332"></a>
+<span class="sourceLineNo">333</span>  }<a name="line.333"></a>
+<span class="sourceLineNo">334</span><a name="line.334"></a>
+<span class="sourceLineNo">335</span>  @SuppressWarnings("serial")<a name="line.335"></a>
+<span class="sourceLineNo">336</span>  public static class BlockIndexNotLoadedException extends IllegalStateException {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    public BlockIndexNotLoadedException() {<a name="line.337"></a>
+<span class="sourceLineNo">338</span>      // Add a message in case anyone relies on it as opposed to class name.<a name="line.338"></a>
+<span class="sourceLineNo">339</span>      super("Block index not loaded");<a name="line.339"></a>
+<span class="sourceLineNo">340</span>    }<a name="line.340"></a>
+<span class="sourceLineNo">341</span>  }<a name="line.341"></a>
+<span class="sourceLineNo">342</span><a name="line.342"></a>
+<span class="sourceLineNo">343</span>  private Optional&lt;String&gt; toStringFirstKey() {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    return getFirstKey().map(CellUtil::getCellKeyAsString);<a name="line.344"></a>
+<span class="sourceLineNo">345</span>  }<a name="line.345"></a>
+<span class="sourceLineNo">346</span><a name="line.346"></a>
+<span class="sourceLineNo">347</span>  private Optional&lt;String&gt; toStringLastKey() {<a name="line.347"></a>
+<span class="sourceLineNo">348</span>    return getLastKey().map(CellUtil::getCellKeyAsString);<a name="line.348"></a>
+<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
+<span class="sourceLineNo">350</span><a name="line.350"></a>
+<span class="sourceLineNo">351</span>  @Override<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  public String toString() {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    return "reader=" + path.toString() +<a name="line.353"></a>
+<span class="sourceLineNo">354</span>        (!isFileInfoLoaded()? "":<a name="line.354"></a>
+<span class="sourceLineNo">355</span>          ", compression=" + compressAlgo.getName() +<a name="line.355"></a>
+<span class="sourceLineNo">356</span>          ", cacheConf=" + cacheConf +<a name="line.356"></a>
+<span class="sourceLineNo">357</span>          ", firstKey=" + toStringFirstKey() +<a name="line.357"></a>
+<span class="sourceLineNo">358</span>          ", lastKey=" + toStringLastKey()) +<a name="line.358"></a>
+<span class="sourceLineNo">359</span>          ", avgKeyLen=" + avgKeyLen +<a name="line.359"></a>
+<span class="sourceLineNo">360</span>          ", avgValueLen=" + avgValueLen +<a name="line.360"></a>
+<span class="sourceLineNo">361</span>          ", entries=" + trailer.getEntryCount() +<a name="line.361"></a>
+<span class="sourceLineNo">362</span>          ", length=" + fileSize;<a name="line.362"></a>
+<span class="sourceLineNo">363</span>  }<a name="line.363"></a>
+<span class="sourceLineNo">364</span><a name="line.364"></a>
+<span class="sourceLineNo">365</span>  @Override<a name="line.365"></a>
+<span class="sourceLineNo">366</span>  public long length() {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    return fileSize;<a name="line.367"></a>
+<span class="sourceLineNo">368</span>  }<a name="line.368"></a>
+<span class="sourceLineNo">369</span><a name="line.369"></a>
+<span class="sourceLineNo">370</span>  @Override<a name="line.370"></a>
+<span class="sourceLineNo">371</span>  public void returnBlock(HFileBlock block) {<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    BlockCache blockCache = this.cacheConf.getBlockCache();<a name="line.372"></a>
+<span class="sourceLineNo">373</span>    if (blockCache != null &amp;&amp; block != null) {<a name="line.373"></a>
+<span class="sourceLineNo">374</span>      BlockCacheKey cacheKey = new BlockCacheKey(this.getFileContext().getHFileName(),<a name="line.374"></a>
+<span class="sourceLineNo">375</span>          block.getOffset(), this.isPrimaryReplicaReader(), block.getBlockType());<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      blockCache.returnBlock(cacheKey, block);<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    }<a name="line.377"></a>
+<span class="sourceLineNo">378</span>  }<a name="line.378"></a>
+<span class="sourceLineNo">379</span>  /**<a name="line.379"></a>
+<span class="sourceLineNo">380</span>   * @return the first key in the file. May be null if file has no entries. Note<a name="line.380"></a>
+<span class="sourceLineNo">381</span>   *         that this is not the first row key, but rather the byte form of the<a name="line.381"></a>
+<span class="sourceLineNo">382</span>   *         first KeyValue.<a name="line.382"></a>
+<span class="sourceLineNo">383</span>   */<a name="line.383"></a>
+<span class="sourceLineNo">384</span>  @Override<a name="line.384"></a>
+<span class="sourceLineNo">385</span>  public Optional&lt;Cell&gt; getFirstKey() {<a name="line.385"></a>
+<span class="sourceLineNo">386</span>    if (dataBlockIndexReader == null) {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>      throw new BlockIndexNotLoadedException();<a name="line.387"></a>
+<span class="sourceLineNo">388</span>    }<a name="line.388"></a>
+<span class="sourceLineNo">389</span>    return dataBlockIndexReader.isEmpty() ? Optional.empty()<a name="line.389"></a>
+<span class="sourceLineNo">390</span>        : Optional.of(dataBlockIndexReader.getRootBlockKey(0));<a name="line.390"></a>
+<span class="sourceLineNo">391</span>  }<a name="line.391"></a>
+<span class="sourceLineNo">392</span><a name="line.392"></a>
+<span class="sourceLineNo">393</span>  /**<a name="line.393"></a>
+<span class="sourceLineNo">394</span>   * TODO left from {@link HFile} version 1: move this to StoreFile after Ryan's<a name="line.394"></a>
+<span class="sourceLineNo">395</span>   * patch goes in to eliminate {@link KeyValue} here.<a name="line.395"></a>
+<span class="sourceLineNo">396</span>   *<a name="line.396"></a>
+<span class="sourceLineNo">397</span>   * @return the first row key, or null if the file is empty.<a name="line.397"></a>
+<span class="sourceLineNo">398</span>   */<a name="line.398"></a>
+<span class="sourceLineNo">399</span>  @Override<a name="line.399"></a>
+<span class="sourceLineNo">400</span>  public Optional&lt;byte[]&gt; getFirstRowKey() {<a name="line.400"></a>
+<span class="sourceLineNo">401</span>    // We have to copy the row part to form the row key alone<a name="line.401"></a>
+<span class="sourceLineNo">402</span>    return getFirstKey().map(CellUtil::cloneRow);<a name="line.402"></a>
+<span class="sourceLineNo">403</span>  }<a name="line.403"></a>
+<span class="sourceLineNo">404</span><a name="line.404"></a>
+<span class="sourceLineNo">405</span>  /**<a name="line.405"></a>
+<span class="sourceLineNo">406</span>   * TODO left from {@link HFile} version 1: move this to StoreFile after<a name="line.406"></a>
+<span class="sourceLineNo">407</span>   * Ryan's patch goes in to eliminate {@link KeyValue} here.<a name="line.407"></a>
+<span class="sourceLineNo">408</span>   *<a name="line.408"></a>
+<span class="sourceLineNo">409</span>   * @return the last row key, or null if the file is empty.<a name="line.409"></a>
+<span class="sourceLineNo">410</span>   */<a name="line.410"></a>
+<span class="sourceLineNo">411</span>  @Override<a name="line.411"></a>
+<span class="sourceLineNo">412</span>  public Optional&lt;byte[]&gt; getLastRowKey() {<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    // We have to copy the row part to form the row key alone<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    return getLastKey().map(CellUtil::cloneRow);<a name="line.414"></a>
+<span class="sourceLineNo">415</span>  }<a name="line.415"></a>
+<span class="sourceLineNo">416</span><a name="line.416"></a>
+<span class="sourceLineNo">417</span>  /** @return number of KV entries in this HFile */<a name="line.417"></a>
+<span class="sourceLineNo">418</span>  @Override<a name="line.418"></a>
+<span class="sourceLineNo">419</span>  public long getEntries() {<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    return trailer.getEntryCount();<a name="line.420"></a>
+<span class="sourceLineNo">421</span>  }<a name="line.421"></a>
+<span class="sourceLineNo">422</span><a name="line.422"></a>
+<span class="sourceLineNo">423</span>  /** @return comparator */<a name="line.423"></a>
+<span class="sourceLineNo">424</span>  @Override<a name="line.424"></a>
+<span class="sourceLineNo">425</span>  public CellComparator getComparator() {<a name="line.425"></a>
+<span class="sourceLineNo">426</span>    return comparator;<a name="line.426"></a>
+<span class="sourceLineNo">427</span>  }<a name="line.427"></a>
+<span class="sourceLineNo">428</span><a name="line.428"></a>
+<span class="sourceLineNo">429</span>  /** @return compression algorithm */<a name="line.429"></a>
+<span class="sourceLineNo">430</span>  @Override<a name="line.430"></a>
+<span class="sourceLineNo">431</span>  public Compression.Algorithm getCompressionAlgorithm() {<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    return compressAlgo;<a name="line.432"></a>
+<span class="sourceLineNo">433</span>  }<a name="line.433"></a>
+<span class="sourceLineNo">434</span><a name="line.434"></a>
+<span class="sourceLineNo">435</span>  /**<a name="line.435"></a>
+<span class="sourceLineNo">436</span>   * @return the total heap size of data and meta block indexes in bytes. Does<a name="line.436"></a>
+<span class="sourceLineNo">437</span>   *         not take into account non-root blocks of a multilevel data index.<a name="line.437"></a>
+<span class="sourceLineNo">438</span>   */<a name="line.438"></a>
+<span class="sourceLineNo">439</span>  public long indexSize() {<a name="line.439"></a>
+<span class="sourceLineNo">440</span>    return (dataBlockIndexReader != null ? dataBlockIndexReader.heapSize() : 0)<a name="line.440"></a>
+<span class="sourceLineNo">441</span>        + ((metaBlockIndexReader != null) ? metaBlockIndexReader.heapSize()<a name="line.441"></a>
+<span class="sourceLineNo">442</span>            : 0);<a name="line.442"></a>
+<span class="sourceLineNo">443</span>  }<a name="line.443"></a>
+<span class="sourceLineNo">444</span><a name="line.444"></a>
+<span class="sourceLineNo">445</span>  @Override<a name="line.445"></a>
+<span class="sourceLineNo">446</span>  public String getName() {<a name="line.446"></a>
+<span class="sourceLineNo">447</span>    return name;<a name="line.447"></a>
+<span class="sourceLineNo">448</span>  }<a name="line.448"></a>
+<span class="sourceLineNo">449</span><a name="line.449"></a>
+<span class="sourceLineNo">450</span>  @Override<a name="line.450"></a>
+<span class="sourceLineNo">451</span>  public HFileBlockIndex.BlockIndexReader getDataBlockIndexReader() {<a name="line.451"></a>
+<span class="sourceLineNo">452</span>    return dataBlockIndexReader;<a name="line.452"></a>
+<span class="sourceLineNo">453</span>  }<a name="line.453"></a>
+<span class="sourceLineNo">454</span><a name="line.454"></a>
+<span class="sourceLineNo">455</span>  @Override<a name="line.455"></a>
+<span class="sourceLineNo">456</span>  public FixedFileTrailer getTrailer() {<a name="line.456"></a>
+<span class="sourceLineNo">457</span>    return trailer;<a name="line.457"></a>
+<span class="sourceLineNo">458</span>  }<a name="line.458"></a>
+<span class="sourceLineNo">459</span><a name="line.459"></a>
+<span class="sourceLineNo">460</span>  @Override<a name="line.460"></a>
+<span class="sourceLineNo">461</span>  public boolean isPrimaryReplicaReader() {<a name="line.461"></a>
+<span class="sourceLineNo">462</span>    return primaryReplicaReader;<a name="line.462"></a>
+<span class="sourceLineNo">463</span>  }<a name="line.463"></a>
+<span class="sourceLineNo">464</span><a name="line.464"></a>
+<span class="sourceLineNo">465</span>  @Override<a name="line.465"></a>
+<span class="sourceLineNo">466</span>  public FileInfo loadFileInfo() throws IOException {<a name="line.466"></a>
+<span class="sourceLineNo">467</span>    return fileInfo;<a name="line.467"></a>
+<span class="sourceLineNo">468</span>  }<a name="line.468"></a>
+<span class="sourceLineNo">469</span><a name="line.469"></a>
+<span class="sourceLineNo">470</span>  /**<a name="line.470"></a>
+<span class="sourceLineNo">471</span>   * An exception thrown when an operation requiring a scanner to be seeked<a name="line.471"></a>
+<span class="sourceLineNo">472</span>   * is invoked on a scanner that is not seeked.<a name="line.472"></a>
+<span class="sourceLineNo">473</span>   */<a name="line.473"></a>
+<span class="sourceLineNo">474</span>  @SuppressWarnings("serial")<a name="line.474"></a>
+<span class="sourceLineNo">475</span>  public static class NotSeekedException extends IllegalStateException {<a name="line.475"></a>
+<span class="sourceLineNo">476</span>    public NotSeekedException() {<a name="line.476"></a>
+<span class="sourceLineNo">477</span>      super("Not seeked to a key/value");<a name="line.477"></a>
+<span class="sourceLineNo">478</span>    }<a name="line.478"></a>
+<span class="sourceLineNo">479</span>  }<a name="line.479"></a>
+<span class="sourceLineNo">480</span><a name="line.480"></a>
+<span class="sourceLineNo">481</span>  protected static class HFileScannerImpl implements HFileScanner {<a name="line.481"></a>
+<span class="sourceLineNo">482</span>    private ByteBuff blockBuffer;<a name="line.482"></a>
+<span class="sourceLineNo">483</span>    protected final boolean cacheBlocks;<a name="line.483"></a>
+<span class="sourceLineNo">484</span>    protected final boolean pread;<a name="line.484"></a>
+<span class="sourceLineNo">485</span>    protected final boolean isCompaction;<a name="line.485"></a>
+<span class="sourceLineNo">486</span>    private int currKeyLen;<a name="line.486"></a>
+<span class="sourceLineNo">487</span>    private int currValueLen;<a name="line.487"></a>
+<span class="sourceLineNo">488</span>    private int currMemstoreTSLen;<a name="line.488"></a>
+<span class="sourceLineNo">489</span>    private long currMemstoreTS;<a name="line.489"></a>
+<span class="sourceLineNo">490</span>    // Updated but never read?<a name="line.490"></a>
+<span class="sourceLineNo">491</span>    protected AtomicInteger blockFetches = new AtomicInteger(0);<a name="line.491"></a>
+<span class="sourceLineNo">492</span>    protected final HFile.Reader reader;<a name="line.492"></a>
+<span class="sourceLineNo">493</span>    private int currTagsLen;<a name="line.493"></a>
+<span class="sourceLineNo">494</span>    // buffer backed keyonlyKV<a name="line.494"></a>
+<span class="sourceLineNo">495</span>    private ByteBufferKeyOnlyKeyValue bufBackedKeyOnlyKv = new ByteBufferKeyOnlyKeyValue();<a name="line.495"></a>
+<span class="sourceLineNo">496</span>    // A pair for reusing in blockSeek() so that we don't garbage lot of objects<a name="line.496"></a>
+<span class="sourceLineNo">497</span>    final ObjectIntPair&lt;ByteBuffer&gt; pair = new ObjectIntPair&lt;&gt;();<a name="line.497"></a>
+<span class="sourceLineNo">498</span><a name="line.498"></a>
+<span class="sourceLineNo">499</span>    /**<a name="line.499"></a>
+<span class="sourceLineNo">500</span>     * The next indexed key is to keep track of the indexed key of the next data block.<a name="line.500"></a>
+<span class="sourceLineNo">501</span>     * If the nextIndexedKey is HConstants.NO_NEXT_INDEXED_KEY, it means that the<a name="line.501"></a>
+<span class="sourceLineNo">502</span>     * current data block is the last data block.<a name="line.502"></a>
+<span class="sourceLineNo">503</span>     *<a name="line.503"></a>
+<span class="sourceLineNo">504</span>     * If the nextIndexedKey is null, it means the nextIndexedKey has not been loaded yet.<a name="line.504"></a>
+<span class="sourceLineNo">505</span>     */<a name="line.505"></a>
+<span class="sourceLineNo">506</span>    protected Cell nextIndexedKey;<a name="line.506"></a>
+<span class="sourceLineNo">507</span>    // Current block being used<a name="line.507"></a>
+<span class="sourceLineNo">508</span>    protected HFileBlock curBlock;<a name="line.508"></a>
+<span class="sourceLineNo">509</span>    // Previous blocks that were used in the course of the read<a name="line.509"></a>
+<span class="sourceLineNo">510</span>    protected final ArrayList&lt;HFileBlock&gt; prevBlocks = new ArrayList&lt;&gt;();<a name="line.510"></a>
+<span class="sourceLineNo">511</span><a name="line.511"></a>
+<span class="sourceLineNo">512</span>    public HFileScannerImpl(final HFile.Reader reader, final boolean cacheBlocks,<a name="line.512"></a>
+<span class="sourceLineNo">513</span>        final boolean pread, final boolean isCompaction) {<a name="line.513"></a>
+<span class="sourceLineNo">514</span>      this.reader = reader;<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      this.cacheBlocks = cacheBlocks;<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      this.pread = pread;<a name="line.516"></a>
+<span class="sourceLineNo">517</span>      this.isCompaction = isCompaction;<a name="line.517"></a>
+<span class="sourceLineNo">518</span>    }<a name="line.518"></a>
+<span class="sourceLineNo">519</span><a name="line.519"></a>
+<span class="sourceLineNo">520</span>    void updateCurrBlockRef(HFileBlock block) {<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      if (block != null &amp;&amp; this.curBlock != null &amp;&amp;<a name="line.521"></a>
+<span class="sourceLineNo">522</span>          block.getOffset() == this.curBlock.getOffset()) {<a name="line.522"></a>
+<span class="sourceLineNo">523</span>        return;<a name="line.523"></a>
+<span class="sourceLineNo">524</span>      }<a name="line.524"></a>
+<span class="sourceLineNo">525</span>      // We don't have to keep ref to EXCLUSIVE type of block<a name="line.525"></a>
+<span class="sourceLineNo">526</span>      if (this.curBlock != null &amp;&amp; this.curBlock.usesSharedMemory()) {<a name="line.526"></a>
+<span class="sourceLineNo">527</span>        prevBlocks.add(this.curBlock);<a name="line.527"></a>
+<span class="sourceLineNo">528</span>      }<a name="line.528"></a>
+<span class="sourceLineNo">529</span>      this.curBlock = block;<a name="line.529"></a>
+<span class="sourceLineNo">530</span>    }<a name="line.530"></a>
+<span class="sourceLineNo">531</span><a name="line.531"></a>
+<span class="sourceLineNo">532</span>    void reset() {<a name="line.532"></a>
+<span class="sourceLineNo">533</span>      // We don't have to keep ref to EXCLUSIVE type of block<a name="line.533"></a>
+<span class="sourceLineNo">534</span>      if (this.curBlock != null &amp;&amp; this.curBlock.usesSharedMemory()) {<a name="line.534"></a>
+<span class="sourceLineNo">535</span>        this.prevBlocks.add(this.curBlock);<a name="line.535"></a>
+<span class="sourceLineNo">536</span>      }<a name="line.536"></a>
+<span class="sourceLineNo">537</span>      this.curBlock = null;<a name="line.537"></a>
+<span class="sourceLineNo">538</span>    }<a name="line.538"></a>
+<span class="sourceLineNo">539</span><a name="line.539"></a>
+<span class="sourceLineNo">540</span>    private void returnBlockToCache(HFileBlock block) {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>      if (LOG.isTraceEnabled()) {<a name="line.541"></a>
+<span class="sourceLineNo">542</span>        LOG.trace("Returning the block : " + block);<a name="line.542"></a>
+<span class="sourceLineNo">543</span>      }<a name="line.543"></a>
+<span class="sourceLineNo">544</span>      this.reader.returnBlock(block);<a name="line.544"></a>
+<span class="sourceLineNo">545</span>    }<a name="line.545"></a>
+<span class="sourceLineNo">546</span><a name="line.546"></a>
+<span class="sourceLineNo">547</span>    private void returnBlocks(boolean returnAll) {<a name="line.547"></a>
+<span class="sourceLineNo">548</span>      for (int i = 0; i &lt; this.prevBlocks.size(); i++) {<a name="line.548"></a>
+<span class="sourceLineNo">549</span>        returnBlockToCache(this.prevBlocks.get(i));<a name="line.549"></a>
+<span class="sourceLineNo">550</span>      }<a name="line.550"></a>
+<span class="sourceLineNo">551</span>      this.prevBlocks.clear();<a name="line.551"></a>
+<span class="sourceLineNo">552</span>      if (returnAll &amp;&amp; this.curBlock != null) {<a name="line.552"></a>
+<span class="sourceLineNo">553</span>        returnBlockToCache(this.curBlock);<a name="line.553"></a>
+<span class="sourceLineNo">554</span>        this.curBlock = null;<a name="line.554"></a>
+<span class="sourceLineNo">555</span>      }<a name="line.555"></a>
+<span class="sourceLineNo">556</span>    }<a name="line.556"></a>
+<span class="sourceLineNo">557</span>    @Override<a name="line.557"></a>
+<span class="sourceLineNo">558</span>    public boolean isSeeked(){<a name="line.558"></a>
+<span class="sourceLineNo">559</span>      return blockBuffer != null;<a name="line.559"></a>
+<span class="sourceLineNo">560</span>    }<a name="line.560"></a>
+<span class="sourceLineNo">561</span><a name="line.561"></a>
+<span class="sourceLineNo">562</span>    @Override<a name="line.562"></a>
+<span class="sourceLineNo">563</span>    public String toString() {<a name="line.563"></a>
+<span class="sourceLineNo">564</span>      return "HFileScanner for reader " + String.valueOf(getReader());<a name="line.564"></a>
+<span class="sourceLineNo">565</span>    }<a name="line.565"></a>
+<span class="sourceLineNo">566</span><a name="line.566"></a>
+<span class="sourceLineNo">567</span>    protected void assertSeeked() {<a name="line.567"></a>
+<span class="sourceLineNo">568</span>      if (!isSeeked())<a name="line.568"></a>
+<span class="sourceLineNo">569</span>        throw new NotSeekedException();<a name="line.569"></a>
+<span class="sourceLineNo">570</span>    }<a name="line.570"></a>
+<span class="sourceLineNo">571</span><a name="line.571"></a>
+<span class="sourceLineNo">572</span>    @Override<a name="line.572"></a>
+<span class="sourceLineNo">573</span>    public HFile.Reader getReader() {<a name="line.573"></a>
+<span class="sourceLineNo">574</span>      return reader;<a name="line.574"></a>
+<span class="sourceLineNo">575</span>    }<a name="line.575"></a>
+<span class="sourceLineNo">576</span><a name="line.576"></a>
+<span class="sourceLineNo">577</span>    // From non encoded HFiles, we always read back KeyValue or its descendant.(Note: When HFile<a name="line.577"></a>
+<span class="sourceLineNo">578</span>    // block is in DBB, it will be OffheapKV). So all parts of the Cell is in a contiguous<a name="line.578"></a>
+<span class="sourceLineNo">579</span>    // array/buffer. How many bytes we should wrap to make the KV is what this method returns.<a name="line.579"></a>
+<span class="sourceLineNo">580</span>    private int getKVBufSize() {<a name="line.580"></a>
+<span class="sourceLineNo">581</span>      int kvBufSize = KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen;<a name="line.581"></a>
+<span class="sourceLineNo">582</span>      if (currTagsLen &gt; 0) {<a name="line.582"></a>
+<span class="sourceLineNo">583</span>        kvBufSize += Bytes.SIZEOF_SHORT + currTagsLen;<a name="line.583"></a>
+<span class="sourceLineNo">584</span>      }<a name="line.584"></a>
+<span class="sourceLineNo">585</span>      return kvBufSize;<a name="line.585"></a>
+<span class="sourceLineNo">586</span>    }<a name="line.586"></a>
+<span class="sourceLineNo">587</span><a name="line.587"></a>
+<span class="sourceLineNo">588</span>    @Override<a name="line.588"></a>
+<span class="sourceLineNo">589</span>    public void close() {<a name="line.589"></a>
+<span class="sourceLineNo">590</span>      if (!pread) {<a name="line.590"></a>
+<span class="sourceLineNo">591</span>        // For seek + pread stream socket should be closed when the scanner is closed. HBASE-9393<a name="line.591"></a>
+<span class="sourceLineNo">592</span>        reader.unbufferStream();<a name="line.592"></a>
+<span class="sourceLineNo">593</span>      }<a name="line.593"></a>
+<span class="sourceLineNo">594</span>      this.returnBlocks(true);<a name="line.594"></a>
+<span class="sourceLineNo">595</span>    }<a name="line.595"></a>
+<span class="sourceLineNo">596</span><a name="line.596"></a>
+<span class="sourceLineNo">597</span>    // Returns the #bytes in HFile for the current cell. Used to skip these many bytes in current<a name="line.597"></a>
+<span class="sourceLineNo">598</span>    // HFile block's buffer so as to position to the next cell.<a name="line.598"></a>
+<span class="sourceLineNo">599</span>    private int getCurCellSerializedSize() {<a name="line.599"></a>
+<span class="sourceLineNo">600</span>      int curCellSize =  KEY_VALUE_LEN_SIZE + currKeyLen + currValueLen<a name="line.600"></a>
+<span class="sourceLineNo">601</span>          + currMemstoreTSLen;<a name="line.601"></a>
+<span class="sourceLineNo">602</span>      if (this.reader.getFileContext().isIncludesTags()) {<a name="line.602"></a>
+<span class="sourceLineNo">603</span>        curCellSize += Bytes.SIZEOF_SHORT + currTagsLen;<a name="line.603"></a>
+<span class="sourceLineNo">604</span>      }<a name="line.604"></a>
+<span class="sourceLineNo">605</span>      return curCellSize;<a name="line.605"></a>
+<span class="sourceLineNo">606</span>    }<a name="line.606"></a>
+<span class="sourceLineNo">607</span><a name="line.607"></a>
+<span class="sourceLineNo">608</span>    protected void readKeyValueLen() {<a name="line.608"></a>
+<span class="sourceLineNo">609</span>      // This is a hot method. We go out of our way to make this method short so it can be<a name="line.609"></a>
+<span class="sourceLineNo">610</span>      // inlined and is not too big to compile. We also manage position in ByteBuffer ourselves<a name="line.610"></a>
+<span class="sourceLineNo">611</span>      // because it is faster than going via range-checked ByteBuffer methods or going through a<a name="line.611"></a>
+<span class="sourceLineNo">612</span>      // byte buffer array a byte at a time.<a name="line.612"></a>
+<span class="sourceLineNo">613</span>      // Get a long at a time rather than read two individual ints. In micro-benchmarking, even<a name="line.613"></a>
+<span class="sourceLineNo">614</span>      // with the extra bit-fiddling, this is order-of-magnitude faster than getting two ints.<a name="line.614"></a>
+<span class="sourceLineNo">615</span>      // Trying to imitate what was done - need to profile if this is better or<a name="line.615"></a>
+<span class="sourceLineNo">616</span>      // earlier way is better by doing mark and reset?<a name="line.616"></a>
+<span class="sourceLineNo">617</span>      // But ensure that you read long instead of two ints<a name="line.617"></a>
+<span class="sourceLineNo">618</span>      long ll = blockBuffer.getLongAfterPosition(0);<a name="line.618"></a>
+<span class="sourceLineNo">619</span>      // Read top half as an int of key length and bottom int as value length<a name="line.619"></a>
+<span class="sourceLineNo">620</span>      this.currKeyLen = (int)(ll &gt;&gt; Integer.SIZE);<a name="line.620"></a>
+<span class="sourceLineNo">621</span>      this.currValueLen = (int)(Bytes.MASK_FOR_LOWER_INT_IN_LONG ^ ll);<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      checkKeyValueLen();<a name="line.622"></a>
+<span class="sourceLineNo">623</span>      // Move position past the key and value lengths and then beyond the key and value<a name="line.623"></a>
+<span class="sourceLineNo">624</span>      int p = (Bytes.SIZEOF_LONG + currKeyLen + currValueLen);<a name="line.624"></a>
+<span class="sourceLineNo">625</span>      if (reader.getFileContext().isIncludesTags()) {<a name="line.625"></a>
+<span class="sourceLineNo">626</span>        // Tags length is a short.<a name="line.626"></a>
+<span class="sourceLineNo">627</span>        this.currTagsLen = blockBuffer.getShortAfterPosition(p);<a name="line.627"></a>
+<span class="sourceLineNo">628</span>        checkTagsLen();<a name="line.628"></a>
+<span class="sourceLineNo">629</span>        p += (Bytes.SIZEOF_SHORT + currTagsLen);<a name="line.629"></a>
+<span class="sourceLineNo">630</span>      }<a name="line.630"></a>
+<span class="sourceLineNo">631</span>      readMvccVersion(p);<a name="line.631"></a>
+<span class="sourceLineNo">632</span>    }<a name="line.632"></a>
+<span class="sourceLineNo">633</span><a name="line.633"></a>
+<span class="sourceLineNo">634</span>    private final void checkTagsLen() {<a name="line.634"></a>
+<span class="sourceLineNo">635</span>      if (checkLen(this.currTagsLen)) {<a name="line.635"></a>
+<span class="sourceLineNo">636</span>        throw new IllegalStateException("Invalid currTagsLen " + this.currTagsLen +<a name="line.636"></a>
+<span class="sourceLineNo">637</span>          ". Block offset: " + curBlock.getOffset() + ", block length: " +<a name="line.637"></a>
+<span class="sourceLineNo">638</span>            this.blockBuffer.limit() +<a name="line.638"></a>
+<span class="sourceLineNo">639</span>          ", position: " + this.blockBuffer.position() + " (without header).");<a name="line.639"></a>
+<span class="sourceLineNo">640</span>      }<a name="line.640"></a>
+<span class="sourceLineNo">641</span>    }<a name="line.641"></a>
+<span class="sourceLineNo">642</span><a name="line.642"></a>
+<span class="sourceLineNo">643</span>    /**<a name="line.643"></a>
+<span class="sourceLineNo">644</span>     * Read mvcc. Does checks to see if we even need to read the mvcc at all.<a name="line.644"></a>
+<span class="sourceLineNo">645</span>     * @param offsetFromPos<a name="line.645"></a>
+<span class="sourceLineNo">646</span>     */<a name="line.646"></a>
+<span class="sourceLineNo">647</span>    protected void readMvccVersion(final int offsetFromPos) {<a name="line.647"></a>
+<span class="sourceLineNo">648</span>      // See if we even need to decode mvcc.<a name="line.648"></a>
+<span class="sourceLineNo">649</span>      if (!this.reader.shouldIncludeMemStoreTS()) return;<a name="line.649"></a>
+<span class="sourceLineNo">650</span>      if (!this.reader.isDecodeMemStoreTS()) {<a name="line.650"></a>
+<span class="sourceLineNo">651</span>        currMemstoreTS = 0;<a name="line.651"></a>
+<span class="sourceLineNo">652</span>        currMemstoreTSLen = 1;<a name="line.652"></a>
+<span class="sourceLineNo">653</span>        return;<a name="line.653"></a>
+<span class="sourceLineNo">654</span>      }<a name="line.654"></a>
+<span class="sourceLineNo">655</span>      _readMvccVersion(offsetFromPos);<a name="line.655"></a>
+<span class="sourceLineNo">656</span>    }<a name="line.656"></a>
+<span class="sourceLineNo">657</span><a name="line.657"></a>
+<span class="sourceLineNo">658</span>    /**<a name="line.658"></a>
+<span class="sourceLineNo">659</span>     * Actually do the mvcc read. Does no checks.<a name="line.659"></a>
+<span class="sourceLineNo">660</span>     * @param offsetFromPos<a name="line.660"></a>
+<span class="sourceLineNo">661</span>     */<a name="line.661"></a>
+<span class="sourceLineNo">662</span>    private void _readMvccVersion(int offsetFromPos) {<a name="line.662"></a>
+<span class="sourceLineNo">663</span>      // This is Bytes#bytesToVint inlined so can save a few instructions in this hot method; i.e.<a name="line.663"></a>
+<span class="sourceLineNo">664</span>      // previous if one-byte vint, we'd redo the vint call to find int size.<a name="line.664"></a>
+<span class="sourceLineNo">665</span>      // Also the method is kept small so can be inlined.<a name="line.665"></a>
+<span class="sourceLineNo">666</span>      byte firstByte = blockBuffer.getByteAfterPosition(offsetFromPos);<a name="line.666"></a>
+<span class="sourceLineNo">667</span>      int len = WritableUtils.decodeVIntSize(firstByte);<a name="line.667"></a>
+<span class="sourceLineNo">668</span>      if (len == 1) {<a name="line.668"></a>
+<span class="sourceLineNo">669</span>        this.currMemstoreTS = firstByte;<a name="line.669"></a>
+<span class="sourceLineNo">670</span>      } else {<a name="line.670"></a>
+<span class="sourceLineNo">671</span>        int remaining = len -1;<a name="line.671"></a>
+<span class="sourceLineNo">672</span>        long i = 0;<a name="line.672"></a>
+<span class="sourceLineNo">673</span>        offsetFromPos++;<a name="line.673"></a>
+<span class="sourceLineNo">674</span>        if (remaining &gt;= Bytes.SIZEOF_INT) {<a name="line.674"></a>
+<span class="sourceLineNo">675</span>          // The int read has to be converted to unsigned long so the &amp; op<a name="line.675"></a>
+<span class="sourceLineNo">676</span>          i = (blockBuffer.getIntAfterPosition(offsetFromPos) &amp; 0x00000000ffffffffL);<a name="line.676"></a>
+<span class="sourceLineNo">677</span>          remaining -= Bytes.SIZEOF_INT;<a name="line.677"></a>
+<span class="sourceLineNo">678</span>          offsetFromPos += Bytes.SIZEOF_INT;<a name="line.678"></a>
+<span class="sourceLineNo">679</span>        }<a name="line.679"></a>
+<span class="sourceLineNo">680</span>        if (remaining &gt;= Bytes.SIZEOF_SHORT) {<a name="line.680"></a>
+<span class="sourceLineNo">681</span>          short s = blockBuffer.getShortAfterPosition(offsetFromPos);<a name="line.681"></a>
+<span class="sourceLineNo">682</span>          i = i &lt;&lt; 16;<a name="line.682"></a>
+<span class="sourceLineNo">683</span>          i = i | (s &amp; 0xFFFF);<a name="line.683"></a>
+<span class="sourceLineNo">684</span>          remaining -= Bytes.SIZEOF_SHORT;<a name="line.684"></a>
+<span class="sourceLineNo">685</span>          offsetFromPos += Bytes.SIZEOF_SHORT;<a name="line.685"></a>
+<span class="sourceLineNo">686</span>        }<a name="line.686"></a>
+<span class="sourceLineNo">687</span>        for (int idx = 0; idx &lt; remaining; idx++) {<a name="line.687"></a>
+<span class="sourceLineNo">688</span>          byte b = blockBuffer.getByteAfterPosition(offsetFromPos + idx);<a name="line.688"></a>
+<span class="sourceLineNo">689</span>          i = i &lt;&lt; 8;<a name="line.689"></a>
+<span class="sourceLineNo">690</span>          i = i | (b &amp; 0xFF);<a name="line.690"></a>
+<span class="sourceLineNo">691</span>        }<a name="line.691"></a>
+<span class="sourceLineNo">692</span>        currMemstoreTS = (WritableUtils.isNegativeVInt(firstByte) ? ~i : i);<a name="line.692"></a>
+<span class="sourceLineNo">693</span>      }<a name="line.693"></a>
+<span class="sourceLineNo">694</span>      this.currMemstoreTSLen = len;<a name="line.694"></a>
+<span class="sourceLineNo">695</span>    }<a name="line.695"></a>
+<span class="sourceLineNo">696</span><a name="line.696"></a>
+<span class="sourceLineNo">697</span>    /**<a name="line.697"></a>
+<span class="sourceLineNo">698</span>     * Within a loaded block, seek looking for the last key that is smaller than<a name="line.698"></a>
+<span class="sourceLineNo">699</span>     * (or equal to?) the key we are interested in.<a name="line.699"></a>
+<span class="sourceLineNo">700</span>     * A note on the seekBefore: if you have seekBefore = true, AND the first<a name="line.700"></a>
+<span class="sourceLineNo">701</span>     * key in the block = key, then you'll get thrown exceptions. The caller has<a name="line.701"></a>
+<span class="sourceLineNo">702</span>     * to check for that case and load the previous block as appropriate.<a name="line.702"></a>
+<span class="sourceLineNo">703</span>     * @param key<a name="line.703"></a>
+<span class="sourceLineNo">704</span>     *          the key to find<a name="line.704"></a>
+<span class="sourceLineNo">705</span>     * @param seekBefore<a name="line.705"></a>
+<span class="sourceLineNo">706</span>     *          find the key before the given key in case of exact match.<a name="line.706"></a>
+<span class="sourceLineNo">707</span>     * @return 0 in case of an exact key match, 1 in case of an inexact match,<a name="line.707"></a>
+<span class="sourceLineNo">708</span>     *         -2 in case of an inexact match and furthermore, the input key<a name="line.708"></a>
+<span class="sourceLineNo">709</span>     *         less than the first key of current block(e.g. using a faked index<a name="line.709"></a>
+<span class="sourceLineNo">710</span>     *         key)<a name="line.710"></a>
+<span class="sourceLineNo">711</span>     */<a name="line.711"></a>
+<span class="sourceLineNo">712</span>    protected int blockSeek(Cell key, boolean seekBefore) {<a name="line.712"></a>
+<span class="sourceLineNo">713</span>      int klen, vlen, tlen = 0;<a name="line.713"></a>
+<span class="sourceLineNo">714</span>      int lastKeyValueSize = -1;<a name="line.714"></a>
+<span class="sourceLineNo">715</span>      int offsetFromPos;<a name="line.715"></a>
+<span class="sourceLineNo">716</span>      do {<a name="line.716"></a>
+<span class="sourceLineNo">717</span>        offsetFromPos = 0;<a name="line.717"></a>
+<span class="sourceLineNo">718</span>        // Better to ensure that we use the BB Utils here<a name="line.718"></a>
+<span class="sourceLineNo">719</span>        long ll = blockBuffer.getLongAfterPosition(offsetFromPos);<a name="line.719"></a>
+<span class="sourceLineNo">720</span>        klen = (int)(ll &gt;&gt; Integer.SIZE);<a name="line.720"></a>
+<span class="sourceLineNo">721</span>        vlen = (int)(Bytes.MASK_FOR_LOWER_INT_IN_LONG ^ ll);<a name="line.721"></a>
+<span class="sourceLineNo">722</span>        if (checkKeyLen(klen) || checkLen(vlen)) {<a name="line.722"></a>
+<span class="sourceLineNo">723</span>          throw new IllegalStateException("Invalid klen " + klen + " or vlen "<a name="line.723"></a>
+<span class="sourceLineNo">724</span>              + vlen + ". Block offset: "<a name="line.724"></a>
+<span class="sourceLineNo">725</span>              + curBlock.getOffset() + ", block length: " + blockBuffer.limit() + ", position: "<a name="line.725"></a>
+<span class="sourceLineNo">726</span>              + blockBuffer.position() + " (without header).");<a name="line.726"></a>
+<span class="sourceLineNo">727</span>        }<a name="line.727"></a>
+<span class="sourceLineNo">728</span>        offsetFromPos += Bytes.SIZEOF_LONG;<a name="line.728"></a>
+<span class="sourceLineNo">729</span>        blockBuffer.asSubByteBuffer(blockBuffer.position() + offsetFromPos, klen, pair);<a name="line.729"></a>
+<span class="sourceLineNo">730</span>        bufBackedKeyOnlyKv.setKey(pair.getFirst(), pair.getSecond(), klen);<a name="line.730"></a>
+<span class="sourceLineNo">731</span>        int comp = CellUtil.compareKeyIgnoresMvcc(reader.getComparator(), key, bufBackedKeyOnlyKv);<a name="line.731"></a>
+<span class="sourceLineNo">732</span>        offsetFromPos += klen + vlen;<a name="line.732"></a>
+<span class="sourceLineNo">733</span>        if (this.reader.getFileContext().isIncludesTags()) {<a name="line.733"></a>
+<span class="sourceLineNo">734</span>          // Read short as unsigned, high byte first<a name="line.734"></a>
+<span class="sourceLineNo">735</span>          tlen = ((blockBuffer.getByteAfterPosition(offsetFromPos) &amp; 0xff) &lt;&lt; 8)<a name="line.735"></a>
+<span class="sourceLineNo">736</span>              ^ (blockBuffer.getByteAfterPosition(offsetFromPos + 1) &amp; 0xff);<a name="line.736"></a>
+<span class="sourceLineNo">737</span>          if (checkLen(tlen)) {<a name="line.737"></a>
+<span class="sourceLineNo">738</span>            throw new IllegalStateException("Invalid tlen " + tlen + ". Block offset: "<a name="line.738"></a>
+<span class="sourceLineNo">739</span>                + curBlock.getOffset() + ", block length: " + blockBuffer.limit() + ", position: "<a name="line.739"></a>
+<span class="sourceLineNo">740</span>                + blockBuffer.position() + " (without header).");<a name="line.740"></a>
+<span class="sourceLineNo">741</span>          }<a name="line.741"></a>
+<span class="sourceLineNo">742</span>          // add the two bytes read for the tags.<a name="line.742"></a>
+<span class="sourceLineNo">743</span>          offsetFromPos += tlen + (Bytes.SIZEOF_SHORT);<a name="line.743"></a>
+<span class="sourceLineNo">744</span>        }<a name="line.744"></a>
+<span class="sourceLineNo">745</span>        if (this.reader.shouldIncludeMemStoreTS()) {<a name="line.745"></a>
+<span class="sourceLineNo">746</span>          // Directly read the mvcc based on current position<a name="line.746"></a>
+<span class="sourceLineNo">747</span>          readMvccVersion(offsetFromPos);<a name="line.747"></a>
+<span class="sourceLineNo">748</span>        }<a name="line.748"></a>
+<span class="sourceLineNo">749</span>        if (comp == 0) {<a name="line.749"></a>
+<span class="sourceLineNo">750</span>          if (seekBefore) {<a name="line.750"></a>
+<span class="sourceLineNo">751</span>            if (lastKeyValueSize &lt; 0) {<a name="line.751"></a>
+<span class="sourceLineNo">752</span>              throw new IllegalStateException("blockSeek with seekBefore "<a name="line.752"></a>
+<span class="sourceLineNo">753</span>                  + "at the first key of the block: key=" + CellUtil.getCellKeyAsString(key)<a name="line.753"></a>
+<span class="sourceLineNo">754</span>                  + ", blockOffset=" + curBlock.getOffset() + ", onDiskSize="<a name="line.754"></a>
+<span class="sourceLineNo">755</span>                  + curBlock.getOnDiskSizeWithHeader());<a name="line.755"></a>
+<span class="sourceLineNo">756</span>            }<a name="line.756"></a>
+<span class="sourceLineNo">757</span>            blockBuffer.moveBack(lastKeyValueSize);<a name="line.757"></a>
+<span class="sourceLineNo">758</span>            readKeyValueLen();<a name="line.758"></a>
+<span class="sourceLineNo">759</span>            return 1; // non exact match.<a name="line.759"></a>
+<span class="sourceLineNo">760</span>          }<a name="line.760"></a>
+<span class="sourceLineNo">761</span>          currKeyLen = klen;<a name="line.761"></a>
+<span class="sourceLineNo">762</span>          currValueLen = vlen;<a name="line.762"></a>
+<span class="sourceLineNo">763</span>          currTagsLen = tlen;<a name="line.763"></a>
+<span class="sourceLineNo">764</span>          return 0; // indicate exact match<a name="line.764"></a>
+<span class="sourceLineNo">765</span>        } else if (comp &lt; 0) {<a name="line.765"></a>
+<span class="sourceLineNo">766</span>          if (lastKeyValueSize &gt; 0) {<a name="line.766"></a>
+<span class="sourceLineNo">767</span>            blockBuffer.moveBack(lastKeyValueSize);<a name="line.767"></a>
+<span class="sourceLineNo">768</span>          }<a name="line.768"></a>
+<span class="sourceLineNo">769</span>          readKeyValueLen();<a name="line.769"></a>
+<span class="sourceLineNo">770</span>          if (lastKeyValueSize == -1 &amp;&amp; blockBuffer.position() == 0) {<a name="line.770"></a>
+<span class="sourceLineNo">771</span>            return HConstants.INDEX_KEY_MAGIC;<a name="line.771"></a>
+<span class="sourceLineNo">772</span>          }<a name="line.772"></a>
+<span class="sourceLineNo">773</span>          return 1;<a name="line.773"></a>
+<span class="sourceLineNo">774</span>        }<a name="line.774"></a>
+<span class="sourceLineNo">775</span>        // The size of this key/value tuple, including key/value length fields.<a name="line.775"></a>
+<span class="sourceLineNo">776</span>        lastKeyValueSize = klen + vlen + currMemstoreTSLen + KEY_VALUE_LEN_SIZE;<a name="line.776"></a>
+<span class="sourceLineNo">777</span>        // include tag length also if tags included with KV<a name="line.777"></a>
+<span class="sourceLineNo">778</span>        if (reader.getFileContext().isIncludesTags()) {<a name="line.778"></a>
+<span class="sourceLineNo">779</span>          lastKeyValueSize += tlen + Bytes.SIZEOF_SHORT;<a name="line.779"></a>
+<span class="sourceLineNo">780</span>        }<a name="line.780"></a>
+<span class="sourceLineNo">781</span>        blockBuffer.skip(lastKeyValueSize);<a name="line.781"></a>
+<span class="sourceLineNo">782</span>      } while (blockBuffer.hasRemaining());<a name="line.782"></a>
+<span class="sourceLineNo">783</span><a name="line.783"></a>
+<span class="sourceLineNo">784</span>      // Seek to the last key we successfully read. This will happen if this is<a name="line.784"></a>
+<span class="sourceLineNo">785</span>      // the last key/value pair in the file, in which case the following call<a name="line.785"></a>
+<span class="sourceLineNo">786</span>      // to next() has to return false.<a name="line.786"></a>
+<span class="sourceLineNo">787</span>      blockBuffer.moveBack(lastKeyValueSize);<a name="line.787"></a>
+<span class="sourceLineNo">788</span>      readKeyValueLen();<a name="line.788"></a>
+<span class="sourceLineNo">789</span>      return 1; // didn't exactly find it.<a name="line.789"></a>
+<span class="sourceLineNo">790</span>    }<a name="line.790"></a>
+<span class="sourceLineNo">791</span><a name="line.791"></a>
+<span class="sourceLineNo">792</span>    @Override<a name="line.792"></a>
+<span class="sourceLineNo">793</span>    public Cell getNextIndexedKey() {<a name="line.793"></a>
+<span class="sourceLineNo">794</span>      return nextIndexedKey;<a name="line.794"></a>
+<span class="sourceLineNo">795</span>    }<a name="line.795"></a>
+<span class="sourceLineNo">796</span><a name="line.796"></a>
+<span class="sourceLineNo">797</span>    @Override<a name="line.797"></a>
+<span class="sourceLineNo">798</span>    public int seekTo(Cell key) throws IOException {<a name="line.798"></a>
+<span class="sourceLineNo">799</span>      return seekTo(key, true);<a name="line.799"></a>
+<span class="sourceLineNo">800</span>    }<a name="line.800"></a>
+<span class="sourceLineNo">801</span><a name="line.801"></a>
+<span class="sourceLineNo">802</span>    @Override<a name="line.802"></a>
+<span class="sourceLineNo">803</span>    public int reseekTo(Cell key) throws IOException {<a name="line.803"></a>
+<span class="sourceLineNo">804</span>      int compared;<a name="line.804"></a>
+<span class="sourceLineNo">805</span>      if (isSeeked()) {<a name="line.805"></a>
+<span class="sourceLineNo">806</span>        compared = compareKey(reader.getComparator(), key);<a name="line.806"></a>
+<span class="sourceLineNo">807</span>        if (compared &lt; 1) {<a name="line.807"></a>
+<span class="sourceLineNo">808</span>          // If the required key is less than or equal to current key, then<a name="line.808"></a>
+<span class="sourceLineNo">809</span>          // don't do anything.<a name="line.809"></a>
+<span class="sourceLineNo">810</span>          return compared;<a name="line.810"></a>
+<span class="sourceLineNo">811</span>        } else {<a name="line.811"></a>
+<span class="sourceLineNo">812</span>          // The comparison with no_next_index_key has to be checked<a name="line.812"></a>
+<span class="sourceLineNo">813</span>          if (this.nextIndexedKey != null &amp;&amp;<a name="line.813"></a>
+<span class="sourceLineNo">814</span>              (this.nextIndexedKey == KeyValueScanner.NO_NEXT_INDEXED_KEY || CellUtil<a name="line.814"></a>
+<span class="sourceLineNo">815</span>                  .compareKeyIgnoresMvcc(reader.getComparator(), key, nextIndexedKey) &lt; 0)) {<a name="line.815"></a>
+<span class="sourceLineNo">816</span>            // The reader shall continue to scan the current data block instead<a name="line.816"></a>
+<span class="sourceLineNo">817</span>            // of querying the<a name="line.817"></a>
+<span class="sourceLineNo">818</span>            // block index as long as it knows the target key is strictly<a name="line.818"></a>
+<span class="sourceLineNo">819</span>            // smaller than<a name="line.819"></a>
+<span class="sourceLineNo">820</span>            // the next indexed key or the current data block is the last data<a name="line.820"></a>
+<span class="sourceLineNo">821</span>            // block.<a name="line.821"></a>
+<span class="sourceLineNo">822</span>            return loadBlockAndSeekToKey(this.curBlock, nextIndexedKey, false, key,<a name="line.822"></a>
+<span class="sourceLineNo">823</span>                false);<a name="line.823"></a>
+<span class="sourceLineNo">824</span>          }<a name="line.824"></a>
+<span class="sourceLineNo">825</span><a name="line.825"></a>
+<span class="sourceLineNo">826</span>        }<a name="line.826"></a>
+<span class="sourceLineNo">827</span>      }<a name="line.827"></a>
+<span class="sourceLineNo">828</span>      // Don't rewind on a reseek operation, because reseek implies that we are<a name="line.828"></a>
+<span class="sourceLineNo">829</span>      // always going forward in the file.<a name="line.829"></a>
+<span class="sourceLineNo">830</span>      return seekTo(key, false);<a name="line.830"></a>
+<span class="sourceLineNo">831</span>    }<a name="line.831"></a>
+<span class="sourceLineNo">832</span><a name="line.832"></a>
+<span class="sourceLineNo">833</span>    /**<a name="line.833"></a>
+<span class="sourceLineNo">834</span>     * An internal API function. Seek to the given key, optionally rewinding to<a name="line.834"></a>
+<span class="sourceLineNo">835</span>     * the first key of the block before doing the seek.<a name="line.835"></a>
+<span class="sourceLineNo">836</span>     *<a name="line.836"></a>
+<span class="sourceLineNo">837</span>     * @param key - a cell representing the key that we need to fetch<a name="line.837"></a>
+<span class="sourceLineNo">838</span>     * @param rewind whether to rewind to the first key of the block before<a name="line.838"></a>
+<span class="sourceLineNo">839</span>     *        doing the seek. If this is false, we are assuming we never go<a name="line.839"></a>
+<span class="sourceLineNo">840</span>     *        back, otherwise the result is undefined.<a name="line.840"></a>
+<span class="sourceLineNo">841</span>     * @return -1 if the key is earlier than the first key of the file,<a name="line.841"></a>
+<span class="sourceLineNo">842</span>     *         0 if we are at the given key, 1 if we are past the given key<a name="line.842"></a>
+<span class="sourceLineNo">843</span>     *         -2 if the key is earlier than the first key of the file while<a name="line.843"></a>
+<span class="sourceLineNo">844</span>     *         using a faked index key<a name="line.844"></a>
+<span class="sourceLineNo">845</span>     * @throws IOException<a name="line.845"></a>
+<span class="sourceLineNo">846</span>     */<a name="line.846"></a>
+<span class="sourceLineNo">847</span>    public int seekTo(Cell key, boolean rewind) throws IOException {<a name="line.847"></a>
+<span class="sourceLineNo">848</span>      HFileBlockIndex.BlockIndexReader indexReader = reader.getDataBlockIndexReader();<a name="line.848"></a>
+<span class="sourceLineNo">849</span>      BlockWithScanInfo blockWithScanInfo = indexReader.loadDataBlockWithScanInfo(key, curBlock,<a name="line.849"></a>
+<span class="sourceLineNo">850</span>          cacheBlocks, pread, isCompaction, getEffectiveDataBlockEncoding());<a name="line.850"></a>
+<span class="sourceLineNo">851</span>      if (blockWithScanInfo == null || blockWithScanInfo.getHFileBlock() == null) {<a name="line.851"></a>
+<span class="sourceLineNo">852</span>        // This happens if the key e.g. falls before the beginning of the<a name="line.852"></a>
+<span class="sourceLineNo">853</span>        // file.<a name="line.853"></a>
+<span class="sourceLineNo">854</span>        return -1;<a name="line.854"></a>
+<span class="sourceLineNo">855</span>      }<a name="line.855"></a>
+<span class="sourceLineNo">856</span>      return loadBlockAndSeekToKey(blockWithScanInfo.getHFileBlock(),<a name="line.856"></a>
+<span class="sourceLineNo">857</span>          blockWithScanInfo.getNextIndexedKey(), rewind, key, false);<a name="line.857"></a>
+<span class="sourceLineNo">858</span>    }<a name="line.858"></a>
+<span class="sourceLineNo">859</span><a name="line.859"></a>
+<span class="sourceLineNo">860</span>    @Override<a name="line.860"></a>
+<span class="sourceLineNo">861</span>    public boolean seekBefore(Cell key) throws IOException {<a name="line.861"></a>
+<span class="sourceLineNo">862</span>      HFileBlock seekToBlock = reader.getDataBlockIndexReader().seekToDataBlock(key, curBlock,<a name="line.862"></a>
+<span class="sourceLineNo">863</span>          cacheBlocks, pread, isCompaction, reader.getEffectiveEncodingInCache(isCompaction));<a name="line.863"></a>
+<span class="sourceLineNo">864</span>      if (seekToBlock == null) {<a name="line.864"></a>
+<span class="sourceLineNo">865</span>        return false;<a name="line.865"></a>
+<span class="sourceLineNo">866</span>      }<a name="line.866"></a>
+<span class="sourceLineNo">867</span>      Cell firstKey = getFirstKeyCellInBlock(seekToBlock);<a name="line.867"></a>
+<span class="sourceLineNo">868</span>      if (CellUtil.compareKeyIgnoresMvcc(reader.getComparator(), firstKey, key) &gt;= 0) {<a name="line.868"></a>
 <span class="sourceLineNo">869</span>        long previousBlockOffset = seekToBlock.getPrevBlockOffset();<a name="line.869"></a>
 <span class="sourceLineNo">870</span>        // The key we are interested in<a name="line.870"></a>
 <span class="sourceLineNo">871</span>        if (previousBlockOffset == -1) {<a name="line.871"></a>
@@ -1237,7 +1237,7 @@
 <span class="sourceLineNo">1229</span>    public int compareKey(CellComparator comparator, Cell key) {<a name="line.1229"></a>
 <span class="sourceLineNo">1230</span>      blockBuffer.asSubByteBuffer(blockBuffer.position() + KEY_VALUE_LEN_SIZE, currKeyLen, pair);<a name="line.1230"></a>
 <span class="sourceLineNo">1231</span>      this.bufBackedKeyOnlyKv.setKey(pair.getFirst(), pair.getSecond(), currKeyLen);<a name="line.1231"></a>
-<span class="sourceLineNo">1232</span>      return comparator.compareKeyIgnoresMvcc(key, this.bufBackedKeyOnlyKv);<a name="line.1232"></a>
+<span class="sourceLineNo">1232</span>      return CellUtil.compareKeyIgnoresMvcc(comparator, key, this.bufBackedKeyOnlyKv);<a name="line.1232"></a>
 <span class="sourceLineNo">1233</span>    }<a name="line.1233"></a>
 <span class="sourceLineNo">1234</span><a name="line.1234"></a>
 <span class="sourceLineNo">1235</span>    @Override<a name="line.1235"></a>
