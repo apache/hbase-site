@@ -55,504 +55,504 @@
 <span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.regionserver.querymatcher.CompactionScanQueryMatcher;<a name="line.47"></a>
 <span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher;<a name="line.48"></a>
 <span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.regionserver.querymatcher.UserScanQueryMatcher;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.util.CollectionUtils;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.52"></a>
-<span class="sourceLineNo">053</span><a name="line.53"></a>
-<span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.54"></a>
-<span class="sourceLineNo">055</span><a name="line.55"></a>
-<span class="sourceLineNo">056</span>/**<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * Scanner scans both the memstore and the Store. Coalesce KeyValue stream into List&amp;lt;KeyValue&amp;gt;<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * for a single row.<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * &lt;p&gt;<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * The implementation is not thread safe. So there will be no race between next and close. The only<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * exception is updateReaders, it will be called in the memstore flush thread to indicate that there<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * is a flush.<a name="line.62"></a>
-<span class="sourceLineNo">063</span> */<a name="line.63"></a>
-<span class="sourceLineNo">064</span>@InterfaceAudience.Private<a name="line.64"></a>
-<span class="sourceLineNo">065</span>public class StoreScanner extends NonReversedNonLazyKeyValueScanner<a name="line.65"></a>
-<span class="sourceLineNo">066</span>    implements KeyValueScanner, InternalScanner, ChangedReadersObserver {<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  private static final Log LOG = LogFactory.getLog(StoreScanner.class);<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  // In unit tests, the store could be null<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  protected final HStore store;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>  private ScanQueryMatcher matcher;<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  protected KeyValueHeap heap;<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private boolean cacheBlocks;<a name="line.72"></a>
-<span class="sourceLineNo">073</span><a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private long countPerRow = 0;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private int storeLimit = -1;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private int storeOffset = 0;<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  // Used to indicate that the scanner has closed (see HBASE-1107)<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // Do not need to be volatile because it's always accessed via synchronized methods<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  private boolean closing = false;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private final boolean get;<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  private final boolean explicitColumnQuery;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private final boolean useRowColBloom;<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  /**<a name="line.84"></a>
-<span class="sourceLineNo">085</span>   * A flag that enables StoreFileScanner parallel-seeking<a name="line.85"></a>
-<span class="sourceLineNo">086</span>   */<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  private boolean parallelSeekEnabled = false;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  private ExecutorService executor;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private final Scan scan;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  private final long oldestUnexpiredTS;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  private final long now;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  private final int minVersions;<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  private final long maxRowSize;<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  private final long cellsPerHeartbeatCheck;<a name="line.94"></a>
-<span class="sourceLineNo">095</span><a name="line.95"></a>
-<span class="sourceLineNo">096</span>  // 1) Collects all the KVHeap that are eagerly getting closed during the<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  //    course of a scan<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  // 2) Collects the unused memstore scanners. If we close the memstore scanners<a name="line.98"></a>
-<span class="sourceLineNo">099</span>  //    before sending data to client, the chunk may be reclaimed by other<a name="line.99"></a>
-<span class="sourceLineNo">100</span>  //    updates and the data will be corrupt.<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private final List&lt;KeyValueScanner&gt; scannersForDelayedClose = new ArrayList&lt;&gt;();<a name="line.101"></a>
-<span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  /**<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * The number of KVs seen by the scanner. Includes explicitly skipped KVs, but not<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * KVs skipped via seeking to next row/column. TODO: estimate them?<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   */<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  private long kvsScanned = 0;<a name="line.107"></a>
-<span class="sourceLineNo">108</span>  private Cell prevCell = null;<a name="line.108"></a>
-<span class="sourceLineNo">109</span><a name="line.109"></a>
-<span class="sourceLineNo">110</span>  private final long preadMaxBytes;<a name="line.110"></a>
-<span class="sourceLineNo">111</span>  private long bytesRead;<a name="line.111"></a>
-<span class="sourceLineNo">112</span><a name="line.112"></a>
-<span class="sourceLineNo">113</span>  /** We don't ever expect to change this, the constant is just for clarity. */<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  static final boolean LAZY_SEEK_ENABLED_BY_DEFAULT = true;<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  public static final String STORESCANNER_PARALLEL_SEEK_ENABLE =<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      "hbase.storescanner.parallel.seek.enable";<a name="line.116"></a>
-<span class="sourceLineNo">117</span><a name="line.117"></a>
-<span class="sourceLineNo">118</span>  /** Used during unit testing to ensure that lazy seek does save seek ops */<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  private static boolean lazySeekEnabledGlobally = LAZY_SEEK_ENABLED_BY_DEFAULT;<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  /**<a name="line.121"></a>
-<span class="sourceLineNo">122</span>   * The number of cells scanned in between timeout checks. Specifying a larger value means that<a name="line.122"></a>
-<span class="sourceLineNo">123</span>   * timeout checks will occur less frequently. Specifying a small value will lead to more frequent<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   * timeout checks.<a name="line.124"></a>
-<span class="sourceLineNo">125</span>   */<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  public static final String HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK =<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      "hbase.cells.scanned.per.heartbeat.check";<a name="line.127"></a>
-<span class="sourceLineNo">128</span><a name="line.128"></a>
-<span class="sourceLineNo">129</span>  /**<a name="line.129"></a>
-<span class="sourceLineNo">130</span>   * Default value of {@link #HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK}.<a name="line.130"></a>
-<span class="sourceLineNo">131</span>   */<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  public static final long DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK = 10000;<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>  /**<a name="line.134"></a>
-<span class="sourceLineNo">135</span>   * If the read type if Scan.ReadType.DEFAULT, we will start with pread, and if the kvs we scanned<a name="line.135"></a>
-<span class="sourceLineNo">136</span>   * reaches this limit, we will reopen the scanner with stream. The default value is 4 times of<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * block size for this store.<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   */<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  public static final String STORESCANNER_PREAD_MAX_BYTES = "hbase.storescanner.pread.max.bytes";<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>  private final Scan.ReadType readType;<a name="line.141"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.shaded.com.google.common.base.Preconditions;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.util.CollectionUtils;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.53"></a>
+<span class="sourceLineNo">054</span><a name="line.54"></a>
+<span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>/**<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * Scanner scans both the memstore and the Store. Coalesce KeyValue stream into List&amp;lt;KeyValue&amp;gt;<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * for a single row.<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * &lt;p&gt;<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * The implementation is not thread safe. So there will be no race between next and close. The only<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * exception is updateReaders, it will be called in the memstore flush thread to indicate that there<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * is a flush.<a name="line.63"></a>
+<span class="sourceLineNo">064</span> */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>@InterfaceAudience.Private<a name="line.65"></a>
+<span class="sourceLineNo">066</span>public class StoreScanner extends NonReversedNonLazyKeyValueScanner<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    implements KeyValueScanner, InternalScanner, ChangedReadersObserver {<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  private static final Log LOG = LogFactory.getLog(StoreScanner.class);<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  // In unit tests, the store could be null<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  protected final HStore store;<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  private final CellComparator comparator;<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private ScanQueryMatcher matcher;<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  protected KeyValueHeap heap;<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private boolean cacheBlocks;<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private long countPerRow = 0;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private int storeLimit = -1;<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private int storeOffset = 0;<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>  // Used to indicate that the scanner has closed (see HBASE-1107)<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  // Do not need to be volatile because it's always accessed via synchronized methods<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private boolean closing = false;<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private final boolean get;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private final boolean explicitColumnQuery;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  private final boolean useRowColBloom;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  /**<a name="line.86"></a>
+<span class="sourceLineNo">087</span>   * A flag that enables StoreFileScanner parallel-seeking<a name="line.87"></a>
+<span class="sourceLineNo">088</span>   */<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  private boolean parallelSeekEnabled = false;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private ExecutorService executor;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  private final Scan scan;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  private final long oldestUnexpiredTS;<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  private final long now;<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  private final int minVersions;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  private final long maxRowSize;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  private final long cellsPerHeartbeatCheck;<a name="line.96"></a>
+<span class="sourceLineNo">097</span><a name="line.97"></a>
+<span class="sourceLineNo">098</span>  // 1) Collects all the KVHeap that are eagerly getting closed during the<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  //    course of a scan<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  // 2) Collects the unused memstore scanners. If we close the memstore scanners<a name="line.100"></a>
+<span class="sourceLineNo">101</span>  //    before sending data to client, the chunk may be reclaimed by other<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  //    updates and the data will be corrupt.<a name="line.102"></a>
+<span class="sourceLineNo">103</span>  private final List&lt;KeyValueScanner&gt; scannersForDelayedClose = new ArrayList&lt;&gt;();<a name="line.103"></a>
+<span class="sourceLineNo">104</span><a name="line.104"></a>
+<span class="sourceLineNo">105</span>  /**<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   * The number of KVs seen by the scanner. Includes explicitly skipped KVs, but not<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   * KVs skipped via seeking to next row/column. TODO: estimate them?<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   */<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  private long kvsScanned = 0;<a name="line.109"></a>
+<span class="sourceLineNo">110</span>  private Cell prevCell = null;<a name="line.110"></a>
+<span class="sourceLineNo">111</span><a name="line.111"></a>
+<span class="sourceLineNo">112</span>  private final long preadMaxBytes;<a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private long bytesRead;<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>  /** We don't ever expect to change this, the constant is just for clarity. */<a name="line.115"></a>
+<span class="sourceLineNo">116</span>  static final boolean LAZY_SEEK_ENABLED_BY_DEFAULT = true;<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  public static final String STORESCANNER_PARALLEL_SEEK_ENABLE =<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      "hbase.storescanner.parallel.seek.enable";<a name="line.118"></a>
+<span class="sourceLineNo">119</span><a name="line.119"></a>
+<span class="sourceLineNo">120</span>  /** Used during unit testing to ensure that lazy seek does save seek ops */<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  private static boolean lazySeekEnabledGlobally = LAZY_SEEK_ENABLED_BY_DEFAULT;<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  /**<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * The number of cells scanned in between timeout checks. Specifying a larger value means that<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   * timeout checks will occur less frequently. Specifying a small value will lead to more frequent<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   * timeout checks.<a name="line.126"></a>
+<span class="sourceLineNo">127</span>   */<a name="line.127"></a>
+<span class="sourceLineNo">128</span>  public static final String HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK =<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      "hbase.cells.scanned.per.heartbeat.check";<a name="line.129"></a>
+<span class="sourceLineNo">130</span><a name="line.130"></a>
+<span class="sourceLineNo">131</span>  /**<a name="line.131"></a>
+<span class="sourceLineNo">132</span>   * Default value of {@link #HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK}.<a name="line.132"></a>
+<span class="sourceLineNo">133</span>   */<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  public static final long DEFAULT_HBASE_CELLS_SCANNED_PER_HEARTBEAT_CHECK = 10000;<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
+<span class="sourceLineNo">137</span>   * If the read type if Scan.ReadType.DEFAULT, we will start with pread, and if the kvs we scanned<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   * reaches this limit, we will reopen the scanner with stream. The default value is 4 times of<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   * block size for this store.<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   */<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  public static final String STORESCANNER_PREAD_MAX_BYTES = "hbase.storescanner.pread.max.bytes";<a name="line.141"></a>
 <span class="sourceLineNo">142</span><a name="line.142"></a>
-<span class="sourceLineNo">143</span>  // A flag whether use pread for scan<a name="line.143"></a>
-<span class="sourceLineNo">144</span>  // it maybe changed if we use Scan.ReadType.DEFAULT and we have read lots of data.<a name="line.144"></a>
-<span class="sourceLineNo">145</span>  private boolean scanUsePread;<a name="line.145"></a>
-<span class="sourceLineNo">146</span>  // Indicates whether there was flush during the course of the scan<a name="line.146"></a>
-<span class="sourceLineNo">147</span>  private volatile boolean flushed = false;<a name="line.147"></a>
-<span class="sourceLineNo">148</span>  // generally we get one file from a flush<a name="line.148"></a>
-<span class="sourceLineNo">149</span>  private final List&lt;HStoreFile&gt; flushedStoreFiles = new ArrayList&lt;&gt;(1);<a name="line.149"></a>
-<span class="sourceLineNo">150</span>  // Since CompactingMemstore is now default, we get three memstore scanners from a flush<a name="line.150"></a>
-<span class="sourceLineNo">151</span>  private final List&lt;KeyValueScanner&gt; memStoreScannersAfterFlush = new ArrayList&lt;&gt;(3);<a name="line.151"></a>
-<span class="sourceLineNo">152</span>  // The current list of scanners<a name="line.152"></a>
-<span class="sourceLineNo">153</span>  @VisibleForTesting<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  final List&lt;KeyValueScanner&gt; currentScanners = new ArrayList&lt;&gt;();<a name="line.154"></a>
-<span class="sourceLineNo">155</span>  // flush update lock<a name="line.155"></a>
-<span class="sourceLineNo">156</span>  private final ReentrantLock flushLock = new ReentrantLock();<a name="line.156"></a>
-<span class="sourceLineNo">157</span><a name="line.157"></a>
-<span class="sourceLineNo">158</span>  protected final long readPt;<a name="line.158"></a>
-<span class="sourceLineNo">159</span>  private boolean topChanged = false;<a name="line.159"></a>
-<span class="sourceLineNo">160</span><a name="line.160"></a>
-<span class="sourceLineNo">161</span>  /** An internal constructor. */<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  private StoreScanner(HStore store, Scan scan, ScanInfo scanInfo,<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      int numColumns, long readPt, boolean cacheBlocks, ScanType scanType) {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    this.readPt = readPt;<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    this.store = store;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    this.cacheBlocks = cacheBlocks;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    get = scan.isGetScan();<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    explicitColumnQuery = numColumns &gt; 0;<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    this.scan = scan;<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    this.now = EnvironmentEdgeManager.currentTime();<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    this.oldestUnexpiredTS = scan.isRaw() ? 0L : now - scanInfo.getTtl();<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    this.minVersions = scanInfo.getMinVersions();<a name="line.172"></a>
-<span class="sourceLineNo">173</span><a name="line.173"></a>
-<span class="sourceLineNo">174</span>     // We look up row-column Bloom filters for multi-column queries as part of<a name="line.174"></a>
-<span class="sourceLineNo">175</span>     // the seek operation. However, we also look the row-column Bloom filter<a name="line.175"></a>
-<span class="sourceLineNo">176</span>     // for multi-row (non-"get") scans because this is not done in<a name="line.176"></a>
-<span class="sourceLineNo">177</span>     // StoreFile.passesBloomFilter(Scan, SortedSet&lt;byte[]&gt;).<a name="line.177"></a>
-<span class="sourceLineNo">178</span>     this.useRowColBloom = numColumns &gt; 1 || (!get &amp;&amp; numColumns == 1);<a name="line.178"></a>
-<span class="sourceLineNo">179</span>     this.maxRowSize = scanInfo.getTableMaxRowSize();<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    if (get) {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>      this.readType = Scan.ReadType.PREAD;<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      this.scanUsePread = true;<a name="line.182"></a>
-<span class="sourceLineNo">183</span>    } else if(scanType != ScanType.USER_SCAN) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      // For compaction scanners never use Pread as already we have stream based scanners on the<a name="line.184"></a>
-<span class="sourceLineNo">185</span>      // store files to be compacted<a name="line.185"></a>
-<span class="sourceLineNo">186</span>      this.readType = Scan.ReadType.STREAM;<a name="line.186"></a>
-<span class="sourceLineNo">187</span>      this.scanUsePread = false;<a name="line.187"></a>
-<span class="sourceLineNo">188</span>    } else {<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      if (scan.getReadType() == Scan.ReadType.DEFAULT) {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        this.readType = scanInfo.isUsePread() ? Scan.ReadType.PREAD : Scan.ReadType.DEFAULT;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>      } else {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>        this.readType = scan.getReadType();<a name="line.192"></a>
-<span class="sourceLineNo">193</span>      }<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      // Always start with pread unless user specific stream. Will change to stream later if<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      // readType is default if the scan keeps running for a long time.<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      this.scanUsePread = this.readType != Scan.ReadType.STREAM;<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    }<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    this.preadMaxBytes = scanInfo.getPreadMaxBytes();<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    this.cellsPerHeartbeatCheck = scanInfo.getCellsPerTimeoutCheck();<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    // Parallel seeking is on if the config allows and more there is more than one store file.<a name="line.200"></a>
-<span class="sourceLineNo">201</span>    if (store != null &amp;&amp; store.getStorefilesCount() &gt; 1) {<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      RegionServerServices rsService = store.getHRegion().getRegionServerServices();<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      if (rsService != null &amp;&amp; scanInfo.isParallelSeekEnabled()) {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>        this.parallelSeekEnabled = true;<a name="line.204"></a>
-<span class="sourceLineNo">205</span>        this.executor = rsService.getExecutorService();<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      }<a name="line.206"></a>
-<span class="sourceLineNo">207</span>    }<a name="line.207"></a>
-<span class="sourceLineNo">208</span>  }<a name="line.208"></a>
-<span class="sourceLineNo">209</span><a name="line.209"></a>
-<span class="sourceLineNo">210</span>  private void addCurrentScanners(List&lt;? extends KeyValueScanner&gt; scanners) {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    this.currentScanners.addAll(scanners);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>  }<a name="line.212"></a>
-<span class="sourceLineNo">213</span><a name="line.213"></a>
-<span class="sourceLineNo">214</span>  /**<a name="line.214"></a>
-<span class="sourceLineNo">215</span>   * Opens a scanner across memstore, snapshot, and all StoreFiles. Assumes we<a name="line.215"></a>
-<span class="sourceLineNo">216</span>   * are not in a compaction.<a name="line.216"></a>
-<span class="sourceLineNo">217</span>   *<a name="line.217"></a>
-<span class="sourceLineNo">218</span>   * @param store who we scan<a name="line.218"></a>
-<span class="sourceLineNo">219</span>   * @param scan the spec<a name="line.219"></a>
-<span class="sourceLineNo">220</span>   * @param columns which columns we are scanning<a name="line.220"></a>
-<span class="sourceLineNo">221</span>   * @throws IOException<a name="line.221"></a>
-<span class="sourceLineNo">222</span>   */<a name="line.222"></a>
-<span class="sourceLineNo">223</span>  public StoreScanner(HStore store, ScanInfo scanInfo, Scan scan, NavigableSet&lt;byte[]&gt; columns,<a name="line.223"></a>
-<span class="sourceLineNo">224</span>      long readPt) throws IOException {<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    this(store, scan, scanInfo, columns != null ? columns.size() : 0, readPt,<a name="line.225"></a>
-<span class="sourceLineNo">226</span>        scan.getCacheBlocks(), ScanType.USER_SCAN);<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    if (columns != null &amp;&amp; scan.isRaw()) {<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      throw new DoNotRetryIOException("Cannot specify any column for a raw scan");<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    }<a name="line.229"></a>
-<span class="sourceLineNo">230</span>    matcher = UserScanQueryMatcher.create(scan, scanInfo, columns, oldestUnexpiredTS, now,<a name="line.230"></a>
-<span class="sourceLineNo">231</span>      store.getCoprocessorHost());<a name="line.231"></a>
-<span class="sourceLineNo">232</span><a name="line.232"></a>
-<span class="sourceLineNo">233</span>    store.addChangedReaderObserver(this);<a name="line.233"></a>
-<span class="sourceLineNo">234</span><a name="line.234"></a>
-<span class="sourceLineNo">235</span>    try {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>      // Pass columns to try to filter out unnecessary StoreFiles.<a name="line.236"></a>
-<span class="sourceLineNo">237</span>      List&lt;KeyValueScanner&gt; scanners = selectScannersFrom(store,<a name="line.237"></a>
-<span class="sourceLineNo">238</span>        store.getScanners(cacheBlocks, scanUsePread, false, matcher, scan.getStartRow(),<a name="line.238"></a>
-<span class="sourceLineNo">239</span>          scan.includeStartRow(), scan.getStopRow(), scan.includeStopRow(), this.readPt));<a name="line.239"></a>
-<span class="sourceLineNo">240</span><a name="line.240"></a>
-<span class="sourceLineNo">241</span>      // Seek all scanners to the start of the Row (or if the exact matching row<a name="line.241"></a>
-<span class="sourceLineNo">242</span>      // key does not exist, then to the start of the next matching Row).<a name="line.242"></a>
-<span class="sourceLineNo">243</span>      // Always check bloom filter to optimize the top row seek for delete<a name="line.243"></a>
-<span class="sourceLineNo">244</span>      // family marker.<a name="line.244"></a>
-<span class="sourceLineNo">245</span>      seekScanners(scanners, matcher.getStartKey(), explicitColumnQuery &amp;&amp; lazySeekEnabledGlobally,<a name="line.245"></a>
-<span class="sourceLineNo">246</span>        parallelSeekEnabled);<a name="line.246"></a>
-<span class="sourceLineNo">247</span><a name="line.247"></a>
-<span class="sourceLineNo">248</span>      // set storeLimit<a name="line.248"></a>
-<span class="sourceLineNo">249</span>      this.storeLimit = scan.getMaxResultsPerColumnFamily();<a name="line.249"></a>
+<span class="sourceLineNo">143</span>  private final Scan.ReadType readType;<a name="line.143"></a>
+<span class="sourceLineNo">144</span><a name="line.144"></a>
+<span class="sourceLineNo">145</span>  // A flag whether use pread for scan<a name="line.145"></a>
+<span class="sourceLineNo">146</span>  // it maybe changed if we use Scan.ReadType.DEFAULT and we have read lots of data.<a name="line.146"></a>
+<span class="sourceLineNo">147</span>  private boolean scanUsePread;<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  // Indicates whether there was flush during the course of the scan<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  private volatile boolean flushed = false;<a name="line.149"></a>
+<span class="sourceLineNo">150</span>  // generally we get one file from a flush<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  private final List&lt;HStoreFile&gt; flushedStoreFiles = new ArrayList&lt;&gt;(1);<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  // Since CompactingMemstore is now default, we get three memstore scanners from a flush<a name="line.152"></a>
+<span class="sourceLineNo">153</span>  private final List&lt;KeyValueScanner&gt; memStoreScannersAfterFlush = new ArrayList&lt;&gt;(3);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>  // The current list of scanners<a name="line.154"></a>
+<span class="sourceLineNo">155</span>  @VisibleForTesting<a name="line.155"></a>
+<span class="sourceLineNo">156</span>  final List&lt;KeyValueScanner&gt; currentScanners = new ArrayList&lt;&gt;();<a name="line.156"></a>
+<span class="sourceLineNo">157</span>  // flush update lock<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  private final ReentrantLock flushLock = new ReentrantLock();<a name="line.158"></a>
+<span class="sourceLineNo">159</span><a name="line.159"></a>
+<span class="sourceLineNo">160</span>  protected final long readPt;<a name="line.160"></a>
+<span class="sourceLineNo">161</span>  private boolean topChanged = false;<a name="line.161"></a>
+<span class="sourceLineNo">162</span><a name="line.162"></a>
+<span class="sourceLineNo">163</span>  /** An internal constructor. */<a name="line.163"></a>
+<span class="sourceLineNo">164</span>  private StoreScanner(HStore store, Scan scan, ScanInfo scanInfo,<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      int numColumns, long readPt, boolean cacheBlocks, ScanType scanType) {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    this.readPt = readPt;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    this.store = store;<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    this.cacheBlocks = cacheBlocks;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    this.comparator = Preconditions.checkNotNull(scanInfo.getComparator());<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    get = scan.isGetScan();<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    explicitColumnQuery = numColumns &gt; 0;<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    this.scan = scan;<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    this.now = EnvironmentEdgeManager.currentTime();<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    this.oldestUnexpiredTS = scan.isRaw() ? 0L : now - scanInfo.getTtl();<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    this.minVersions = scanInfo.getMinVersions();<a name="line.175"></a>
+<span class="sourceLineNo">176</span><a name="line.176"></a>
+<span class="sourceLineNo">177</span>     // We look up row-column Bloom filters for multi-column queries as part of<a name="line.177"></a>
+<span class="sourceLineNo">178</span>     // the seek operation. However, we also look the row-column Bloom filter<a name="line.178"></a>
+<span class="sourceLineNo">179</span>     // for multi-row (non-"get") scans because this is not done in<a name="line.179"></a>
+<span class="sourceLineNo">180</span>     // StoreFile.passesBloomFilter(Scan, SortedSet&lt;byte[]&gt;).<a name="line.180"></a>
+<span class="sourceLineNo">181</span>     this.useRowColBloom = numColumns &gt; 1 || (!get &amp;&amp; numColumns == 1);<a name="line.181"></a>
+<span class="sourceLineNo">182</span>     this.maxRowSize = scanInfo.getTableMaxRowSize();<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    if (get) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      this.readType = Scan.ReadType.PREAD;<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      this.scanUsePread = true;<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    } else if(scanType != ScanType.USER_SCAN) {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      // For compaction scanners never use Pread as already we have stream based scanners on the<a name="line.187"></a>
+<span class="sourceLineNo">188</span>      // store files to be compacted<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      this.readType = Scan.ReadType.STREAM;<a name="line.189"></a>
+<span class="sourceLineNo">190</span>      this.scanUsePread = false;<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    } else {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      if (scan.getReadType() == Scan.ReadType.DEFAULT) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        this.readType = scanInfo.isUsePread() ? Scan.ReadType.PREAD : Scan.ReadType.DEFAULT;<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      } else {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        this.readType = scan.getReadType();<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      }<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      // Always start with pread unless user specific stream. Will change to stream later if<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      // readType is default if the scan keeps running for a long time.<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      this.scanUsePread = this.readType != Scan.ReadType.STREAM;<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
+<span class="sourceLineNo">201</span>    this.preadMaxBytes = scanInfo.getPreadMaxBytes();<a name="line.201"></a>
+<span class="sourceLineNo">202</span>    this.cellsPerHeartbeatCheck = scanInfo.getCellsPerTimeoutCheck();<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    // Parallel seeking is on if the config allows and more there is more than one store file.<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    if (store != null &amp;&amp; store.getStorefilesCount() &gt; 1) {<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      RegionServerServices rsService = store.getHRegion().getRegionServerServices();<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      if (rsService != null &amp;&amp; scanInfo.isParallelSeekEnabled()) {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>        this.parallelSeekEnabled = true;<a name="line.207"></a>
+<span class="sourceLineNo">208</span>        this.executor = rsService.getExecutorService();<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      }<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    }<a name="line.210"></a>
+<span class="sourceLineNo">211</span>  }<a name="line.211"></a>
+<span class="sourceLineNo">212</span><a name="line.212"></a>
+<span class="sourceLineNo">213</span>  private void addCurrentScanners(List&lt;? extends KeyValueScanner&gt; scanners) {<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    this.currentScanners.addAll(scanners);<a name="line.214"></a>
+<span class="sourceLineNo">215</span>  }<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>  /**<a name="line.217"></a>
+<span class="sourceLineNo">218</span>   * Opens a scanner across memstore, snapshot, and all StoreFiles. Assumes we<a name="line.218"></a>
+<span class="sourceLineNo">219</span>   * are not in a compaction.<a name="line.219"></a>
+<span class="sourceLineNo">220</span>   *<a name="line.220"></a>
+<span class="sourceLineNo">221</span>   * @param store who we scan<a name="line.221"></a>
+<span class="sourceLineNo">222</span>   * @param scan the spec<a name="line.222"></a>
+<span class="sourceLineNo">223</span>   * @param columns which columns we are scanning<a name="line.223"></a>
+<span class="sourceLineNo">224</span>   * @throws IOException<a name="line.224"></a>
+<span class="sourceLineNo">225</span>   */<a name="line.225"></a>
+<span class="sourceLineNo">226</span>  public StoreScanner(HStore store, ScanInfo scanInfo, Scan scan, NavigableSet&lt;byte[]&gt; columns,<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      long readPt) throws IOException {<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    this(store, scan, scanInfo, columns != null ? columns.size() : 0, readPt,<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        scan.getCacheBlocks(), ScanType.USER_SCAN);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    if (columns != null &amp;&amp; scan.isRaw()) {<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      throw new DoNotRetryIOException("Cannot specify any column for a raw scan");<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    }<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    matcher = UserScanQueryMatcher.create(scan, scanInfo, columns, oldestUnexpiredTS, now,<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      store.getCoprocessorHost());<a name="line.234"></a>
+<span class="sourceLineNo">235</span><a name="line.235"></a>
+<span class="sourceLineNo">236</span>    store.addChangedReaderObserver(this);<a name="line.236"></a>
+<span class="sourceLineNo">237</span><a name="line.237"></a>
+<span class="sourceLineNo">238</span>    try {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      // Pass columns to try to filter out unnecessary StoreFiles.<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      List&lt;KeyValueScanner&gt; scanners = selectScannersFrom(store,<a name="line.240"></a>
+<span class="sourceLineNo">241</span>        store.getScanners(cacheBlocks, scanUsePread, false, matcher, scan.getStartRow(),<a name="line.241"></a>
+<span class="sourceLineNo">242</span>          scan.includeStartRow(), scan.getStopRow(), scan.includeStopRow(), this.readPt));<a name="line.242"></a>
+<span class="sourceLineNo">243</span><a name="line.243"></a>
+<span class="sourceLineNo">244</span>      // Seek all scanners to the start of the Row (or if the exact matching row<a name="line.244"></a>
+<span class="sourceLineNo">245</span>      // key does not exist, then to the start of the next matching Row).<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      // Always check bloom filter to optimize the top row seek for delete<a name="line.246"></a>
+<span class="sourceLineNo">247</span>      // family marker.<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      seekScanners(scanners, matcher.getStartKey(), explicitColumnQuery &amp;&amp; lazySeekEnabledGlobally,<a name="line.248"></a>
+<span class="sourceLineNo">249</span>        parallelSeekEnabled);<a name="line.249"></a>
 <span class="sourceLineNo">250</span><a name="line.250"></a>
-<span class="sourceLineNo">251</span>      // set rowOffset<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      this.storeOffset = scan.getRowOffsetPerColumnFamily();<a name="line.252"></a>
-<span class="sourceLineNo">253</span>      addCurrentScanners(scanners);<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      // Combine all seeked scanners with a heap<a name="line.254"></a>
-<span class="sourceLineNo">255</span>      resetKVHeap(scanners, store.getComparator());<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    } catch (IOException e) {<a name="line.256"></a>
-<span class="sourceLineNo">257</span>      // remove us from the HStore#changedReaderObservers here or we'll have no chance to<a name="line.257"></a>
-<span class="sourceLineNo">258</span>      // and might cause memory leak<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      store.deleteChangedReaderObserver(this);<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      throw e;<a name="line.260"></a>
-<span class="sourceLineNo">261</span>    }<a name="line.261"></a>
-<span class="sourceLineNo">262</span>  }<a name="line.262"></a>
-<span class="sourceLineNo">263</span><a name="line.263"></a>
-<span class="sourceLineNo">264</span>  // a dummy scan instance for compaction.<a name="line.264"></a>
-<span class="sourceLineNo">265</span>  private static final Scan SCAN_FOR_COMPACTION = new Scan();<a name="line.265"></a>
+<span class="sourceLineNo">251</span>      // set storeLimit<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      this.storeLimit = scan.getMaxResultsPerColumnFamily();<a name="line.252"></a>
+<span class="sourceLineNo">253</span><a name="line.253"></a>
+<span class="sourceLineNo">254</span>      // set rowOffset<a name="line.254"></a>
+<span class="sourceLineNo">255</span>      this.storeOffset = scan.getRowOffsetPerColumnFamily();<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      addCurrentScanners(scanners);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      // Combine all seeked scanners with a heap<a name="line.257"></a>
+<span class="sourceLineNo">258</span>      resetKVHeap(scanners, comparator);<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    } catch (IOException e) {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      // remove us from the HStore#changedReaderObservers here or we'll have no chance to<a name="line.260"></a>
+<span class="sourceLineNo">261</span>      // and might cause memory leak<a name="line.261"></a>
+<span class="sourceLineNo">262</span>      store.deleteChangedReaderObserver(this);<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      throw e;<a name="line.263"></a>
+<span class="sourceLineNo">264</span>    }<a name="line.264"></a>
+<span class="sourceLineNo">265</span>  }<a name="line.265"></a>
 <span class="sourceLineNo">266</span><a name="line.266"></a>
-<span class="sourceLineNo">267</span>  /**<a name="line.267"></a>
-<span class="sourceLineNo">268</span>   * Used for compactions.<a name="line.268"></a>
-<span class="sourceLineNo">269</span>   * &lt;p&gt;<a name="line.269"></a>
-<span class="sourceLineNo">270</span>   * Opens a scanner across specified StoreFiles.<a name="line.270"></a>
-<span class="sourceLineNo">271</span>   * @param store who we scan<a name="line.271"></a>
-<span class="sourceLineNo">272</span>   * @param scanners ancillary scanners<a name="line.272"></a>
-<span class="sourceLineNo">273</span>   * @param smallestReadPoint the readPoint that we should use for tracking versions<a name="line.273"></a>
-<span class="sourceLineNo">274</span>   */<a name="line.274"></a>
-<span class="sourceLineNo">275</span>  public StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.275"></a>
-<span class="sourceLineNo">276</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs) throws IOException {<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    this(store, scanInfo, scanners, scanType, smallestReadPoint, earliestPutTs, null, null);<a name="line.277"></a>
-<span class="sourceLineNo">278</span>  }<a name="line.278"></a>
-<span class="sourceLineNo">279</span><a name="line.279"></a>
-<span class="sourceLineNo">280</span>  /**<a name="line.280"></a>
-<span class="sourceLineNo">281</span>   * Used for compactions that drop deletes from a limited range of rows.<a name="line.281"></a>
-<span class="sourceLineNo">282</span>   * &lt;p&gt;<a name="line.282"></a>
-<span class="sourceLineNo">283</span>   * Opens a scanner across specified StoreFiles.<a name="line.283"></a>
-<span class="sourceLineNo">284</span>   * @param store who we scan<a name="line.284"></a>
-<span class="sourceLineNo">285</span>   * @param scanners ancillary scanners<a name="line.285"></a>
-<span class="sourceLineNo">286</span>   * @param smallestReadPoint the readPoint that we should use for tracking versions<a name="line.286"></a>
-<span class="sourceLineNo">287</span>   * @param dropDeletesFromRow The inclusive left bound of the range; can be EMPTY_START_ROW.<a name="line.287"></a>
-<span class="sourceLineNo">288</span>   * @param dropDeletesToRow The exclusive right bound of the range; can be EMPTY_END_ROW.<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   */<a name="line.289"></a>
-<span class="sourceLineNo">290</span>  public StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      long smallestReadPoint, long earliestPutTs, byte[] dropDeletesFromRow,<a name="line.291"></a>
-<span class="sourceLineNo">292</span>      byte[] dropDeletesToRow) throws IOException {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    this(store, scanInfo, scanners, ScanType.COMPACT_RETAIN_DELETES, smallestReadPoint,<a name="line.293"></a>
-<span class="sourceLineNo">294</span>        earliestPutTs, dropDeletesFromRow, dropDeletesToRow);<a name="line.294"></a>
-<span class="sourceLineNo">295</span>  }<a name="line.295"></a>
-<span class="sourceLineNo">296</span><a name="line.296"></a>
-<span class="sourceLineNo">297</span>  private StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.297"></a>
-<span class="sourceLineNo">298</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs, byte[] dropDeletesFromRow,<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      byte[] dropDeletesToRow) throws IOException {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    this(store, SCAN_FOR_COMPACTION, scanInfo, 0,<a name="line.300"></a>
-<span class="sourceLineNo">301</span>        store.getHRegion().getReadPoint(IsolationLevel.READ_COMMITTED), false, scanType);<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    assert scanType != ScanType.USER_SCAN;<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    matcher =<a name="line.303"></a>
-<span class="sourceLineNo">304</span>        CompactionScanQueryMatcher.create(scanInfo, scanType, smallestReadPoint, earliestPutTs,<a name="line.304"></a>
-<span class="sourceLineNo">305</span>          oldestUnexpiredTS, now, dropDeletesFromRow, dropDeletesToRow, store.getCoprocessorHost());<a name="line.305"></a>
-<span class="sourceLineNo">306</span><a name="line.306"></a>
-<span class="sourceLineNo">307</span>    // Filter the list of scanners using Bloom filters, time range, TTL, etc.<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    scanners = selectScannersFrom(store, scanners);<a name="line.308"></a>
+<span class="sourceLineNo">267</span>  // a dummy scan instance for compaction.<a name="line.267"></a>
+<span class="sourceLineNo">268</span>  private static final Scan SCAN_FOR_COMPACTION = new Scan();<a name="line.268"></a>
+<span class="sourceLineNo">269</span><a name="line.269"></a>
+<span class="sourceLineNo">270</span>  /**<a name="line.270"></a>
+<span class="sourceLineNo">271</span>   * Used for store file compaction and memstore compaction.<a name="line.271"></a>
+<span class="sourceLineNo">272</span>   * &lt;p&gt;<a name="line.272"></a>
+<span class="sourceLineNo">273</span>   * Opens a scanner across specified StoreFiles/MemStoreSegments.<a name="line.273"></a>
+<span class="sourceLineNo">274</span>   * @param store who we scan<a name="line.274"></a>
+<span class="sourceLineNo">275</span>   * @param scanners ancillary scanners<a name="line.275"></a>
+<span class="sourceLineNo">276</span>   * @param smallestReadPoint the readPoint that we should use for tracking versions<a name="line.276"></a>
+<span class="sourceLineNo">277</span>   */<a name="line.277"></a>
+<span class="sourceLineNo">278</span>  public StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs) throws IOException {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    this(store, scanInfo, scanners, scanType, smallestReadPoint, earliestPutTs, null, null);<a name="line.280"></a>
+<span class="sourceLineNo">281</span>  }<a name="line.281"></a>
+<span class="sourceLineNo">282</span><a name="line.282"></a>
+<span class="sourceLineNo">283</span>  /**<a name="line.283"></a>
+<span class="sourceLineNo">284</span>   * Used for compactions that drop deletes from a limited range of rows.<a name="line.284"></a>
+<span class="sourceLineNo">285</span>   * &lt;p&gt;<a name="line.285"></a>
+<span class="sourceLineNo">286</span>   * Opens a scanner across specified StoreFiles.<a name="line.286"></a>
+<span class="sourceLineNo">287</span>   * @param store who we scan<a name="line.287"></a>
+<span class="sourceLineNo">288</span>   * @param scanners ancillary scanners<a name="line.288"></a>
+<span class="sourceLineNo">289</span>   * @param smallestReadPoint the readPoint that we should use for tracking versions<a name="line.289"></a>
+<span class="sourceLineNo">290</span>   * @param dropDeletesFromRow The inclusive left bound of the range; can be EMPTY_START_ROW.<a name="line.290"></a>
+<span class="sourceLineNo">291</span>   * @param dropDeletesToRow The exclusive right bound of the range; can be EMPTY_END_ROW.<a name="line.291"></a>
+<span class="sourceLineNo">292</span>   */<a name="line.292"></a>
+<span class="sourceLineNo">293</span>  public StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      long smallestReadPoint, long earliestPutTs, byte[] dropDeletesFromRow,<a name="line.294"></a>
+<span class="sourceLineNo">295</span>      byte[] dropDeletesToRow) throws IOException {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    this(store, scanInfo, scanners, ScanType.COMPACT_RETAIN_DELETES, smallestReadPoint,<a name="line.296"></a>
+<span class="sourceLineNo">297</span>        earliestPutTs, dropDeletesFromRow, dropDeletesToRow);<a name="line.297"></a>
+<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>  private StoreScanner(HStore store, ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      ScanType scanType, long smallestReadPoint, long earliestPutTs, byte[] dropDeletesFromRow,<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      byte[] dropDeletesToRow) throws IOException {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>    this(store, SCAN_FOR_COMPACTION, scanInfo, 0,<a name="line.303"></a>
+<span class="sourceLineNo">304</span>        store.getHRegion().getReadPoint(IsolationLevel.READ_COMMITTED), false, scanType);<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    assert scanType != ScanType.USER_SCAN;<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    matcher =<a name="line.306"></a>
+<span class="sourceLineNo">307</span>        CompactionScanQueryMatcher.create(scanInfo, scanType, smallestReadPoint, earliestPutTs,<a name="line.307"></a>
+<span class="sourceLineNo">308</span>          oldestUnexpiredTS, now, dropDeletesFromRow, dropDeletesToRow, store.getCoprocessorHost());<a name="line.308"></a>
 <span class="sourceLineNo">309</span><a name="line.309"></a>
-<span class="sourceLineNo">310</span>    // Seek all scanners to the initial key<a name="line.310"></a>
-<span class="sourceLineNo">311</span>    seekScanners(scanners, matcher.getStartKey(), false, parallelSeekEnabled);<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    addCurrentScanners(scanners);<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    // Combine all seeked scanners with a heap<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    resetKVHeap(scanners, store.getComparator());<a name="line.314"></a>
-<span class="sourceLineNo">315</span>  }<a name="line.315"></a>
-<span class="sourceLineNo">316</span><a name="line.316"></a>
-<span class="sourceLineNo">317</span>  private void seekAllScanner(ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners)<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      throws IOException {<a name="line.318"></a>
-<span class="sourceLineNo">319</span>    // Seek all scanners to the initial key<a name="line.319"></a>
-<span class="sourceLineNo">320</span>    seekScanners(scanners, matcher.getStartKey(), false, parallelSeekEnabled);<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    addCurrentScanners(scanners);<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    resetKVHeap(scanners, scanInfo.getComparator());<a name="line.322"></a>
-<span class="sourceLineNo">323</span>  }<a name="line.323"></a>
-<span class="sourceLineNo">324</span><a name="line.324"></a>
-<span class="sourceLineNo">325</span>  // For mob compaction only as we do not have a Store instance when doing mob compaction.<a name="line.325"></a>
-<span class="sourceLineNo">326</span>  public StoreScanner(ScanInfo scanInfo, ScanType scanType,<a name="line.326"></a>
-<span class="sourceLineNo">327</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.327"></a>
-<span class="sourceLineNo">328</span>    this(null, SCAN_FOR_COMPACTION, scanInfo, 0, Long.MAX_VALUE, false, scanType);<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    assert scanType != ScanType.USER_SCAN;<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    this.matcher = CompactionScanQueryMatcher.create(scanInfo, scanType, Long.MAX_VALUE, 0L,<a name="line.330"></a>
-<span class="sourceLineNo">331</span>      oldestUnexpiredTS, now, null, null, null);<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    seekAllScanner(scanInfo, scanners);<a name="line.332"></a>
-<span class="sourceLineNo">333</span>  }<a name="line.333"></a>
-<span class="sourceLineNo">334</span><a name="line.334"></a>
-<span class="sourceLineNo">335</span>  // Used to instantiate a scanner for user scan in test<a name="line.335"></a>
-<span class="sourceLineNo">336</span>  @VisibleForTesting<a name="line.336"></a>
-<span class="sourceLineNo">337</span>  StoreScanner(Scan scan, ScanInfo scanInfo, NavigableSet&lt;byte[]&gt; columns,<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    // 0 is passed as readpoint because the test bypasses Store<a name="line.339"></a>
-<span class="sourceLineNo">340</span>    this(null, scan, scanInfo, columns != null ? columns.size() : 0, 0L,<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        scan.getCacheBlocks(), ScanType.USER_SCAN);<a name="line.341"></a>
-<span class="sourceLineNo">342</span>    this.matcher =<a name="line.342"></a>
-<span class="sourceLineNo">343</span>        UserScanQueryMatcher.create(scan, scanInfo, columns, oldestUnexpiredTS, now, null);<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    seekAllScanner(scanInfo, scanners);<a name="line.344"></a>
-<span class="sourceLineNo">345</span>  }<a name="line.345"></a>
-<span class="sourceLineNo">346</span><a name="line.346"></a>
-<span class="sourceLineNo">347</span>  // Used to instantiate a scanner for compaction in test<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  @VisibleForTesting<a name="line.348"></a>
-<span class="sourceLineNo">349</span>  StoreScanner(ScanInfo scanInfo, OptionalInt maxVersions, ScanType scanType,<a name="line.349"></a>
-<span class="sourceLineNo">350</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>    // 0 is passed as readpoint because the test bypasses Store<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    this(null, maxVersions.isPresent() ? new Scan().readVersions(maxVersions.getAsInt())<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        : SCAN_FOR_COMPACTION, scanInfo, 0, 0L, false, scanType);<a name="line.353"></a>
-<span class="sourceLineNo">354</span>    this.matcher = CompactionScanQueryMatcher.create(scanInfo, scanType, Long.MAX_VALUE,<a name="line.354"></a>
-<span class="sourceLineNo">355</span>      HConstants.OLDEST_TIMESTAMP, oldestUnexpiredTS, now, null, null, null);<a name="line.355"></a>
-<span class="sourceLineNo">356</span>    seekAllScanner(scanInfo, scanners);<a name="line.356"></a>
-<span class="sourceLineNo">357</span>  }<a name="line.357"></a>
-<span class="sourceLineNo">358</span><a name="line.358"></a>
-<span class="sourceLineNo">359</span>  @VisibleForTesting<a name="line.359"></a>
-<span class="sourceLineNo">360</span>  boolean isScanUsePread() {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>    return this.scanUsePread;<a name="line.361"></a>
-<span class="sourceLineNo">362</span>  }<a name="line.362"></a>
-<span class="sourceLineNo">363</span>  /**<a name="line.363"></a>
-<span class="sourceLineNo">364</span>   * Seek the specified scanners with the given key<a name="line.364"></a>
-<span class="sourceLineNo">365</span>   * @param scanners<a name="line.365"></a>
-<span class="sourceLineNo">366</span>   * @param seekKey<a name="line.366"></a>
-<span class="sourceLineNo">367</span>   * @param isLazy true if using lazy seek<a name="line.367"></a>
-<span class="sourceLineNo">368</span>   * @param isParallelSeek true if using parallel seek<a name="line.368"></a>
-<span class="sourceLineNo">369</span>   * @throws IOException<a name="line.369"></a>
-<span class="sourceLineNo">370</span>   */<a name="line.370"></a>
-<span class="sourceLineNo">371</span>  protected void seekScanners(List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      Cell seekKey, boolean isLazy, boolean isParallelSeek)<a name="line.372"></a>
-<span class="sourceLineNo">373</span>      throws IOException {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>    // Seek all scanners to the start of the Row (or if the exact matching row<a name="line.374"></a>
-<span class="sourceLineNo">375</span>    // key does not exist, then to the start of the next matching Row).<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    // Always check bloom filter to optimize the top row seek for delete<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    // family marker.<a name="line.377"></a>
-<span class="sourceLineNo">378</span>    if (isLazy) {<a name="line.378"></a>
-<span class="sourceLineNo">379</span>      for (KeyValueScanner scanner : scanners) {<a name="line.379"></a>
-<span class="sourceLineNo">380</span>        scanner.requestSeek(seekKey, false, true);<a name="line.380"></a>
-<span class="sourceLineNo">381</span>      }<a name="line.381"></a>
-<span class="sourceLineNo">382</span>    } else {<a name="line.382"></a>
-<span class="sourceLineNo">383</span>      if (!isParallelSeek) {<a name="line.383"></a>
-<span class="sourceLineNo">384</span>        long totalScannersSoughtBytes = 0;<a name="line.384"></a>
-<span class="sourceLineNo">385</span>        for (KeyValueScanner scanner : scanners) {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>          if (matcher.isUserScan() &amp;&amp; totalScannersSoughtBytes &gt;= maxRowSize) {<a name="line.386"></a>
-<span class="sourceLineNo">387</span>            throw new RowTooBigException("Max row size allowed: " + maxRowSize<a name="line.387"></a>
-<span class="sourceLineNo">388</span>              + ", but row is bigger than that");<a name="line.388"></a>
-<span class="sourceLineNo">389</span>          }<a name="line.389"></a>
-<span class="sourceLineNo">390</span>          scanner.seek(seekKey);<a name="line.390"></a>
-<span class="sourceLineNo">391</span>          Cell c = scanner.peek();<a name="line.391"></a>
-<span class="sourceLineNo">392</span>          if (c != null) {<a name="line.392"></a>
-<span class="sourceLineNo">393</span>            totalScannersSoughtBytes += PrivateCellUtil.estimatedSerializedSizeOf(c);<a name="line.393"></a>
-<span class="sourceLineNo">394</span>          }<a name="line.394"></a>
-<span class="sourceLineNo">395</span>        }<a name="line.395"></a>
-<span class="sourceLineNo">396</span>      } else {<a name="line.396"></a>
-<span class="sourceLineNo">397</span>        parallelSeek(scanners, seekKey);<a name="line.397"></a>
-<span class="sourceLineNo">398</span>      }<a name="line.398"></a>
-<span class="sourceLineNo">399</span>    }<a name="line.399"></a>
-<span class="sourceLineNo">400</span>  }<a name="line.400"></a>
-<span class="sourceLineNo">401</span><a name="line.401"></a>
-<span class="sourceLineNo">402</span>  protected void resetKVHeap(List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.402"></a>
-<span class="sourceLineNo">403</span>      CellComparator comparator) throws IOException {<a name="line.403"></a>
-<span class="sourceLineNo">404</span>    // Combine all seeked scanners with a heap<a name="line.404"></a>
-<span class="sourceLineNo">405</span>    heap = new KeyValueHeap(scanners, comparator);<a name="line.405"></a>
-<span class="sourceLineNo">406</span>  }<a name="line.406"></a>
-<span class="sourceLineNo">407</span><a name="line.407"></a>
-<span class="sourceLineNo">408</span>  /**<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   * Filters the given list of scanners using Bloom filter, time range, and TTL.<a name="line.409"></a>
-<span class="sourceLineNo">410</span>   * &lt;p&gt;<a name="line.410"></a>
-<span class="sourceLineNo">411</span>   * Will be overridden by testcase so declared as protected.<a name="line.411"></a>
-<span class="sourceLineNo">412</span>   */<a name="line.412"></a>
-<span class="sourceLineNo">413</span>  @VisibleForTesting<a name="line.413"></a>
-<span class="sourceLineNo">414</span>  protected List&lt;KeyValueScanner&gt; selectScannersFrom(HStore store,<a name="line.414"></a>
-<span class="sourceLineNo">415</span>      List&lt;? extends KeyValueScanner&gt; allScanners) {<a name="line.415"></a>
-<span class="sourceLineNo">416</span>    boolean memOnly;<a name="line.416"></a>
-<span class="sourceLineNo">417</span>    boolean filesOnly;<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    if (scan instanceof InternalScan) {<a name="line.418"></a>
-<span class="sourceLineNo">419</span>      InternalScan iscan = (InternalScan) scan;<a name="line.419"></a>
-<span class="sourceLineNo">420</span>      memOnly = iscan.isCheckOnlyMemStore();<a name="line.420"></a>
-<span class="sourceLineNo">421</span>      filesOnly = iscan.isCheckOnlyStoreFiles();<a name="line.421"></a>
-<span class="sourceLineNo">422</span>    } else {<a name="line.422"></a>
-<span class="sourceLineNo">423</span>      memOnly = false;<a name="line.423"></a>
-<span class="sourceLineNo">424</span>      filesOnly = false;<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
-<span class="sourceLineNo">426</span><a name="line.426"></a>
-<span class="sourceLineNo">427</span>    List&lt;KeyValueScanner&gt; scanners = new ArrayList&lt;&gt;(allScanners.size());<a name="line.427"></a>
-<span class="sourceLineNo">428</span><a name="line.428"></a>
-<span class="sourceLineNo">429</span>    // We can only exclude store files based on TTL if minVersions is set to 0.<a name="line.429"></a>
-<span class="sourceLineNo">430</span>    // Otherwise, we might have to return KVs that have technically expired.<a name="line.430"></a>
-<span class="sourceLineNo">431</span>    long expiredTimestampCutoff = minVersions == 0 ? oldestUnexpiredTS : Long.MIN_VALUE;<a name="line.431"></a>
-<span class="sourceLineNo">432</span><a name="line.432"></a>
-<span class="sourceLineNo">433</span>    // include only those scan files which pass all filters<a name="line.433"></a>
-<span class="sourceLineNo">434</span>    for (KeyValueScanner kvs : allScanners) {<a name="line.434"></a>
-<span class="sourceLineNo">435</span>      boolean isFile = kvs.isFileScanner();<a name="line.435"></a>
-<span class="sourceLineNo">436</span>      if ((!isFile &amp;&amp; filesOnly) || (isFile &amp;&amp; memOnly)) {<a name="line.436"></a>
-<span class="sourceLineNo">437</span>        continue;<a name="line.437"></a>
-<span class="sourceLineNo">438</span>      }<a name="line.438"></a>
-<span class="sourceLineNo">439</span><a name="line.439"></a>
-<span class="sourceLineNo">440</span>      if (kvs.shouldUseScanner(scan, store, expiredTimestampCutoff)) {<a name="line.440"></a>
-<span class="sourceLineNo">441</span>        scanners.add(kvs);<a name="line.441"></a>
-<span class="sourceLineNo">442</span>      } else {<a name="line.442"></a>
-<span class="sourceLineNo">443</span>        kvs.close();<a name="line.443"></a>
-<span class="sourceLineNo">444</span>      }<a name="line.444"></a>
-<span class="sourceLineNo">445</span>    }<a name="line.445"></a>
-<span class="sourceLineNo">446</span>    return scanners;<a name="line.446"></a>
-<span class="sourceLineNo">447</span>  }<a name="line.447"></a>
-<span class="sourceLineNo">448</span><a name="line.448"></a>
-<span class="sourceLineNo">449</span>  @Override<a name="line.449"></a>
-<span class="sourceLineNo">450</span>  public Cell peek() {<a name="line.450"></a>
-<span class="sourceLineNo">451</span>    return heap != null ? heap.peek() : null;<a name="line.451"></a>
-<span class="sourceLineNo">452</span>  }<a name="line.452"></a>
-<span class="sourceLineNo">453</span><a name="line.453"></a>
-<span class="sourceLineNo">454</span>  @Override<a name="line.454"></a>
-<span class="sourceLineNo">455</span>  public KeyValue next() {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>    // throw runtime exception perhaps?<a name="line.456"></a>
-<span class="sourceLineNo">457</span>    throw new RuntimeException("Never call StoreScanner.next()");<a name="line.457"></a>
-<span class="sourceLineNo">458</span>  }<a name="line.458"></a>
-<span class="sourceLineNo">459</span><a name="line.459"></a>
-<span class="sourceLineNo">460</span>  @Override<a name="line.460"></a>
-<span class="sourceLineNo">461</span>  public void close() {<a name="line.461"></a>
-<span class="sourceLineNo">462</span>    close(true);<a name="line.462"></a>
-<span class="sourceLineNo">463</span>  }<a name="line.463"></a>
-<span class="sourceLineNo">464</span><a name="line.464"></a>
-<span class="sourceLineNo">465</span>  private void close(boolean withDelayedScannersClose) {<a name="line.465"></a>
-<span class="sourceLineNo">466</span>    if (this.closing) {<a name="line.466"></a>
-<span class="sourceLineNo">467</span>      return;<a name="line.467"></a>
-<span class="sourceLineNo">468</span>    }<a name="line.468"></a>
-<span class="sourceLineNo">469</span>    if (withDelayedScannersClose) {<a name="line.469"></a>
-<span class="sourceLineNo">470</span>      this.closing = true;<a name="line.470"></a>
+<span class="sourceLineNo">310</span>    // Filter the list of scanners using Bloom filters, time range, TTL, etc.<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    scanners = selectScannersFrom(store, scanners);<a name="line.311"></a>
+<span class="sourceLineNo">312</span><a name="line.312"></a>
+<span class="sourceLineNo">313</span>    // Seek all scanners to the initial key<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    seekScanners(scanners, matcher.getStartKey(), false, parallelSeekEnabled);<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    addCurrentScanners(scanners);<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    // Combine all seeked scanners with a heap<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    resetKVHeap(scanners, comparator);<a name="line.317"></a>
+<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
+<span class="sourceLineNo">319</span><a name="line.319"></a>
+<span class="sourceLineNo">320</span>  private void seekAllScanner(ScanInfo scanInfo, List&lt;? extends KeyValueScanner&gt; scanners)<a name="line.320"></a>
+<span class="sourceLineNo">321</span>      throws IOException {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    // Seek all scanners to the initial key<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    seekScanners(scanners, matcher.getStartKey(), false, parallelSeekEnabled);<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    addCurrentScanners(scanners);<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    resetKVHeap(scanners, comparator);<a name="line.325"></a>
+<span class="sourceLineNo">326</span>  }<a name="line.326"></a>
+<span class="sourceLineNo">327</span><a name="line.327"></a>
+<span class="sourceLineNo">328</span>  // For mob compaction only as we do not have a Store instance when doing mob compaction.<a name="line.328"></a>
+<span class="sourceLineNo">329</span>  public StoreScanner(ScanInfo scanInfo, ScanType scanType,<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>    this(null, SCAN_FOR_COMPACTION, scanInfo, 0, Long.MAX_VALUE, false, scanType);<a name="line.331"></a>
+<span class="sourceLineNo">332</span>    assert scanType != ScanType.USER_SCAN;<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    this.matcher = CompactionScanQueryMatcher.create(scanInfo, scanType, Long.MAX_VALUE, 0L,<a name="line.333"></a>
+<span class="sourceLineNo">334</span>      oldestUnexpiredTS, now, null, null, null);<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    seekAllScanner(scanInfo, scanners);<a name="line.335"></a>
+<span class="sourceLineNo">336</span>  }<a name="line.336"></a>
+<span class="sourceLineNo">337</span><a name="line.337"></a>
+<span class="sourceLineNo">338</span>  // Used to instantiate a scanner for user scan in test<a name="line.338"></a>
+<span class="sourceLineNo">339</span>  @VisibleForTesting<a name="line.339"></a>
+<span class="sourceLineNo">340</span>  StoreScanner(Scan scan, ScanInfo scanInfo, NavigableSet&lt;byte[]&gt; columns,<a name="line.340"></a>
+<span class="sourceLineNo">341</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.341"></a>
+<span class="sourceLineNo">342</span>    // 0 is passed as readpoint because the test bypasses Store<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    this(null, scan, scanInfo, columns != null ? columns.size() : 0, 0L,<a name="line.343"></a>
+<span class="sourceLineNo">344</span>        scan.getCacheBlocks(), ScanType.USER_SCAN);<a name="line.344"></a>
+<span class="sourceLineNo">345</span>    this.matcher =<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        UserScanQueryMatcher.create(scan, scanInfo, columns, oldestUnexpiredTS, now, null);<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    seekAllScanner(scanInfo, scanners);<a name="line.347"></a>
+<span class="sourceLineNo">348</span>  }<a name="line.348"></a>
+<span class="sourceLineNo">349</span><a name="line.349"></a>
+<span class="sourceLineNo">350</span>  // Used to instantiate a scanner for compaction in test<a name="line.350"></a>
+<span class="sourceLineNo">351</span>  @VisibleForTesting<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  StoreScanner(ScanInfo scanInfo, OptionalInt maxVersions, ScanType scanType,<a name="line.352"></a>
+<span class="sourceLineNo">353</span>      List&lt;? extends KeyValueScanner&gt; scanners) throws IOException {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>    // 0 is passed as readpoint because the test bypasses Store<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    this(null, maxVersions.isPresent() ? new Scan().readVersions(maxVersions.getAsInt())<a name="line.355"></a>
+<span class="sourceLineNo">356</span>        : SCAN_FOR_COMPACTION, scanInfo, 0, 0L, false, scanType);<a name="line.356"></a>
+<span class="sourceLineNo">357</span>    this.matcher = CompactionScanQueryMatcher.create(scanInfo, scanType, Long.MAX_VALUE,<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      HConstants.OLDEST_TIMESTAMP, oldestUnexpiredTS, now, null, null, null);<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    seekAllScanner(scanInfo, scanners);<a name="line.359"></a>
+<span class="sourceLineNo">360</span>  }<a name="line.360"></a>
+<span class="sourceLineNo">361</span><a name="line.361"></a>
+<span class="sourceLineNo">362</span>  @VisibleForTesting<a name="line.362"></a>
+<span class="sourceLineNo">363</span>  boolean isScanUsePread() {<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    return this.scanUsePread;<a name="line.364"></a>
+<span class="sourceLineNo">365</span>  }<a name="line.365"></a>
+<span class="sourceLineNo">366</span>  /**<a name="line.366"></a>
+<span class="sourceLineNo">367</span>   * Seek the specified scanners with the given key<a name="line.367"></a>
+<span class="sourceLineNo">368</span>   * @param scanners<a name="line.368"></a>
+<span class="sourceLineNo">369</span>   * @param seekKey<a name="line.369"></a>
+<span class="sourceLineNo">370</span>   * @param isLazy true if using lazy seek<a name="line.370"></a>
+<span class="sourceLineNo">371</span>   * @param isParallelSeek true if using parallel seek<a name="line.371"></a>
+<span class="sourceLineNo">372</span>   * @throws IOException<a name="line.372"></a>
+<span class="sourceLineNo">373</span>   */<a name="line.373"></a>
+<span class="sourceLineNo">374</span>  protected void seekScanners(List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      Cell seekKey, boolean isLazy, boolean isParallelSeek)<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      throws IOException {<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    // Seek all scanners to the start of the Row (or if the exact matching row<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    // key does not exist, then to the start of the next matching Row).<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    // Always check bloom filter to optimize the top row seek for delete<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    // family marker.<a name="line.380"></a>
+<span class="sourceLineNo">381</span>    if (isLazy) {<a name="line.381"></a>
+<span class="sourceLineNo">382</span>      for (KeyValueScanner scanner : scanners) {<a name="line.382"></a>
+<span class="sourceLineNo">383</span>        scanner.requestSeek(seekKey, false, true);<a name="line.383"></a>
+<span class="sourceLineNo">384</span>      }<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    } else {<a name="line.385"></a>
+<span class="sourceLineNo">386</span>      if (!isParallelSeek) {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>        long totalScannersSoughtBytes = 0;<a name="line.387"></a>
+<span class="sourceLineNo">388</span>        for (KeyValueScanner scanner : scanners) {<a name="line.388"></a>
+<span class="sourceLineNo">389</span>          if (matcher.isUserScan() &amp;&amp; totalScannersSoughtBytes &gt;= maxRowSize) {<a name="line.389"></a>
+<span class="sourceLineNo">390</span>            throw new RowTooBigException("Max row size allowed: " + maxRowSize<a name="line.390"></a>
+<span class="sourceLineNo">391</span>              + ", but row is bigger than that");<a name="line.391"></a>
+<span class="sourceLineNo">392</span>          }<a name="line.392"></a>
+<span class="sourceLineNo">393</span>          scanner.seek(seekKey);<a name="line.393"></a>
+<span class="sourceLineNo">394</span>          Cell c = scanner.peek();<a name="line.394"></a>
+<span class="sourceLineNo">395</span>          if (c != null) {<a name="line.395"></a>
+<span class="sourceLineNo">396</span>            totalScannersSoughtBytes += PrivateCellUtil.estimatedSerializedSizeOf(c);<a name="line.396"></a>
+<span class="sourceLineNo">397</span>          }<a name="line.397"></a>
+<span class="sourceLineNo">398</span>        }<a name="line.398"></a>
+<span class="sourceLineNo">399</span>      } else {<a name="line.399"></a>
+<span class="sourceLineNo">400</span>        parallelSeek(scanners, seekKey);<a name="line.400"></a>
+<span class="sourceLineNo">401</span>      }<a name="line.401"></a>
+<span class="sourceLineNo">402</span>    }<a name="line.402"></a>
+<span class="sourceLineNo">403</span>  }<a name="line.403"></a>
+<span class="sourceLineNo">404</span><a name="line.404"></a>
+<span class="sourceLineNo">405</span>  protected void resetKVHeap(List&lt;? extends KeyValueScanner&gt; scanners,<a name="line.405"></a>
+<span class="sourceLineNo">406</span>      CellComparator comparator) throws IOException {<a name="line.406"></a>
+<span class="sourceLineNo">407</span>    // Combine all seeked scanners with a heap<a name="line.407"></a>
+<span class="sourceLineNo">408</span>    heap = new KeyValueHeap(scanners, comparator);<a name="line.408"></a>
+<span class="sourceLineNo">409</span>  }<a name="line.409"></a>
+<span class="sourceLineNo">410</span><a name="line.410"></a>
+<span class="sourceLineNo">411</span>  /**<a name="line.411"></a>
+<span class="sourceLineNo">412</span>   * Filters the given list of scanners using Bloom filter, time range, and TTL.<a name="line.412"></a>
+<span class="sourceLineNo">413</span>   * &lt;p&gt;<a name="line.413"></a>
+<span class="sourceLineNo">414</span>   * Will be overridden by testcase so declared as protected.<a name="line.414"></a>
+<span class="sourceLineNo">415</span>   */<a name="line.415"></a>
+<span class="sourceLineNo">416</span>  @VisibleForTesting<a name="line.416"></a>
+<span class="sourceLineNo">417</span>  protected List&lt;KeyValueScanner&gt; selectScannersFrom(HStore store,<a name="line.417"></a>
+<span class="sourceLineNo">418</span>      List&lt;? extends KeyValueScanner&gt; allScanners) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>    boolean memOnly;<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    boolean filesOnly;<a name="line.420"></a>
+<span class="sourceLineNo">421</span>    if (scan instanceof InternalScan) {<a name="line.421"></a>
+<span class="sourceLineNo">422</span>      InternalScan iscan = (InternalScan) scan;<a name="line.422"></a>
+<span class="sourceLineNo">423</span>      memOnly = iscan.isCheckOnlyMemStore();<a name="line.423"></a>
+<span class="sourceLineNo">424</span>      filesOnly = iscan.isCheckOnlyStoreFiles();<a name="line.424"></a>
+<span class="sourceLineNo">425</span>    } else {<a name="line.425"></a>
+<span class="sourceLineNo">426</span>      memOnly = false;<a name="line.426"></a>
+<span class="sourceLineNo">427</span>      filesOnly = false;<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    }<a name="line.428"></a>
+<span class="sourceLineNo">429</span><a name="line.429"></a>
+<span class="sourceLineNo">430</span>    List&lt;KeyValueScanner&gt; scanners = new ArrayList&lt;&gt;(allScanners.size());<a name="line.430"></a>
+<span class="sourceLineNo">431</span><a name="line.431"></a>
+<span class="sourceLineNo">432</span>    // We can only exclude store files based on TTL if minVersions is set to 0.<a name="line.432"></a>
+<span class="sourceLineNo">433</span>    // Otherwise, we might have to return KVs that have technically expired.<a name="line.433"></a>
+<span class="sourceLineNo">434</span>    long expiredTimestampCutoff = minVersions == 0 ? oldestUnexpiredTS : Long.MIN_VALUE;<a name="line.434"></a>
+<span class="sourceLineNo">435</span><a name="line.435"></a>
+<span class="sourceLineNo">436</span>    // include only those scan files which pass all filters<a name="line.436"></a>
+<span class="sourceLineNo">437</span>    for (KeyValueScanner kvs : allScanners) {<a name="line.437"></a>
+<span class="sourceLineNo">438</span>      boolean isFile = kvs.isFileScanner();<a name="line.438"></a>
+<span class="sourceLineNo">439</span>      if ((!isFile &amp;&amp; filesOnly) || (isFile &amp;&amp; memOnly)) {<a name="line.439"></a>
+<span class="sourceLineNo">440</span>        continue;<a name="line.440"></a>
+<span class="sourceLineNo">441</span>      }<a name="line.441"></a>
+<span class="sourceLineNo">442</span><a name="line.442"></a>
+<span class="sourceLineNo">443</span>      if (kvs.shouldUseScanner(scan, store, expiredTimestampCutoff)) {<a name="line.443"></a>
+<span class="sourceLineNo">444</span>        scanners.add(kvs);<a name="line.444"></a>
+<span class="sourceLineNo">445</span>      } else {<a name="line.445"></a>
+<span class="sourceLineNo">446</span>        kvs.close();<a name="line.446"></a>
+<span class="sourceLineNo">447</span>      }<a name="line.447"></a>
+<span class="sourceLineNo">448</span>    }<a name="line.448"></a>
+<span class="sourceLineNo">449</span>    return scanners;<a name="line.449"></a>
+<span class="sourceLineNo">450</span>  }<a name="line.450"></a>
+<span class="sourceLineNo">451</span><a name="line.451"></a>
+<span class="sourceLineNo">452</span>  @Override<a name="line.452"></a>
+<span class="sourceLineNo">453</span>  public Cell peek() {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>    return heap != null ? heap.peek() : null;<a name="line.454"></a>
+<span class="sourceLineNo">455</span>  }<a name="line.455"></a>
+<span class="sourceLineNo">456</span><a name="line.456"></a>
+<span class="sourceLineNo">457</span>  @Override<a name="line.457"></a>
+<span class="sourceLineNo">458</span>  public KeyValue next() {<a name="line.458"></a>
+<span class="sourceLineNo">459</span>    // throw runtime exception perhaps?<a name="line.459"></a>
+<span class="sourceLineNo">460</span>    throw new RuntimeException("Never call StoreScanner.next()");<a name="line.460"></a>
+<span class="sourceLineNo">461</span>  }<a name="line.461"></a>
+<span class="sourceLineNo">462</span><a name="line.462"></a>
+<span class="sourceLineNo">463</span>  @Override<a name="line.463"></a>
+<span class="sourceLineNo">464</span>  public void close() {<a name="line.464"></a>
+<span class="sourceLineNo">465</span>    close(true);<a name="line.465"></a>
+<span class="sourceLineNo">466</span>  }<a name="line.466"></a>
+<span class="sourceLineNo">467</span><a name="line.467"></a>
+<span class="sourceLineNo">468</span>  private void close(boolean withDelayedScannersClose) {<a name="line.468"></a>
+<span class="sourceLineNo">469</span>    if (this.closing) {<a name="line.469"></a>
+<span class="sourceLineNo">470</span>      return;<a name="line.470"></a>
 <span class="sourceLineNo">471</span>    }<a name="line.471"></a>
-<span class="sourceLineNo">472</span>    // For mob compaction, we do not have a store.<a name="line.472"></a>
-<span class="sourceLineNo">473</span>    if (this.store != null) {<a name="line.473"></a>
-<span class="sourceLineNo">474</span>      this.store.deleteChangedReaderObserver(this);<a name="line.474"></a>
-<span class="sourceLineNo">475</span>    }<a name="line.475"></a>
-<span class="sourceLineNo">476</span>    if (withDelayedScannersClose) {<a name="line.476"></a>
-<span class="sourceLineNo">477</span>      clearAndClose(scannersForDelayedClose);<a name="line.477"></a>
-<span class="sourceLineNo">478</span>      clearAndClose(memStoreScannersAfterFlush);<a name="line.478"></a>
-<span class="sourceLineNo">479</span>      if (this.heap != null) {<a name="line.479"></a>
-<span class="sourceLineNo">480</span>        this.heap.close();<a name="line.480"></a>
-<span class="sourceLineNo">481</span>        this.currentScanners.clear();<a name="line.481"></a>
-<span class="sourceLineNo">482</span>        this.heap = null; // CLOSED!<a name="line.482"></a>
-<span class="sourceLineNo">483</span>      }<a name="line.483"></a>
-<span class="sourceLineNo">484</span>    } else {<a name="line.484"></a>
-<span class="sourceLineNo">485</span>      if (this.heap != null) {<a name="line.485"></a>
-<span class="sourceLineNo">486</span>        this.scannersForDelayedClose.add(this.heap);<a name="line.486"></a>
-<span class="sourceLineNo">487</span>        this.currentScanners.clear();<a name="line.487"></a>
-<span class="sourceLineNo">488</span>        this.heap = null;<a name="line.488"></a>
-<span class="sourceLineNo">489</span>      }<a name="line.489"></a>
-<span class="sourceLineNo">490</span>    }<a name="line.490"></a>
-<span class="sourceLineNo">491</span>  }<a name="line.491"></a>
-<span class="sourceLineNo">492</span><a name="line.492"></a>
-<span class="sourceLineNo">493</span>  @Override<a name="line.493"></a>
-<span class="sourceLineNo">494</span>  public boolean seek(Cell key) throws IOException {<a name="line.494"></a>
-<span class="sourceLineNo">495</span>    if (checkFlushed()) {<a name="line.495"></a>
-<span class="sourceLineNo">496</span>      reopenAfterFlush();<a name="line.496"></a>
-<span class="sourceLineNo">497</span>    }<a name="line.497"></a>
-<span class="sourceLineNo">498</span>    return this.heap.seek(key);<a name="line.498"></a>
-<span class="sourceLineNo">499</span>  }<a name="line.499"></a>
-<span class="sourceLineNo">500</span><a name="line.500"></a>
-<span class="sourceLineNo">501</span>  /**<a name="line.501"></a>
-<span class="sourceLineNo">502</span>   * Get the next row of values from this Store.<a name="line.502"></a>
-<span class="sourceLineNo">503</span>   * @param outResult<a name="line.503"></a>
-<span class="sourceLineNo">504</span>   * @param scannerContext<a name="line.504"></a>
-<span class="sourceLineNo">505</span>   * @return true if there are more rows, false if scanner is done<a name="line.505"></a>
-<span class="sourceLineNo">506</span>   */<a name="line.506"></a>
-<span class="sourceLineNo">507</span>  @Override<a name="line.507"></a>
-<span class="sourceLineNo">508</span>  public boolean next(List&lt;Cell&gt; outResult, ScannerContext scannerContext) throws IOException {<a name="line.508"></a>
-<span class="sourceLineNo">509</span>    if (scannerContext == null) {<a name="line.509"></a>
-<span class="sourceLineNo">510</span>      throw new IllegalArgumentException("Scanner context cannot be null");<a name="line.510"></a>
-<span class="sourceLineNo">511</span>    }<a name="line.511"></a>
-<span class="sourceLineNo">512</span>    if (checkFlushed() &amp;&amp; reopenAfterFlush()) {<a name="line.512"></a>
-<span class="sourceLineNo">513</span>      return scannerContext.setScannerState(NextState.MORE_VALUES).hasMoreValues();<a name="line.513"></a>
+<span class="sourceLineNo">472</span>    if (withDelayedScannersClose) {<a name="line.472"></a>
+<span class="sourceLineNo">473</span>      this.closing = true;<a name="line.473"></a>
+<span class="sourceLineNo">474</span>    }<a name="line.474"></a>
+<span class="sourceLineNo">475</span>    // For mob compaction, we do not have a store.<a name="line.475"></a>
+<span class="sourceLineNo">476</span>    if (this.store != null) {<a name="line.476"></a>
+<span class="sourceLineNo">477</span>      this.store.deleteChangedReaderObserver(this);<a name="line.477"></a>
+<span class="sourceLineNo">478</span>    }<a name="line.478"></a>
+<span class="sourceLineNo">479</span>    if (withDelayedScannersClose) {<a name="line.479"></a>
+<span class="sourceLineNo">480</span>      clearAndClose(scannersForDelayedClose);<a name="line.480"></a>
+<span class="sourceLineNo">481</span>      clearAndClose(memStoreScannersAfterFlush);<a name="line.481"></a>
+<span class="sourceLineNo">482</span>      if (this.heap != null) {<a name="line.482"></a>
+<span class="sourceLineNo">483</span>        this.heap.close();<a name="line.483"></a>
+<span class="sourceLineNo">484</span>        this.currentScanners.clear();<a name="line.484"></a>
+<span class="sourceLineNo">485</span>        this.heap = null; // CLOSED!<a name="line.485"></a>
+<span class="sourceLineNo">486</span>      }<a name="line.486"></a>
+<span class="sourceLineNo">487</span>    } else {<a name="line.487"></a>
+<span class="sourceLineNo">488</span>      if (this.heap != null) {<a name="line.488"></a>
+<span class="sourceLineNo">489</span>        this.scannersForDelayedClose.add(this.heap);<a name="line.489"></a>
+<span class="sourceLineNo">490</span>        this.currentScanners.clear();<a name="line.490"></a>
+<span class="sourceLineNo">491</span>        this.heap = null;<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      }<a name="line.492"></a>
+<span class="sourceLineNo">493</span>    }<a name="line.493"></a>
+<span class="sourceLineNo">494</span>  }<a name="line.494"></a>
+<span class="sourceLineNo">495</span><a name="line.495"></a>
+<span class="sourceLineNo">496</span>  @Override<a name="line.496"></a>
+<span class="sourceLineNo">497</span>  public boolean seek(Cell key) throws IOException {<a name="line.497"></a>
+<span class="sourceLineNo">498</span>    if (checkFlushed()) {<a name="line.498"></a>
+<span class="sourceLineNo">499</span>      reopenAfterFlush();<a name="line.499"></a>
+<span class="sourceLineNo">500</span>    }<a name="line.500"></a>
+<span class="sourceLineNo">501</span>    return this.heap.seek(key);<a name="line.501"></a>
+<span class="sourceLineNo">502</span>  }<a name="line.502"></a>
+<span class="sourceLineNo">503</span><a name="line.503"></a>
+<span class="sourceLineNo">504</span>  /**<a name="line.504"></a>
+<span class="sourceLineNo">505</span>   * Get the next row of values from this Store.<a name="line.505"></a>
+<span class="sourceLineNo">506</span>   * @param outResult<a name="line.506"></a>
+<span class="sourceLineNo">507</span>   * @param scannerContext<a name="line.507"></a>
+<span class="sourceLineNo">508</span>   * @return true if there are more rows, false if scanner is done<a name="line.508"></a>
+<span class="sourceLineNo">509</span>   */<a name="line.509"></a>
+<span class="sourceLineNo">510</span>  @Override<a name="line.510"></a>
+<span class="sourceLineNo">511</span>  public boolean next(List&lt;Cell&gt; outResult, ScannerContext scannerContext) throws IOException {<a name="line.511"></a>
+<span class="sourceLineNo">512</span>    if (scannerContext == null) {<a name="line.512"></a>
+<span class="sourceLineNo">513</span>      throw new IllegalArgumentException("Scanner context cannot be null");<a name="line.513"></a>
 <span class="sourceLineNo">514</span>    }<a name="line.514"></a>
-<span class="sourceLineNo">515</span><a name="line.515"></a>
-<span class="sourceLineNo">516</span>    // if the heap was left null, then the scanners had previously run out anyways, close and<a name="line.516"></a>
-<span class="sourceLineNo">517</span>    // return.<a name="line.517"></a>
-<span class="sourceLineNo">518</span>    if (this.heap == null) {<a name="line.518"></a>
-<span class="sourceLineNo">519</span>      // By this time partial close should happened because already heap is null<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      close(false);// Do all cleanup except heap.close()<a name="line.520"></a>
-<span class="sourceLineNo">521</span>      return scannerContext.setScannerState(NextState.NO_MORE_VALUES).hasMoreValues();<a name="line.521"></a>
-<span class="sourceLineNo">522</span>    }<a name="line.522"></a>
-<span class="sourceLineNo">523</span><a name="line.523"></a>
-<span class="sourceLineNo">524</span>    Cell cell = this.heap.peek();<a name="line.524"></a>
-<span class="sourceLineNo">525</span>    if (cell == null) {<a name="line.525"></a>
-<span class="sourceLineNo">526</span>      close(false);// Do all cleanup except heap.close()<a name="line.526"></a>
-<span class="sourceLineNo">527</span>      return scannerContext.setScannerState(NextState.NO_MORE_VALUES).hasMoreValues();<a name="line.527"></a>
-<span class="sourceLineNo">528</span>    }<a name="line.528"></a>
-<span class="sourceLineNo">529</span><a name="line.529"></a>
-<span class="sourceLineNo">530</span>    // only call setRow if the row changes; avoids confusing the query matcher<a name="line.530"></a>
-<span class="sourceLineNo">531</span>    // if scanning intra-row<a name="line.531"></a>
+<span class="sourceLineNo">515</span>    if (checkFlushed() &amp;&amp; reopenAfterFlush()) {<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      return scannerContext.setScannerState(NextState.MORE_VALUES).hasMoreValues();<a name="line.516"></a>
+<span class="sourceLineNo">517</span>    }<a name="line.517"></a>
+<span class="sourceLineNo">518</span><a name="line.518"></a>
+<span class="sourceLineNo">519</span>    // if the heap was left null, then the scanners had previously run out anyways, close and<a name="line.519"></a>
+<span class="sourceLineNo">520</span>    // return.<a name="line.520"></a>
+<span class="sourceLineNo">521</span>    if (this.heap == null) {<a name="line.521"></a>
+<span class="sourceLineNo">522</span>      // By this time partial close should happened because already heap is null<a name="line.522"></a>
+<span class="sourceLineNo">523</span>      close(false);// Do all cleanup except heap.close()<a name="line.523"></a>
+<span class="sourceLineNo">524</span>      return scannerContext.setScannerState(NextState.NO_MORE_VALUES).hasMoreValues();<a name="line.524"></a>
+<span class="sourceLineNo">525</span>    }<a name="line.525"></a>
+<span class="sourceLineNo">526</span><a name="line.526"></a>
+<span class="sourceLineNo">527</span>    Cell cell = this.heap.peek();<a name="line.527"></a>
+<span class="sourceLineNo">528</span>    if (cell == null) {<a name="line.528"></a>
+<span class="sourceLineNo">529</span>      close(false);// Do all cleanup except heap.close()<a name="line.529"></a>
+<span class="sourceLineNo">530</span>      return scannerContext.setScannerState(NextState.NO_MORE_VALUES).hasMoreValues();<a name="line.530"></a>
+<span class="sourceLineNo">531</span>    }<a name="line.531"></a>
 <span class="sourceLineNo">532</span><a name="line.532"></a>
-<span class="sourceLineNo">533</span>    // If no limits exists in the scope LimitScope.Between_Cells then we are sure we are changing<a name="line.533"></a>
-<span class="sourceLineNo">534</span>    // rows. Else it is possible we are still traversing the same row so we must perform the row<a name="line.534"></a>
-<span class="sourceLineNo">535</span>    // comparison.<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    if (!scannerContext.hasAnyLimit(LimitScope.BETWEEN_CELLS) || matcher.currentRow() == null) {<a name="line.536"></a>
-<span class="sourceLineNo">537</span>      this.countPerRow = 0;<a name="line.537"></a>
-<span class="sourceLineNo">538</span>      matcher.setToNewRow(cell);<a name="line.538"></a>
-<span class="sourceLineNo">539</span>    }<a name="line.539"></a>
-<span class="sourceLineNo">540</span><a name="line.540"></a>
-<span class="sourceLineNo">541</span>    // Clear progress away unless invoker has indicated it should be kept.<a name="line.541"></a>
-<span class="sourceLineNo">542</span>    if (!scannerContext.getKeepProgress()) {<a name="line.542"></a>
-<span class="sourceLineNo">543</span>      scannerContext.clearProgress();<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    }<a name="line.544"></a>
-<span class="sourceLineNo">545</span><a name="line.545"></a>
-<span class="sourceLineNo">546</span>    // Only do a sanity-check if store and comparator are available.<a name="line.546"></a>
-<span class="sourceLineNo">547</span>    CellComparator comparator = store != null ? store.getComparator() : null;<a name="line.547"></a>
+<span class="sourceLineNo">533</span>    // only call setRow if the row changes; avoids confusing the query matcher<a name="line.533"></a>
+<span class="sourceLineNo">534</span>    // if scanning intra-row<a name="line.534"></a>
+<span class="sourceLineNo">535</span><a name="line.535"></a>
+<span class="sourceLineNo">536</span>    // If no limits exists in the scope LimitScope.Between_Cells then we are sure we are changing<a name="line.536"></a>
+<span class="sourceLineNo">537</span>    // rows. Else it is possible we are still traversing the same row so we must perform the row<a name="line.537"></a>
+<span class="sourceLineNo">538</span>    // comparison.<a name="line.538"></a>
+<span class="sourceLineNo">539</span>    if (!scannerContext.hasAnyLimit(LimitScope.BETWEEN_CELLS) || matcher.currentRow() == null) {<a name="line.539"></a>
+<span class="sourceLineNo">540</span>      this.countPerRow = 0;<a name="line.540"></a>
+<span class="sourceLineNo">541</span>      matcher.setToNewRow(cell);<a name="line.541"></a>
+<span class="sourceLineNo">542</span>    }<a name="line.542"></a>
+<span class="sourceLineNo">543</span><a name="line.543"></a>
+<span class="sourceLineNo">544</span>    // Clear progress away unless invoker has indicated it should be kept.<a name="line.544"></a>
+<span class="sourceLineNo">545</span>    if (!scannerContext.getKeepProgress()) {<a name="line.545"></a>
+<span class="sourceLineNo">546</span>      scannerContext.clearProgress();<a name="line.546"></a>
+<span class="sourceLineNo">547</span>    }<a name="line.547"></a>
 <span class="sourceLineNo">548</span><a name="line.548"></a>
 <span class="sourceLineNo">549</span>    int count = 0;<a name="line.549"></a>
 <span class="sourceLineNo">550</span>    long totalBytesRead = 0;<a name="line.550"></a>
@@ -1005,7 +1005,7 @@
 <span class="sourceLineNo">997</span>      newCurrentScanners = new ArrayList&lt;&gt;(fileScanners.size() + memstoreScanners.size());<a name="line.997"></a>
 <span class="sourceLineNo">998</span>      newCurrentScanners.addAll(fileScanners);<a name="line.998"></a>
 <span class="sourceLineNo">999</span>      newCurrentScanners.addAll(memstoreScanners);<a name="line.999"></a>
-<span class="sourceLineNo">1000</span>      newHeap = new KeyValueHeap(newCurrentScanners, store.getComparator());<a name="line.1000"></a>
+<span class="sourceLineNo">1000</span>      newHeap = new KeyValueHeap(newCurrentScanners, comparator);<a name="line.1000"></a>
 <span class="sourceLineNo">1001</span>    } catch (Exception e) {<a name="line.1001"></a>
 <span class="sourceLineNo">1002</span>      LOG.warn("failed to switch to stream read", e);<a name="line.1002"></a>
 <span class="sourceLineNo">1003</span>      if (fileScanners != null) {<a name="line.1003"></a>
