@@ -29,352 +29,351 @@
 <span class="sourceLineNo">021</span>import java.util.concurrent.ScheduledThreadPoolExecutor;<a name="line.21"></a>
 <span class="sourceLineNo">022</span>import java.util.concurrent.TimeUnit;<a name="line.22"></a>
 <span class="sourceLineNo">023</span><a name="line.23"></a>
-<span class="sourceLineNo">024</span>import org.apache.commons.logging.Log;<a name="line.24"></a>
-<span class="sourceLineNo">025</span>import org.apache.commons.logging.LogFactory;<a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.26"></a>
-<span class="sourceLineNo">027</span><a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.28"></a>
-<span class="sourceLineNo">029</span><a name="line.29"></a>
-<span class="sourceLineNo">030</span>/**<a name="line.30"></a>
-<span class="sourceLineNo">031</span> * ScheduledChore is a task performed on a period in hbase. ScheduledChores become active once<a name="line.31"></a>
-<span class="sourceLineNo">032</span> * scheduled with a {@link ChoreService} via {@link ChoreService#scheduleChore(ScheduledChore)}. The<a name="line.32"></a>
-<span class="sourceLineNo">033</span> * chore is run in a {@link ScheduledThreadPoolExecutor} and competes with other ScheduledChores for<a name="line.33"></a>
-<span class="sourceLineNo">034</span> * access to the threads in the core thread pool. If an unhandled exception occurs, the chore<a name="line.34"></a>
-<span class="sourceLineNo">035</span> * cancellation is logged. Implementers should consider whether or not the Chore will be able to<a name="line.35"></a>
-<span class="sourceLineNo">036</span> * execute within the defined period. It is bad practice to define a ScheduledChore whose execution<a name="line.36"></a>
-<span class="sourceLineNo">037</span> * time exceeds its period since it will try to hog one of the threads in the {@link ChoreService}'s<a name="line.37"></a>
-<span class="sourceLineNo">038</span> * thread pool.<a name="line.38"></a>
-<span class="sourceLineNo">039</span> * &lt;p&gt;<a name="line.39"></a>
-<span class="sourceLineNo">040</span> * Don't subclass ScheduledChore if the task relies on being woken up for something to do, such as<a name="line.40"></a>
-<span class="sourceLineNo">041</span> * an entry being added to a queue, etc.<a name="line.41"></a>
-<span class="sourceLineNo">042</span> */<a name="line.42"></a>
-<span class="sourceLineNo">043</span>@InterfaceAudience.Public<a name="line.43"></a>
-<span class="sourceLineNo">044</span>public abstract class ScheduledChore implements Runnable {<a name="line.44"></a>
-<span class="sourceLineNo">045</span>  private static final Log LOG = LogFactory.getLog(ScheduledChore.class);<a name="line.45"></a>
-<span class="sourceLineNo">046</span><a name="line.46"></a>
-<span class="sourceLineNo">047</span>  private final String name;<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>  /**<a name="line.49"></a>
-<span class="sourceLineNo">050</span>   * Default values for scheduling parameters should they be excluded during construction<a name="line.50"></a>
-<span class="sourceLineNo">051</span>   */<a name="line.51"></a>
-<span class="sourceLineNo">052</span>  private final static TimeUnit DEFAULT_TIME_UNIT = TimeUnit.MILLISECONDS;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>  private final static long DEFAULT_INITIAL_DELAY = 0;<a name="line.53"></a>
-<span class="sourceLineNo">054</span><a name="line.54"></a>
-<span class="sourceLineNo">055</span>  /**<a name="line.55"></a>
-<span class="sourceLineNo">056</span>   * Scheduling parameters. Used by ChoreService when scheduling the chore to run periodically<a name="line.56"></a>
-<span class="sourceLineNo">057</span>   */<a name="line.57"></a>
-<span class="sourceLineNo">058</span>  private final int period; // in TimeUnit units<a name="line.58"></a>
-<span class="sourceLineNo">059</span>  private final TimeUnit timeUnit;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>  private final long initialDelay; // in TimeUnit units<a name="line.60"></a>
-<span class="sourceLineNo">061</span><a name="line.61"></a>
-<span class="sourceLineNo">062</span>  /**<a name="line.62"></a>
-<span class="sourceLineNo">063</span>   * Interface to the ChoreService that this ScheduledChore is scheduled with. null if the chore is<a name="line.63"></a>
-<span class="sourceLineNo">064</span>   * not scheduled.<a name="line.64"></a>
-<span class="sourceLineNo">065</span>   */<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  private ChoreServicer choreServicer;<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>  /**<a name="line.68"></a>
-<span class="sourceLineNo">069</span>   * Variables that encapsulate the meaningful state information<a name="line.69"></a>
-<span class="sourceLineNo">070</span>   */<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  private long timeOfLastRun = -1; // system time millis<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private long timeOfThisRun = -1; // system time millis<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private boolean initialChoreComplete = false;<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  /**<a name="line.75"></a>
-<span class="sourceLineNo">076</span>   * A means by which a ScheduledChore can be stopped. Once a chore recognizes that it has been<a name="line.76"></a>
-<span class="sourceLineNo">077</span>   * stopped, it will cancel itself. This is particularly useful in the case where a single stopper<a name="line.77"></a>
-<span class="sourceLineNo">078</span>   * instance is given to multiple chores. In such a case, a single {@link Stoppable#stop(String)}<a name="line.78"></a>
-<span class="sourceLineNo">079</span>   * command can cause many chores to stop together.<a name="line.79"></a>
-<span class="sourceLineNo">080</span>   */<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private final Stoppable stopper;<a name="line.81"></a>
-<span class="sourceLineNo">082</span><a name="line.82"></a>
-<span class="sourceLineNo">083</span>  interface ChoreServicer {<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    /**<a name="line.84"></a>
-<span class="sourceLineNo">085</span>     * Cancel any ongoing schedules that this chore has with the implementer of this interface.<a name="line.85"></a>
-<span class="sourceLineNo">086</span>     */<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    public void cancelChore(ScheduledChore chore);<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    public void cancelChore(ScheduledChore chore, boolean mayInterruptIfRunning);<a name="line.88"></a>
-<span class="sourceLineNo">089</span><a name="line.89"></a>
-<span class="sourceLineNo">090</span>    /**<a name="line.90"></a>
-<span class="sourceLineNo">091</span>     * @return true when the chore is scheduled with the implementer of this interface<a name="line.91"></a>
-<span class="sourceLineNo">092</span>     */<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    public boolean isChoreScheduled(ScheduledChore chore);<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>    /**<a name="line.95"></a>
-<span class="sourceLineNo">096</span>     * This method tries to execute the chore immediately. If the chore is executing at the time of<a name="line.96"></a>
-<span class="sourceLineNo">097</span>     * this call, the chore will begin another execution as soon as the current execution finishes<a name="line.97"></a>
-<span class="sourceLineNo">098</span>     * &lt;p&gt;<a name="line.98"></a>
-<span class="sourceLineNo">099</span>     * If the chore is not scheduled with a ChoreService, this call will fail.<a name="line.99"></a>
-<span class="sourceLineNo">100</span>     * @return false when the chore could not be triggered immediately<a name="line.100"></a>
-<span class="sourceLineNo">101</span>     */<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    public boolean triggerNow(ScheduledChore chore);<a name="line.102"></a>
-<span class="sourceLineNo">103</span><a name="line.103"></a>
-<span class="sourceLineNo">104</span>    /**<a name="line.104"></a>
-<span class="sourceLineNo">105</span>     * A callback that tells the implementer of this interface that one of the scheduled chores is<a name="line.105"></a>
-<span class="sourceLineNo">106</span>     * missing its start time. The implication of a chore missing its start time is that the<a name="line.106"></a>
-<span class="sourceLineNo">107</span>     * service's current means of scheduling may not be sufficient to handle the number of ongoing<a name="line.107"></a>
-<span class="sourceLineNo">108</span>     * chores (the other explanation is that the chore's execution time is greater than its<a name="line.108"></a>
-<span class="sourceLineNo">109</span>     * scheduled period). The service should try to increase its concurrency when this callback is<a name="line.109"></a>
-<span class="sourceLineNo">110</span>     * received.<a name="line.110"></a>
-<span class="sourceLineNo">111</span>     * @param chore The chore that missed its start time<a name="line.111"></a>
-<span class="sourceLineNo">112</span>     */<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    public void onChoreMissedStartTime(ScheduledChore chore);<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  }<a name="line.114"></a>
-<span class="sourceLineNo">115</span><a name="line.115"></a>
-<span class="sourceLineNo">116</span>  /**<a name="line.116"></a>
-<span class="sourceLineNo">117</span>   * This constructor is for test only. It allows us to create an object and to call chore() on it.<a name="line.117"></a>
-<span class="sourceLineNo">118</span>   */<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  @InterfaceAudience.Private<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  @VisibleForTesting<a name="line.120"></a>
-<span class="sourceLineNo">121</span>  protected ScheduledChore() {<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    this.name = null;<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    this.stopper = null;<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    this.period = 0;<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    this.initialDelay = DEFAULT_INITIAL_DELAY;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    this.timeUnit = DEFAULT_TIME_UNIT;<a name="line.126"></a>
-<span class="sourceLineNo">127</span>  }<a name="line.127"></a>
-<span class="sourceLineNo">128</span><a name="line.128"></a>
-<span class="sourceLineNo">129</span>  /**<a name="line.129"></a>
-<span class="sourceLineNo">130</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.130"></a>
-<span class="sourceLineNo">131</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.131"></a>
-<span class="sourceLineNo">132</span>   * @param period Period in millis with which this Chore repeats execution when scheduled.<a name="line.132"></a>
-<span class="sourceLineNo">133</span>   */<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  public ScheduledChore(final String name, Stoppable stopper, final int period) {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    this(name, stopper, period, DEFAULT_INITIAL_DELAY);<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  }<a name="line.136"></a>
-<span class="sourceLineNo">137</span><a name="line.137"></a>
-<span class="sourceLineNo">138</span>  /**<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   * @param period Period in millis with which this Chore repeats execution when scheduled.<a name="line.141"></a>
-<span class="sourceLineNo">142</span>   * @param initialDelay Delay before this Chore begins to execute once it has been scheduled. A<a name="line.142"></a>
-<span class="sourceLineNo">143</span>   *          value of 0 means the chore will begin to execute immediately. Negative delays are<a name="line.143"></a>
-<span class="sourceLineNo">144</span>   *          invalid and will be corrected to a value of 0.<a name="line.144"></a>
-<span class="sourceLineNo">145</span>   */<a name="line.145"></a>
-<span class="sourceLineNo">146</span>  public ScheduledChore(final String name, Stoppable stopper, final int period,<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      final long initialDelay) {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    this(name, stopper, period, initialDelay, DEFAULT_TIME_UNIT);<a name="line.148"></a>
-<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
-<span class="sourceLineNo">150</span><a name="line.150"></a>
-<span class="sourceLineNo">151</span>  /**<a name="line.151"></a>
-<span class="sourceLineNo">152</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.153"></a>
-<span class="sourceLineNo">154</span>   * @param period Period in Timeunit unit with which this Chore repeats execution when scheduled.<a name="line.154"></a>
-<span class="sourceLineNo">155</span>   * @param initialDelay Delay in Timeunit unit before this Chore begins to execute once it has been<a name="line.155"></a>
-<span class="sourceLineNo">156</span>   *          scheduled. A value of 0 means the chore will begin to execute immediately. Negative<a name="line.156"></a>
-<span class="sourceLineNo">157</span>   *          delays are invalid and will be corrected to a value of 0.<a name="line.157"></a>
-<span class="sourceLineNo">158</span>   * @param unit The unit that is used to measure period and initialDelay<a name="line.158"></a>
-<span class="sourceLineNo">159</span>   */<a name="line.159"></a>
-<span class="sourceLineNo">160</span>  public ScheduledChore(final String name, Stoppable stopper, final int period,<a name="line.160"></a>
-<span class="sourceLineNo">161</span>      final long initialDelay, final TimeUnit unit) {<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    this.name = name;<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    this.stopper = stopper;<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    this.period = period;<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    this.initialDelay = initialDelay &lt; 0 ? 0 : initialDelay;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    this.timeUnit = unit;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>  }<a name="line.167"></a>
-<span class="sourceLineNo">168</span><a name="line.168"></a>
-<span class="sourceLineNo">169</span>  /**<a name="line.169"></a>
-<span class="sourceLineNo">170</span>   * @see java.lang.Runnable#run()<a name="line.170"></a>
-<span class="sourceLineNo">171</span>   */<a name="line.171"></a>
-<span class="sourceLineNo">172</span>  @Override<a name="line.172"></a>
-<span class="sourceLineNo">173</span>  public void run() {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    updateTimeTrackingBeforeRun();<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    if (missedStartTime() &amp;&amp; isScheduled()) {<a name="line.175"></a>
-<span class="sourceLineNo">176</span>      onChoreMissedStartTime();<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      if (LOG.isInfoEnabled()) LOG.info("Chore: " + getName() + " missed its start time");<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    } else if (stopper.isStopped() || !isScheduled()) {<a name="line.178"></a>
-<span class="sourceLineNo">179</span>      cancel(false);<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      cleanup();<a name="line.180"></a>
-<span class="sourceLineNo">181</span>      if (LOG.isInfoEnabled()) LOG.info("Chore: " + getName() + " was stopped");<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    } else {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      try {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>        if (!initialChoreComplete) {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>          initialChoreComplete = initialChore();<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        } else {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>          chore();<a name="line.187"></a>
-<span class="sourceLineNo">188</span>        }<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      } catch (Throwable t) {<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        if (LOG.isErrorEnabled()) LOG.error("Caught error", t);<a name="line.190"></a>
-<span class="sourceLineNo">191</span>        if (this.stopper.isStopped()) {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>          cancel(false);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>          cleanup();<a name="line.193"></a>
-<span class="sourceLineNo">194</span>        }<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      }<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    }<a name="line.196"></a>
-<span class="sourceLineNo">197</span>  }<a name="line.197"></a>
-<span class="sourceLineNo">198</span><a name="line.198"></a>
-<span class="sourceLineNo">199</span>  /**<a name="line.199"></a>
-<span class="sourceLineNo">200</span>   * Update our time tracking members. Called at the start of an execution of this chore's run()<a name="line.200"></a>
-<span class="sourceLineNo">201</span>   * method so that a correct decision can be made as to whether or not we missed the start time<a name="line.201"></a>
-<span class="sourceLineNo">202</span>   */<a name="line.202"></a>
-<span class="sourceLineNo">203</span>  private synchronized void updateTimeTrackingBeforeRun() {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    timeOfLastRun = timeOfThisRun;<a name="line.204"></a>
-<span class="sourceLineNo">205</span>    timeOfThisRun = System.currentTimeMillis();<a name="line.205"></a>
-<span class="sourceLineNo">206</span>  }<a name="line.206"></a>
-<span class="sourceLineNo">207</span><a name="line.207"></a>
-<span class="sourceLineNo">208</span>  /**<a name="line.208"></a>
-<span class="sourceLineNo">209</span>   * Notify the ChoreService that this chore has missed its start time. Allows the ChoreService to<a name="line.209"></a>
-<span class="sourceLineNo">210</span>   * make the decision as to whether or not it would be worthwhile to increase the number of core<a name="line.210"></a>
-<span class="sourceLineNo">211</span>   * pool threads<a name="line.211"></a>
-<span class="sourceLineNo">212</span>   */<a name="line.212"></a>
-<span class="sourceLineNo">213</span>  private synchronized void onChoreMissedStartTime() {<a name="line.213"></a>
-<span class="sourceLineNo">214</span>    if (choreServicer != null) choreServicer.onChoreMissedStartTime(this);<a name="line.214"></a>
-<span class="sourceLineNo">215</span>  }<a name="line.215"></a>
-<span class="sourceLineNo">216</span><a name="line.216"></a>
-<span class="sourceLineNo">217</span>  /**<a name="line.217"></a>
-<span class="sourceLineNo">218</span>   * @return How long in millis has it been since this chore last run. Useful for checking if the<a name="line.218"></a>
-<span class="sourceLineNo">219</span>   *         chore has missed its scheduled start time by too large of a margin<a name="line.219"></a>
-<span class="sourceLineNo">220</span>   */<a name="line.220"></a>
-<span class="sourceLineNo">221</span>  synchronized long getTimeBetweenRuns() {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    return timeOfThisRun - timeOfLastRun;<a name="line.222"></a>
-<span class="sourceLineNo">223</span>  }<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>  /**<a name="line.225"></a>
-<span class="sourceLineNo">226</span>   * @return true when the time between runs exceeds the acceptable threshold<a name="line.226"></a>
-<span class="sourceLineNo">227</span>   */<a name="line.227"></a>
-<span class="sourceLineNo">228</span>  private synchronized boolean missedStartTime() {<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    return isValidTime(timeOfLastRun) &amp;&amp; isValidTime(timeOfThisRun)<a name="line.229"></a>
-<span class="sourceLineNo">230</span>        &amp;&amp; getTimeBetweenRuns() &gt; getMaximumAllowedTimeBetweenRuns();<a name="line.230"></a>
-<span class="sourceLineNo">231</span>  }<a name="line.231"></a>
-<span class="sourceLineNo">232</span><a name="line.232"></a>
-<span class="sourceLineNo">233</span>  /**<a name="line.233"></a>
-<span class="sourceLineNo">234</span>   * @return max allowed time in millis between runs.<a name="line.234"></a>
-<span class="sourceLineNo">235</span>   */<a name="line.235"></a>
-<span class="sourceLineNo">236</span>  private double getMaximumAllowedTimeBetweenRuns() {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    // Threshold used to determine if the Chore's current run started too late<a name="line.237"></a>
-<span class="sourceLineNo">238</span>    return 1.5 * timeUnit.toMillis(period);<a name="line.238"></a>
-<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
-<span class="sourceLineNo">240</span><a name="line.240"></a>
-<span class="sourceLineNo">241</span>  /**<a name="line.241"></a>
-<span class="sourceLineNo">242</span>   * @param time in system millis<a name="line.242"></a>
-<span class="sourceLineNo">243</span>   * @return true if time is earlier or equal to current milli time<a name="line.243"></a>
-<span class="sourceLineNo">244</span>   */<a name="line.244"></a>
-<span class="sourceLineNo">245</span>  private synchronized boolean isValidTime(final long time) {<a name="line.245"></a>
-<span class="sourceLineNo">246</span>    return time &gt; 0 &amp;&amp; time &lt;= System.currentTimeMillis();<a name="line.246"></a>
-<span class="sourceLineNo">247</span>  }<a name="line.247"></a>
-<span class="sourceLineNo">248</span><a name="line.248"></a>
-<span class="sourceLineNo">249</span>  /**<a name="line.249"></a>
-<span class="sourceLineNo">250</span>   * @return false when the Chore is not currently scheduled with a ChoreService<a name="line.250"></a>
-<span class="sourceLineNo">251</span>   */<a name="line.251"></a>
-<span class="sourceLineNo">252</span>  public synchronized boolean triggerNow() {<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    if (choreServicer != null) {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      return choreServicer.triggerNow(this);<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    } else {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>      return false;<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    }<a name="line.257"></a>
-<span class="sourceLineNo">258</span>  }<a name="line.258"></a>
-<span class="sourceLineNo">259</span><a name="line.259"></a>
-<span class="sourceLineNo">260</span>  synchronized void setChoreServicer(ChoreServicer service) {<a name="line.260"></a>
-<span class="sourceLineNo">261</span>    // Chores should only ever be scheduled with a single ChoreService. If the choreServicer<a name="line.261"></a>
-<span class="sourceLineNo">262</span>    // is changing, cancel any existing schedules of this chore.<a name="line.262"></a>
-<span class="sourceLineNo">263</span>    if (choreServicer != null &amp;&amp; choreServicer != service) {<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      choreServicer.cancelChore(this, false);<a name="line.264"></a>
-<span class="sourceLineNo">265</span>    }<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    choreServicer = service;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>    timeOfThisRun = System.currentTimeMillis();<a name="line.267"></a>
-<span class="sourceLineNo">268</span>  }<a name="line.268"></a>
-<span class="sourceLineNo">269</span><a name="line.269"></a>
-<span class="sourceLineNo">270</span>  public synchronized void cancel() {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    cancel(true);<a name="line.271"></a>
-<span class="sourceLineNo">272</span>  }<a name="line.272"></a>
-<span class="sourceLineNo">273</span><a name="line.273"></a>
-<span class="sourceLineNo">274</span>  public synchronized void cancel(boolean mayInterruptIfRunning) {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    if (isScheduled()) choreServicer.cancelChore(this, mayInterruptIfRunning);<a name="line.275"></a>
-<span class="sourceLineNo">276</span><a name="line.276"></a>
-<span class="sourceLineNo">277</span>    choreServicer = null;<a name="line.277"></a>
-<span class="sourceLineNo">278</span>  }<a name="line.278"></a>
-<span class="sourceLineNo">279</span><a name="line.279"></a>
-<span class="sourceLineNo">280</span>  public String getName() {<a name="line.280"></a>
-<span class="sourceLineNo">281</span>    return name;<a name="line.281"></a>
-<span class="sourceLineNo">282</span>  }<a name="line.282"></a>
-<span class="sourceLineNo">283</span><a name="line.283"></a>
-<span class="sourceLineNo">284</span>  public Stoppable getStopper() {<a name="line.284"></a>
-<span class="sourceLineNo">285</span>    return stopper;<a name="line.285"></a>
-<span class="sourceLineNo">286</span>  }<a name="line.286"></a>
-<span class="sourceLineNo">287</span><a name="line.287"></a>
-<span class="sourceLineNo">288</span>  /**<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   * @return period to execute chore in getTimeUnit() units<a name="line.289"></a>
-<span class="sourceLineNo">290</span>   */<a name="line.290"></a>
-<span class="sourceLineNo">291</span>  public int getPeriod() {<a name="line.291"></a>
-<span class="sourceLineNo">292</span>    return period;<a name="line.292"></a>
-<span class="sourceLineNo">293</span>  }<a name="line.293"></a>
-<span class="sourceLineNo">294</span><a name="line.294"></a>
-<span class="sourceLineNo">295</span>  /**<a name="line.295"></a>
-<span class="sourceLineNo">296</span>   * @return initial delay before executing chore in getTimeUnit() units<a name="line.296"></a>
-<span class="sourceLineNo">297</span>   */<a name="line.297"></a>
-<span class="sourceLineNo">298</span>  public long getInitialDelay() {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    return initialDelay;<a name="line.299"></a>
-<span class="sourceLineNo">300</span>  }<a name="line.300"></a>
-<span class="sourceLineNo">301</span><a name="line.301"></a>
-<span class="sourceLineNo">302</span>  public TimeUnit getTimeUnit() {<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    return timeUnit;<a name="line.303"></a>
-<span class="sourceLineNo">304</span>  }<a name="line.304"></a>
-<span class="sourceLineNo">305</span><a name="line.305"></a>
-<span class="sourceLineNo">306</span>  public synchronized boolean isInitialChoreComplete() {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    return initialChoreComplete;<a name="line.307"></a>
-<span class="sourceLineNo">308</span>  }<a name="line.308"></a>
-<span class="sourceLineNo">309</span><a name="line.309"></a>
-<span class="sourceLineNo">310</span>  @VisibleForTesting<a name="line.310"></a>
-<span class="sourceLineNo">311</span>  synchronized ChoreServicer getChoreServicer() {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    return choreServicer;<a name="line.312"></a>
-<span class="sourceLineNo">313</span>  }<a name="line.313"></a>
-<span class="sourceLineNo">314</span><a name="line.314"></a>
-<span class="sourceLineNo">315</span>  @VisibleForTesting<a name="line.315"></a>
-<span class="sourceLineNo">316</span>  synchronized long getTimeOfLastRun() {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>    return timeOfLastRun;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
-<span class="sourceLineNo">319</span><a name="line.319"></a>
-<span class="sourceLineNo">320</span>  @VisibleForTesting<a name="line.320"></a>
-<span class="sourceLineNo">321</span>  synchronized long getTimeOfThisRun() {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    return timeOfThisRun;<a name="line.322"></a>
-<span class="sourceLineNo">323</span>  }<a name="line.323"></a>
-<span class="sourceLineNo">324</span><a name="line.324"></a>
-<span class="sourceLineNo">325</span>  /**<a name="line.325"></a>
-<span class="sourceLineNo">326</span>   * @return true when this Chore is scheduled with a ChoreService<a name="line.326"></a>
-<span class="sourceLineNo">327</span>   */<a name="line.327"></a>
-<span class="sourceLineNo">328</span>  public synchronized boolean isScheduled() {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    return choreServicer != null &amp;&amp; choreServicer.isChoreScheduled(this);<a name="line.329"></a>
-<span class="sourceLineNo">330</span>  }<a name="line.330"></a>
-<span class="sourceLineNo">331</span><a name="line.331"></a>
-<span class="sourceLineNo">332</span>  @InterfaceAudience.Private<a name="line.332"></a>
-<span class="sourceLineNo">333</span>  @VisibleForTesting<a name="line.333"></a>
-<span class="sourceLineNo">334</span>  public synchronized void choreForTesting() {<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    chore();<a name="line.335"></a>
-<span class="sourceLineNo">336</span>  }<a name="line.336"></a>
-<span class="sourceLineNo">337</span><a name="line.337"></a>
-<span class="sourceLineNo">338</span>  /**<a name="line.338"></a>
-<span class="sourceLineNo">339</span>   * The task to execute on each scheduled execution of the Chore<a name="line.339"></a>
-<span class="sourceLineNo">340</span>   */<a name="line.340"></a>
-<span class="sourceLineNo">341</span>  protected abstract void chore();<a name="line.341"></a>
-<span class="sourceLineNo">342</span><a name="line.342"></a>
-<span class="sourceLineNo">343</span>  /**<a name="line.343"></a>
-<span class="sourceLineNo">344</span>   * Override to run a task before we start looping.<a name="line.344"></a>
-<span class="sourceLineNo">345</span>   * @return true if initial chore was successful<a name="line.345"></a>
-<span class="sourceLineNo">346</span>   */<a name="line.346"></a>
-<span class="sourceLineNo">347</span>  protected boolean initialChore() {<a name="line.347"></a>
-<span class="sourceLineNo">348</span>    // Default does nothing<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    return true;<a name="line.349"></a>
-<span class="sourceLineNo">350</span>  }<a name="line.350"></a>
-<span class="sourceLineNo">351</span><a name="line.351"></a>
-<span class="sourceLineNo">352</span>  /**<a name="line.352"></a>
-<span class="sourceLineNo">353</span>   * Override to run cleanup tasks when the Chore encounters an error and must stop running<a name="line.353"></a>
-<span class="sourceLineNo">354</span>   */<a name="line.354"></a>
-<span class="sourceLineNo">355</span>  protected synchronized void cleanup() {<a name="line.355"></a>
-<span class="sourceLineNo">356</span>  }<a name="line.356"></a>
-<span class="sourceLineNo">357</span><a name="line.357"></a>
-<span class="sourceLineNo">358</span>  /**<a name="line.358"></a>
-<span class="sourceLineNo">359</span>   * A summation of this chore in human readable format. Downstream users should not presume<a name="line.359"></a>
-<span class="sourceLineNo">360</span>   * parsing of this string can relaibly be done between versions. Instead, they should rely<a name="line.360"></a>
-<span class="sourceLineNo">361</span>   * on the public accessor methods to get the information they desire.<a name="line.361"></a>
-<span class="sourceLineNo">362</span>   */<a name="line.362"></a>
-<span class="sourceLineNo">363</span>  @InterfaceAudience.Private<a name="line.363"></a>
-<span class="sourceLineNo">364</span>  @Override<a name="line.364"></a>
-<span class="sourceLineNo">365</span>  public String toString() {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    return "[ScheduledChore: Name: " + getName() + " Period: " + getPeriod() + " Unit: "<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        + getTimeUnit() + "]";<a name="line.367"></a>
-<span class="sourceLineNo">368</span>  }<a name="line.368"></a>
-<span class="sourceLineNo">369</span>}<a name="line.369"></a>
+<span class="sourceLineNo">024</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.slf4j.Logger;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.slf4j.LoggerFactory;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.shaded.com.google.common.annotations.VisibleForTesting;<a name="line.27"></a>
+<span class="sourceLineNo">028</span><a name="line.28"></a>
+<span class="sourceLineNo">029</span>/**<a name="line.29"></a>
+<span class="sourceLineNo">030</span> * ScheduledChore is a task performed on a period in hbase. ScheduledChores become active once<a name="line.30"></a>
+<span class="sourceLineNo">031</span> * scheduled with a {@link ChoreService} via {@link ChoreService#scheduleChore(ScheduledChore)}. The<a name="line.31"></a>
+<span class="sourceLineNo">032</span> * chore is run in a {@link ScheduledThreadPoolExecutor} and competes with other ScheduledChores for<a name="line.32"></a>
+<span class="sourceLineNo">033</span> * access to the threads in the core thread pool. If an unhandled exception occurs, the chore<a name="line.33"></a>
+<span class="sourceLineNo">034</span> * cancellation is logged. Implementers should consider whether or not the Chore will be able to<a name="line.34"></a>
+<span class="sourceLineNo">035</span> * execute within the defined period. It is bad practice to define a ScheduledChore whose execution<a name="line.35"></a>
+<span class="sourceLineNo">036</span> * time exceeds its period since it will try to hog one of the threads in the {@link ChoreService}'s<a name="line.36"></a>
+<span class="sourceLineNo">037</span> * thread pool.<a name="line.37"></a>
+<span class="sourceLineNo">038</span> * &lt;p&gt;<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * Don't subclass ScheduledChore if the task relies on being woken up for something to do, such as<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * an entry being added to a queue, etc.<a name="line.40"></a>
+<span class="sourceLineNo">041</span> */<a name="line.41"></a>
+<span class="sourceLineNo">042</span>@InterfaceAudience.Public<a name="line.42"></a>
+<span class="sourceLineNo">043</span>public abstract class ScheduledChore implements Runnable {<a name="line.43"></a>
+<span class="sourceLineNo">044</span>  private static final Logger LOG = LoggerFactory.getLogger(ScheduledChore.class);<a name="line.44"></a>
+<span class="sourceLineNo">045</span><a name="line.45"></a>
+<span class="sourceLineNo">046</span>  private final String name;<a name="line.46"></a>
+<span class="sourceLineNo">047</span><a name="line.47"></a>
+<span class="sourceLineNo">048</span>  /**<a name="line.48"></a>
+<span class="sourceLineNo">049</span>   * Default values for scheduling parameters should they be excluded during construction<a name="line.49"></a>
+<span class="sourceLineNo">050</span>   */<a name="line.50"></a>
+<span class="sourceLineNo">051</span>  private final static TimeUnit DEFAULT_TIME_UNIT = TimeUnit.MILLISECONDS;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>  private final static long DEFAULT_INITIAL_DELAY = 0;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>  /**<a name="line.54"></a>
+<span class="sourceLineNo">055</span>   * Scheduling parameters. Used by ChoreService when scheduling the chore to run periodically<a name="line.55"></a>
+<span class="sourceLineNo">056</span>   */<a name="line.56"></a>
+<span class="sourceLineNo">057</span>  private final int period; // in TimeUnit units<a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private final TimeUnit timeUnit;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  private final long initialDelay; // in TimeUnit units<a name="line.59"></a>
+<span class="sourceLineNo">060</span><a name="line.60"></a>
+<span class="sourceLineNo">061</span>  /**<a name="line.61"></a>
+<span class="sourceLineNo">062</span>   * Interface to the ChoreService that this ScheduledChore is scheduled with. null if the chore is<a name="line.62"></a>
+<span class="sourceLineNo">063</span>   * not scheduled.<a name="line.63"></a>
+<span class="sourceLineNo">064</span>   */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private ChoreServicer choreServicer;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  /**<a name="line.67"></a>
+<span class="sourceLineNo">068</span>   * Variables that encapsulate the meaningful state information<a name="line.68"></a>
+<span class="sourceLineNo">069</span>   */<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  private long timeOfLastRun = -1; // system time millis<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  private long timeOfThisRun = -1; // system time millis<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private boolean initialChoreComplete = false;<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  /**<a name="line.74"></a>
+<span class="sourceLineNo">075</span>   * A means by which a ScheduledChore can be stopped. Once a chore recognizes that it has been<a name="line.75"></a>
+<span class="sourceLineNo">076</span>   * stopped, it will cancel itself. This is particularly useful in the case where a single stopper<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   * instance is given to multiple chores. In such a case, a single {@link Stoppable#stop(String)}<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   * command can cause many chores to stop together.<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   */<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  private final Stoppable stopper;<a name="line.80"></a>
+<span class="sourceLineNo">081</span><a name="line.81"></a>
+<span class="sourceLineNo">082</span>  interface ChoreServicer {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    /**<a name="line.83"></a>
+<span class="sourceLineNo">084</span>     * Cancel any ongoing schedules that this chore has with the implementer of this interface.<a name="line.84"></a>
+<span class="sourceLineNo">085</span>     */<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    public void cancelChore(ScheduledChore chore);<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    public void cancelChore(ScheduledChore chore, boolean mayInterruptIfRunning);<a name="line.87"></a>
+<span class="sourceLineNo">088</span><a name="line.88"></a>
+<span class="sourceLineNo">089</span>    /**<a name="line.89"></a>
+<span class="sourceLineNo">090</span>     * @return true when the chore is scheduled with the implementer of this interface<a name="line.90"></a>
+<span class="sourceLineNo">091</span>     */<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    public boolean isChoreScheduled(ScheduledChore chore);<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>    /**<a name="line.94"></a>
+<span class="sourceLineNo">095</span>     * This method tries to execute the chore immediately. If the chore is executing at the time of<a name="line.95"></a>
+<span class="sourceLineNo">096</span>     * this call, the chore will begin another execution as soon as the current execution finishes<a name="line.96"></a>
+<span class="sourceLineNo">097</span>     * &lt;p&gt;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>     * If the chore is not scheduled with a ChoreService, this call will fail.<a name="line.98"></a>
+<span class="sourceLineNo">099</span>     * @return false when the chore could not be triggered immediately<a name="line.99"></a>
+<span class="sourceLineNo">100</span>     */<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    public boolean triggerNow(ScheduledChore chore);<a name="line.101"></a>
+<span class="sourceLineNo">102</span><a name="line.102"></a>
+<span class="sourceLineNo">103</span>    /**<a name="line.103"></a>
+<span class="sourceLineNo">104</span>     * A callback that tells the implementer of this interface that one of the scheduled chores is<a name="line.104"></a>
+<span class="sourceLineNo">105</span>     * missing its start time. The implication of a chore missing its start time is that the<a name="line.105"></a>
+<span class="sourceLineNo">106</span>     * service's current means of scheduling may not be sufficient to handle the number of ongoing<a name="line.106"></a>
+<span class="sourceLineNo">107</span>     * chores (the other explanation is that the chore's execution time is greater than its<a name="line.107"></a>
+<span class="sourceLineNo">108</span>     * scheduled period). The service should try to increase its concurrency when this callback is<a name="line.108"></a>
+<span class="sourceLineNo">109</span>     * received.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>     * @param chore The chore that missed its start time<a name="line.110"></a>
+<span class="sourceLineNo">111</span>     */<a name="line.111"></a>
+<span class="sourceLineNo">112</span>    public void onChoreMissedStartTime(ScheduledChore chore);<a name="line.112"></a>
+<span class="sourceLineNo">113</span>  }<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>  /**<a name="line.115"></a>
+<span class="sourceLineNo">116</span>   * This constructor is for test only. It allows us to create an object and to call chore() on it.<a name="line.116"></a>
+<span class="sourceLineNo">117</span>   */<a name="line.117"></a>
+<span class="sourceLineNo">118</span>  @InterfaceAudience.Private<a name="line.118"></a>
+<span class="sourceLineNo">119</span>  @VisibleForTesting<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  protected ScheduledChore() {<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    this.name = null;<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    this.stopper = null;<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    this.period = 0;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    this.initialDelay = DEFAULT_INITIAL_DELAY;<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    this.timeUnit = DEFAULT_TIME_UNIT;<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  }<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  /**<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.129"></a>
+<span class="sourceLineNo">130</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.130"></a>
+<span class="sourceLineNo">131</span>   * @param period Period in millis with which this Chore repeats execution when scheduled.<a name="line.131"></a>
+<span class="sourceLineNo">132</span>   */<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  public ScheduledChore(final String name, Stoppable stopper, final int period) {<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    this(name, stopper, period, DEFAULT_INITIAL_DELAY);<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  }<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>  /**<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   * @param period Period in millis with which this Chore repeats execution when scheduled.<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   * @param initialDelay Delay before this Chore begins to execute once it has been scheduled. A<a name="line.141"></a>
+<span class="sourceLineNo">142</span>   *          value of 0 means the chore will begin to execute immediately. Negative delays are<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   *          invalid and will be corrected to a value of 0.<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   */<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  public ScheduledChore(final String name, Stoppable stopper, final int period,<a name="line.145"></a>
+<span class="sourceLineNo">146</span>      final long initialDelay) {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    this(name, stopper, period, initialDelay, DEFAULT_TIME_UNIT);<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  }<a name="line.148"></a>
+<span class="sourceLineNo">149</span><a name="line.149"></a>
+<span class="sourceLineNo">150</span>  /**<a name="line.150"></a>
+<span class="sourceLineNo">151</span>   * @param name Name assigned to Chore. Useful for identification amongst chores of the same type<a name="line.151"></a>
+<span class="sourceLineNo">152</span>   * @param stopper When {@link Stoppable#isStopped()} is true, this chore will cancel and cleanup<a name="line.152"></a>
+<span class="sourceLineNo">153</span>   * @param period Period in Timeunit unit with which this Chore repeats execution when scheduled.<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   * @param initialDelay Delay in Timeunit unit before this Chore begins to execute once it has been<a name="line.154"></a>
+<span class="sourceLineNo">155</span>   *          scheduled. A value of 0 means the chore will begin to execute immediately. Negative<a name="line.155"></a>
+<span class="sourceLineNo">156</span>   *          delays are invalid and will be corrected to a value of 0.<a name="line.156"></a>
+<span class="sourceLineNo">157</span>   * @param unit The unit that is used to measure period and initialDelay<a name="line.157"></a>
+<span class="sourceLineNo">158</span>   */<a name="line.158"></a>
+<span class="sourceLineNo">159</span>  public ScheduledChore(final String name, Stoppable stopper, final int period,<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      final long initialDelay, final TimeUnit unit) {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    this.name = name;<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    this.stopper = stopper;<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    this.period = period;<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    this.initialDelay = initialDelay &lt; 0 ? 0 : initialDelay;<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    this.timeUnit = unit;<a name="line.165"></a>
+<span class="sourceLineNo">166</span>  }<a name="line.166"></a>
+<span class="sourceLineNo">167</span><a name="line.167"></a>
+<span class="sourceLineNo">168</span>  /**<a name="line.168"></a>
+<span class="sourceLineNo">169</span>   * @see java.lang.Runnable#run()<a name="line.169"></a>
+<span class="sourceLineNo">170</span>   */<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  @Override<a name="line.171"></a>
+<span class="sourceLineNo">172</span>  public void run() {<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    updateTimeTrackingBeforeRun();<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    if (missedStartTime() &amp;&amp; isScheduled()) {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      onChoreMissedStartTime();<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      if (LOG.isInfoEnabled()) LOG.info("Chore: " + getName() + " missed its start time");<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    } else if (stopper.isStopped() || !isScheduled()) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      cancel(false);<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      cleanup();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>      if (LOG.isInfoEnabled()) LOG.info("Chore: " + getName() + " was stopped");<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    } else {<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      try {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        if (!initialChoreComplete) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>          initialChoreComplete = initialChore();<a name="line.184"></a>
+<span class="sourceLineNo">185</span>        } else {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>          chore();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>        }<a name="line.187"></a>
+<span class="sourceLineNo">188</span>      } catch (Throwable t) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>        if (LOG.isErrorEnabled()) LOG.error("Caught error", t);<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        if (this.stopper.isStopped()) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>          cancel(false);<a name="line.191"></a>
+<span class="sourceLineNo">192</span>          cleanup();<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        }<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
+<span class="sourceLineNo">196</span>  }<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>  /**<a name="line.198"></a>
+<span class="sourceLineNo">199</span>   * Update our time tracking members. Called at the start of an execution of this chore's run()<a name="line.199"></a>
+<span class="sourceLineNo">200</span>   * method so that a correct decision can be made as to whether or not we missed the start time<a name="line.200"></a>
+<span class="sourceLineNo">201</span>   */<a name="line.201"></a>
+<span class="sourceLineNo">202</span>  private synchronized void updateTimeTrackingBeforeRun() {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    timeOfLastRun = timeOfThisRun;<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    timeOfThisRun = System.currentTimeMillis();<a name="line.204"></a>
+<span class="sourceLineNo">205</span>  }<a name="line.205"></a>
+<span class="sourceLineNo">206</span><a name="line.206"></a>
+<span class="sourceLineNo">207</span>  /**<a name="line.207"></a>
+<span class="sourceLineNo">208</span>   * Notify the ChoreService that this chore has missed its start time. Allows the ChoreService to<a name="line.208"></a>
+<span class="sourceLineNo">209</span>   * make the decision as to whether or not it would be worthwhile to increase the number of core<a name="line.209"></a>
+<span class="sourceLineNo">210</span>   * pool threads<a name="line.210"></a>
+<span class="sourceLineNo">211</span>   */<a name="line.211"></a>
+<span class="sourceLineNo">212</span>  private synchronized void onChoreMissedStartTime() {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>    if (choreServicer != null) choreServicer.onChoreMissedStartTime(this);<a name="line.213"></a>
+<span class="sourceLineNo">214</span>  }<a name="line.214"></a>
+<span class="sourceLineNo">215</span><a name="line.215"></a>
+<span class="sourceLineNo">216</span>  /**<a name="line.216"></a>
+<span class="sourceLineNo">217</span>   * @return How long in millis has it been since this chore last run. Useful for checking if the<a name="line.217"></a>
+<span class="sourceLineNo">218</span>   *         chore has missed its scheduled start time by too large of a margin<a name="line.218"></a>
+<span class="sourceLineNo">219</span>   */<a name="line.219"></a>
+<span class="sourceLineNo">220</span>  synchronized long getTimeBetweenRuns() {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    return timeOfThisRun - timeOfLastRun;<a name="line.221"></a>
+<span class="sourceLineNo">222</span>  }<a name="line.222"></a>
+<span class="sourceLineNo">223</span><a name="line.223"></a>
+<span class="sourceLineNo">224</span>  /**<a name="line.224"></a>
+<span class="sourceLineNo">225</span>   * @return true when the time between runs exceeds the acceptable threshold<a name="line.225"></a>
+<span class="sourceLineNo">226</span>   */<a name="line.226"></a>
+<span class="sourceLineNo">227</span>  private synchronized boolean missedStartTime() {<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    return isValidTime(timeOfLastRun) &amp;&amp; isValidTime(timeOfThisRun)<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        &amp;&amp; getTimeBetweenRuns() &gt; getMaximumAllowedTimeBetweenRuns();<a name="line.229"></a>
+<span class="sourceLineNo">230</span>  }<a name="line.230"></a>
+<span class="sourceLineNo">231</span><a name="line.231"></a>
+<span class="sourceLineNo">232</span>  /**<a name="line.232"></a>
+<span class="sourceLineNo">233</span>   * @return max allowed time in millis between runs.<a name="line.233"></a>
+<span class="sourceLineNo">234</span>   */<a name="line.234"></a>
+<span class="sourceLineNo">235</span>  private double getMaximumAllowedTimeBetweenRuns() {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    // Threshold used to determine if the Chore's current run started too late<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    return 1.5 * timeUnit.toMillis(period);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>  }<a name="line.238"></a>
+<span class="sourceLineNo">239</span><a name="line.239"></a>
+<span class="sourceLineNo">240</span>  /**<a name="line.240"></a>
+<span class="sourceLineNo">241</span>   * @param time in system millis<a name="line.241"></a>
+<span class="sourceLineNo">242</span>   * @return true if time is earlier or equal to current milli time<a name="line.242"></a>
+<span class="sourceLineNo">243</span>   */<a name="line.243"></a>
+<span class="sourceLineNo">244</span>  private synchronized boolean isValidTime(final long time) {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    return time &gt; 0 &amp;&amp; time &lt;= System.currentTimeMillis();<a name="line.245"></a>
+<span class="sourceLineNo">246</span>  }<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>  /**<a name="line.248"></a>
+<span class="sourceLineNo">249</span>   * @return false when the Chore is not currently scheduled with a ChoreService<a name="line.249"></a>
+<span class="sourceLineNo">250</span>   */<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  public synchronized boolean triggerNow() {<a name="line.251"></a>
+<span class="sourceLineNo">252</span>    if (choreServicer != null) {<a name="line.252"></a>
+<span class="sourceLineNo">253</span>      return choreServicer.triggerNow(this);<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    } else {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>      return false;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    }<a name="line.256"></a>
+<span class="sourceLineNo">257</span>  }<a name="line.257"></a>
+<span class="sourceLineNo">258</span><a name="line.258"></a>
+<span class="sourceLineNo">259</span>  synchronized void setChoreServicer(ChoreServicer service) {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    // Chores should only ever be scheduled with a single ChoreService. If the choreServicer<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    // is changing, cancel any existing schedules of this chore.<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    if (choreServicer != null &amp;&amp; choreServicer != service) {<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      choreServicer.cancelChore(this, false);<a name="line.263"></a>
+<span class="sourceLineNo">264</span>    }<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    choreServicer = service;<a name="line.265"></a>
+<span class="sourceLineNo">266</span>    timeOfThisRun = System.currentTimeMillis();<a name="line.266"></a>
+<span class="sourceLineNo">267</span>  }<a name="line.267"></a>
+<span class="sourceLineNo">268</span><a name="line.268"></a>
+<span class="sourceLineNo">269</span>  public synchronized void cancel() {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    cancel(true);<a name="line.270"></a>
+<span class="sourceLineNo">271</span>  }<a name="line.271"></a>
+<span class="sourceLineNo">272</span><a name="line.272"></a>
+<span class="sourceLineNo">273</span>  public synchronized void cancel(boolean mayInterruptIfRunning) {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    if (isScheduled()) choreServicer.cancelChore(this, mayInterruptIfRunning);<a name="line.274"></a>
+<span class="sourceLineNo">275</span><a name="line.275"></a>
+<span class="sourceLineNo">276</span>    choreServicer = null;<a name="line.276"></a>
+<span class="sourceLineNo">277</span>  }<a name="line.277"></a>
+<span class="sourceLineNo">278</span><a name="line.278"></a>
+<span class="sourceLineNo">279</span>  public String getName() {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    return name;<a name="line.280"></a>
+<span class="sourceLineNo">281</span>  }<a name="line.281"></a>
+<span class="sourceLineNo">282</span><a name="line.282"></a>
+<span class="sourceLineNo">283</span>  public Stoppable getStopper() {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>    return stopper;<a name="line.284"></a>
+<span class="sourceLineNo">285</span>  }<a name="line.285"></a>
+<span class="sourceLineNo">286</span><a name="line.286"></a>
+<span class="sourceLineNo">287</span>  /**<a name="line.287"></a>
+<span class="sourceLineNo">288</span>   * @return period to execute chore in getTimeUnit() units<a name="line.288"></a>
+<span class="sourceLineNo">289</span>   */<a name="line.289"></a>
+<span class="sourceLineNo">290</span>  public int getPeriod() {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>    return period;<a name="line.291"></a>
+<span class="sourceLineNo">292</span>  }<a name="line.292"></a>
+<span class="sourceLineNo">293</span><a name="line.293"></a>
+<span class="sourceLineNo">294</span>  /**<a name="line.294"></a>
+<span class="sourceLineNo">295</span>   * @return initial delay before executing chore in getTimeUnit() units<a name="line.295"></a>
+<span class="sourceLineNo">296</span>   */<a name="line.296"></a>
+<span class="sourceLineNo">297</span>  public long getInitialDelay() {<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    return initialDelay;<a name="line.298"></a>
+<span class="sourceLineNo">299</span>  }<a name="line.299"></a>
+<span class="sourceLineNo">300</span><a name="line.300"></a>
+<span class="sourceLineNo">301</span>  public TimeUnit getTimeUnit() {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    return timeUnit;<a name="line.302"></a>
+<span class="sourceLineNo">303</span>  }<a name="line.303"></a>
+<span class="sourceLineNo">304</span><a name="line.304"></a>
+<span class="sourceLineNo">305</span>  public synchronized boolean isInitialChoreComplete() {<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    return initialChoreComplete;<a name="line.306"></a>
+<span class="sourceLineNo">307</span>  }<a name="line.307"></a>
+<span class="sourceLineNo">308</span><a name="line.308"></a>
+<span class="sourceLineNo">309</span>  @VisibleForTesting<a name="line.309"></a>
+<span class="sourceLineNo">310</span>  synchronized ChoreServicer getChoreServicer() {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    return choreServicer;<a name="line.311"></a>
+<span class="sourceLineNo">312</span>  }<a name="line.312"></a>
+<span class="sourceLineNo">313</span><a name="line.313"></a>
+<span class="sourceLineNo">314</span>  @VisibleForTesting<a name="line.314"></a>
+<span class="sourceLineNo">315</span>  synchronized long getTimeOfLastRun() {<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    return timeOfLastRun;<a name="line.316"></a>
+<span class="sourceLineNo">317</span>  }<a name="line.317"></a>
+<span class="sourceLineNo">318</span><a name="line.318"></a>
+<span class="sourceLineNo">319</span>  @VisibleForTesting<a name="line.319"></a>
+<span class="sourceLineNo">320</span>  synchronized long getTimeOfThisRun() {<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    return timeOfThisRun;<a name="line.321"></a>
+<span class="sourceLineNo">322</span>  }<a name="line.322"></a>
+<span class="sourceLineNo">323</span><a name="line.323"></a>
+<span class="sourceLineNo">324</span>  /**<a name="line.324"></a>
+<span class="sourceLineNo">325</span>   * @return true when this Chore is scheduled with a ChoreService<a name="line.325"></a>
+<span class="sourceLineNo">326</span>   */<a name="line.326"></a>
+<span class="sourceLineNo">327</span>  public synchronized boolean isScheduled() {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    return choreServicer != null &amp;&amp; choreServicer.isChoreScheduled(this);<a name="line.328"></a>
+<span class="sourceLineNo">329</span>  }<a name="line.329"></a>
+<span class="sourceLineNo">330</span><a name="line.330"></a>
+<span class="sourceLineNo">331</span>  @InterfaceAudience.Private<a name="line.331"></a>
+<span class="sourceLineNo">332</span>  @VisibleForTesting<a name="line.332"></a>
+<span class="sourceLineNo">333</span>  public synchronized void choreForTesting() {<a name="line.333"></a>
+<span class="sourceLineNo">334</span>    chore();<a name="line.334"></a>
+<span class="sourceLineNo">335</span>  }<a name="line.335"></a>
+<span class="sourceLineNo">336</span><a name="line.336"></a>
+<span class="sourceLineNo">337</span>  /**<a name="line.337"></a>
+<span class="sourceLineNo">338</span>   * The task to execute on each scheduled execution of the Chore<a name="line.338"></a>
+<span class="sourceLineNo">339</span>   */<a name="line.339"></a>
+<span class="sourceLineNo">340</span>  protected abstract void chore();<a name="line.340"></a>
+<span class="sourceLineNo">341</span><a name="line.341"></a>
+<span class="sourceLineNo">342</span>  /**<a name="line.342"></a>
+<span class="sourceLineNo">343</span>   * Override to run a task before we start looping.<a name="line.343"></a>
+<span class="sourceLineNo">344</span>   * @return true if initial chore was successful<a name="line.344"></a>
+<span class="sourceLineNo">345</span>   */<a name="line.345"></a>
+<span class="sourceLineNo">346</span>  protected boolean initialChore() {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    // Default does nothing<a name="line.347"></a>
+<span class="sourceLineNo">348</span>    return true;<a name="line.348"></a>
+<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
+<span class="sourceLineNo">350</span><a name="line.350"></a>
+<span class="sourceLineNo">351</span>  /**<a name="line.351"></a>
+<span class="sourceLineNo">352</span>   * Override to run cleanup tasks when the Chore encounters an error and must stop running<a name="line.352"></a>
+<span class="sourceLineNo">353</span>   */<a name="line.353"></a>
+<span class="sourceLineNo">354</span>  protected synchronized void cleanup() {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>  }<a name="line.355"></a>
+<span class="sourceLineNo">356</span><a name="line.356"></a>
+<span class="sourceLineNo">357</span>  /**<a name="line.357"></a>
+<span class="sourceLineNo">358</span>   * A summation of this chore in human readable format. Downstream users should not presume<a name="line.358"></a>
+<span class="sourceLineNo">359</span>   * parsing of this string can relaibly be done between versions. Instead, they should rely<a name="line.359"></a>
+<span class="sourceLineNo">360</span>   * on the public accessor methods to get the information they desire.<a name="line.360"></a>
+<span class="sourceLineNo">361</span>   */<a name="line.361"></a>
+<span class="sourceLineNo">362</span>  @InterfaceAudience.Private<a name="line.362"></a>
+<span class="sourceLineNo">363</span>  @Override<a name="line.363"></a>
+<span class="sourceLineNo">364</span>  public String toString() {<a name="line.364"></a>
+<span class="sourceLineNo">365</span>    return "[ScheduledChore: Name: " + getName() + " Period: " + getPeriod() + " Unit: "<a name="line.365"></a>
+<span class="sourceLineNo">366</span>        + getTimeUnit() + "]";<a name="line.366"></a>
+<span class="sourceLineNo">367</span>  }<a name="line.367"></a>
+<span class="sourceLineNo">368</span>}<a name="line.368"></a>
 
 
 
