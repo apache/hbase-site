@@ -35,254 +35,262 @@
 <span class="sourceLineNo">027</span>import java.util.List;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import java.util.concurrent.ConcurrentHashMap;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import java.util.concurrent.ConcurrentMap;<a name="line.29"></a>
-<span class="sourceLineNo">030</span><a name="line.30"></a>
+<span class="sourceLineNo">030</span>import java.util.concurrent.locks.Lock;<a name="line.30"></a>
 <span class="sourceLineNo">031</span>import org.apache.hadoop.conf.Configuration;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.slf4j.Logger;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.slf4j.LoggerFactory;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>// imports for classes still in regionserver.wal<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.regionserver.wal.WALActionsListener;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.util.IdLock;<a name="line.38"></a>
-<span class="sourceLineNo">039</span><a name="line.39"></a>
-<span class="sourceLineNo">040</span>/**<a name="line.40"></a>
-<span class="sourceLineNo">041</span> * A WAL Provider that returns a WAL per group of regions.<a name="line.41"></a>
-<span class="sourceLineNo">042</span> *<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * This provider follows the decorator pattern and mainly holds the logic for WAL grouping.<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * WAL creation/roll/close is delegated to {@link #DELEGATE_PROVIDER}<a name="line.44"></a>
-<span class="sourceLineNo">045</span> *<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * Region grouping is handled via {@link RegionGroupingStrategy} and can be configured via the<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * property "hbase.wal.regiongrouping.strategy". Current strategy choices are<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * &lt;ul&gt;<a name="line.48"></a>
-<span class="sourceLineNo">049</span> *   &lt;li&gt;&lt;em&gt;defaultStrategy&lt;/em&gt; : Whatever strategy this version of HBase picks. currently<a name="line.49"></a>
-<span class="sourceLineNo">050</span> *                                  "bounded".&lt;/li&gt;<a name="line.50"></a>
-<span class="sourceLineNo">051</span> *   &lt;li&gt;&lt;em&gt;identity&lt;/em&gt; : each region belongs to its own group.&lt;/li&gt;<a name="line.51"></a>
-<span class="sourceLineNo">052</span> *   &lt;li&gt;&lt;em&gt;bounded&lt;/em&gt; : bounded number of groups and region evenly assigned to each group.&lt;/li&gt;<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * &lt;/ul&gt;<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * Optionally, a FQCN to a custom implementation may be given.<a name="line.54"></a>
-<span class="sourceLineNo">055</span> */<a name="line.55"></a>
-<span class="sourceLineNo">056</span>@InterfaceAudience.Private<a name="line.56"></a>
-<span class="sourceLineNo">057</span>public class RegionGroupingProvider implements WALProvider {<a name="line.57"></a>
-<span class="sourceLineNo">058</span>  private static final Logger LOG = LoggerFactory.getLogger(RegionGroupingProvider.class);<a name="line.58"></a>
-<span class="sourceLineNo">059</span><a name="line.59"></a>
-<span class="sourceLineNo">060</span>  /**<a name="line.60"></a>
-<span class="sourceLineNo">061</span>   * Map identifiers to a group number.<a name="line.61"></a>
-<span class="sourceLineNo">062</span>   */<a name="line.62"></a>
-<span class="sourceLineNo">063</span>  public static interface RegionGroupingStrategy {<a name="line.63"></a>
-<span class="sourceLineNo">064</span>    String GROUP_NAME_DELIMITER = ".";<a name="line.64"></a>
-<span class="sourceLineNo">065</span><a name="line.65"></a>
-<span class="sourceLineNo">066</span>    /**<a name="line.66"></a>
-<span class="sourceLineNo">067</span>     * Given an identifier and a namespace, pick a group.<a name="line.67"></a>
-<span class="sourceLineNo">068</span>     */<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    String group(final byte[] identifier, byte[] namespace);<a name="line.69"></a>
-<span class="sourceLineNo">070</span>    void init(Configuration config, String providerId);<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  }<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  /**<a name="line.73"></a>
-<span class="sourceLineNo">074</span>   * Maps between configuration names for strategies and implementation classes.<a name="line.74"></a>
-<span class="sourceLineNo">075</span>   */<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  static enum Strategies {<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    defaultStrategy(BoundedGroupingStrategy.class),<a name="line.77"></a>
-<span class="sourceLineNo">078</span>    identity(IdentityGroupingStrategy.class),<a name="line.78"></a>
-<span class="sourceLineNo">079</span>    bounded(BoundedGroupingStrategy.class),<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    namespace(NamespaceGroupingStrategy.class);<a name="line.80"></a>
-<span class="sourceLineNo">081</span><a name="line.81"></a>
-<span class="sourceLineNo">082</span>    final Class&lt;? extends RegionGroupingStrategy&gt; clazz;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    Strategies(Class&lt;? extends RegionGroupingStrategy&gt; clazz) {<a name="line.83"></a>
-<span class="sourceLineNo">084</span>      this.clazz = clazz;<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    }<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  }<a name="line.86"></a>
-<span class="sourceLineNo">087</span><a name="line.87"></a>
-<span class="sourceLineNo">088</span>  /**<a name="line.88"></a>
-<span class="sourceLineNo">089</span>   * instantiate a strategy from a config property.<a name="line.89"></a>
-<span class="sourceLineNo">090</span>   * requires conf to have already been set (as well as anything the provider might need to read).<a name="line.90"></a>
-<span class="sourceLineNo">091</span>   */<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  RegionGroupingStrategy getStrategy(final Configuration conf, final String key,<a name="line.92"></a>
-<span class="sourceLineNo">093</span>      final String defaultValue) throws IOException {<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    Class&lt;? extends RegionGroupingStrategy&gt; clazz;<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    try {<a name="line.95"></a>
-<span class="sourceLineNo">096</span>      clazz = Strategies.valueOf(conf.get(key, defaultValue)).clazz;<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    } catch (IllegalArgumentException exception) {<a name="line.97"></a>
-<span class="sourceLineNo">098</span>      // Fall back to them specifying a class name<a name="line.98"></a>
-<span class="sourceLineNo">099</span>      // Note that the passed default class shouldn't actually be used, since the above only fails<a name="line.99"></a>
-<span class="sourceLineNo">100</span>      // when there is a config value present.<a name="line.100"></a>
-<span class="sourceLineNo">101</span>      clazz = conf.getClass(key, IdentityGroupingStrategy.class, RegionGroupingStrategy.class);<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    }<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    LOG.info("Instantiating RegionGroupingStrategy of type " + clazz);<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    try {<a name="line.104"></a>
-<span class="sourceLineNo">105</span>      final RegionGroupingStrategy result = clazz.newInstance();<a name="line.105"></a>
-<span class="sourceLineNo">106</span>      result.init(conf, providerId);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>      return result;<a name="line.107"></a>
-<span class="sourceLineNo">108</span>    } catch (InstantiationException exception) {<a name="line.108"></a>
-<span class="sourceLineNo">109</span>      LOG.error("couldn't set up region grouping strategy, check config key " +<a name="line.109"></a>
-<span class="sourceLineNo">110</span>          REGION_GROUPING_STRATEGY);<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      LOG.debug("Exception details for failure to load region grouping strategy.", exception);<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      throw new IOException("couldn't set up region grouping strategy", exception);<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    } catch (IllegalAccessException exception) {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>      LOG.error("couldn't set up region grouping strategy, check config key " +<a name="line.114"></a>
-<span class="sourceLineNo">115</span>          REGION_GROUPING_STRATEGY);<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      LOG.debug("Exception details for failure to load region grouping strategy.", exception);<a name="line.116"></a>
-<span class="sourceLineNo">117</span>      throw new IOException("couldn't set up region grouping strategy", exception);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    }<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  }<a name="line.119"></a>
-<span class="sourceLineNo">120</span><a name="line.120"></a>
-<span class="sourceLineNo">121</span>  public static final String REGION_GROUPING_STRATEGY = "hbase.wal.regiongrouping.strategy";<a name="line.121"></a>
-<span class="sourceLineNo">122</span>  public static final String DEFAULT_REGION_GROUPING_STRATEGY = Strategies.defaultStrategy.name();<a name="line.122"></a>
-<span class="sourceLineNo">123</span><a name="line.123"></a>
-<span class="sourceLineNo">124</span>  /** delegate provider for WAL creation/roll/close */<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  public static final String DELEGATE_PROVIDER = "hbase.wal.regiongrouping.delegate.provider";<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  public static final String DEFAULT_DELEGATE_PROVIDER = WALFactory.Providers.defaultProvider<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      .name();<a name="line.127"></a>
-<span class="sourceLineNo">128</span><a name="line.128"></a>
-<span class="sourceLineNo">129</span>  private static final String META_WAL_GROUP_NAME = "meta";<a name="line.129"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.HConstants;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>// imports for classes still in regionserver.wal<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.regionserver.wal.WALActionsListener;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.util.KeyLocker;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.slf4j.Logger;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.slf4j.LoggerFactory;<a name="line.40"></a>
+<span class="sourceLineNo">041</span><a name="line.41"></a>
+<span class="sourceLineNo">042</span>/**<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * A WAL Provider that returns a WAL per group of regions.<a name="line.43"></a>
+<span class="sourceLineNo">044</span> *<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * This provider follows the decorator pattern and mainly holds the logic for WAL grouping.<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * WAL creation/roll/close is delegated to {@link #DELEGATE_PROVIDER}<a name="line.46"></a>
+<span class="sourceLineNo">047</span> *<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * Region grouping is handled via {@link RegionGroupingStrategy} and can be configured via the<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * property "hbase.wal.regiongrouping.strategy". Current strategy choices are<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * &lt;ul&gt;<a name="line.50"></a>
+<span class="sourceLineNo">051</span> *   &lt;li&gt;&lt;em&gt;defaultStrategy&lt;/em&gt; : Whatever strategy this version of HBase picks. currently<a name="line.51"></a>
+<span class="sourceLineNo">052</span> *                                  "bounded".&lt;/li&gt;<a name="line.52"></a>
+<span class="sourceLineNo">053</span> *   &lt;li&gt;&lt;em&gt;identity&lt;/em&gt; : each region belongs to its own group.&lt;/li&gt;<a name="line.53"></a>
+<span class="sourceLineNo">054</span> *   &lt;li&gt;&lt;em&gt;bounded&lt;/em&gt; : bounded number of groups and region evenly assigned to each group.&lt;/li&gt;<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * &lt;/ul&gt;<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * Optionally, a FQCN to a custom implementation may be given.<a name="line.56"></a>
+<span class="sourceLineNo">057</span> */<a name="line.57"></a>
+<span class="sourceLineNo">058</span>@InterfaceAudience.Private<a name="line.58"></a>
+<span class="sourceLineNo">059</span>public class RegionGroupingProvider implements WALProvider {<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private static final Logger LOG = LoggerFactory.getLogger(RegionGroupingProvider.class);<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  /**<a name="line.62"></a>
+<span class="sourceLineNo">063</span>   * Map identifiers to a group number.<a name="line.63"></a>
+<span class="sourceLineNo">064</span>   */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  public static interface RegionGroupingStrategy {<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    String GROUP_NAME_DELIMITER = ".";<a name="line.66"></a>
+<span class="sourceLineNo">067</span><a name="line.67"></a>
+<span class="sourceLineNo">068</span>    /**<a name="line.68"></a>
+<span class="sourceLineNo">069</span>     * Given an identifier and a namespace, pick a group.<a name="line.69"></a>
+<span class="sourceLineNo">070</span>     */<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    String group(final byte[] identifier, byte[] namespace);<a name="line.71"></a>
+<span class="sourceLineNo">072</span>    void init(Configuration config, String providerId);<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  }<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  /**<a name="line.75"></a>
+<span class="sourceLineNo">076</span>   * Maps between configuration names for strategies and implementation classes.<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   */<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  static enum Strategies {<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    defaultStrategy(BoundedGroupingStrategy.class),<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    identity(IdentityGroupingStrategy.class),<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    bounded(BoundedGroupingStrategy.class),<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    namespace(NamespaceGroupingStrategy.class);<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>    final Class&lt;? extends RegionGroupingStrategy&gt; clazz;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    Strategies(Class&lt;? extends RegionGroupingStrategy&gt; clazz) {<a name="line.85"></a>
+<span class="sourceLineNo">086</span>      this.clazz = clazz;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    }<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  }<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  /**<a name="line.90"></a>
+<span class="sourceLineNo">091</span>   * instantiate a strategy from a config property.<a name="line.91"></a>
+<span class="sourceLineNo">092</span>   * requires conf to have already been set (as well as anything the provider might need to read).<a name="line.92"></a>
+<span class="sourceLineNo">093</span>   */<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  RegionGroupingStrategy getStrategy(final Configuration conf, final String key,<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      final String defaultValue) throws IOException {<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    Class&lt;? extends RegionGroupingStrategy&gt; clazz;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    try {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      clazz = Strategies.valueOf(conf.get(key, defaultValue)).clazz;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    } catch (IllegalArgumentException exception) {<a name="line.99"></a>
+<span class="sourceLineNo">100</span>      // Fall back to them specifying a class name<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      // Note that the passed default class shouldn't actually be used, since the above only fails<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      // when there is a config value present.<a name="line.102"></a>
+<span class="sourceLineNo">103</span>      clazz = conf.getClass(key, IdentityGroupingStrategy.class, RegionGroupingStrategy.class);<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    }<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    LOG.info("Instantiating RegionGroupingStrategy of type " + clazz);<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    try {<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      final RegionGroupingStrategy result = clazz.newInstance();<a name="line.107"></a>
+<span class="sourceLineNo">108</span>      result.init(conf, providerId);<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      return result;<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    } catch (InstantiationException exception) {<a name="line.110"></a>
+<span class="sourceLineNo">111</span>      LOG.error("couldn't set up region grouping strategy, check config key " +<a name="line.111"></a>
+<span class="sourceLineNo">112</span>          REGION_GROUPING_STRATEGY);<a name="line.112"></a>
+<span class="sourceLineNo">113</span>      LOG.debug("Exception details for failure to load region grouping strategy.", exception);<a name="line.113"></a>
+<span class="sourceLineNo">114</span>      throw new IOException("couldn't set up region grouping strategy", exception);<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    } catch (IllegalAccessException exception) {<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      LOG.error("couldn't set up region grouping strategy, check config key " +<a name="line.116"></a>
+<span class="sourceLineNo">117</span>          REGION_GROUPING_STRATEGY);<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      LOG.debug("Exception details for failure to load region grouping strategy.", exception);<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      throw new IOException("couldn't set up region grouping strategy", exception);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    }<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  public static final String REGION_GROUPING_STRATEGY = "hbase.wal.regiongrouping.strategy";<a name="line.123"></a>
+<span class="sourceLineNo">124</span>  public static final String DEFAULT_REGION_GROUPING_STRATEGY = Strategies.defaultStrategy.name();<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>  /** delegate provider for WAL creation/roll/close */<a name="line.126"></a>
+<span class="sourceLineNo">127</span>  public static final String DELEGATE_PROVIDER = "hbase.wal.regiongrouping.delegate.provider";<a name="line.127"></a>
+<span class="sourceLineNo">128</span>  public static final String DEFAULT_DELEGATE_PROVIDER = WALFactory.Providers.defaultProvider<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      .name();<a name="line.129"></a>
 <span class="sourceLineNo">130</span><a name="line.130"></a>
-<span class="sourceLineNo">131</span>  /** A group-provider mapping, make sure one-one rather than many-one mapping */<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  private final ConcurrentMap&lt;String, WALProvider&gt; cached = new ConcurrentHashMap&lt;&gt;();<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>  private final IdLock createLock = new IdLock();<a name="line.134"></a>
+<span class="sourceLineNo">131</span>  private static final String META_WAL_GROUP_NAME = "meta";<a name="line.131"></a>
+<span class="sourceLineNo">132</span><a name="line.132"></a>
+<span class="sourceLineNo">133</span>  /** A group-provider mapping, make sure one-one rather than many-one mapping */<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  private final ConcurrentMap&lt;String, WALProvider&gt; cached = new ConcurrentHashMap&lt;&gt;();<a name="line.134"></a>
 <span class="sourceLineNo">135</span><a name="line.135"></a>
-<span class="sourceLineNo">136</span>  private RegionGroupingStrategy strategy = null;<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  private WALFactory factory = null;<a name="line.137"></a>
-<span class="sourceLineNo">138</span>  private List&lt;WALActionsListener&gt; listeners = null;<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  private String providerId = null;<a name="line.139"></a>
-<span class="sourceLineNo">140</span>  private Class&lt;? extends WALProvider&gt; providerClass;<a name="line.140"></a>
-<span class="sourceLineNo">141</span><a name="line.141"></a>
-<span class="sourceLineNo">142</span>  @Override<a name="line.142"></a>
-<span class="sourceLineNo">143</span>  public void init(final WALFactory factory, final Configuration conf,<a name="line.143"></a>
-<span class="sourceLineNo">144</span>      final List&lt;WALActionsListener&gt; listeners, final String providerId) throws IOException {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>    if (null != strategy) {<a name="line.145"></a>
-<span class="sourceLineNo">146</span>      throw new IllegalStateException("WALProvider.init should only be called once.");<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    }<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    this.factory = factory;<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    this.listeners = null == listeners ? null : Collections.unmodifiableList(listeners);<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    StringBuilder sb = new StringBuilder().append(factory.factoryId);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    if (providerId != null) {<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      if (providerId.startsWith(WAL_FILE_NAME_DELIMITER)) {<a name="line.152"></a>
-<span class="sourceLineNo">153</span>        sb.append(providerId);<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      } else {<a name="line.154"></a>
-<span class="sourceLineNo">155</span>        sb.append(WAL_FILE_NAME_DELIMITER).append(providerId);<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      }<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    }<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    this.providerId = sb.toString();<a name="line.158"></a>
-<span class="sourceLineNo">159</span>    this.strategy = getStrategy(conf, REGION_GROUPING_STRATEGY, DEFAULT_REGION_GROUPING_STRATEGY);<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    this.providerClass = factory.getProviderClass(DELEGATE_PROVIDER, DEFAULT_DELEGATE_PROVIDER);<a name="line.160"></a>
-<span class="sourceLineNo">161</span>  }<a name="line.161"></a>
-<span class="sourceLineNo">162</span><a name="line.162"></a>
-<span class="sourceLineNo">163</span>  private WALProvider createProvider(String group) throws IOException {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    if (META_WAL_PROVIDER_ID.equals(providerId)) {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>      return factory.createProvider(providerClass, listeners, META_WAL_PROVIDER_ID);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    } else {<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      return factory.createProvider(providerClass, listeners, group);<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    }<a name="line.168"></a>
-<span class="sourceLineNo">169</span>  }<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>  @Override<a name="line.171"></a>
-<span class="sourceLineNo">172</span>  public List&lt;WAL&gt; getWALs() {<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    List&lt;WAL&gt; wals = new ArrayList&lt;&gt;();<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    for (WALProvider provider : cached.values()) {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>      wals.addAll(provider.getWALs());<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    }<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    return wals;<a name="line.177"></a>
-<span class="sourceLineNo">178</span>  }<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>  private WAL getWAL(final String group) throws IOException {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    WALProvider provider = cached.get(group);<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    if (provider == null) {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      IdLock.Entry lockEntry = null;<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      try {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>        lockEntry = createLock.getLockEntry(group.hashCode());<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        provider = cached.get(group);<a name="line.186"></a>
-<span class="sourceLineNo">187</span>        if (provider == null) {<a name="line.187"></a>
-<span class="sourceLineNo">188</span>          provider = createProvider(group);<a name="line.188"></a>
-<span class="sourceLineNo">189</span>          cached.put(group, provider);<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        }<a name="line.190"></a>
-<span class="sourceLineNo">191</span>      } finally {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>        if (lockEntry != null) {<a name="line.192"></a>
-<span class="sourceLineNo">193</span>          createLock.releaseLockEntry(lockEntry);<a name="line.193"></a>
-<span class="sourceLineNo">194</span>        }<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      }<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    }<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    return provider.getWAL(null, null);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>  }<a name="line.198"></a>
-<span class="sourceLineNo">199</span><a name="line.199"></a>
-<span class="sourceLineNo">200</span>  @Override<a name="line.200"></a>
-<span class="sourceLineNo">201</span>  public WAL getWAL(final byte[] identifier, byte[] namespace) throws IOException {<a name="line.201"></a>
-<span class="sourceLineNo">202</span>    final String group;<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    if (META_WAL_PROVIDER_ID.equals(this.providerId)) {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      group = META_WAL_GROUP_NAME;<a name="line.204"></a>
-<span class="sourceLineNo">205</span>    } else {<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      group = strategy.group(identifier, namespace);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>    }<a name="line.207"></a>
-<span class="sourceLineNo">208</span>    return getWAL(group);<a name="line.208"></a>
-<span class="sourceLineNo">209</span>  }<a name="line.209"></a>
-<span class="sourceLineNo">210</span><a name="line.210"></a>
-<span class="sourceLineNo">211</span>  @Override<a name="line.211"></a>
-<span class="sourceLineNo">212</span>  public void shutdown() throws IOException {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>    // save the last exception and rethrow<a name="line.213"></a>
-<span class="sourceLineNo">214</span>    IOException failure = null;<a name="line.214"></a>
-<span class="sourceLineNo">215</span>    for (WALProvider provider: cached.values()) {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>      try {<a name="line.216"></a>
-<span class="sourceLineNo">217</span>        provider.shutdown();<a name="line.217"></a>
-<span class="sourceLineNo">218</span>      } catch (IOException e) {<a name="line.218"></a>
-<span class="sourceLineNo">219</span>        LOG.error("Problem shutting down wal provider '" + provider + "': " + e.getMessage());<a name="line.219"></a>
-<span class="sourceLineNo">220</span>        if (LOG.isDebugEnabled()) {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>          LOG.debug("Details of problem shutting down wal provider '" + provider + "'", e);<a name="line.221"></a>
-<span class="sourceLineNo">222</span>        }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        failure = e;<a name="line.223"></a>
-<span class="sourceLineNo">224</span>      }<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    }<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    if (failure != null) {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>      throw failure;<a name="line.227"></a>
-<span class="sourceLineNo">228</span>    }<a name="line.228"></a>
-<span class="sourceLineNo">229</span>  }<a name="line.229"></a>
-<span class="sourceLineNo">230</span><a name="line.230"></a>
-<span class="sourceLineNo">231</span>  @Override<a name="line.231"></a>
-<span class="sourceLineNo">232</span>  public void close() throws IOException {<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    // save the last exception and rethrow<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    IOException failure = null;<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    for (WALProvider provider : cached.values()) {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>      try {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>        provider.close();<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      } catch (IOException e) {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        LOG.error("Problem closing wal provider '" + provider + "': " + e.getMessage());<a name="line.239"></a>
-<span class="sourceLineNo">240</span>        if (LOG.isDebugEnabled()) {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>          LOG.debug("Details of problem closing wal provider '" + provider + "'", e);<a name="line.241"></a>
-<span class="sourceLineNo">242</span>        }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>        failure = e;<a name="line.243"></a>
-<span class="sourceLineNo">244</span>      }<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    }<a name="line.245"></a>
-<span class="sourceLineNo">246</span>    if (failure != null) {<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      throw failure;<a name="line.247"></a>
-<span class="sourceLineNo">248</span>    }<a name="line.248"></a>
-<span class="sourceLineNo">249</span>  }<a name="line.249"></a>
-<span class="sourceLineNo">250</span><a name="line.250"></a>
-<span class="sourceLineNo">251</span>  static class IdentityGroupingStrategy implements RegionGroupingStrategy {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>    @Override<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    public void init(Configuration config, String providerId) {}<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    @Override<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    public String group(final byte[] identifier, final byte[] namespace) {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>      return Bytes.toString(identifier);<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    }<a name="line.257"></a>
-<span class="sourceLineNo">258</span>  }<a name="line.258"></a>
-<span class="sourceLineNo">259</span><a name="line.259"></a>
-<span class="sourceLineNo">260</span>  @Override<a name="line.260"></a>
-<span class="sourceLineNo">261</span>  public long getNumLogFiles() {<a name="line.261"></a>
-<span class="sourceLineNo">262</span>    long numLogFiles = 0;<a name="line.262"></a>
-<span class="sourceLineNo">263</span>    for (WALProvider provider : cached.values()) {<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      numLogFiles += provider.getNumLogFiles();<a name="line.264"></a>
+<span class="sourceLineNo">136</span>  private final KeyLocker&lt;String&gt; createLock = new KeyLocker&lt;&gt;();<a name="line.136"></a>
+<span class="sourceLineNo">137</span><a name="line.137"></a>
+<span class="sourceLineNo">138</span>  private RegionGroupingStrategy strategy = null;<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  private WALFactory factory = null;<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  private List&lt;WALActionsListener&gt; listeners = null;<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  private String providerId = null;<a name="line.141"></a>
+<span class="sourceLineNo">142</span>  private Class&lt;? extends WALProvider&gt; providerClass;<a name="line.142"></a>
+<span class="sourceLineNo">143</span><a name="line.143"></a>
+<span class="sourceLineNo">144</span>  @Override<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  public void init(final WALFactory factory, final Configuration conf,<a name="line.145"></a>
+<span class="sourceLineNo">146</span>      final List&lt;WALActionsListener&gt; listeners, final String providerId) throws IOException {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    if (null != strategy) {<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      throw new IllegalStateException("WALProvider.init should only be called once.");<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    }<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    this.factory = factory;<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    this.listeners = null == listeners ? null : Collections.unmodifiableList(listeners);<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    StringBuilder sb = new StringBuilder().append(factory.factoryId);<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    if (providerId != null) {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      if (providerId.startsWith(WAL_FILE_NAME_DELIMITER)) {<a name="line.154"></a>
+<span class="sourceLineNo">155</span>        sb.append(providerId);<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      } else {<a name="line.156"></a>
+<span class="sourceLineNo">157</span>        sb.append(WAL_FILE_NAME_DELIMITER).append(providerId);<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      }<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    }<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    this.providerId = sb.toString();<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    this.strategy = getStrategy(conf, REGION_GROUPING_STRATEGY, DEFAULT_REGION_GROUPING_STRATEGY);<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    this.providerClass = factory.getProviderClass(DELEGATE_PROVIDER, DEFAULT_DELEGATE_PROVIDER);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>  }<a name="line.163"></a>
+<span class="sourceLineNo">164</span><a name="line.164"></a>
+<span class="sourceLineNo">165</span>  private WALProvider createProvider(String group) throws IOException {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    if (META_WAL_PROVIDER_ID.equals(providerId)) {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      return factory.createProvider(providerClass, listeners, META_WAL_PROVIDER_ID);<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    } else {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      return factory.createProvider(providerClass, listeners, group);<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  }<a name="line.171"></a>
+<span class="sourceLineNo">172</span><a name="line.172"></a>
+<span class="sourceLineNo">173</span>  @Override<a name="line.173"></a>
+<span class="sourceLineNo">174</span>  public List&lt;WAL&gt; getWALs() {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    List&lt;WAL&gt; wals = new ArrayList&lt;&gt;();<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    for (WALProvider provider : cached.values()) {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      wals.addAll(provider.getWALs());<a name="line.177"></a>
+<span class="sourceLineNo">178</span>    }<a name="line.178"></a>
+<span class="sourceLineNo">179</span>    return wals;<a name="line.179"></a>
+<span class="sourceLineNo">180</span>  }<a name="line.180"></a>
+<span class="sourceLineNo">181</span><a name="line.181"></a>
+<span class="sourceLineNo">182</span>  private WAL getWAL(String group) throws IOException {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    WALProvider provider = cached.get(group);<a name="line.183"></a>
+<span class="sourceLineNo">184</span>    if (provider == null) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      Lock lock = createLock.acquireLock(group);<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      try {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>        provider = cached.get(group);<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        if (provider == null) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>          provider = createProvider(group);<a name="line.189"></a>
+<span class="sourceLineNo">190</span>          cached.put(group, provider);<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        }<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      } finally {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        lock.unlock();<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    return provider.getWAL(null);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>  }<a name="line.197"></a>
+<span class="sourceLineNo">198</span><a name="line.198"></a>
+<span class="sourceLineNo">199</span>  @Override<a name="line.199"></a>
+<span class="sourceLineNo">200</span>  public WAL getWAL(RegionInfo region) throws IOException {<a name="line.200"></a>
+<span class="sourceLineNo">201</span>    String group;<a name="line.201"></a>
+<span class="sourceLineNo">202</span>    if (META_WAL_PROVIDER_ID.equals(this.providerId)) {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      group = META_WAL_GROUP_NAME;<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    } else {<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      byte[] id;<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      byte[] namespace;<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      if (region != null) {<a name="line.207"></a>
+<span class="sourceLineNo">208</span>        id = region.getEncodedNameAsBytes();<a name="line.208"></a>
+<span class="sourceLineNo">209</span>        namespace = region.getTable().getNamespace();<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      } else {<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        id = HConstants.EMPTY_BYTE_ARRAY;<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        namespace = null;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      }<a name="line.213"></a>
+<span class="sourceLineNo">214</span>      group = strategy.group(id, namespace);<a name="line.214"></a>
+<span class="sourceLineNo">215</span>    }<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    return getWAL(group);<a name="line.216"></a>
+<span class="sourceLineNo">217</span>  }<a name="line.217"></a>
+<span class="sourceLineNo">218</span><a name="line.218"></a>
+<span class="sourceLineNo">219</span>  @Override<a name="line.219"></a>
+<span class="sourceLineNo">220</span>  public void shutdown() throws IOException {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    // save the last exception and rethrow<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    IOException failure = null;<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    for (WALProvider provider: cached.values()) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>      try {<a name="line.224"></a>
+<span class="sourceLineNo">225</span>        provider.shutdown();<a name="line.225"></a>
+<span class="sourceLineNo">226</span>      } catch (IOException e) {<a name="line.226"></a>
+<span class="sourceLineNo">227</span>        LOG.error("Problem shutting down wal provider '" + provider + "': " + e.getMessage());<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        if (LOG.isDebugEnabled()) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          LOG.debug("Details of problem shutting down wal provider '" + provider + "'", e);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        }<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        failure = e;<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      }<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>    if (failure != null) {<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      throw failure;<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    }<a name="line.236"></a>
+<span class="sourceLineNo">237</span>  }<a name="line.237"></a>
+<span class="sourceLineNo">238</span><a name="line.238"></a>
+<span class="sourceLineNo">239</span>  @Override<a name="line.239"></a>
+<span class="sourceLineNo">240</span>  public void close() throws IOException {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>    // save the last exception and rethrow<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    IOException failure = null;<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    for (WALProvider provider : cached.values()) {<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      try {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>        provider.close();<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      } catch (IOException e) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        LOG.error("Problem closing wal provider '" + provider + "': " + e.getMessage());<a name="line.247"></a>
+<span class="sourceLineNo">248</span>        if (LOG.isDebugEnabled()) {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>          LOG.debug("Details of problem closing wal provider '" + provider + "'", e);<a name="line.249"></a>
+<span class="sourceLineNo">250</span>        }<a name="line.250"></a>
+<span class="sourceLineNo">251</span>        failure = e;<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      }<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    if (failure != null) {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>      throw failure;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    }<a name="line.256"></a>
+<span class="sourceLineNo">257</span>  }<a name="line.257"></a>
+<span class="sourceLineNo">258</span><a name="line.258"></a>
+<span class="sourceLineNo">259</span>  static class IdentityGroupingStrategy implements RegionGroupingStrategy {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    @Override<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    public void init(Configuration config, String providerId) {}<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    @Override<a name="line.262"></a>
+<span class="sourceLineNo">263</span>    public String group(final byte[] identifier, final byte[] namespace) {<a name="line.263"></a>
+<span class="sourceLineNo">264</span>      return Bytes.toString(identifier);<a name="line.264"></a>
 <span class="sourceLineNo">265</span>    }<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    return numLogFiles;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>  }<a name="line.267"></a>
-<span class="sourceLineNo">268</span><a name="line.268"></a>
-<span class="sourceLineNo">269</span>  @Override<a name="line.269"></a>
-<span class="sourceLineNo">270</span>  public long getLogFileSize() {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    long logFileSize = 0;<a name="line.271"></a>
-<span class="sourceLineNo">272</span>    for (WALProvider provider : cached.values()) {<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      logFileSize += provider.getLogFileSize();<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    }<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    return logFileSize;<a name="line.275"></a>
-<span class="sourceLineNo">276</span>  }<a name="line.276"></a>
-<span class="sourceLineNo">277</span>}<a name="line.277"></a>
+<span class="sourceLineNo">266</span>  }<a name="line.266"></a>
+<span class="sourceLineNo">267</span><a name="line.267"></a>
+<span class="sourceLineNo">268</span>  @Override<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  public long getNumLogFiles() {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    long numLogFiles = 0;<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    for (WALProvider provider : cached.values()) {<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      numLogFiles += provider.getNumLogFiles();<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    }<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    return numLogFiles;<a name="line.274"></a>
+<span class="sourceLineNo">275</span>  }<a name="line.275"></a>
+<span class="sourceLineNo">276</span><a name="line.276"></a>
+<span class="sourceLineNo">277</span>  @Override<a name="line.277"></a>
+<span class="sourceLineNo">278</span>  public long getLogFileSize() {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    long logFileSize = 0;<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    for (WALProvider provider : cached.values()) {<a name="line.280"></a>
+<span class="sourceLineNo">281</span>      logFileSize += provider.getLogFileSize();<a name="line.281"></a>
+<span class="sourceLineNo">282</span>    }<a name="line.282"></a>
+<span class="sourceLineNo">283</span>    return logFileSize;<a name="line.283"></a>
+<span class="sourceLineNo">284</span>  }<a name="line.284"></a>
+<span class="sourceLineNo">285</span>}<a name="line.285"></a>
 
 
 
