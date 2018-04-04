@@ -901,7 +901,7 @@ The following command starts 3 backup servers using ports 16002/16012, 16003/160
 </div>
 <div class="listingblock">
 <div class="content">
-<pre>$ ./bin/local-master-backup.sh 2 3 5</pre>
+<pre>$ ./bin/local-master-backup.sh start 2 3 5</pre>
 </div>
 </div>
 <div class="paragraph">
@@ -6751,6 +6751,12 @@ Quitting...</code></pre>
 <li>
 <p>The metric 'blockCacheEvictionCount' published on a per-region server basis no longer includes blocks removed from the cache due to the invalidation of the hfiles they are from (e.g. via compaction).</p>
 </li>
+<li>
+<p>The metric 'totalRequestCount' increments once per request; previously it incremented by the number of <code>Actions</code> carried in the request; e.g. if a request was a <code>multi</code> made of four Gets and two Puts, we&#8217;d increment 'totalRequestCount' by six; now we increment by one regardless. Expect to see lower values for this metric in hbase-2.0.0.</p>
+</li>
+<li>
+<p>The 'readRequestCount' now counts reads that return a non-empty row where in older hbases, we&#8217;d increment 'readRequestCount' whether a Result or not. This change will flatten the profile of the read-requests graphs if requests for non-existent rows. A YCSB read-heavy workload can do this dependent on how the database was loaded.</p>
+</li>
 </ul>
 </div>
 <div class="paragraph">
@@ -6760,6 +6766,16 @@ Quitting...</code></pre>
 <ul>
 <li>
 <p>Metrics related to the Distributed Log Replay feature are no longer present. They were previsouly found in the region server context under the name 'replay'. See the section <a id="upgrade2.0.distributed.log.replay"></a> for details.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>The following metrics have been added:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>'totalRowActionRequestCount' is a count of region row actions summing reads and writes.</p>
 </li>
 </ul>
 </div>
@@ -6784,6 +6800,34 @@ Quitting...</code></pre>
 <div id="upgrade2.0.admin.commands" class="paragraph">
 <div class="title">Most Admin APIs don&#8217;t work against an HBase 2.0+ cluster from pre-HBase 2.0 clients</div>
 <p>A number of admin commands are known to not work when used from a pre-HBase 2.0 client. This includes an HBase Shell that has the library jars from pre-HBase 2.0. You will need to plan for an outage of use of admin APIs and commands until you can also update to the needed client version.</p>
+</div>
+<div class="paragraph">
+<p>The following client operations do not work against HBase 2.0+ cluster when executed from a pre-HBase 2.0 client:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>list_procedures</p>
+</li>
+<li>
+<p>split</p>
+</li>
+<li>
+<p>merge_region</p>
+</li>
+<li>
+<p>list_quotas</p>
+</li>
+<li>
+<p>enable_table_replication</p>
+</li>
+<li>
+<p>disable_table_replication</p>
+</li>
+<li>
+<p>Snapshot related commands</p>
+</li>
+</ul>
 </div>
 <div class="paragraph">
 <div class="title">Deprecated in 1.0 admin commands have been removed.</div>
@@ -14702,8 +14746,11 @@ If writing to the WAL fails, the entire operation to modify the data fails.</p>
 </div>
 <div class="paragraph">
 <p>HBase uses an implementation of the <a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/wal/WAL.html">WAL</a> interface.
-Usually, there is only one instance of a WAL per RegionServer.
-The RegionServer records Puts and Deletes to it, before recording them to the <a href="#store.memstore">MemStore</a> for the affected <a href="#store">Store</a>.</p>
+Usually, there is only one instance of a WAL per RegionServer. An exception
+is the RegionServer that is carrying <em>hbase:meta</em>; the <em>meta</em> table gets its
+own dedicated WAL.
+The RegionServer records Puts and Deletes to its WAL, before recording them
+these Mutations <a href="#store.memstore">MemStore</a> for the affected <a href="#store">Store</a>.</p>
 </div>
 <div class="admonitionblock note">
 <table>
@@ -14723,14 +14770,46 @@ You will likely find references to the HLog in documentation tailored to these o
 </table>
 </div>
 <div class="paragraph">
-<p>The WAL resides in HDFS in the <em>/hbase/WALs/</em> directory (prior to HBase 0.94, they were stored in <em>/hbase/.logs/</em>), with subdirectories per region.</p>
+<p>The WAL resides in HDFS in the <em>/hbase/WALs/</em> directory, with subdirectories per region.</p>
 </div>
 <div class="paragraph">
-<p>For more general information about the concept of write ahead logs, see the Wikipedia <a href="http://en.wikipedia.org/wiki/Write-ahead_logging">Write-Ahead Log</a> article.</p>
+<p>For more general information about the concept of write ahead logs, see the Wikipedia
+<a href="http://en.wikipedia.org/wiki/Write-ahead_logging">Write-Ahead Log</a> article.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_multiwal"><a class="anchor" href="#_multiwal"></a>70.6.2. MultiWAL</h4>
+<h4 id="wal.providers"><a class="anchor" href="#wal.providers"></a>70.6.2. WAL Providers</h4>
+<div class="paragraph">
+<p>In HBase, there are a number of WAL imlementations (or 'Providers'). Each is known
+by a short name label (that unfortunately is not always descriptive). You set the provider in
+<em>hbase-site.xml</em> passing the WAL provder short-name as the value on the
+<em>hbase.wal.provider</em> property (Set the provider for <em>hbase:meta</em> using the
+<em>hbase.wal.meta_provider</em> property).</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><em>asyncfs</em>: The <strong>default</strong>. New since hbase-2.0.0 (HBASE-15536, HBASE-14790). This <em>AsyncFSWAL</em> provider, as it identifies itself in RegionServer logs, is built on a new non-blocking dfsclient implementation. It is currently resident in the hbase codebase but intent is to move it back up into HDFS itself. WALs edits are written concurrently ("fan-out") style to each of the WAL-block replicas on each DataNode rather than in a chained pipeline as the default client does. Latencies should be better. See <a href="https://www.slideshare.net/HBaseCon/apache-hbase-improvements-and-practices-at-xiaomi">Apache HBase Improements and Practices at Xiaomi</a> at slide 14 onward for more detail on implementation.</p>
+</li>
+<li>
+<p><em>filesystem</em>: This was the default in hbase-1.x releases. It is built on the blocking <em>DFSClient</em> and writes to replicas in classic <em>DFSCLient</em> pipeline mode. In logs it identifies as <em>FSHLog</em> or <em>FSHLogProvider</em>.</p>
+</li>
+<li>
+<p><em>multiwal</em>: This provider is made of multiple instances of <em>asyncfs</em> or  <em>filesystem</em>. See the next section for more on <em>multiwal</em>.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Look for the lines like the below in the RegionServer log to see which provider is in place (The below shows the default AsyncFSWALProvider):</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre>2018-04-02 13:22:37,983 INFO  [regionserver/ve0528:16020] wal.WALFactory: Instantiating WALProvider of type class org.apache.hadoop.hbase.wal.AsyncFSWALProvider</pre>
+</div>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_multiwal"><a class="anchor" href="#_multiwal"></a>70.6.3. MultiWAL</h4>
 <div class="paragraph">
 <p>With a single WAL per RegionServer, the RegionServer must write to the WAL serially, because HDFS files must be sequential. This causes the WAL to be a performance bottleneck.</p>
 </div>
@@ -14760,13 +14839,13 @@ You will likely find references to the HLog in documentation tailored to these o
 </div>
 </div>
 <div class="sect3">
-<h4 id="wal_flush"><a class="anchor" href="#wal_flush"></a>70.6.3. WAL Flushing</h4>
+<h4 id="wal_flush"><a class="anchor" href="#wal_flush"></a>70.6.4. WAL Flushing</h4>
 <div class="paragraph">
 <p>TODO (describe).</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_wal_splitting"><a class="anchor" href="#_wal_splitting"></a>70.6.4. WAL Splitting</h4>
+<h4 id="_wal_splitting"><a class="anchor" href="#_wal_splitting"></a>70.6.5. WAL Splitting</h4>
 <div class="paragraph">
 <p>A RegionServer serves many regions.
 All of the regions in a region server share the same active WAL file.
@@ -15099,7 +15178,7 @@ If none are found, it throws an exception so that the log splitting can be retri
 </div>
 </div>
 <div class="sect3">
-<h4 id="wal.compression"><a class="anchor" href="#wal.compression"></a>70.6.5. WAL Compression</h4>
+<h4 id="wal.compression"><a class="anchor" href="#wal.compression"></a>70.6.6. WAL Compression</h4>
 <div class="paragraph">
 <p>The content of the WAL can be compressed using LRU Dictionary compression.
 This can be used to speed up WAL replication to different datanodes.
@@ -15118,7 +15197,33 @@ dictionary because of an abrupt termination, a read of this last block may not b
 </div>
 </div>
 <div class="sect3">
-<h4 id="wal.disable"><a class="anchor" href="#wal.disable"></a>70.6.6. Disabling the WAL</h4>
+<h4 id="wal.durability"><a class="anchor" href="#wal.durability"></a>70.6.7. Durability</h4>
+<div class="paragraph">
+<p>It is possible to set <em>durability</em> on each Mutation or on a Table basis. Options include:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><em>SKIP_WAL</em>: Do not write Mutations to the WAL (See the next section, <a href="#wal.disable">Disabling the WAL</a>).</p>
+</li>
+<li>
+<p><em>ASYNC_WAL</em>: Write the WAL asynchronously; do not hold-up clients waiting on the sync of their write to the filesystem but return immediately; the Mutation will be flushed to the WAL at a later time. This option currently may lose data. See HBASE-16689.</p>
+</li>
+<li>
+<p><em>SYNC_WAL</em>: The <strong>default</strong>. Each edit is sync&#8217;d to HDFS before we return success to the client.</p>
+</li>
+<li>
+<p><em>FSYNC_WAL</em>: Each edit is fsync&#8217;d to HDFS and the filesystem before we return success to the client.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Do not confuse the <em>ASYNC_WAL</em> option on a Mutation or Table with the <em>AsyncFSWAL</em> writer; they are distinct
+options unfortunately closely named</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="wal.disable"><a class="anchor" href="#wal.disable"></a>70.6.8. Disabling the WAL</h4>
 <div class="paragraph">
 <p>It is possible to disable the WAL, to improve performance in certain specific situations.
 However, disabling the WAL puts your data at risk.
@@ -17588,6 +17693,14 @@ configure the MOB file reader&#8217;s cache settings for each RegionServer (see
 Client code does not need to change to take advantage of HBase MOB support. The
 feature is transparent to the client.</p>
 </div>
+<div class="paragraph">
+<p>MOB compaction</p>
+</div>
+<div class="paragraph">
+<p>MOB data is flushed into MOB files after MemStore flush. There will be lots of MOB files
+after some time. To reduce MOB file count, there is a periodic task which compacts
+small MOB files into a large one (MOB compaction).</p>
+</div>
 <div class="sect2">
 <h3 id="_configuring_columns_for_mob"><a class="anchor" href="#_configuring_columns_for_mob"></a>75.1. Configuring Columns for MOB</h3>
 <div class="paragraph">
@@ -17625,7 +17738,54 @@ hcd.setMobThreshold(<span class="integer">102400L</span>);
 </div>
 </div>
 <div class="sect2">
-<h3 id="_testing_mob"><a class="anchor" href="#_testing_mob"></a>75.2. Testing MOB</h3>
+<h3 id="_configure_mob_compaction_policy"><a class="anchor" href="#_configure_mob_compaction_policy"></a>75.2. Configure MOB Compaction Policy</h3>
+<div class="paragraph">
+<p>By default, MOB files for one specific day are compacted into one large MOB file.
+To reduce MOB file count more, there are other MOB Compaction policies supported.</p>
+</div>
+<div class="paragraph">
+<p>daily policy  - compact MOB Files for one day into one large MOB file (default policy)
+weekly policy - compact MOB Files for one week into one large MOB file
+montly policy - compact MOB Files for one  month into one large MOB File</p>
+</div>
+<div class="exampleblock">
+<div class="title">Example 39. Configure MOB compaction policy Using HBase Shell</div>
+<div class="content">
+<div class="listingblock">
+<div class="content">
+<pre>hbase&gt; create 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'daily'}
+hbase&gt; create 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'weekly'}
+hbase&gt; create 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'monthly'}
+
+hbase&gt; alter 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'daily'}
+hbase&gt; alter 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'weekly'}
+hbase&gt; alter 't1', {NAME =&gt; 'f1', IS_MOB =&gt; true, MOB_THRESHOLD =&gt; 102400, MOB_COMPACT_PARTITION_POLICY =&gt; 'monthly'}</pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_configure_mob_compaction_mergeable_threshold"><a class="anchor" href="#_configure_mob_compaction_mergeable_threshold"></a>75.3. Configure MOB Compaction mergeable threshold</h3>
+<div class="paragraph">
+<p>If the size of a mob file is less than this value, it&#8217;s regarded as a small file and needs to
+be merged in mob compaction. The default value is 1280MB.</p>
+</div>
+<div class="exampleblock">
+<div class="content">
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="xml"><span class="tag">&lt;property&gt;</span>
+    <span class="tag">&lt;name&gt;</span>hbase.mob.compaction.mergeable.threshold<span class="tag">&lt;/name&gt;</span>
+    <span class="tag">&lt;value&gt;</span>10000000000<span class="tag">&lt;/value&gt;</span>
+<span class="tag">&lt;/property&gt;</span></code></pre>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_testing_mob"><a class="anchor" href="#_testing_mob"></a>75.4. Testing MOB</h3>
 <div class="paragraph">
 <p>The utility <code>org.apache.hadoop.hbase.IntegrationTestIngestWithMOB</code> is provided to assist with testing
 the MOB feature. The utility is run as follows:</p>
@@ -17656,7 +17816,7 @@ The default is 5 kB, expressed in bytes.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="mob.cache.configure"><a class="anchor" href="#mob.cache.configure"></a>75.3. Configuring the MOB Cache</h3>
+<h3 id="mob.cache.configure"><a class="anchor" href="#mob.cache.configure"></a>75.5. Configuring the MOB Cache</h3>
 <div class="paragraph">
 <p>Because there can be a large number of MOB files at any time, as compared to the number of HFiles,
 MOB files are not always kept open. The MOB file reader cache is a LRU cache which keeps the most
@@ -17665,7 +17825,7 @@ the following properties to the RegionServer&#8217;s <code>hbase-site.xml</code>
 suit your environment, and restart or rolling restart the RegionServer.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 39. Example MOB Cache Configuration</div>
+<div class="title">Example 40. Example MOB Cache Configuration</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -17705,9 +17865,9 @@ suit your environment, and restart or rolling restart the RegionServer.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_mob_optimization_tasks"><a class="anchor" href="#_mob_optimization_tasks"></a>75.4. MOB Optimization Tasks</h3>
+<h3 id="_mob_optimization_tasks"><a class="anchor" href="#_mob_optimization_tasks"></a>75.6. MOB Optimization Tasks</h3>
 <div class="sect3">
-<h4 id="_manually_compacting_mob_files"><a class="anchor" href="#_manually_compacting_mob_files"></a>75.4.1. Manually Compacting MOB Files</h4>
+<h4 id="_manually_compacting_mob_files"><a class="anchor" href="#_manually_compacting_mob_files"></a>75.6.1. Manually Compacting MOB Files</h4>
 <div class="paragraph">
 <p>To manually compact MOB files, rather than waiting for the
 <a href="#mob.cache.configure">configuration</a> to trigger compaction, use the
@@ -19123,7 +19283,7 @@ See <a href="#external_apis">Apache HBase External APIs</a> for more information
 <h2 id="_examples"><a class="anchor" href="#_examples"></a>92. Examples</h2>
 <div class="sectionbody">
 <div class="exampleblock">
-<div class="title">Example 40. Create, modify and delete a Table Using Java</div>
+<div class="title">Example 41. Create, modify and delete a Table Using Java</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -19967,7 +20127,7 @@ represent persistent data.</p>
 <p>Download the code from <a href="http://code.google.com/p/hbase-jdo/" class="bare">http://code.google.com/p/hbase-jdo/</a>.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 41. JDO Example</div>
+<div class="title">Example 42. JDO Example</div>
 <div class="content">
 <div class="paragraph">
 <p>This example uses JDO to create a table and an index, insert a row into a table, get
@@ -20211,7 +20371,7 @@ $ bin/hbase org.python.util.jython</p>
 <div class="sect2">
 <h3 id="_jython_code_examples"><a class="anchor" href="#_jython_code_examples"></a>98.2. Jython Code Examples</h3>
 <div class="exampleblock">
-<div class="title">Example 42. Table Creation, Population, Get, and Delete with Jython</div>
+<div class="title">Example 43. Table Creation, Population, Get, and Delete with Jython</div>
 <div class="content">
 <div class="paragraph">
 <p>The following Jython code example creates a table, populates it with data, fetches
@@ -20268,7 +20428,7 @@ admin.deleteTable(desc.getName())</code></pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 43. Table Scan Using Jython</div>
+<div class="title">Example 44. Table Scan Using Jython</div>
 <div class="content">
 <div class="paragraph">
 <p>This example scans a table and returns the results that match a given family qualifier.</p>
@@ -20392,7 +20552,7 @@ If single quotes are present in the argument, they must be escaped by an additio
 </dl>
 </div>
 <div class="exampleblock">
-<div class="title">Example 44. Compound Operators</div>
+<div class="title">Example 45. Compound Operators</div>
 <div class="content">
 <div class="paragraph">
 <p>You can combine multiple operators to create a hierarchy of filters, such as the following example:</p>
@@ -20421,7 +20581,7 @@ If single quotes are present in the argument, they must be escaped by an additio
 </ol>
 </div>
 <div class="exampleblock">
-<div class="title">Example 45. Precedence Example</div>
+<div class="title">Example 46. Precedence Example</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -20780,7 +20940,7 @@ Executor as a multi-threaded client application. This allows any Spark Tasks
 running on the executors to access the shared Connection object.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 46. HBaseContext Usage Example</div>
+<div class="title">Example 47. HBaseContext Usage Example</div>
 <div class="content">
 <div class="paragraph">
 <p>This example shows how HBaseContext can be used to do a <code>foreachPartition</code> on a RDD
@@ -20942,7 +21102,7 @@ access to HBase</p>
 </dl>
 </div>
 <div class="exampleblock">
-<div class="title">Example 47. <code>bulkPut</code> Example with DStreams</div>
+<div class="title">Example 48. <code>bulkPut</code> Example with DStreams</div>
 <div class="content">
 <div class="paragraph">
 <p>Below is an example of bulkPut with DStreams. It is very close in feel to the RDD
@@ -21017,7 +21177,7 @@ out directly from the reduce phase.</p>
 <p>First lets look at an example of using the basic bulk load functionality</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 48. Bulk Loading Example</div>
+<div class="title">Example 49. Bulk Loading Example</div>
 <div class="content">
 <div class="paragraph">
 <p>The following example shows bulk loading with Spark.</p>
@@ -21097,7 +21257,7 @@ to load the newly created HFiles into HBase.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 49. Using Additional Parameters</div>
+<div class="title">Example 50. Using Additional Parameters</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -21145,7 +21305,7 @@ load.doBulkLoad(new Path(stagingFolder.getPath),
 <p>Now lets look at how you would call the thin record bulk load implementation</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 50. Using thin record bulk load</div>
+<div class="title">Example 51. Using thin record bulk load</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -21350,7 +21510,7 @@ The lifetime of this temporary table is tied to the SQLContext that was used to 
 <div class="sect2">
 <h3 id="_others"><a class="anchor" href="#_others"></a>103.6. Others</h3>
 <div class="exampleblock">
-<div class="title">Example 51. Query with different timestamps</div>
+<div class="title">Example 52. Query with different timestamps</div>
 <div class="content">
 <div class="paragraph">
 <p>In HBaseSparkConf, four parameters related to timestamp can be set. They are TIMESTAMP,
@@ -21397,7 +21557,7 @@ sqlContext.sql(&quot;select count(col1) from table&quot;).show</code></pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 52. Native Avro support</div>
+<div class="title">Example 53. Native Avro support</div>
 <div class="content">
 <div class="paragraph">
 <p>HBase-Spark Connector support different data formats like Avro, Jason, etc. The use case below
@@ -22864,7 +23024,7 @@ It is useful for tuning the IO impact of prefetching versus the time before all 
 <p>To enable prefetching on a given column family, you can use HBase Shell or use the API.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 53. Enable Prefetch Using HBase Shell</div>
+<div class="title">Example 54. Enable Prefetch Using HBase Shell</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -22874,7 +23034,7 @@ It is useful for tuning the IO impact of prefetching versus the time before all 
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 54. Enable Prefetch Using the API</div>
+<div class="title">Example 55. Enable Prefetch Using the API</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -23638,7 +23798,7 @@ If this is set to 0 (the default), hedged reads are disabled.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 55. Hedged Reads Configuration Example</div>
+<div class="title">Example 56. Hedged Reads Configuration Example</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -25828,6 +25988,22 @@ Usage: hbase canary [opts] [table1 [table2]...] | [regionserver1 [regionserver2]
    -D&lt;configProperty&gt;=&lt;value&gt; assigning or override the configuration params</pre>
 </div>
 </div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+The <code>Sink</code> class is instantiated using the <code>hbase.canary.sink.class</code> configuration property which
+will also determine the used Monitor class. In the absence of this property RegionServerStdOutSink
+will be used. You need to use the Sink according to the passed parameters to the <em>canary</em> command.
+As an example you have to set <code>hbase.canary.sink.class</code> property to
+<code>org.apache.hadoop.hbase.tool.Canary$RegionStdOutSink</code> for using table parameters.
+</td>
+</tr>
+</table>
+</div>
 <div class="paragraph">
 <p>This tool will return non zero error codes to user for collaborating with other monitoring tools, such as Nagios.
 The error code definitions are:</p>
@@ -26045,7 +26221,7 @@ exit code.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 56. Canary in a Kerberos-Enabled Cluster</div>
+<div class="title">Example 57. Canary in a Kerberos-Enabled Cluster</div>
 <div class="content">
 <div class="paragraph">
 <p>This example shows each of the properties with valid values.</p>
@@ -27022,7 +27198,7 @@ The script requires you to set some environment variables before running it.
 Examine the script and modify it to suit your needs.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 57. <em>rolling-restart.sh</em> General Usage</div>
+<div class="title">Example 58. <em>rolling-restart.sh</em> General Usage</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -29837,7 +30013,7 @@ a similar issue in the future.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 58. Code Blocks in Jira Comments</div>
+<div class="title">Example 59. Code Blocks in Jira Comments</div>
 <div class="content">
 <div class="paragraph">
 <p>A commonly used macro in Jira is {code}. Everything inside the tags is preformatted, as in this example.</p>
@@ -30280,7 +30456,7 @@ See <a href="#java">java</a> for Java requirements per HBase release.</p>
 </table>
 </div>
 <div id="maven.settings.xml" class="exampleblock">
-<div class="title">Example 59. Example <em>~/.m2/settings.xml</em> File</div>
+<div class="title">Example 60. Example <em>~/.m2/settings.xml</em> File</div>
 <div class="content">
 <div class="paragraph">
 <p>Publishing to maven requires you sign the artifacts you want to upload.
@@ -32299,7 +32475,7 @@ below.</p>
 </ul>
 </div>
 <div class="exampleblock">
-<div class="title">Example 60. Example of committing a Patch</div>
+<div class="title">Example 61. Example of committing a Patch</div>
 <div class="content">
 <div class="paragraph">
 <p>One thing you will notice with these examples is that there are a lot of git pull commands.
@@ -35793,7 +35969,7 @@ You do not need to re-create the table or copy data.
 If you are changing codecs, be sure the old codec is still available until all the old StoreFiles have been compacted.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 61. Enabling Compression on a ColumnFamily of an Existing Table using HBaseShell</div>
+<div class="title">Example 62. Enabling Compression on a ColumnFamily of an Existing Table using HBaseShell</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35805,7 +35981,7 @@ hbase&gt; enable 'test'</pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 62. Creating a New Table with Compression On a ColumnFamily</div>
+<div class="title">Example 63. Creating a New Table with Compression On a ColumnFamily</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35815,7 +35991,7 @@ hbase&gt; enable 'test'</pre>
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 63. Verifying a ColumnFamily&#8217;s Compression Settings</div>
+<div class="title">Example 64. Verifying a ColumnFamily&#8217;s Compression Settings</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35840,7 +36016,7 @@ DESCRIPTION                                          ENABLED
 You must specify either <code>-write</code> or <code>-update-read</code> as your first parameter, and if you do not specify another parameter, usage advice is printed for each option.</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 64. LoadTestTool Usage</div>
+<div class="title">Example 65. LoadTestTool Usage</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35900,7 +36076,7 @@ Options:
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 65. Example Usage of LoadTestTool</div>
+<div class="title">Example 66. Example Usage of LoadTestTool</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35921,7 +36097,7 @@ Disable the table before altering its DATA_BLOCK_ENCODING setting.
 Following is an example using HBase Shell:</p>
 </div>
 <div class="exampleblock">
-<div class="title">Example 66. Enable Data Block Encoding On a Table</div>
+<div class="title">Example 67. Enable Data Block Encoding On a Table</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -35939,7 +36115,7 @@ hbase&gt; enable 'test'
 </div>
 </div>
 <div class="exampleblock">
-<div class="title">Example 67. Verifying a ColumnFamily&#8217;s Data Block Encoding</div>
+<div class="title">Example 68. Verifying a ColumnFamily&#8217;s Data Block Encoding</div>
 <div class="content">
 <div class="listingblock">
 <div class="content">
@@ -37197,7 +37373,7 @@ The server will return cellblocks compressed using this same compressor as long 
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-SNAPSHOT<br>
-Last updated 2018-04-03 14:29:47 UTC
+Last updated 2018-04-04 14:29:50 UTC
 </div>
 </div>
 </body>
