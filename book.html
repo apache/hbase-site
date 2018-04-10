@@ -28110,10 +28110,13 @@ If a slave cluster does run out of room, or is inaccessible for other reasons, i
 <td class="content">
 <div class="title">Consistency Across Replicated Clusters</div>
 <div class="paragraph">
-<p>How your application builds on top of the HBase API matters when replication is in play. HBase&#8217;s replication system provides at-least-once delivery of client edits for an enabled column family to each configured destination cluster. In the event of failure to reach a given destination, the replication system will retry sending edits in a way that might repeat a given message. Further more, there is not a guaranteed order of delivery for client edits. In the event of a RegionServer failing, recovery of the replication queue happens independent of recovery of the individual regions that server was previously handling. This means that it is possible for the not-yet-replicated edits to be serviced by a RegionServer that is currently slower to replicate than the one that handles edits from after the failure.</p>
+<p>How your application builds on top of the HBase API matters when replication is in play. HBase&#8217;s replication system provides at-least-once delivery of client edits for an enabled column family to each configured destination cluster. In the event of failure to reach a given destination, the replication system will retry sending edits in a way that might repeat a given message. HBase provides two ways of replication, one is the original replication and the other is serial replication. In the previous way of replication, there is not a guaranteed order of delivery for client edits. In the event of a RegionServer failing, recovery of the replication queue happens independent of recovery of the individual regions that server was previously handling. This means that it is possible for the not-yet-replicated edits to be serviced by a RegionServer that is currently slower to replicate than the one that handles edits from after the failure.</p>
 </div>
 <div class="paragraph">
 <p>The combination of these two properties (at-least-once delivery and the lack of message ordering) means that some destination clusters may end up in a different state if your application makes use of operations that are not idempotent, e.g. Increments.</p>
+</div>
+<div class="paragraph">
+<p>To solve the problem, HBase now supports serial replication, which sends edits to destination cluster as the order of requests from client. See <a href="#_serial_replication">Serial Replication</a>.</p>
 </div>
 </td>
 </tr>
@@ -28197,6 +28200,10 @@ Create tables with the same names and column families on both the source and des
 <pre>LOG.info("Replicating "+clusterId + " -&gt; " + peerClusterId);</pre>
 </div>
 </div>
+<div class="paragraph">
+<div class="title">Serial Replication Configuration</div>
+<p>See <a href="#_serial_replication">Serial Replication</a></p>
+</div>
 <div class="dlist">
 <div class="title">Cluster Management Commands</div>
 <dl>
@@ -28248,7 +28255,48 @@ replication as long as peers exist.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_verifying_replicated_data"><a class="anchor" href="#_verifying_replicated_data"></a>151.3. Verifying Replicated Data</h3>
+<h3 id="_serial_replication"><a class="anchor" href="#_serial_replication"></a>151.3. Serial Replication</h3>
+<div class="paragraph">
+<p>Note: this feature is introduced in HBase 2.1</p>
+</div>
+<div class="paragraph">
+<div class="title">Function of serial replication</div>
+<p>Serial replication supports to push logs to the destination cluster in the same order as logs reach to the source cluster.</p>
+</div>
+<div class="paragraph">
+<div class="title">Why need serial replication?</div>
+<p>In replication of HBase, we push mutations to destination cluster by reading WAL in each region server. We have a queue for WAL files so we can read them in order of creation time. However, when region-move or RS failure occurs in source cluster, the hlog entries that are not pushed before region-move or RS-failure will be pushed by original RS(for region move) or another RS which takes over the remained hlog of dead RS(for RS failure), and the new entries for the same region(s) will be pushed by the RS which now serves the region(s), but they push the hlog entries of a same region concurrently without coordination.</p>
+</div>
+<div class="paragraph">
+<p>This treatment can possibly lead to data inconsistency between source and destination clusters:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p>there are put and then delete written to source cluster.</p>
+</li>
+<li>
+<p>due to region-move / RS-failure, they are pushed by different replication-source threads to peer cluster.</p>
+</li>
+<li>
+<p>if delete is pushed to peer cluster before put, and flush and major-compact occurs in peer cluster before put is pushed to peer cluster, the delete is collected and the put remains in peer cluster, but in source cluster the put is masked by the delete, hence data inconsistency between source and destination clusters.</p>
+</li>
+</ol>
+</div>
+<div class="olist arabic">
+<div class="title">Serial replication configuration</div>
+<ol class="arabic">
+<li>
+<p>Set the serial flag to true for a repliation peer. You can either set it to true when creating a replication peer, or change it to true later.</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>The serial replication feature had been done firstly in <a href="https://issues.apache.org/jira/browse/HBASE-9465">HBASE-9465</a> and then reverted and redone in <a href="https://issues.apache.org/jira/browse/HBASE-20046">HBASE-20046</a>. You can find more details in these issues.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_verifying_replicated_data"><a class="anchor" href="#_verifying_replicated_data"></a>151.4. Verifying Replicated Data</h3>
 <div class="paragraph">
 <p>The <code>VerifyReplication</code> MapReduce job, which is included in HBase, performs a systematic comparison of replicated data between two different clusters. Run the VerifyReplication job on the master cluster, supplying it with the peer ID and table name to use for validation. You can limit the verification further by specifying a time range or specific families. The job&#8217;s short name is <code>verifyrep</code>. To run the job, use a command like the following:</p>
 </div>
@@ -28266,7 +28314,7 @@ The <code>VerifyReplication</code> command prints out <code>GOODROWS</code> and 
 </div>
 </div>
 <div class="sect2">
-<h3 id="_detailed_information_about_cluster_replication"><a class="anchor" href="#_detailed_information_about_cluster_replication"></a>151.4. Detailed Information About Cluster Replication</h3>
+<h3 id="_detailed_information_about_cluster_replication"><a class="anchor" href="#_detailed_information_about_cluster_replication"></a>151.5. Detailed Information About Cluster Replication</h3>
 <div class="imageblock">
 <div class="content">
 <img src="images/replication_overview.png" alt="replication overview">
@@ -28274,7 +28322,7 @@ The <code>VerifyReplication</code> command prints out <code>GOODROWS</code> and 
 <div class="title">Figure 13. Replication Architecture Overview</div>
 </div>
 <div class="sect3">
-<h4 id="_life_of_a_wal_edit"><a class="anchor" href="#_life_of_a_wal_edit"></a>151.4.1. Life of a WAL Edit</h4>
+<h4 id="_life_of_a_wal_edit"><a class="anchor" href="#_life_of_a_wal_edit"></a>151.5.1. Life of a WAL Edit</h4>
 <div class="paragraph">
 <p>A single WAL edit goes through several steps in order to be replicated to a slave cluster.</p>
 </div>
@@ -28357,7 +28405,7 @@ This option was introduced in <a href="https://issues.apache.org/jira/browse/HBA
 </div>
 </div>
 <div class="sect3">
-<h4 id="_replication_internals"><a class="anchor" href="#_replication_internals"></a>151.4.2. Replication Internals</h4>
+<h4 id="_replication_internals"><a class="anchor" href="#_replication_internals"></a>151.5.2. Replication Internals</h4>
 <div class="dlist">
 <dl>
 <dt class="hdlist1">Replication State in ZooKeeper</dt>
@@ -28385,7 +28433,7 @@ This list includes both live and dead region servers.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_choosing_region_servers_to_replicate_to"><a class="anchor" href="#_choosing_region_servers_to_replicate_to"></a>151.4.3. Choosing Region Servers to Replicate To</h4>
+<h4 id="_choosing_region_servers_to_replicate_to"><a class="anchor" href="#_choosing_region_servers_to_replicate_to"></a>151.5.3. Choosing Region Servers to Replicate To</h4>
 <div class="paragraph">
 <p>When a master cluster region server initiates a replication source to a slave cluster, it first connects to the slave&#8217;s ZooKeeper ensemble using the provided cluster key . It then scans the <em>rs/</em> directory to discover all the available sinks (region servers that are accepting incoming streams of edits to replicate) and randomly chooses a subset of them using a configured ratio which has a default value of 10%. For example, if a slave cluster has 150 machines, 15 will be chosen as potential recipient for edits that this master cluster region server sends.
 Because this selection is performed by each master region server, the probability that all slave region servers are used is very high, and this method works for clusters of any size.
@@ -28398,7 +28446,7 @@ When nodes are removed from the slave cluster, or if nodes go down or come back 
 </div>
 </div>
 <div class="sect3">
-<h4 id="_keeping_track_of_logs"><a class="anchor" href="#_keeping_track_of_logs"></a>151.4.4. Keeping Track of Logs</h4>
+<h4 id="_keeping_track_of_logs"><a class="anchor" href="#_keeping_track_of_logs"></a>151.5.4. Keeping Track of Logs</h4>
 <div class="paragraph">
 <p>Each master cluster region server has its own znode in the replication znodes hierarchy.
 It contains one znode per peer cluster (if 5 slave clusters, 5 znodes are created), and each of these contain a queue of WALs to process.
@@ -28423,7 +28471,7 @@ Because moving a file is a NameNode operation , if the reader is currently readi
 </div>
 </div>
 <div class="sect3">
-<h4 id="_reading_filtering_and_sending_edits"><a class="anchor" href="#_reading_filtering_and_sending_edits"></a>151.4.5. Reading, Filtering and Sending Edits</h4>
+<h4 id="_reading_filtering_and_sending_edits"><a class="anchor" href="#_reading_filtering_and_sending_edits"></a>151.5.5. Reading, Filtering and Sending Edits</h4>
 <div class="paragraph">
 <p>By default, a source attempts to read from a WAL and ship log entries to a sink as quickly as possible.
 Speed is limited by the filtering of log entries Only KeyValues that are scoped GLOBAL and that do not belong to catalog tables will be retained.
@@ -28440,7 +28488,7 @@ If the RPC threw an exception, the source will retry 10 times before trying to f
 </div>
 </div>
 <div class="sect3">
-<h4 id="_cleaning_logs"><a class="anchor" href="#_cleaning_logs"></a>151.4.6. Cleaning Logs</h4>
+<h4 id="_cleaning_logs"><a class="anchor" href="#_cleaning_logs"></a>151.5.6. Cleaning Logs</h4>
 <div class="paragraph">
 <p>If replication is not enabled, the master&#8217;s log-cleaning thread deletes old logs using a configured TTL.
 This TTL-based method does not work well with replication, because archived logs which have exceeded their TTL may still be in a queue.
@@ -28462,7 +28510,7 @@ WALs are saved when replication is enabled or disabled as long as peers exist.
 </div>
 </div>
 <div class="sect3">
-<h4 id="rs.failover.details"><a class="anchor" href="#rs.failover.details"></a>151.4.7. Region Server Failover</h4>
+<h4 id="rs.failover.details"><a class="anchor" href="#rs.failover.details"></a>151.5.7. Region Server Failover</h4>
 <div class="paragraph">
 <p>When no region servers are failing, keeping track of the logs in ZooKeeper adds no value.
 Unfortunately, region servers do fail, and since ZooKeeper is highly available, it is useful for managing the transfer of the queues in the event of a failure.</p>
@@ -28561,7 +28609,7 @@ The new layout will be:</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_replication_metrics"><a class="anchor" href="#_replication_metrics"></a>151.5. Replication Metrics</h3>
+<h3 id="_replication_metrics"><a class="anchor" href="#_replication_metrics"></a>151.6. Replication Metrics</h3>
 <div class="paragraph">
 <p>The following metrics are exposed at the global region server level and at the peer level:</p>
 </div>
@@ -28615,7 +28663,7 @@ The new layout will be:</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_replication_configuration_options"><a class="anchor" href="#_replication_configuration_options"></a>151.6. Replication Configuration Options</h3>
+<h3 id="_replication_configuration_options"><a class="anchor" href="#_replication_configuration_options"></a>151.7. Replication Configuration Options</h3>
 <table class="tableblock frame-all grid-all spread">
 <colgroup>
 <col style="width: 33.3333%;">
@@ -28671,7 +28719,7 @@ The new layout will be:</p>
 </table>
 </div>
 <div class="sect2">
-<h3 id="_monitoring_replication_status"><a class="anchor" href="#_monitoring_replication_status"></a>151.7. Monitoring Replication Status</h3>
+<h3 id="_monitoring_replication_status"><a class="anchor" href="#_monitoring_replication_status"></a>151.8. Monitoring Replication Status</h3>
 <div class="paragraph">
 <p>You can use the HBase Shell command <code>status 'replication'</code> to monitor the replication status on your cluster. The  command has three variations:
 * <code>status 'replication'</code>&#8201;&#8212;&#8201;prints the status of each source and its sinks, sorted by hostname.
@@ -37631,7 +37679,7 @@ The server will return cellblocks compressed using this same compressor as long 
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-SNAPSHOT<br>
-Last updated 2018-04-09 17:04:15 UTC
+Last updated 2018-04-10 13:51:52 UTC
 </div>
 </div>
 </body>
