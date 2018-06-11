@@ -318,43 +318,60 @@
 <span class="sourceLineNo">310</span>          exception.getClass().getSimpleName());<a name="line.310"></a>
 <span class="sourceLineNo">311</span>      if (!env.getMasterServices().getServerManager().expireServer(serverName)) {<a name="line.311"></a>
 <span class="sourceLineNo">312</span>        // Failed to queue an expire. Lots of possible reasons including it may be already expired.<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        // If so, is it beyond the state where we will be woken-up if go ahead and suspend the<a name="line.313"></a>
-<span class="sourceLineNo">314</span>        // procedure. Look for this rare condition.<a name="line.314"></a>
-<span class="sourceLineNo">315</span>        if (env.getAssignmentManager().isDeadServerProcessed(serverName)) {<a name="line.315"></a>
-<span class="sourceLineNo">316</span>          // Its ok to proceed with this unassign.<a name="line.316"></a>
-<span class="sourceLineNo">317</span>          LOG.info("{} is dead and processed; moving procedure to finished state; {}",<a name="line.317"></a>
-<span class="sourceLineNo">318</span>              serverName, this);<a name="line.318"></a>
-<span class="sourceLineNo">319</span>          proceed(env, regionNode);<a name="line.319"></a>
-<span class="sourceLineNo">320</span>          // Return true; wake up the procedure so we can act on proceed.<a name="line.320"></a>
-<span class="sourceLineNo">321</span>          return true;<a name="line.321"></a>
-<span class="sourceLineNo">322</span>        }<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      }<a name="line.323"></a>
-<span class="sourceLineNo">324</span>      // Return false so this procedure stays in suspended state. It will be woken up by the<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      // ServerCrashProcedure that was scheduled when we called #expireServer above. SCP calls<a name="line.325"></a>
-<span class="sourceLineNo">326</span>      // #handleRIT which will call this method only the exception will be a ServerCrashException<a name="line.326"></a>
-<span class="sourceLineNo">327</span>      // this time around (See above).<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      // TODO: Add a SCP as a new subprocedure that we now come to depend on.<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      return false;<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    return true;<a name="line.331"></a>
-<span class="sourceLineNo">332</span>  }<a name="line.332"></a>
-<span class="sourceLineNo">333</span><a name="line.333"></a>
-<span class="sourceLineNo">334</span>  @Override<a name="line.334"></a>
-<span class="sourceLineNo">335</span>  public void toStringClassDetails(StringBuilder sb) {<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    super.toStringClassDetails(sb);<a name="line.336"></a>
-<span class="sourceLineNo">337</span>    sb.append(", server=").append(this.hostingServer);<a name="line.337"></a>
-<span class="sourceLineNo">338</span>  }<a name="line.338"></a>
-<span class="sourceLineNo">339</span><a name="line.339"></a>
-<span class="sourceLineNo">340</span>  @Override<a name="line.340"></a>
-<span class="sourceLineNo">341</span>  public ServerName getServer(final MasterProcedureEnv env) {<a name="line.341"></a>
-<span class="sourceLineNo">342</span>    return this.hostingServer;<a name="line.342"></a>
-<span class="sourceLineNo">343</span>  }<a name="line.343"></a>
-<span class="sourceLineNo">344</span><a name="line.344"></a>
-<span class="sourceLineNo">345</span>  @Override<a name="line.345"></a>
-<span class="sourceLineNo">346</span>  protected ProcedureMetrics getProcedureMetrics(MasterProcedureEnv env) {<a name="line.346"></a>
-<span class="sourceLineNo">347</span>    return env.getAssignmentManager().getAssignmentManagerMetrics().getUnassignProcMetrics();<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  }<a name="line.348"></a>
-<span class="sourceLineNo">349</span>}<a name="line.349"></a>
+<span class="sourceLineNo">313</span>        // In ServerCrashProcedure and RecoverMetaProcedure, there is a handleRIT stage where we<a name="line.313"></a>
+<span class="sourceLineNo">314</span>        // will iterator over all the RIT procedures for the related regions of a crashed RS and<a name="line.314"></a>
+<span class="sourceLineNo">315</span>        // fail them with ServerCrashException. You can see the isSafeToProceed method above for<a name="line.315"></a>
+<span class="sourceLineNo">316</span>        // more details.<a name="line.316"></a>
+<span class="sourceLineNo">317</span>        // This can work for most cases, but since we do not hold the region lock in handleRIT,<a name="line.317"></a>
+<span class="sourceLineNo">318</span>        // there could be race that we arrive here after the handleRIT stage of the SCP. So here we<a name="line.318"></a>
+<span class="sourceLineNo">319</span>        // need to check whether it is safe to quit.<a name="line.319"></a>
+<span class="sourceLineNo">320</span>        // Notice that, the first assumption is that we can only quit after the log splitting is<a name="line.320"></a>
+<span class="sourceLineNo">321</span>        // done, as MRP can schedule an AssignProcedure right after us, and if the log splitting has<a name="line.321"></a>
+<span class="sourceLineNo">322</span>        // not been done then there will be data loss. And in SCP, we will change the state from<a name="line.322"></a>
+<span class="sourceLineNo">323</span>        // SPLITTING to OFFLINE(or SPLITTING_META_DONE for meta log processing) after finishing the<a name="line.323"></a>
+<span class="sourceLineNo">324</span>        // log splitting, and then calling handleRIT, so checking the state here can be a safe<a name="line.324"></a>
+<span class="sourceLineNo">325</span>        // fence. If the state is not OFFLINE(or SPLITTING_META_DONE), then we can just leave this<a name="line.325"></a>
+<span class="sourceLineNo">326</span>        // procedure in suspended state as we can make sure that the handleRIT has not been executed<a name="line.326"></a>
+<span class="sourceLineNo">327</span>        // yet and it will wake us up later. And if the state is OFFLINE(or SPLITTING_META_DONE), we<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        // can safely quit since there will be no data loss. There could be duplicated<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        // AssignProcedures for the same region but it is OK as we will do a check at the beginning<a name="line.329"></a>
+<span class="sourceLineNo">330</span>        // of AssignProcedure to prevent double assign. And there we have region lock so there will<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        // be no race.<a name="line.331"></a>
+<span class="sourceLineNo">332</span>        if (env.getAssignmentManager().isLogSplittingDone(serverName, isMeta())) {<a name="line.332"></a>
+<span class="sourceLineNo">333</span>          // Its ok to proceed with this unassign.<a name="line.333"></a>
+<span class="sourceLineNo">334</span>          LOG.info("{} is dead and processed; moving procedure to finished state; {}", serverName,<a name="line.334"></a>
+<span class="sourceLineNo">335</span>            this);<a name="line.335"></a>
+<span class="sourceLineNo">336</span>          proceed(env, regionNode);<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          // Return true; wake up the procedure so we can act on proceed.<a name="line.337"></a>
+<span class="sourceLineNo">338</span>          return true;<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>      }<a name="line.340"></a>
+<span class="sourceLineNo">341</span>      // Return false so this procedure stays in suspended state. It will be woken up by the<a name="line.341"></a>
+<span class="sourceLineNo">342</span>      // ServerCrashProcedure that was scheduled when we called #expireServer above. SCP calls<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      // #handleRIT which will call this method only the exception will be a ServerCrashException<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      // this time around (See above).<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      // TODO: Add a SCP as a new subprocedure that we now come to depend on.<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      return false;<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    }<a name="line.347"></a>
+<span class="sourceLineNo">348</span>    return true;<a name="line.348"></a>
+<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
+<span class="sourceLineNo">350</span><a name="line.350"></a>
+<span class="sourceLineNo">351</span>  @Override<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  public void toStringClassDetails(StringBuilder sb) {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    super.toStringClassDetails(sb);<a name="line.353"></a>
+<span class="sourceLineNo">354</span>    sb.append(", server=").append(this.hostingServer);<a name="line.354"></a>
+<span class="sourceLineNo">355</span>  }<a name="line.355"></a>
+<span class="sourceLineNo">356</span><a name="line.356"></a>
+<span class="sourceLineNo">357</span>  @Override<a name="line.357"></a>
+<span class="sourceLineNo">358</span>  public ServerName getServer(final MasterProcedureEnv env) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    return this.hostingServer;<a name="line.359"></a>
+<span class="sourceLineNo">360</span>  }<a name="line.360"></a>
+<span class="sourceLineNo">361</span><a name="line.361"></a>
+<span class="sourceLineNo">362</span>  @Override<a name="line.362"></a>
+<span class="sourceLineNo">363</span>  protected ProcedureMetrics getProcedureMetrics(MasterProcedureEnv env) {<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    return env.getAssignmentManager().getAssignmentManagerMetrics().getUnassignProcMetrics();<a name="line.364"></a>
+<span class="sourceLineNo">365</span>  }<a name="line.365"></a>
+<span class="sourceLineNo">366</span>}<a name="line.366"></a>
 
 
 
