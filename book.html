@@ -294,17 +294,41 @@
 <li><a href="#_protobuf">175. Protobuf</a></li>
 </ul>
 </li>
+<li><a href="#pv2">Procedure Framework (Pv2): <a href="https://issues.apache.org/jira/browse/HBASE-12439">HBASE-12439</a></a>
+<ul class="sectlevel1">
+<li><a href="#_procedures">176. Procedures</a></li>
+<li><a href="#_subprocedures">177. Subprocedures</a></li>
+<li><a href="#_procedureexecutor">178. ProcedureExecutor</a></li>
+<li><a href="#_nonces">179. Nonces</a></li>
+<li><a href="#_wait_wake_suspend_yield">180. Wait/Wake/Suspend/Yield</a></li>
+<li><a href="#_locking">181. Locking</a></li>
+<li><a href="#_procedure_types">182. Procedure Types</a></li>
+<li><a href="#_references">183. References</a></li>
+</ul>
+</li>
+<li><a href="#amv2">AMv2 Description for Devs</a>
+<ul class="sectlevel1">
+<li><a href="#_background">184. Background</a></li>
+<li><a href="#_new_system">185. New System</a></li>
+<li><a href="#_procedures_detail">186. Procedures Detail</a></li>
+<li><a href="#_ui">187. UI</a></li>
+<li><a href="#_logging">188. Logging</a></li>
+<li><a href="#_implementation_notes">189. Implementation Notes</a></li>
+<li><a href="#_new_configs">190. New Configs</a></li>
+<li><a href="#_tools">191. Tools</a></li>
+</ul>
+</li>
 <li><a href="#zookeeper">ZooKeeper</a>
 <ul class="sectlevel1">
-<li><a href="#_using_existing_zookeeper_ensemble">176. Using existing ZooKeeper ensemble</a></li>
-<li><a href="#zk.sasl.auth">177. SASL Authentication with ZooKeeper</a></li>
+<li><a href="#_using_existing_zookeeper_ensemble">192. Using existing ZooKeeper ensemble</a></li>
+<li><a href="#zk.sasl.auth">193. SASL Authentication with ZooKeeper</a></li>
 </ul>
 </li>
 <li><a href="#community">Community</a>
 <ul class="sectlevel1">
-<li><a href="#_decisions">178. Decisions</a></li>
-<li><a href="#community.roles">179. Community Roles</a></li>
-<li><a href="#hbase.commit.msg.format">180. Commit Message format</a></li>
+<li><a href="#_decisions">194. Decisions</a></li>
+<li><a href="#community.roles">195. Community Roles</a></li>
+<li><a href="#hbase.commit.msg.format">196. Commit Message format</a></li>
 </ul>
 </li>
 <li><a href="#_appendix">Appendix</a>
@@ -322,8 +346,8 @@
 <li><a href="#asf">Appendix K: HBase and the Apache Software Foundation</a></li>
 <li><a href="#orca">Appendix L: Apache HBase Orca</a></li>
 <li><a href="#tracing">Appendix M: Enabling Dapper-like Tracing in HBase</a></li>
-<li><a href="#tracing.client.modifications">181. Client Modifications</a></li>
-<li><a href="#tracing.client.shell">182. Tracing from HBase Shell</a></li>
+<li><a href="#tracing.client.modifications">197. Client Modifications</a></li>
+<li><a href="#tracing.client.shell">198. Tracing from HBase Shell</a></li>
 <li><a href="#hbase.rpc">Appendix N: 0.95 RPC Specification</a></li>
 </ul>
 </li>
@@ -33910,6 +33934,509 @@ public API. TODO.</p>
 </div>
 </div>
 </div>
+<h1 id="pv2" class="sect0"><a class="anchor" href="#pv2"></a>Procedure Framework (Pv2): <a href="https://issues.apache.org/jira/browse/HBASE-12439">HBASE-12439</a></h1>
+<div class="openblock partintro">
+<div class="content">
+<div class="paragraph">
+<p><em>Procedure v2 &#8230;&#8203;aims to provide a unified way to build&#8230;&#8203;multi-step procedures with a rollback/roll-forward ability in case of failure (e.g. create/delete table)&#8201;&#8212;&#8201;Matteo Bertozzi, the author of Pv2.</em></p>
+</div>
+<div class="paragraph">
+<p>With Pv2 you can build and run state machines. It was built by Matteo to make distributed state transitions in HBase resilient in the face of process failures. Previous to Pv2, state transition handling was spread about the codebase with implementation varying by transition-type and context. Pv2 was inspired by <a href="https://accumulo.apache.org/1.8/accumulo_user_manual.html#_fault_tolerant_executor_fate">FATE</a>, of Apache Accumulo.<br></p>
+</div>
+<div class="paragraph">
+<p>Early Pv2 aspects have been shipping in HBase with a good while now but it has continued to evolve as it takes on more involved scenarios. What we have now is powerful but intricate in operation and incomplete, in need of cleanup and hardening. In this doc we have given overview on the system so you can make use of it (and help with its polishing).</p>
+</div>
+<div class="paragraph">
+<p>This system has the awkward name of Pv2 because HBase already had the notion of a Procedure used in snapshots (see hbase-server <em>org.apache.hadoop.hbase.procedure</em> as opposed to hbase-procedure <em>org.apache.hadoop.hbase.procedure2</em>). Pv2 supercedes and is to replace Procedure.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_procedures"><a class="anchor" href="#_procedures"></a>176. Procedures</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>A Procedure is a transform made on an HBase entity. Examples of HBase entities would be Regions and Tables.<br>
+Procedures are run by a ProcedureExecutor instance. Procedure current state is kept in the ProcedureStore.<br>
+The ProcedureExecutor has but a primitive view on what goes on inside a Procedure. From its PoV, Procedures are submitted and then the ProcedureExecutor keeps calling <em>#execute(Object)</em> until the Procedure is done. Execute may be called multiple times in the case of failure or restart, so Procedure code must be idempotent yielding the same result each time it run. Procedure code can also implement <em>rollback</em> so steps can be undone if failure. A call to <em>execute()</em> can result in one of following possibilities:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><em>execute()</em> returns</p>
+<div class="ulist">
+<ul>
+<li>
+<p><em>null</em>: indicates we are done.</p>
+</li>
+<li>
+<p><em>this</em>: indicates there is more to do so, persist current procedure state and re-<em>execute()</em>.</p>
+</li>
+<li>
+<p><em>Array</em> of sub-procedures: indicates a set of procedures needed to be run to completion before we can proceed (after which we expect the framework to call our execute again).</p>
+</li>
+</ul>
+</div>
+</li>
+<li>
+<p><em>execute()</em> throws exception</p>
+<div class="ulist">
+<ul>
+<li>
+<p><em>suspend</em>: indicates execution of procedure is suspended and can be resumed due to some external event. The procedure state is persisted.</p>
+</li>
+<li>
+<p><em>yield</em>: procedure is added back to scheduler. The procedure state is not persisted.</p>
+</li>
+<li>
+<p><em>interrupted</em>: currently same as <em>yield</em>.</p>
+</li>
+<li>
+<p>Any <em>exception</em> not listed above: Procedure <em>state</em> is changed to <em>FAILED</em> (after which we expect the framework will attempt rollback).</p>
+</li>
+</ul>
+</div>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>The ProcedureExecutor stamps the frameworks notions of Procedure State into the Procedure itself; e.g. it marks Procedures as INITIALIZING on submit. It moves the state to RUNNABLE when it goes to execute. When done, a Procedure gets marked FAILED or SUCCESS depending. Here is the list of all states as of this writing:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong><em>INITIALIZING</em></strong> Procedure in construction, not yet added to the executor</p>
+</li>
+<li>
+<p><strong><em>RUNNABLE</em></strong> Procedure added to the executor, and ready to be executed.</p>
+</li>
+<li>
+<p><strong><em>WAITING</em></strong> The procedure is waiting on children (subprocedures) to be completed</p>
+</li>
+<li>
+<p><strong><em>WAITING_TIMEOUT</em></strong> The procedure is waiting a timeout or an external event</p>
+</li>
+<li>
+<p><strong><em>ROLLEDBACK</em></strong> The procedure failed and was rolledback.</p>
+</li>
+<li>
+<p><strong><em>SUCCESS</em></strong> The procedure execution completed successfully.</p>
+</li>
+<li>
+<p><strong><em>FAILED</em></strong> The procedure execution failed, may need to rollback.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>After each execute, the Procedure state is persisted to the ProcedureStore. Hooks are invoked on Procedures so they can preserve custom state. Post-fault, the ProcedureExecutor re-hydrates its pre-crash state by replaying the content of the ProcedureStore. This makes the Procedure Framework resilient against process failure.</p>
+</div>
+<div class="sect2">
+<h3 id="_implementation"><a class="anchor" href="#_implementation"></a>176.1. Implementation</h3>
+<div class="paragraph">
+<p>In implementation, Procedures tend to divide transforms into finer-grained tasks and while some of these work items are handed off to sub-procedures,
+the bulk are done as processing <em>steps</em> in-Procedure; each invocation of the execute is used to perform a single step, and then the Procedure relinquishes returning to the framework. The Procedure does its own tracking of where it is in the processing.</p>
+</div>
+<div class="paragraph">
+<p>What comprises a sub-task, or <em>step</em> in the execution is up to the Procedure author but generally it is a small piece of work that cannot be further decomposed and that moves the processing forward toward its end state. Having procedures made of many small steps rather than a few large ones allows the Procedure framework give out insight on where we are in the processing. It also allows the framework be more fair in its execution. As stated per above, each step may be called multiple times (failure/restart) so steps must be implemented idempotent.<br>
+It is easy to confuse the state that the Procedure itself is keeping with that of the Framework itself. Try to keep them distinct.<br></p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_rollback_2"><a class="anchor" href="#_rollback_2"></a>176.2. Rollback</h3>
+<div class="paragraph">
+<p>Rollback is called when the procedure or one of the sub-procedures has failed. The rollback step is supposed to cleanup the resources created during the execute() step. In case of failure and restart, rollback() may be called multiple times, so again the code must be idempotent.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_metrics_2"><a class="anchor" href="#_metrics_2"></a>176.3. Metrics</h3>
+<div class="paragraph">
+<p>There are hooks for collecting metrics on submit of the procedure and on finish.</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>updateMetricsOnSubmit()</p>
+</li>
+<li>
+<p>updateMetricsOnFinish()</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Individual procedures can override these methods to collect procedure specific metrics. The default implementations of these methods  try to get an object implementing an interface ProcedureMetrics which encapsulates following set of generic metrics:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>SubmittedCount (Counter): Total number of procedure instances submitted of a type.</p>
+</li>
+<li>
+<p>Time (Histogram): Histogram of runtime for procedure instances.</p>
+</li>
+<li>
+<p>FailedCount (Counter): Total number of failed procedure instances.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Individual procedures can implement this object and define these generic set of metrics.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_baggage"><a class="anchor" href="#_baggage"></a>176.4. Baggage</h3>
+<div class="paragraph">
+<p>Procedures can carry baggage. One example is the <em>step</em> the procedure last attained (see previous section); procedures persist the enum that marks where they are currently. Other examples might be the Region or Server name the Procedure is currently working. After each call to execute, the Procedure#serializeStateData is called. Procedures can persist whatever.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_result_state_and_queries"><a class="anchor" href="#_result_state_and_queries"></a>176.5. Result/State and Queries</h3>
+<div class="paragraph">
+<p>(From Matteo’s <a href="https://issues.apache.org/jira/secure/attachment/12693273/Procedurev2Notification-Bus.pdf">ProcedureV2 and Notification Bus</a> doc)<br>
+In the case of asynchronous operations, the result must be kept around until the client asks for it. Once we receive a “get” of the result we can schedule the delete of the record. For some operations the result may be “unnecessary” especially in case of failure (e.g. if the create table fail, we can query the operation result or we can just do a list table to see if it was created) so in some cases we can schedule the delete after a timeout. On the client side the operation will return a “Procedure ID”, this ID can be used to wait until the procedure is completed and get the result/exception.<br></p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java">Admin.doOperation() { longprocId=master.doOperation(); master.waitCompletion(procId); }  +</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>If the master goes down while performing the operation the backup master will pickup the half in­progress operation and complete it. The client will not notice the failure.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_subprocedures"><a class="anchor" href="#_subprocedures"></a>177. Subprocedures</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Subprocedures are <em>Procedure</em> instances created and returned by <em>#execute(Object)</em> method of a procedure instance (parent procedure). As subprocedures are of type <em>Procedure</em>, they can instantiate their own subprocedures. As its a recursive, procedure stack is maintained by the framework. The framework makes sure that the parent procedure does not proceed till all sub-procedures and their subprocedures in a procedure stack are successfully finished.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_procedureexecutor"><a class="anchor" href="#_procedureexecutor"></a>178. ProcedureExecutor</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p><em>ProcedureExecutor</em> uses <em>ProcedureStore</em> and <em>ProcedureScheduler</em> and executes procedures submitted to it. Some of the basic operations supported are:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><em>abort(procId)</em>: aborts specified procedure if its not finished</p>
+</li>
+<li>
+<p><em>submit(Procedure)</em>: submits procedure for execution</p>
+</li>
+<li>
+<p><em>retrieve:</em> list of get methods to get <em>Procedure</em> instances and results</p>
+</li>
+<li>
+<p><em>register/ unregister</em> listeners: for listening on Procedure related notifications</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>When <em>ProcedureExecutor</em> starts it loads procedure instances persisted in <em>ProcedureStore</em> from previous run. All unfinished procedures are resumed from the last stored state.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_nonces"><a class="anchor" href="#_nonces"></a>179. Nonces</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You can pass the nonce that came in with the RPC to the Procedure on submit at the executor. This nonce will then be serialized along w/ the Procedure on persist. If a crash, on reload, the nonce will be put back into a map of nonces to pid in case a client tries to run same procedure for a second time (it will be rejected). See the base Procedure and how nonce is a base data member.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_wait_wake_suspend_yield"><a class="anchor" href="#_wait_wake_suspend_yield"></a>180. Wait/Wake/Suspend/Yield</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>‘suspend’ means stop processing a procedure because we can make no more progress until a condition changes; i.e. we sent RPC and need to wait on response. The way this works is that a Procedure throws a suspend exception from down in its guts as a GOTO the end-of-the-current-processing step. Suspend also puts the Procedure back on the scheduler. Problematic is we do some accounting on our way out even on suspend making it so it can take time exiting (We have to update state in the WAL).</p>
+</div>
+<div class="paragraph">
+<p>RegionTransitionProcedure#reportTransition is called on receipt of a report from a RS. For Assign and Unassign, this event response from the server we sent an RPC wakes up suspended Assign/Unassigns.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_locking"><a class="anchor" href="#_locking"></a>181. Locking</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Procedure Locks are not about concurrency! They are about giving a Procedure read/write access to an HBase Entity such as a Table or Region so that is possible to shut out other Procedures from making modifications to an HBase Entity state while the current one is running.</p>
+</div>
+<div class="paragraph">
+<p>Locking is optional, up to the Procedure implementor but if an entity is being operated on by a Procedure, all transforms need to be done via Procedures using the same locking scheme else havoc.</p>
+</div>
+<div class="paragraph">
+<p>Two ProcedureExecutor Worker threads can actually end up both processing the same Procedure instance. If it happens, the threads are meant to be running different parts of the one Procedure&#8201;&#8212;&#8201;changes that do not stamp on each other (This gets awkward around the procedure frameworks notion of ‘suspend’. More on this below).</p>
+</div>
+<div class="paragraph">
+<p>Locks optionally may be held for the life of a Procedure. For example, if moving a Region, you probably want to have exclusive access to the HBase Region until the Region completes (or fails).  This is used in conjunction with {@link #holdLock(Object)}. If {@link #holdLock(Object)} returns true, the procedure executor will call acquireLock() once and thereafter not call {@link #releaseLock(Object)} until the Procedure is done (Normally, it calls release/acquire around each invocation of {@link #execute(Object)}.</p>
+</div>
+<div class="paragraph">
+<p>Locks also may live the life of a procedure; i.e. once an Assign Procedure starts, we do not want another procedure meddling w/ the region under assignment. Procedures that hold the lock for the life of the procedure set Procedure#holdLock to true. AssignProcedure does this as do Split and Move (If in the middle of a Region move, you do not want it Splitting).</p>
+</div>
+<div class="paragraph">
+<p>Locking can be for life of Procedure.</p>
+</div>
+<div class="paragraph">
+<p>Some locks have a hierarchy. For example, taking a region lock also takes (read) lock on its containing table and namespace to prevent another Procedure obtaining an exclusive lock on the hosting table (or namespace).</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_procedure_types"><a class="anchor" href="#_procedure_types"></a>182. Procedure Types</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_statemachineprocedure"><a class="anchor" href="#_statemachineprocedure"></a>182.1. StateMachineProcedure</h3>
+<div class="paragraph">
+<p>One can consider each call to <em>#execute(Object)</em> method as transitioning from one state to another in a state machine. Abstract class <em>StateMachineProcedure</em> is wrapper around base <em>Procedure</em> class which provides constructs for implementing a state machine as a <em>Procedure</em>. After each state transition current state is persisted so that, in case of crash/ restart, the state transition can be resumed from the previous state of a procedure before crash/ restart. Individual procedures need to define initial and terminus states and hooks <em>executeFromState()</em> and <em>setNextState()</em> are provided for state transitions.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_remoteproceduredispatcher"><a class="anchor" href="#_remoteproceduredispatcher"></a>182.2. RemoteProcedureDispatcher</h3>
+<div class="paragraph">
+<p>A new RemoteProcedureDispatcher (+ subclass RSProcedureDispatcher) primitive takes care of running the Procedure-based Assignments ‘remote’ component. This dispatcher knows about ‘servers’. It does aggregation of assignments by time on a time/count basis so can send procedures in batches rather than one per RPC. Procedure status comes back on the back of the RegionServer heartbeat reporting online/offline regions (No more notifications via ZK). The response is passed to the AMv2 to ‘process’. It will check against the in-memory state. If there is a mismatch, it fences out the RegionServer on the assumption that something went wrong on the RS side. Timeouts trigger retries (Not Yet Implemented!). The Procedure machine ensures only one operation at a time on any one Region/Table using entity <em>locking</em> and smarts about what is serial and what can be run concurrently (Locking was zk-based&#8201;&#8212;&#8201;you’d put a znode in zk for a table&#8201;&#8212;&#8201;but now has been converted to be procedure-based as part of this project).</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_references"><a class="anchor" href="#_references"></a>183. References</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p>Matteo had a slide deck on what it the Procedure Framework would look like and the problems it addresses initially <a href="https://issues.apache.org/jira/secure/attachment/12845124/ProcedureV2b.pdf">attached to the Pv2 issue.</a></p>
+</li>
+<li>
+<p><a href="https://issues.apache.org/jira/secure/attachment/12693273/Procedurev2Notification-Bus.pdf">A good doc by Matteo</a> on problem and how Pv2 addresses it w/ roadmap (from the Pv2 JIRA). We should go back to the roadmap to do the Notification Bus, convertion of log splitting to Pv2, etc.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<h1 id="amv2" class="sect0"><a class="anchor" href="#amv2"></a>AMv2 Description for Devs</h1>
+<div class="openblock partintro">
+<div class="content">
+<div class="paragraph">
+<p>The AssignmentManager (AM) in HBase Master manages assignment of Regions over a cluster of RegionServers.</p>
+</div>
+<div class="paragraph">
+<p>The AMv2 project is a redo of Assignment in an attempt at addressing the root cause of many of our operational issues in production, namely slow assignment and problematic accounting such that Regions are misplaced stuck offline in the notorious <em>Regions-In-Transition (RIT)</em> limbo state.</p>
+</div>
+<div class="paragraph">
+<p>Below are notes for devs on key aspects of AMv2 in no particular order.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_background"><a class="anchor" href="#_background"></a>184. Background</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Assignment in HBase 1.x has been problematic in operation. It is not hard to see why. Region state is kept at the other end of an RPC in ZooKeeper (Terminal states&#8201;&#8212;&#8201;i.e. OPEN or CLOSED&#8201;&#8212;&#8201;are published to the <em>hbase:meta</em> table). In HBase-1.x.x, state has multiple writers with Master and RegionServers all able to make state edits concurrently (in <em>hbase:meta</em> table and out on ZooKeeper). If clocks are awry or watchers missed, state changes can be skipped or overwritten. Locking of HBase Entities&#8201;&#8212;&#8201;tables, regions&#8201;&#8212;&#8201;is not comprehensive so a table operation&#8201;&#8212;&#8201;disable/enable&#8201;&#8212;&#8201;could clash with a region-level operation; a split or merge. Region state is distributed and hard to reason about and test. Assignment is slow in operation because each assign involves moving remote znodes through transitions. Cluster size tends to top out at a couple of hundred thousand regions; beyond this, cluster start/stop takes hours and is prone to corruption.</p>
+</div>
+<div class="paragraph">
+<p>AMv2 (AssignmentManager Version 2) is a refactor (<a href="https://issues.apache.org/jira/browse/HBASE-14350">HBASE-14350</a>) of the hbase-1.x AssignmentManager putting it up on a <a href="https://issues.apache.org/jira/browse/HBASE-12439">ProcedureV2 (HBASE-12439)</a> basis. ProcedureV2 (Pv2)<em>,</em> is an awkwardly named system that allows describing and running multi-step state machines. It is performant and persists all state to a Store which is recoverable post crash. See the companion chapter on <a href="#pv2">Procedure Framework (Pv2): <a href="https://issues.apache.org/jira/browse/HBASE-12439">HBASE-12439</a></a>, to learn more about the ProcedureV2 system.</p>
+</div>
+<div class="paragraph">
+<p>In AMv2, all assignment, crash handling, splits and merges are recast as Procedures(v2).  ZooKeeper is purged from the mix. As before, the final assignment state gets published to <em>hbase:meta</em> for non-Master participants to read (all-clients) with intermediate state kept in the local Pv2 WAL-based ‘store’ but only the active Master, a single-writer, evolves state. The Master’s in-memory cluster image is the authority and if disagreement, RegionServers are forced to comply. Pv2 adds shared/exclusive locking of all core HBase Entities&#8201;&#8212;&#8201;namespace, tables, and regions&#8201;&#8212;&#8201;to ensure one actor at a time access and to prevent operations contending over resources (move/split, disable/assign, etc.).</p>
+</div>
+<div class="paragraph">
+<p>This redo of AM atop of a purposed, performant state machine with all operations taking on the common Procedure form with a single state writer only moves our AM to a new level of resilience and scale.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_new_system"><a class="anchor" href="#_new_system"></a>185. New System</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Each Region Assign or Unassign of a Region is now a Procedure. A Move (Region) Procedure is a compound of Procedures; it is the running of an Unassign Procedure followed by an Assign Procedure. The Move Procedure spawns the Assign and Unassign in series and then waits on their completions.</p>
+</div>
+<div class="paragraph">
+<p>And so on. ServerCrashProcedure spawns the WAL splitting tasks and then the reassign of all regions that were hosted on the crashed server as subprocedures.</p>
+</div>
+<div class="paragraph">
+<p>AMv2 Procedures are run by the Master in a ProcedureExecutor instance. All Procedures make use of utility provided by the Pv2 framework.</p>
+</div>
+<div class="paragraph">
+<p>For example, Procedures persist each state transition to the frameworks’ Procedure Store. The default implementation is done as a WAL kept on HDFS. On crash, we reopen the Store and rerun all WALs of Procedure transitions to put the Assignment State Machine back into the attitude it had just before crash. We then continue Procedure execution.</p>
+</div>
+<div class="paragraph">
+<p>In the new system, the Master is the Authority on all things Assign. Previous we were ambiguous; e.g. the RegionServer was in charge of Split operations. Master keeps an in-memory image of Region states and servers. If disagreement, the Master always prevails; at an extreme it will kill the RegionServer that is in disagreement.</p>
+</div>
+<div class="paragraph">
+<p>A new RegionStateStore class takes care of publishing the terminal Region state, whether OPEN or CLOSED, out to the _hbase:meta _table<em>.</em></p>
+</div>
+<div class="paragraph">
+<p>RegionServers now report their run version on Connection. This version is available inside the AM for use running migrating rolling restarts.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_procedures_detail"><a class="anchor" href="#_procedures_detail"></a>186. Procedures Detail</h2>
+<div class="sectionbody">
+<div class="sect2">
+<h3 id="_assign_unassign"><a class="anchor" href="#_assign_unassign"></a>186.1. Assign/Unassign</h3>
+<div class="paragraph">
+<p>Assign and Unassign subclass a common RegionTransitionProcedure. There can only be one RegionTransitionProcedure per region running at a time since the RTP instance takes a lock on the region. The RTP base Procedure has three steps; a store the procedure step (REGION_TRANSITION_QUEUE); a dispatch of the procedure open or close followed by a suspend waiting on the remote regionserver to report successful open or fail (REGION_TRANSITION_DISPATCH) or notification that the server fielding the request crashed; and finally registration of the successful open/close in hbase:meta (REGION_TRANSITION_FINISH).</p>
+</div>
+<div class="paragraph">
+<p>Here is how the assign of a region 56f985a727afe80a184dac75fbf6860c looks in the logs. The assign was provoked by a Server Crash (Process ID 1176 or pid=1176 which when it is the parent of a procedure, it is identified as ppid=1176). The assign is pid=1179, the second region of the two being assigned by this Server Crash.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java"><span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">24</span>,<span class="integer">175</span> INFO  [ProcExecWrkr-<span class="integer">30</span>] procedure2.ProcedureExecutor: Initialized subprocedures=[{pid=<span class="integer">1178</span>, ppid=<span class="integer">1176</span>, state=RUNNABLE:REGION_TRANSITION_QUEUE; AssignProcedure table=IntegrationTestBigLinkedList, region=bfd57f0b72fd3ca77e9d3c5e3ae48d76, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>}, {pid=<span class="integer">1179</span>, ppid=<span class="integer">1176</span>, state=RUNNABLE:REGION_TRANSITION_QUEUE; AssignProcedure table=IntegrationTestBigLinkedList, region=<span class="float">56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>}]</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Next we start the assign by queuing (‘registering’) the Procedure with the framework.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java"><span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">24</span>,<span class="integer">241</span> INFO  [ProcExecWrkr-<span class="integer">30</span>] assignment.AssignProcedure: Start pid=<span class="integer">1179</span>, ppid=<span class="integer">1176</span>, state=RUNNABLE:REGION_TRANSITION_QUEUE; AssignProcedure table=IntegrationTestBigLinkedList, region=<span class="float">56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>; rit=OFFLINE, location=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>; forceNewPlan=<span class="predefined-constant">false</span>, retain=<span class="predefined-constant">false</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Track the running of Procedures in logs by tracing their process id&#8201;&#8212;&#8201;here pid=1179.</p>
+</div>
+<div class="paragraph">
+<p>Next we move to the dispatch phase where we update hbase:meta table setting the region state as OPENING on server ve540. We then dispatch an rpc to ve540 asking it to open the region. Thereafter we suspend the Assign until we get a message back from ve540 on whether it has opened the region successfully (or not).</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java"><span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">24</span>,<span class="integer">494</span> INFO  [ProcExecWrkr-<span class="integer">38</span>] assignment.RegionStateStore: pid=<span class="integer">1179</span> updating hbase:meta row=IntegrationTestBigLinkedList,H<span class="error">\</span>xE3<span class="error">@</span><span class="error">\</span>x8D<span class="error">\</span>x964<span class="error">\</span>x9D<span class="error">\</span>xDF<span class="error">\</span>x8F<span class="error">@</span><span class="integer">9</span><span class="error">\</span>x0F<span class="error">\</span>xC8<span class="error">\</span>xCC<span class="error">\</span>xC2,<span class="float">1495566261066.56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c., regionState=OPENING, regionLocation=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>
+<span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">24</span>,<span class="integer">498</span> INFO  [ProcExecWrkr-<span class="integer">38</span>] assignment.RegionTransitionProcedure: Dispatch pid=<span class="integer">1179</span>, ppid=<span class="integer">1176</span>, state=RUNNABLE:REGION_TRANSITION_DISPATCH; AssignProcedure table=IntegrationTestBigLinkedList, region=<span class="float">56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>; rit=OPENING, location=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Below we log the incoming report that the region opened successfully on ve540. The Procedure is woken up (you can tell it the procedure is running by the name of the thread, its a ProcedureExecutor thread, ProcExecWrkr-9).  The woken up Procedure updates state in hbase:meta to denote the region as open on ve0540. It then reports finished and exits.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java"><span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">26</span>,<span class="integer">643</span> DEBUG [RpcServer.default.FPBQ.Fifo.handler=<span class="integer">46</span>,queue=<span class="integer">1</span>,port=<span class="integer">16000</span>] assignment.RegionTransitionProcedure: Received report OPENED seqId=<span class="integer">11984985</span>, pid=<span class="integer">1179</span>, ppid=<span class="integer">1176</span>, state=RUNNABLE:REGION_TRANSITION_DISPATCH; AssignProcedure table=IntegrationTestBigLinkedList, region=<span class="float">56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>; rit=OPENING, location=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>                                                                                                                                                                       <span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">26</span>,<span class="integer">643</span> INFO  [ProcExecWrkr-<span class="integer">9</span>] assignment.RegionStateStore: pid=<span class="integer">1179</span> updating hbase:meta row=IntegrationTestBigLinkedList,H<span class="error">\</span>xE3<span class="error">@</span><span class="error">\</span>x8D<span class="error">\</span>x964<span class="error">\</span>x9D<span class="error">\</span>xDF<span class="error">\</span>x8F<span class="error">@</span><span class="integer">9</span><span class="error">\</span>x0F<span class="error">\</span>xC8<span class="error">\</span>xCC<span class="error">\</span>xC2,<span class="float">1495566261066.56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c., regionState=OPEN, openSeqNum=<span class="integer">11984985</span>, regionLocation=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span>
+<span class="integer">2017</span>-<span class="octal">05</span>-<span class="integer">23</span> <span class="integer">12</span>:<span class="octal">04</span>:<span class="integer">26</span>,<span class="integer">836</span> INFO  [ProcExecWrkr-<span class="integer">9</span>] procedure2.ProcedureExecutor: Finish suprocedure pid=<span class="integer">1179</span>, ppid=<span class="integer">1176</span>, state=SUCCESS; AssignProcedure table=IntegrationTestBigLinkedList, region=<span class="float">56f</span><span class="integer">985</span>a727afe80a184dac75fbf6860c, target=ve0540.halxg.example.org,<span class="integer">16020</span>,<span class="integer">1495525111232</span></code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Unassign looks similar given it is based on the base RegionTransitionProcedure. It has the same state transitions and does basically the same steps but with different state name (CLOSING, CLOSED).</p>
+</div>
+<div class="paragraph">
+<p>Most other procedures are subclasses of a Pv2 StateMachine implementation. We have both Table and Region focused StateMachines types.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_ui"><a class="anchor" href="#_ui"></a>187. UI</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Along the top-bar on the Master, you can now find a ‘Procedures&amp;Locks’ tab which takes you to a page that is ugly but useful. It dumps currently running procedures and framework locks. Look at this when you can’t figure what stuff is stuck; it will at least identify problematic procedures (take the pid and grep the logs…). Look for ROLLEDBACK or pids that have been RUNNING for a long time.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_logging"><a class="anchor" href="#_logging"></a>188. Logging</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Procedures log their process ids as pid= and their parent ids (ppid=) everywhere. Work has been done so you can grep the pid and see history of a procedure operation.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_implementation_notes"><a class="anchor" href="#_implementation_notes"></a>189. Implementation Notes</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>In this section we note some idiosyncrasies of operation as an attempt at saving you some head-scratching.</p>
+</div>
+<div class="sect2">
+<h3 id="_region_transition_rpc_and_rs_heartbeat_can_arrive_at_same_time_on_master"><a class="anchor" href="#_region_transition_rpc_and_rs_heartbeat_can_arrive_at_same_time_on_master"></a>189.1. Region Transition RPC and RS Heartbeat can arrive at ~same time on Master</h3>
+<div class="paragraph">
+<p>Reporting Region Transition on a RegionServer is now a RPC distinct from RS heartbeating (‘RegionServerServices’ Service). An heartbeat and a status update can arrive at the Master at about the same time. The Master will update its internal state for a Region but this same state is checked when heartbeat processing. We may find the unexpected; i.e. a Region just reported as CLOSED so heartbeat is surprised to find region OPEN on the back of the RS report. In the new system, all slaves must cow to the Masters’ understanding of cluster state; the Master will kill/close any misaligned entities.</p>
+</div>
+<div class="paragraph">
+<p>To address the above, we added a lastUpdate for in-memory Master state. Let a region state have some vintage before we act on it (one second currently).</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_master_as_regionserver_or_as_regionserver_that_just_does_system_tables"><a class="anchor" href="#_master_as_regionserver_or_as_regionserver_that_just_does_system_tables"></a>189.2. Master as RegionServer or as RegionServer that just does system tables</h3>
+<div class="paragraph">
+<p>AMv2 enforces current master branch default of HMaster carrying system tables only; i.e. the Master in an HBase cluster acts also as a RegionServer only it is the exclusive host for tables such as <em>hbase:meta</em>, <em>hbase:namespace</em>, etc., the core system tables. This is causing a couple of test failures as AMv1, though it is not supposed to, allows moving hbase:meta off Master while AMv2 does not.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_new_configs"><a class="anchor" href="#_new_configs"></a>190. New Configs</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>These configs all need doc on when you’d change them.</p>
+</div>
+<div class="sect2">
+<h3 id="_hbase_procedure_remote_dispatcher_threadpool_size"><a class="anchor" href="#_hbase_procedure_remote_dispatcher_threadpool_size"></a>190.1. hbase.procedure.remote.dispatcher.threadpool.size</h3>
+<div class="paragraph">
+<p>Defaults 128</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_hbase_procedure_remote_dispatcher_delay_msec"><a class="anchor" href="#_hbase_procedure_remote_dispatcher_delay_msec"></a>190.2. hbase.procedure.remote.dispatcher.delay.msec</h3>
+<div class="paragraph">
+<p>Default 150ms</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_hbase_procedure_remote_dispatcher_max_queue_size"><a class="anchor" href="#_hbase_procedure_remote_dispatcher_max_queue_size"></a>190.3. hbase.procedure.remote.dispatcher.max.queue.size</h3>
+<div class="paragraph">
+<p>Default 32</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_hbase_regionserver_rpc_startup_waittime"><a class="anchor" href="#_hbase_regionserver_rpc_startup_waittime"></a>190.4. hbase.regionserver.rpc.startup.waittime</h3>
+<div class="paragraph">
+<p>Default 60 seconds.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="_tools"><a class="anchor" href="#_tools"></a>191. Tools</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>HBASE-15592 Print Procedure WAL Content</p>
+</div>
+<div class="paragraph">
+<p>Patch in <a href="https://issues.apache.org/jira/browse/HBASE-18152">HBASE-18152</a> [AMv2] Corrupt Procedure WAL file; procedure data stored out of order <a href="https://issues.apache.org/jira/secure/attachment/12871066/reading_bad_wal.patch">https://issues.apache.org/jira/secure/attachment/12871066/reading_bad_wal.patch</a></p>
+</div>
+<div class="sect2">
+<h3 id="_masterprocedureschedulerperformanceevaluation"><a class="anchor" href="#_masterprocedureschedulerperformanceevaluation"></a>191.1. MasterProcedureSchedulerPerformanceEvaluation</h3>
+<div class="paragraph">
+<p>Tool to test performance of locks and queues in procedure scheduler independently from other framework components. Run this after any substantial changes in proc system. Prints nice output:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre>******************************************
+Time - addBack     : 5.0600sec
+Ops/sec - addBack  : 1.9M
+Time - poll        : 19.4590sec
+Ops/sec - poll     : 501.9K
+Num Operations     : 10000000
+
+Completed          : 10000006
+Yield              : 22025876
+
+Num Tables         : 5
+Regions per table  : 10
+Operations type    : both
+Threads            : 10
+******************************************
+Raw format for scripts
+
+RESULT [num_ops=10000000, ops_type=both, num_table=5, regions_per_table=10, threads=10, num_yield=22025876, time_addback_ms=5060, time_poll_ms=19459]</pre>
+</div>
+</div>
+</div>
+</div>
+</div>
 <h1 id="zookeeper" class="sect0"><a class="anchor" href="#zookeeper"></a>ZooKeeper</h1>
 <div class="openblock partintro">
 <div class="content">
@@ -34031,7 +34558,7 @@ zookeeper could start dropping sessions if it has to run through a directory of 
 </div>
 </div>
 <div class="sect1">
-<h2 id="_using_existing_zookeeper_ensemble"><a class="anchor" href="#_using_existing_zookeeper_ensemble"></a>176. Using existing ZooKeeper ensemble</h2>
+<h2 id="_using_existing_zookeeper_ensemble"><a class="anchor" href="#_using_existing_zookeeper_ensemble"></a>192. Using existing ZooKeeper ensemble</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <p>To point HBase at an existing ZooKeeper cluster, one that is not managed by HBase, set <code>HBASE_MANAGES_ZK</code> in <em>conf/hbase-env.sh</em> to false</p>
@@ -34068,7 +34595,7 @@ Additionally, see the <a href="https://wiki.apache.org/hadoop/ZooKeeper/FAQ#A7">
 </div>
 </div>
 <div class="sect1">
-<h2 id="zk.sasl.auth"><a class="anchor" href="#zk.sasl.auth"></a>177. SASL Authentication with ZooKeeper</h2>
+<h2 id="zk.sasl.auth"><a class="anchor" href="#zk.sasl.auth"></a>193. SASL Authentication with ZooKeeper</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <p>Newer releases of Apache HBase (&gt;= 0.92) will support connecting to a ZooKeeper Quorum that supports SASL authentication (which is available in ZooKeeper versions 3.4.0 or later).</p>
@@ -34078,7 +34605,7 @@ Additionally, see the <a href="https://wiki.apache.org/hadoop/ZooKeeper/FAQ#A7">
 ZooKeeper/HBase mutual authentication (<a href="https://issues.apache.org/jira/browse/HBASE-2418">HBASE-2418</a>) is required as part of a complete secure HBase configuration (<a href="https://issues.apache.org/jira/browse/HBASE-3025">HBASE-3025</a>). For simplicity of explication, this section ignores additional configuration required (Secure HDFS and Coprocessor configuration). It&#8217;s recommended to begin with an HBase-managed ZooKeeper configuration (as opposed to a standalone ZooKeeper quorum) for ease of learning.</p>
 </div>
 <div class="sect2">
-<h3 id="_operating_system_prerequisites"><a class="anchor" href="#_operating_system_prerequisites"></a>177.1. Operating System Prerequisites</h3>
+<h3 id="_operating_system_prerequisites"><a class="anchor" href="#_operating_system_prerequisites"></a>193.1. Operating System Prerequisites</h3>
 <div class="paragraph">
 <p>You need to have a working Kerberos KDC setup.
 For each <code>$HOST</code> that will run a ZooKeeper server, you should have a principle <code>zookeeper/$HOST</code>.
@@ -34114,7 +34641,7 @@ The ZooKeeper client and server libraries manage their own ticket refreshment by
 </div>
 </div>
 <div class="sect2">
-<h3 id="_hbase_managed_zookeeper_configuration"><a class="anchor" href="#_hbase_managed_zookeeper_configuration"></a>177.2. HBase-managed ZooKeeper Configuration</h3>
+<h3 id="_hbase_managed_zookeeper_configuration"><a class="anchor" href="#_hbase_managed_zookeeper_configuration"></a>193.2. HBase-managed ZooKeeper Configuration</h3>
 <div class="paragraph">
 <p>On each node that will run a zookeeper, a master, or a regionserver, create a <a href="http://docs.oracle.com/javase/7/docs/technotes/guides/security/jgss/tutorials/LoginConfigFile.html">JAAS</a>        configuration file in the conf directory of the node&#8217;s <em>HBASE_HOME</em>        directory that looks like the following:</p>
 </div>
@@ -34206,7 +34733,7 @@ bin/hbase regionserver start</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_external_zookeeper_configuration"><a class="anchor" href="#_external_zookeeper_configuration"></a>177.3. External ZooKeeper Configuration</h3>
+<h3 id="_external_zookeeper_configuration"><a class="anchor" href="#_external_zookeeper_configuration"></a>193.3. External ZooKeeper Configuration</h3>
 <div class="paragraph">
 <p>Add a JAAS configuration file that looks like:</p>
 </div>
@@ -34307,7 +34834,7 @@ bin/hbase regionserver start</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_zookeeper_server_authentication_log_output"><a class="anchor" href="#_zookeeper_server_authentication_log_output"></a>177.4. ZooKeeper Server Authentication Log Output</h3>
+<h3 id="_zookeeper_server_authentication_log_output"><a class="anchor" href="#_zookeeper_server_authentication_log_output"></a>193.4. ZooKeeper Server Authentication Log Output</h3>
 <div class="paragraph">
 <p>If the configuration above is successful, you should see something similar to the following in your ZooKeeper server logs:</p>
 </div>
@@ -34329,7 +34856,7 @@ bin/hbase regionserver start</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_zookeeper_client_authentication_log_output"><a class="anchor" href="#_zookeeper_client_authentication_log_output"></a>177.5. ZooKeeper Client Authentication Log Output</h3>
+<h3 id="_zookeeper_client_authentication_log_output"><a class="anchor" href="#_zookeeper_client_authentication_log_output"></a>193.5. ZooKeeper Client Authentication Log Output</h3>
 <div class="paragraph">
 <p>On the ZooKeeper client side (HBase master or regionserver), you should see something similar to the following:</p>
 </div>
@@ -34350,7 +34877,7 @@ bin/hbase regionserver start</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_configuration_from_scratch"><a class="anchor" href="#_configuration_from_scratch"></a>177.6. Configuration from Scratch</h3>
+<h3 id="_configuration_from_scratch"><a class="anchor" href="#_configuration_from_scratch"></a>193.6. Configuration from Scratch</h3>
 <div class="paragraph">
 <p>This has been tested on the current standard Amazon Linux AMI.
 First setup KDC and principals as described above.
@@ -34376,9 +34903,9 @@ bin/hbase regionserver &amp;</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_future_improvements"><a class="anchor" href="#_future_improvements"></a>177.7. Future improvements</h3>
+<h3 id="_future_improvements"><a class="anchor" href="#_future_improvements"></a>193.7. Future improvements</h3>
 <div class="sect3">
-<h4 id="_fix_target_cached_classpath_txt"><a class="anchor" href="#_fix_target_cached_classpath_txt"></a>177.7.1. Fix target/cached_classpath.txt</h4>
+<h4 id="_fix_target_cached_classpath_txt"><a class="anchor" href="#_fix_target_cached_classpath_txt"></a>193.7.1. Fix target/cached_classpath.txt</h4>
 <div class="paragraph">
 <p>You must override the standard hadoop-core jar file from the <code>target/cached_classpath.txt</code> file with the version containing the HADOOP-7070 fix.
 You can use the following script to do this:</p>
@@ -34391,13 +34918,13 @@ mv target/tmp.txt target/cached_classpath.txt</pre>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_set_jaas_configuration_programmatically"><a class="anchor" href="#_set_jaas_configuration_programmatically"></a>177.7.2. Set JAAS configuration programmatically</h4>
+<h4 id="_set_jaas_configuration_programmatically"><a class="anchor" href="#_set_jaas_configuration_programmatically"></a>193.7.2. Set JAAS configuration programmatically</h4>
 <div class="paragraph">
 <p>This would avoid the need for a separate Hadoop jar that fixes <a href="https://issues.apache.org/jira/browse/HADOOP-7070">HADOOP-7070</a>.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_elimination_of_code_kerberos_removehostfromprincipal_code_and_kerberos_removerealmfromprincipal"><a class="anchor" href="#_elimination_of_code_kerberos_removehostfromprincipal_code_and_kerberos_removerealmfromprincipal"></a>177.7.3. Elimination of <code>kerberos.removeHostFromPrincipal</code> and`kerberos.removeRealmFromPrincipal`</h4>
+<h4 id="_elimination_of_code_kerberos_removehostfromprincipal_code_and_kerberos_removerealmfromprincipal"><a class="anchor" href="#_elimination_of_code_kerberos_removehostfromprincipal_code_and_kerberos_removerealmfromprincipal"></a>193.7.3. Elimination of <code>kerberos.removeHostFromPrincipal</code> and`kerberos.removeRealmFromPrincipal`</h4>
 
 </div>
 </div>
@@ -34405,7 +34932,7 @@ mv target/tmp.txt target/cached_classpath.txt</pre>
 </div>
 <h1 id="community" class="sect0"><a class="anchor" href="#community"></a>Community</h1>
 <div class="sect1">
-<h2 id="_decisions"><a class="anchor" href="#_decisions"></a>178. Decisions</h2>
+<h2 id="_decisions"><a class="anchor" href="#_decisions"></a>194. Decisions</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <div class="title">Feature Branches</div>
@@ -34453,10 +34980,10 @@ We also are currently in violation of this basic tenet&#8201;&#8212;&#8201;repli
 </div>
 </div>
 <div class="sect1">
-<h2 id="community.roles"><a class="anchor" href="#community.roles"></a>179. Community Roles</h2>
+<h2 id="community.roles"><a class="anchor" href="#community.roles"></a>195. Community Roles</h2>
 <div class="sectionbody">
 <div class="sect2">
-<h3 id="_release_managers"><a class="anchor" href="#_release_managers"></a>179.1. Release Managers</h3>
+<h3 id="_release_managers"><a class="anchor" href="#_release_managers"></a>195.1. Release Managers</h3>
 <div class="paragraph">
 <p>Each maintained release branch has a release manager, who volunteers to coordinate new features and bug fixes are backported to that release.
 The release managers are <a href="https://hbase.apache.org/team-list.html">committers</a>.
@@ -34510,7 +35037,7 @@ End-of-life releases are not included in this list.
 </div>
 </div>
 <div class="sect1">
-<h2 id="hbase.commit.msg.format"><a class="anchor" href="#hbase.commit.msg.format"></a>180. Commit Message format</h2>
+<h2 id="hbase.commit.msg.format"><a class="anchor" href="#hbase.commit.msg.format"></a>196. Commit Message format</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <p>We <a href="http://search-hadoop.com/m/Gwxwl10cFHa1">agreed</a> to the following Git commit message format:</p>
@@ -37717,7 +38244,7 @@ The <code>LocalFileSpanReceiver</code> looks in <em>hbase-site.xml</em>      for
 </div>
 </div>
 <div class="sect1">
-<h2 id="tracing.client.modifications"><a class="anchor" href="#tracing.client.modifications"></a>181. Client Modifications</h2>
+<h2 id="tracing.client.modifications"><a class="anchor" href="#tracing.client.modifications"></a>197. Client Modifications</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <p>In order to turn on tracing in your client code, you must initialize the module sending spans to receiver once per client process.</p>
@@ -37775,7 +38302,7 @@ See the HTrace <em>README</em> for more information on Samplers.</p>
 </div>
 </div>
 <div class="sect1">
-<h2 id="tracing.client.shell"><a class="anchor" href="#tracing.client.shell"></a>182. Tracing from HBase Shell</h2>
+<h2 id="tracing.client.shell"><a class="anchor" href="#tracing.client.shell"></a>198. Tracing from HBase Shell</h2>
 <div class="sectionbody">
 <div class="paragraph">
 <p>You can use <code>trace</code> command for tracing requests from HBase Shell. <code>trace 'start'</code> command turns on tracing and <code>trace 'stop'</code> command turns off tracing.</p>
@@ -38085,7 +38612,7 @@ The server will return cellblocks compressed using this same compressor as long 
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-SNAPSHOT<br>
-Last updated 2018-06-15 21:26:14 UTC
+Last updated 2018-06-16 21:25:17 UTC
 </div>
 </div>
 </body>
