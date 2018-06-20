@@ -23,933 +23,938 @@
 <span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
 <span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
 <span class="sourceLineNo">017</span> */<a name="line.17"></a>
-<span class="sourceLineNo">018</span><a name="line.18"></a>
-<span class="sourceLineNo">019</span>package org.apache.hadoop.hbase.master.procedure;<a name="line.19"></a>
-<span class="sourceLineNo">020</span><a name="line.20"></a>
-<span class="sourceLineNo">021</span>import java.io.IOException;<a name="line.21"></a>
-<span class="sourceLineNo">022</span>import java.util.Arrays;<a name="line.22"></a>
-<span class="sourceLineNo">023</span>import java.util.List;<a name="line.23"></a>
-<span class="sourceLineNo">024</span>import org.apache.hadoop.hbase.ServerName;<a name="line.24"></a>
-<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.TableExistsException;<a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.TableName;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.TableNotFoundException;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.master.procedure.TableProcedureInterface.TableOperationType;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.procedure2.AbstractProcedureScheduler;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.procedure2.LockAndQueue;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.procedure2.LockedResource;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.procedure2.LockedResourceType;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.procedure2.Procedure;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlIterableList;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlKeyComparator;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlTree;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlTreeIterator;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.slf4j.Logger;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.slf4j.LoggerFactory;<a name="line.41"></a>
-<span class="sourceLineNo">042</span><a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.43"></a>
-<span class="sourceLineNo">044</span><a name="line.44"></a>
-<span class="sourceLineNo">045</span>/**<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * ProcedureScheduler for the Master Procedures.<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * This ProcedureScheduler tries to provide to the ProcedureExecutor procedures<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * that can be executed without having to wait on a lock.<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * Most of the master operations can be executed concurrently, if they<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * are operating on different tables (e.g. two create table procedures can be performed<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * at the same time) or against two different servers; say two servers that crashed at<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * about the same time.<a name="line.52"></a>
-<span class="sourceLineNo">053</span> *<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * &lt;p&gt;Each procedure should implement an Interface providing information for this queue.<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * For example table related procedures should implement TableProcedureInterface.<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * Each procedure will be pushed in its own queue, and based on the operation type<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * we may make smarter decisions: e.g. we can abort all the operations preceding<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * a delete table, or similar.<a name="line.58"></a>
-<span class="sourceLineNo">059</span> *<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * &lt;h4&gt;Concurrency control&lt;/h4&gt;<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * Concurrent access to member variables (tableRunQueue, serverRunQueue, locking, tableMap,<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * serverBuckets) is controlled by schedLock(). This mainly includes:&lt;br&gt;<a name="line.62"></a>
-<span class="sourceLineNo">063</span> * &lt;ul&gt;<a name="line.63"></a>
-<span class="sourceLineNo">064</span> *   &lt;li&gt;<a name="line.64"></a>
-<span class="sourceLineNo">065</span> *     {@link #push(Procedure, boolean, boolean)}: A push will add a Queue back to run-queue<a name="line.65"></a>
-<span class="sourceLineNo">066</span> *     when:<a name="line.66"></a>
-<span class="sourceLineNo">067</span> *     &lt;ol&gt;<a name="line.67"></a>
-<span class="sourceLineNo">068</span> *       &lt;li&gt;Queue was empty before push (so must have been out of run-queue)&lt;/li&gt;<a name="line.68"></a>
-<span class="sourceLineNo">069</span> *       &lt;li&gt;Child procedure is added (which means parent procedure holds exclusive lock, and it<a name="line.69"></a>
-<span class="sourceLineNo">070</span> *           must have moved Queue out of run-queue)&lt;/li&gt;<a name="line.70"></a>
-<span class="sourceLineNo">071</span> *     &lt;/ol&gt;<a name="line.71"></a>
-<span class="sourceLineNo">072</span> *   &lt;/li&gt;<a name="line.72"></a>
-<span class="sourceLineNo">073</span> *   &lt;li&gt;<a name="line.73"></a>
-<span class="sourceLineNo">074</span> *     {@link #poll(long)}: A poll will remove a Queue from run-queue when:<a name="line.74"></a>
-<span class="sourceLineNo">075</span> *     &lt;ol&gt;<a name="line.75"></a>
-<span class="sourceLineNo">076</span> *       &lt;li&gt;Queue becomes empty after poll&lt;/li&gt;<a name="line.76"></a>
-<span class="sourceLineNo">077</span> *       &lt;li&gt;Exclusive lock is requested by polled procedure and lock is available (returns the<a name="line.77"></a>
-<span class="sourceLineNo">078</span> *           procedure)&lt;/li&gt;<a name="line.78"></a>
-<span class="sourceLineNo">079</span> *       &lt;li&gt;Exclusive lock is requested but lock is not available (returns null)&lt;/li&gt;<a name="line.79"></a>
-<span class="sourceLineNo">080</span> *       &lt;li&gt;Polled procedure is child of parent holding exclusive lock and the next procedure is<a name="line.80"></a>
-<span class="sourceLineNo">081</span> *           not a child&lt;/li&gt;<a name="line.81"></a>
-<span class="sourceLineNo">082</span> *     &lt;/ol&gt;<a name="line.82"></a>
-<span class="sourceLineNo">083</span> *   &lt;/li&gt;<a name="line.83"></a>
-<span class="sourceLineNo">084</span> *   &lt;li&gt;<a name="line.84"></a>
-<span class="sourceLineNo">085</span> *     Namespace/table/region locks: Queue is added back to run-queue when lock being released is:<a name="line.85"></a>
-<span class="sourceLineNo">086</span> *     &lt;ol&gt;<a name="line.86"></a>
-<span class="sourceLineNo">087</span> *       &lt;li&gt;Exclusive lock&lt;/li&gt;<a name="line.87"></a>
-<span class="sourceLineNo">088</span> *       &lt;li&gt;Last shared lock (in case queue was removed because next procedure in queue required<a name="line.88"></a>
-<span class="sourceLineNo">089</span> *           exclusive lock)&lt;/li&gt;<a name="line.89"></a>
-<span class="sourceLineNo">090</span> *     &lt;/ol&gt;<a name="line.90"></a>
-<span class="sourceLineNo">091</span> *   &lt;/li&gt;<a name="line.91"></a>
-<span class="sourceLineNo">092</span> * &lt;/ul&gt;<a name="line.92"></a>
-<span class="sourceLineNo">093</span> */<a name="line.93"></a>
-<span class="sourceLineNo">094</span>@InterfaceAudience.Private<a name="line.94"></a>
-<span class="sourceLineNo">095</span>public class MasterProcedureScheduler extends AbstractProcedureScheduler {<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  private static final Logger LOG = LoggerFactory.getLogger(MasterProcedureScheduler.class);<a name="line.96"></a>
-<span class="sourceLineNo">097</span><a name="line.97"></a>
-<span class="sourceLineNo">098</span>  private static final AvlKeyComparator&lt;ServerQueue&gt; SERVER_QUEUE_KEY_COMPARATOR =<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    (n, k) -&gt; n.compareKey((ServerName) k);<a name="line.99"></a>
-<span class="sourceLineNo">100</span>  private final static AvlKeyComparator&lt;TableQueue&gt; TABLE_QUEUE_KEY_COMPARATOR =<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    (n, k) -&gt; n.compareKey((TableName) k);<a name="line.101"></a>
-<span class="sourceLineNo">102</span>  private final static AvlKeyComparator&lt;PeerQueue&gt; PEER_QUEUE_KEY_COMPARATOR =<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    (n, k) -&gt; n.compareKey((String) k);<a name="line.103"></a>
-<span class="sourceLineNo">104</span>  private final static AvlKeyComparator&lt;MetaQueue&gt; META_QUEUE_KEY_COMPARATOR =<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    (n, k) -&gt; n.compareKey((TableName) k);<a name="line.105"></a>
-<span class="sourceLineNo">106</span><a name="line.106"></a>
-<span class="sourceLineNo">107</span>  private final FairQueue&lt;ServerName&gt; serverRunQueue = new FairQueue&lt;&gt;();<a name="line.107"></a>
-<span class="sourceLineNo">108</span>  private final FairQueue&lt;TableName&gt; tableRunQueue = new FairQueue&lt;&gt;();<a name="line.108"></a>
-<span class="sourceLineNo">109</span>  private final FairQueue&lt;String&gt; peerRunQueue = new FairQueue&lt;&gt;();<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  private final FairQueue&lt;TableName&gt; metaRunQueue = new FairQueue&lt;&gt;();<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  private final ServerQueue[] serverBuckets = new ServerQueue[128];<a name="line.112"></a>
-<span class="sourceLineNo">113</span>  private TableQueue tableMap = null;<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  private PeerQueue peerMap = null;<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  private MetaQueue metaMap = null;<a name="line.115"></a>
-<span class="sourceLineNo">116</span><a name="line.116"></a>
-<span class="sourceLineNo">117</span>  private final SchemaLocking locking = new SchemaLocking();<a name="line.117"></a>
-<span class="sourceLineNo">118</span><a name="line.118"></a>
-<span class="sourceLineNo">119</span>  @Override<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  public void yield(final Procedure proc) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    push(proc, isTableProcedure(proc), true);<a name="line.121"></a>
-<span class="sourceLineNo">122</span>  }<a name="line.122"></a>
-<span class="sourceLineNo">123</span><a name="line.123"></a>
-<span class="sourceLineNo">124</span>  @Override<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  protected void enqueue(final Procedure proc, final boolean addFront) {<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    if (isMetaProcedure(proc)) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      doAdd(metaRunQueue, getMetaQueue(), proc, addFront);<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    } else if (isTableProcedure(proc)) {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      doAdd(tableRunQueue, getTableQueue(getTableName(proc)), proc, addFront);<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    } else if (isServerProcedure(proc)) {<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      doAdd(serverRunQueue, getServerQueue(getServerName(proc)), proc, addFront);<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    } else if (isPeerProcedure(proc)) {<a name="line.132"></a>
-<span class="sourceLineNo">133</span>      doAdd(peerRunQueue, getPeerQueue(getPeerId(proc)), proc, addFront);<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    } else {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>      // TODO: at the moment we only have Table and Server procedures<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      // if you are implementing a non-table/non-server procedure, you have two options: create<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      // a group for all the non-table/non-server procedures or try to find a key for your<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      // non-table/non-server procedures and implement something similar to the TableRunQueue.<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      throw new UnsupportedOperationException(<a name="line.139"></a>
-<span class="sourceLineNo">140</span>        "RQs for non-table/non-server procedures are not implemented yet: " + proc);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    }<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  }<a name="line.142"></a>
-<span class="sourceLineNo">143</span><a name="line.143"></a>
-<span class="sourceLineNo">144</span>  private &lt;T extends Comparable&lt;T&gt;&gt; void doAdd(final FairQueue&lt;T&gt; fairq,<a name="line.144"></a>
-<span class="sourceLineNo">145</span>      final Queue&lt;T&gt; queue, final Procedure&lt;?&gt; proc, final boolean addFront) {<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    queue.add(proc, addFront);<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    if (!queue.getLockStatus().hasExclusiveLock() || queue.getLockStatus().isLockOwner(proc.getProcId())) {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      // if the queue was not remove for an xlock execution<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      // or the proc is the lock owner, put the queue back into execution<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      addToRunQueue(fairq, queue);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    } else if (queue.getLockStatus().hasParentLock(proc)) {<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      assert addFront : "expected to add a child in the front";<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      // our (proc) parent has the xlock,<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      // so the queue is not in the fairq (run-queue)<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      // add it back to let the child run (inherit the lock)<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      addToRunQueue(fairq, queue);<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    }<a name="line.157"></a>
-<span class="sourceLineNo">158</span>  }<a name="line.158"></a>
-<span class="sourceLineNo">159</span><a name="line.159"></a>
-<span class="sourceLineNo">160</span>  @Override<a name="line.160"></a>
-<span class="sourceLineNo">161</span>  protected boolean queueHasRunnables() {<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    return metaRunQueue.hasRunnables() || tableRunQueue.hasRunnables() ||<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      serverRunQueue.hasRunnables() || peerRunQueue.hasRunnables();<a name="line.163"></a>
-<span class="sourceLineNo">164</span>  }<a name="line.164"></a>
-<span class="sourceLineNo">165</span><a name="line.165"></a>
-<span class="sourceLineNo">166</span>  @Override<a name="line.166"></a>
-<span class="sourceLineNo">167</span>  protected Procedure dequeue() {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    // meta procedure is always the first priority<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    Procedure&lt;?&gt; pollResult = doPoll(metaRunQueue);<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    // For now, let server handling have precedence over table handling; presumption is that it<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    // is more important handling crashed servers than it is running the<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    // enabling/disabling tables, etc.<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    if (pollResult == null) {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      pollResult = doPoll(serverRunQueue);<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    }<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    if (pollResult == null) {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      pollResult = doPoll(peerRunQueue);<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    }<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    if (pollResult == null) {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      pollResult = doPoll(tableRunQueue);<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    return pollResult;<a name="line.182"></a>
-<span class="sourceLineNo">183</span>  }<a name="line.183"></a>
-<span class="sourceLineNo">184</span><a name="line.184"></a>
-<span class="sourceLineNo">185</span>  private &lt;T extends Comparable&lt;T&gt;&gt; Procedure&lt;?&gt; doPoll(final FairQueue&lt;T&gt; fairq) {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    final Queue&lt;T&gt; rq = fairq.poll();<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    if (rq == null || !rq.isAvailable()) {<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      return null;<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    }<a name="line.189"></a>
-<span class="sourceLineNo">190</span><a name="line.190"></a>
-<span class="sourceLineNo">191</span>    final Procedure&lt;?&gt; pollResult = rq.peek();<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    if (pollResult == null) {<a name="line.192"></a>
-<span class="sourceLineNo">193</span>      return null;<a name="line.193"></a>
-<span class="sourceLineNo">194</span>    }<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    final boolean xlockReq = rq.requireExclusiveLock(pollResult);<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    if (xlockReq &amp;&amp; rq.getLockStatus().isLocked() &amp;&amp; !rq.getLockStatus().hasLockAccess(pollResult)) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      // someone is already holding the lock (e.g. shared lock). avoid a yield<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      removeFromRunQueue(fairq, rq);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      return null;<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>    rq.poll();<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    if (rq.isEmpty() || xlockReq) {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      removeFromRunQueue(fairq, rq);<a name="line.204"></a>
-<span class="sourceLineNo">205</span>    } else if (rq.getLockStatus().hasParentLock(pollResult)) {<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      // if the rq is in the fairq because of runnable child<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      // check if the next procedure is still a child.<a name="line.207"></a>
-<span class="sourceLineNo">208</span>      // if not, remove the rq from the fairq and go back to the xlock state<a name="line.208"></a>
-<span class="sourceLineNo">209</span>      Procedure&lt;?&gt; nextProc = rq.peek();<a name="line.209"></a>
-<span class="sourceLineNo">210</span>      if (nextProc != null &amp;&amp; !Procedure.haveSameParent(nextProc, pollResult)) {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        removeFromRunQueue(fairq, rq);<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      }<a name="line.212"></a>
-<span class="sourceLineNo">213</span>    }<a name="line.213"></a>
-<span class="sourceLineNo">214</span><a name="line.214"></a>
-<span class="sourceLineNo">215</span>    return pollResult;<a name="line.215"></a>
-<span class="sourceLineNo">216</span>  }<a name="line.216"></a>
-<span class="sourceLineNo">217</span><a name="line.217"></a>
-<span class="sourceLineNo">218</span>  @Override<a name="line.218"></a>
-<span class="sourceLineNo">219</span>  public List&lt;LockedResource&gt; getLocks() {<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    schedLock();<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    try {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      return locking.getLocks();<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    } finally {<a name="line.223"></a>
-<span class="sourceLineNo">224</span>      schedUnlock();<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    }<a name="line.225"></a>
-<span class="sourceLineNo">226</span>  }<a name="line.226"></a>
-<span class="sourceLineNo">227</span><a name="line.227"></a>
-<span class="sourceLineNo">228</span>  @Override<a name="line.228"></a>
-<span class="sourceLineNo">229</span>  public LockedResource getLockResource(LockedResourceType resourceType, String resourceName) {<a name="line.229"></a>
-<span class="sourceLineNo">230</span>    schedLock();<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    try {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      return locking.getLockResource(resourceType, resourceName);<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    } finally {<a name="line.233"></a>
-<span class="sourceLineNo">234</span>      schedUnlock();<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
-<span class="sourceLineNo">236</span>  }<a name="line.236"></a>
-<span class="sourceLineNo">237</span><a name="line.237"></a>
-<span class="sourceLineNo">238</span>  @Override<a name="line.238"></a>
-<span class="sourceLineNo">239</span>  public void clear() {<a name="line.239"></a>
-<span class="sourceLineNo">240</span>    schedLock();<a name="line.240"></a>
-<span class="sourceLineNo">241</span>    try {<a name="line.241"></a>
-<span class="sourceLineNo">242</span>      clearQueue();<a name="line.242"></a>
-<span class="sourceLineNo">243</span>      locking.clear();<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    } finally {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>      schedUnlock();<a name="line.245"></a>
-<span class="sourceLineNo">246</span>    }<a name="line.246"></a>
-<span class="sourceLineNo">247</span>  }<a name="line.247"></a>
-<span class="sourceLineNo">248</span><a name="line.248"></a>
-<span class="sourceLineNo">249</span>  private void clearQueue() {<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    // Remove Servers<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    for (int i = 0; i &lt; serverBuckets.length; ++i) {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      clear(serverBuckets[i], serverRunQueue, SERVER_QUEUE_KEY_COMPARATOR);<a name="line.252"></a>
-<span class="sourceLineNo">253</span>      serverBuckets[i] = null;<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    }<a name="line.254"></a>
-<span class="sourceLineNo">255</span><a name="line.255"></a>
-<span class="sourceLineNo">256</span>    // Remove Tables<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    clear(tableMap, tableRunQueue, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    tableMap = null;<a name="line.258"></a>
-<span class="sourceLineNo">259</span><a name="line.259"></a>
-<span class="sourceLineNo">260</span>    // Remove Peers<a name="line.260"></a>
-<span class="sourceLineNo">261</span>    clear(peerMap, peerRunQueue, PEER_QUEUE_KEY_COMPARATOR);<a name="line.261"></a>
-<span class="sourceLineNo">262</span>    peerMap = null;<a name="line.262"></a>
-<span class="sourceLineNo">263</span><a name="line.263"></a>
-<span class="sourceLineNo">264</span>    assert size() == 0 : "expected queue size to be 0, got " + size();<a name="line.264"></a>
-<span class="sourceLineNo">265</span>  }<a name="line.265"></a>
-<span class="sourceLineNo">266</span><a name="line.266"></a>
-<span class="sourceLineNo">267</span>  private &lt;T extends Comparable&lt;T&gt;, TNode extends Queue&lt;T&gt;&gt; void clear(TNode treeMap,<a name="line.267"></a>
-<span class="sourceLineNo">268</span>      final FairQueue&lt;T&gt; fairq, final AvlKeyComparator&lt;TNode&gt; comparator) {<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    while (treeMap != null) {<a name="line.269"></a>
-<span class="sourceLineNo">270</span>      Queue&lt;T&gt; node = AvlTree.getFirst(treeMap);<a name="line.270"></a>
-<span class="sourceLineNo">271</span>      treeMap = AvlTree.remove(treeMap, node.getKey(), comparator);<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      if (fairq != null) removeFromRunQueue(fairq, node);<a name="line.272"></a>
-<span class="sourceLineNo">273</span>    }<a name="line.273"></a>
-<span class="sourceLineNo">274</span>  }<a name="line.274"></a>
-<span class="sourceLineNo">275</span><a name="line.275"></a>
-<span class="sourceLineNo">276</span>  private int queueSize(Queue&lt;?&gt; head) {<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    int count = 0;<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    AvlTreeIterator&lt;Queue&lt;?&gt;&gt; iter = new AvlTreeIterator&lt;Queue&lt;?&gt;&gt;(head);<a name="line.278"></a>
-<span class="sourceLineNo">279</span>    while (iter.hasNext()) {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      count += iter.next().size();<a name="line.280"></a>
-<span class="sourceLineNo">281</span>    }<a name="line.281"></a>
-<span class="sourceLineNo">282</span>    return count;<a name="line.282"></a>
-<span class="sourceLineNo">283</span>  }<a name="line.283"></a>
-<span class="sourceLineNo">284</span><a name="line.284"></a>
-<span class="sourceLineNo">285</span>  @Override<a name="line.285"></a>
-<span class="sourceLineNo">286</span>  protected int queueSize() {<a name="line.286"></a>
-<span class="sourceLineNo">287</span>    int count = 0;<a name="line.287"></a>
-<span class="sourceLineNo">288</span>    for (ServerQueue serverMap : serverBuckets) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>      count += queueSize(serverMap);<a name="line.289"></a>
-<span class="sourceLineNo">290</span>    }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>    count += queueSize(tableMap);<a name="line.291"></a>
-<span class="sourceLineNo">292</span>    count += queueSize(peerMap);<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    count += queueSize(metaMap);<a name="line.293"></a>
-<span class="sourceLineNo">294</span>    return count;<a name="line.294"></a>
-<span class="sourceLineNo">295</span>  }<a name="line.295"></a>
-<span class="sourceLineNo">296</span><a name="line.296"></a>
-<span class="sourceLineNo">297</span>  @Override<a name="line.297"></a>
-<span class="sourceLineNo">298</span>  public void completionCleanup(final Procedure proc) {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    if (proc instanceof TableProcedureInterface) {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>      TableProcedureInterface iProcTable = (TableProcedureInterface) proc;<a name="line.300"></a>
-<span class="sourceLineNo">301</span>      boolean tableDeleted;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>      if (proc.hasException()) {<a name="line.302"></a>
-<span class="sourceLineNo">303</span>        Exception procEx = proc.getException().unwrapRemoteException();<a name="line.303"></a>
-<span class="sourceLineNo">304</span>        if (iProcTable.getTableOperationType() == TableOperationType.CREATE) {<a name="line.304"></a>
-<span class="sourceLineNo">305</span>          // create failed because the table already exist<a name="line.305"></a>
-<span class="sourceLineNo">306</span>          tableDeleted = !(procEx instanceof TableExistsException);<a name="line.306"></a>
-<span class="sourceLineNo">307</span>        } else {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>          // the operation failed because the table does not exist<a name="line.308"></a>
-<span class="sourceLineNo">309</span>          tableDeleted = (procEx instanceof TableNotFoundException);<a name="line.309"></a>
-<span class="sourceLineNo">310</span>        }<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      } else {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>        // the table was deleted<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        tableDeleted = (iProcTable.getTableOperationType() == TableOperationType.DELETE);<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      }<a name="line.314"></a>
-<span class="sourceLineNo">315</span>      if (tableDeleted) {<a name="line.315"></a>
-<span class="sourceLineNo">316</span>        markTableAsDeleted(iProcTable.getTableName(), proc);<a name="line.316"></a>
-<span class="sourceLineNo">317</span>        return;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      }<a name="line.318"></a>
-<span class="sourceLineNo">319</span>    } else if (proc instanceof PeerProcedureInterface) {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>      PeerProcedureInterface iProcPeer = (PeerProcedureInterface) proc;<a name="line.320"></a>
-<span class="sourceLineNo">321</span>      tryCleanupPeerQueue(iProcPeer.getPeerId(), proc);<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    } else {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      // No cleanup for ServerProcedureInterface types, yet.<a name="line.323"></a>
-<span class="sourceLineNo">324</span>      return;<a name="line.324"></a>
-<span class="sourceLineNo">325</span>    }<a name="line.325"></a>
-<span class="sourceLineNo">326</span>  }<a name="line.326"></a>
-<span class="sourceLineNo">327</span><a name="line.327"></a>
-<span class="sourceLineNo">328</span>  private static &lt;T extends Comparable&lt;T&gt;&gt; void addToRunQueue(FairQueue&lt;T&gt; fairq, Queue&lt;T&gt; queue) {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    if (!AvlIterableList.isLinked(queue) &amp;&amp; !queue.isEmpty()) {<a name="line.329"></a>
-<span class="sourceLineNo">330</span>      fairq.add(queue);<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    }<a name="line.331"></a>
-<span class="sourceLineNo">332</span>  }<a name="line.332"></a>
-<span class="sourceLineNo">333</span><a name="line.333"></a>
-<span class="sourceLineNo">334</span>  private static &lt;T extends Comparable&lt;T&gt;&gt; void removeFromRunQueue(<a name="line.334"></a>
-<span class="sourceLineNo">335</span>      FairQueue&lt;T&gt; fairq, Queue&lt;T&gt; queue) {<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    if (AvlIterableList.isLinked(queue)) {<a name="line.336"></a>
-<span class="sourceLineNo">337</span>      fairq.remove(queue);<a name="line.337"></a>
-<span class="sourceLineNo">338</span>    }<a name="line.338"></a>
-<span class="sourceLineNo">339</span>  }<a name="line.339"></a>
-<span class="sourceLineNo">340</span><a name="line.340"></a>
-<span class="sourceLineNo">341</span>  // ============================================================================<a name="line.341"></a>
-<span class="sourceLineNo">342</span>  //  Table Queue Lookup Helpers<a name="line.342"></a>
-<span class="sourceLineNo">343</span>  // ============================================================================<a name="line.343"></a>
-<span class="sourceLineNo">344</span>  private TableQueue getTableQueue(TableName tableName) {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>    TableQueue node = AvlTree.get(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    if (node != null) return node;<a name="line.346"></a>
-<span class="sourceLineNo">347</span><a name="line.347"></a>
-<span class="sourceLineNo">348</span>    node = new TableQueue(tableName, MasterProcedureUtil.getTablePriority(tableName),<a name="line.348"></a>
-<span class="sourceLineNo">349</span>        locking.getTableLock(tableName), locking.getNamespaceLock(tableName.getNamespaceAsString()));<a name="line.349"></a>
-<span class="sourceLineNo">350</span>    tableMap = AvlTree.insert(tableMap, node);<a name="line.350"></a>
-<span class="sourceLineNo">351</span>    return node;<a name="line.351"></a>
-<span class="sourceLineNo">352</span>  }<a name="line.352"></a>
-<span class="sourceLineNo">353</span><a name="line.353"></a>
-<span class="sourceLineNo">354</span>  private void removeTableQueue(TableName tableName) {<a name="line.354"></a>
-<span class="sourceLineNo">355</span>    tableMap = AvlTree.remove(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.355"></a>
-<span class="sourceLineNo">356</span>    locking.removeTableLock(tableName);<a name="line.356"></a>
-<span class="sourceLineNo">357</span>  }<a name="line.357"></a>
-<span class="sourceLineNo">358</span><a name="line.358"></a>
-<span class="sourceLineNo">359</span>  private static boolean isTableProcedure(Procedure&lt;?&gt; proc) {<a name="line.359"></a>
-<span class="sourceLineNo">360</span>    return proc instanceof TableProcedureInterface;<a name="line.360"></a>
-<span class="sourceLineNo">361</span>  }<a name="line.361"></a>
-<span class="sourceLineNo">362</span><a name="line.362"></a>
-<span class="sourceLineNo">363</span>  private static TableName getTableName(Procedure&lt;?&gt; proc) {<a name="line.363"></a>
-<span class="sourceLineNo">364</span>    return ((TableProcedureInterface)proc).getTableName();<a name="line.364"></a>
-<span class="sourceLineNo">365</span>  }<a name="line.365"></a>
-<span class="sourceLineNo">366</span><a name="line.366"></a>
-<span class="sourceLineNo">367</span>  // ============================================================================<a name="line.367"></a>
-<span class="sourceLineNo">368</span>  //  Server Queue Lookup Helpers<a name="line.368"></a>
-<span class="sourceLineNo">369</span>  // ============================================================================<a name="line.369"></a>
-<span class="sourceLineNo">370</span>  private ServerQueue getServerQueue(ServerName serverName) {<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    final int index = getBucketIndex(serverBuckets, serverName.hashCode());<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    ServerQueue node = AvlTree.get(serverBuckets[index], serverName, SERVER_QUEUE_KEY_COMPARATOR);<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    if (node != null) return node;<a name="line.373"></a>
-<span class="sourceLineNo">374</span><a name="line.374"></a>
-<span class="sourceLineNo">375</span>    node = new ServerQueue(serverName, locking.getServerLock(serverName));<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    serverBuckets[index] = AvlTree.insert(serverBuckets[index], node);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    return node;<a name="line.377"></a>
-<span class="sourceLineNo">378</span>  }<a name="line.378"></a>
-<span class="sourceLineNo">379</span><a name="line.379"></a>
-<span class="sourceLineNo">380</span>  private static int getBucketIndex(Object[] buckets, int hashCode) {<a name="line.380"></a>
-<span class="sourceLineNo">381</span>    return Math.abs(hashCode) % buckets.length;<a name="line.381"></a>
-<span class="sourceLineNo">382</span>  }<a name="line.382"></a>
-<span class="sourceLineNo">383</span><a name="line.383"></a>
-<span class="sourceLineNo">384</span>  private static boolean isServerProcedure(Procedure&lt;?&gt; proc) {<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    return proc instanceof ServerProcedureInterface;<a name="line.385"></a>
-<span class="sourceLineNo">386</span>  }<a name="line.386"></a>
-<span class="sourceLineNo">387</span><a name="line.387"></a>
-<span class="sourceLineNo">388</span>  private static ServerName getServerName(Procedure&lt;?&gt; proc) {<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    return ((ServerProcedureInterface)proc).getServerName();<a name="line.389"></a>
-<span class="sourceLineNo">390</span>  }<a name="line.390"></a>
-<span class="sourceLineNo">391</span><a name="line.391"></a>
-<span class="sourceLineNo">392</span>  // ============================================================================<a name="line.392"></a>
-<span class="sourceLineNo">393</span>  //  Peer Queue Lookup Helpers<a name="line.393"></a>
-<span class="sourceLineNo">394</span>  // ============================================================================<a name="line.394"></a>
-<span class="sourceLineNo">395</span>  private PeerQueue getPeerQueue(String peerId) {<a name="line.395"></a>
-<span class="sourceLineNo">396</span>    PeerQueue node = AvlTree.get(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.396"></a>
-<span class="sourceLineNo">397</span>    if (node != null) {<a name="line.397"></a>
-<span class="sourceLineNo">398</span>      return node;<a name="line.398"></a>
-<span class="sourceLineNo">399</span>    }<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    node = new PeerQueue(peerId, locking.getPeerLock(peerId));<a name="line.400"></a>
-<span class="sourceLineNo">401</span>    peerMap = AvlTree.insert(peerMap, node);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>    return node;<a name="line.402"></a>
-<span class="sourceLineNo">403</span>  }<a name="line.403"></a>
-<span class="sourceLineNo">404</span><a name="line.404"></a>
-<span class="sourceLineNo">405</span>  private void removePeerQueue(String peerId) {<a name="line.405"></a>
-<span class="sourceLineNo">406</span>    peerMap = AvlTree.remove(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.406"></a>
-<span class="sourceLineNo">407</span>    locking.removePeerLock(peerId);<a name="line.407"></a>
-<span class="sourceLineNo">408</span>  }<a name="line.408"></a>
-<span class="sourceLineNo">409</span><a name="line.409"></a>
-<span class="sourceLineNo">410</span>  private void tryCleanupPeerQueue(String peerId, Procedure&lt;?&gt; procedure) {<a name="line.410"></a>
-<span class="sourceLineNo">411</span>    schedLock();<a name="line.411"></a>
-<span class="sourceLineNo">412</span>    try {<a name="line.412"></a>
-<span class="sourceLineNo">413</span>      PeerQueue queue = AvlTree.get(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>      if (queue == null) {<a name="line.414"></a>
-<span class="sourceLineNo">415</span>        return;<a name="line.415"></a>
-<span class="sourceLineNo">416</span>      }<a name="line.416"></a>
-<span class="sourceLineNo">417</span><a name="line.417"></a>
-<span class="sourceLineNo">418</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.418"></a>
-<span class="sourceLineNo">419</span>      if (queue.isEmpty() &amp;&amp; lock.tryExclusiveLock(procedure)) {<a name="line.419"></a>
-<span class="sourceLineNo">420</span>        removeFromRunQueue(peerRunQueue, queue);<a name="line.420"></a>
-<span class="sourceLineNo">421</span>        removePeerQueue(peerId);<a name="line.421"></a>
-<span class="sourceLineNo">422</span>      }<a name="line.422"></a>
-<span class="sourceLineNo">423</span>    } finally {<a name="line.423"></a>
-<span class="sourceLineNo">424</span>      schedUnlock();<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
-<span class="sourceLineNo">426</span>  }<a name="line.426"></a>
-<span class="sourceLineNo">427</span><a name="line.427"></a>
-<span class="sourceLineNo">428</span>  private static boolean isPeerProcedure(Procedure&lt;?&gt; proc) {<a name="line.428"></a>
-<span class="sourceLineNo">429</span>    return proc instanceof PeerProcedureInterface;<a name="line.429"></a>
-<span class="sourceLineNo">430</span>  }<a name="line.430"></a>
-<span class="sourceLineNo">431</span><a name="line.431"></a>
-<span class="sourceLineNo">432</span>  private static String getPeerId(Procedure&lt;?&gt; proc) {<a name="line.432"></a>
-<span class="sourceLineNo">433</span>    return ((PeerProcedureInterface) proc).getPeerId();<a name="line.433"></a>
-<span class="sourceLineNo">434</span>  }<a name="line.434"></a>
-<span class="sourceLineNo">435</span><a name="line.435"></a>
-<span class="sourceLineNo">436</span>  // ============================================================================<a name="line.436"></a>
-<span class="sourceLineNo">437</span>  //  Meta Queue Lookup Helpers<a name="line.437"></a>
-<span class="sourceLineNo">438</span>  // ============================================================================<a name="line.438"></a>
-<span class="sourceLineNo">439</span>  private MetaQueue getMetaQueue() {<a name="line.439"></a>
-<span class="sourceLineNo">440</span>    MetaQueue node = AvlTree.get(metaMap, TableName.META_TABLE_NAME, META_QUEUE_KEY_COMPARATOR);<a name="line.440"></a>
-<span class="sourceLineNo">441</span>    if (node != null) {<a name="line.441"></a>
-<span class="sourceLineNo">442</span>      return node;<a name="line.442"></a>
-<span class="sourceLineNo">443</span>    }<a name="line.443"></a>
-<span class="sourceLineNo">444</span>    node = new MetaQueue(locking.getMetaLock());<a name="line.444"></a>
-<span class="sourceLineNo">445</span>    metaMap = AvlTree.insert(metaMap, node);<a name="line.445"></a>
-<span class="sourceLineNo">446</span>    return node;<a name="line.446"></a>
-<span class="sourceLineNo">447</span>  }<a name="line.447"></a>
-<span class="sourceLineNo">448</span><a name="line.448"></a>
-<span class="sourceLineNo">449</span>  private static boolean isMetaProcedure(Procedure&lt;?&gt; proc) {<a name="line.449"></a>
-<span class="sourceLineNo">450</span>    return proc instanceof MetaProcedureInterface;<a name="line.450"></a>
-<span class="sourceLineNo">451</span>  }<a name="line.451"></a>
-<span class="sourceLineNo">452</span>  // ============================================================================<a name="line.452"></a>
-<span class="sourceLineNo">453</span>  //  Table Locking Helpers<a name="line.453"></a>
-<span class="sourceLineNo">454</span>  // ============================================================================<a name="line.454"></a>
-<span class="sourceLineNo">455</span>  /**<a name="line.455"></a>
-<span class="sourceLineNo">456</span>   * Get lock info for a resource of specified type and name and log details<a name="line.456"></a>
-<span class="sourceLineNo">457</span>   */<a name="line.457"></a>
-<span class="sourceLineNo">458</span>  private void logLockedResource(LockedResourceType resourceType, String resourceName) {<a name="line.458"></a>
-<span class="sourceLineNo">459</span>    if (!LOG.isDebugEnabled()) {<a name="line.459"></a>
-<span class="sourceLineNo">460</span>      return;<a name="line.460"></a>
-<span class="sourceLineNo">461</span>    }<a name="line.461"></a>
-<span class="sourceLineNo">462</span><a name="line.462"></a>
-<span class="sourceLineNo">463</span>    LockedResource lockedResource = getLockResource(resourceType, resourceName);<a name="line.463"></a>
-<span class="sourceLineNo">464</span>    if (lockedResource != null) {<a name="line.464"></a>
-<span class="sourceLineNo">465</span>      String msg = resourceType.toString() + " '" + resourceName + "', shared lock count=" +<a name="line.465"></a>
-<span class="sourceLineNo">466</span>          lockedResource.getSharedLockCount();<a name="line.466"></a>
-<span class="sourceLineNo">467</span><a name="line.467"></a>
-<span class="sourceLineNo">468</span>      Procedure&lt;?&gt; proc = lockedResource.getExclusiveLockOwnerProcedure();<a name="line.468"></a>
-<span class="sourceLineNo">469</span>      if (proc != null) {<a name="line.469"></a>
-<span class="sourceLineNo">470</span>        msg += ", exclusively locked by procId=" + proc.getProcId();<a name="line.470"></a>
-<span class="sourceLineNo">471</span>      }<a name="line.471"></a>
-<span class="sourceLineNo">472</span>      LOG.debug(msg);<a name="line.472"></a>
-<span class="sourceLineNo">473</span>    }<a name="line.473"></a>
-<span class="sourceLineNo">474</span>  }<a name="line.474"></a>
-<span class="sourceLineNo">475</span><a name="line.475"></a>
-<span class="sourceLineNo">476</span>  /**<a name="line.476"></a>
-<span class="sourceLineNo">477</span>   * Suspend the procedure if the specified table is already locked.<a name="line.477"></a>
-<span class="sourceLineNo">478</span>   * Other operations in the table-queue will be executed after the lock is released.<a name="line.478"></a>
-<span class="sourceLineNo">479</span>   * @param procedure the procedure trying to acquire the lock<a name="line.479"></a>
-<span class="sourceLineNo">480</span>   * @param table Table to lock<a name="line.480"></a>
-<span class="sourceLineNo">481</span>   * @return true if the procedure has to wait for the table to be available<a name="line.481"></a>
-<span class="sourceLineNo">482</span>   */<a name="line.482"></a>
-<span class="sourceLineNo">483</span>  public boolean waitTableExclusiveLock(final Procedure procedure, final TableName table) {<a name="line.483"></a>
-<span class="sourceLineNo">484</span>    schedLock();<a name="line.484"></a>
-<span class="sourceLineNo">485</span>    try {<a name="line.485"></a>
-<span class="sourceLineNo">486</span>      final String namespace = table.getNamespaceAsString();<a name="line.486"></a>
-<span class="sourceLineNo">487</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.487"></a>
-<span class="sourceLineNo">488</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.488"></a>
-<span class="sourceLineNo">489</span>      if (!namespaceLock.trySharedLock()) {<a name="line.489"></a>
-<span class="sourceLineNo">490</span>        waitProcedure(namespaceLock, procedure);<a name="line.490"></a>
-<span class="sourceLineNo">491</span>        logLockedResource(LockedResourceType.NAMESPACE, namespace);<a name="line.491"></a>
-<span class="sourceLineNo">492</span>        return true;<a name="line.492"></a>
-<span class="sourceLineNo">493</span>      }<a name="line.493"></a>
-<span class="sourceLineNo">494</span>      if (!tableLock.tryExclusiveLock(procedure)) {<a name="line.494"></a>
-<span class="sourceLineNo">495</span>        namespaceLock.releaseSharedLock();<a name="line.495"></a>
-<span class="sourceLineNo">496</span>        waitProcedure(tableLock, procedure);<a name="line.496"></a>
-<span class="sourceLineNo">497</span>        logLockedResource(LockedResourceType.TABLE, table.getNameAsString());<a name="line.497"></a>
-<span class="sourceLineNo">498</span>        return true;<a name="line.498"></a>
-<span class="sourceLineNo">499</span>      }<a name="line.499"></a>
-<span class="sourceLineNo">500</span>      removeFromRunQueue(tableRunQueue, getTableQueue(table));<a name="line.500"></a>
-<span class="sourceLineNo">501</span>      return false;<a name="line.501"></a>
-<span class="sourceLineNo">502</span>    } finally {<a name="line.502"></a>
-<span class="sourceLineNo">503</span>      schedUnlock();<a name="line.503"></a>
-<span class="sourceLineNo">504</span>    }<a name="line.504"></a>
-<span class="sourceLineNo">505</span>  }<a name="line.505"></a>
-<span class="sourceLineNo">506</span><a name="line.506"></a>
-<span class="sourceLineNo">507</span>  /**<a name="line.507"></a>
-<span class="sourceLineNo">508</span>   * Wake the procedures waiting for the specified table<a name="line.508"></a>
-<span class="sourceLineNo">509</span>   * @param procedure the procedure releasing the lock<a name="line.509"></a>
-<span class="sourceLineNo">510</span>   * @param table the name of the table that has the exclusive lock<a name="line.510"></a>
-<span class="sourceLineNo">511</span>   */<a name="line.511"></a>
-<span class="sourceLineNo">512</span>  public void wakeTableExclusiveLock(final Procedure procedure, final TableName table) {<a name="line.512"></a>
-<span class="sourceLineNo">513</span>    schedLock();<a name="line.513"></a>
-<span class="sourceLineNo">514</span>    try {<a name="line.514"></a>
-<span class="sourceLineNo">515</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.516"></a>
-<span class="sourceLineNo">517</span>      int waitingCount = 0;<a name="line.517"></a>
-<span class="sourceLineNo">518</span><a name="line.518"></a>
-<span class="sourceLineNo">519</span>      if (!tableLock.hasParentLock(procedure)) {<a name="line.519"></a>
-<span class="sourceLineNo">520</span>        tableLock.releaseExclusiveLock(procedure);<a name="line.520"></a>
-<span class="sourceLineNo">521</span>        waitingCount += wakeWaitingProcedures(tableLock);<a name="line.521"></a>
-<span class="sourceLineNo">522</span>      }<a name="line.522"></a>
-<span class="sourceLineNo">523</span>      if (namespaceLock.releaseSharedLock()) {<a name="line.523"></a>
-<span class="sourceLineNo">524</span>        waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.524"></a>
-<span class="sourceLineNo">525</span>      }<a name="line.525"></a>
-<span class="sourceLineNo">526</span>      addToRunQueue(tableRunQueue, getTableQueue(table));<a name="line.526"></a>
-<span class="sourceLineNo">527</span>      wakePollIfNeeded(waitingCount);<a name="line.527"></a>
-<span class="sourceLineNo">528</span>    } finally {<a name="line.528"></a>
-<span class="sourceLineNo">529</span>      schedUnlock();<a name="line.529"></a>
-<span class="sourceLineNo">530</span>    }<a name="line.530"></a>
-<span class="sourceLineNo">531</span>  }<a name="line.531"></a>
-<span class="sourceLineNo">532</span><a name="line.532"></a>
-<span class="sourceLineNo">533</span>  /**<a name="line.533"></a>
-<span class="sourceLineNo">534</span>   * Suspend the procedure if the specified table is already locked.<a name="line.534"></a>
-<span class="sourceLineNo">535</span>   * other "read" operations in the table-queue may be executed concurrently,<a name="line.535"></a>
-<span class="sourceLineNo">536</span>   * @param procedure the procedure trying to acquire the lock<a name="line.536"></a>
-<span class="sourceLineNo">537</span>   * @param table Table to lock<a name="line.537"></a>
-<span class="sourceLineNo">538</span>   * @return true if the procedure has to wait for the table to be available<a name="line.538"></a>
-<span class="sourceLineNo">539</span>   */<a name="line.539"></a>
-<span class="sourceLineNo">540</span>  public boolean waitTableSharedLock(final Procedure procedure, final TableName table) {<a name="line.540"></a>
-<span class="sourceLineNo">541</span>    return waitTableQueueSharedLock(procedure, table) == null;<a name="line.541"></a>
-<span class="sourceLineNo">542</span>  }<a name="line.542"></a>
-<span class="sourceLineNo">543</span><a name="line.543"></a>
-<span class="sourceLineNo">544</span>  private TableQueue waitTableQueueSharedLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    schedLock();<a name="line.545"></a>
-<span class="sourceLineNo">546</span>    try {<a name="line.546"></a>
-<span class="sourceLineNo">547</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.547"></a>
-<span class="sourceLineNo">548</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.548"></a>
-<span class="sourceLineNo">549</span>      if (!namespaceLock.trySharedLock()) {<a name="line.549"></a>
-<span class="sourceLineNo">550</span>        waitProcedure(namespaceLock, procedure);<a name="line.550"></a>
-<span class="sourceLineNo">551</span>        return null;<a name="line.551"></a>
-<span class="sourceLineNo">552</span>      }<a name="line.552"></a>
-<span class="sourceLineNo">553</span><a name="line.553"></a>
-<span class="sourceLineNo">554</span>      if (!tableLock.trySharedLock()) {<a name="line.554"></a>
-<span class="sourceLineNo">555</span>        namespaceLock.releaseSharedLock();<a name="line.555"></a>
-<span class="sourceLineNo">556</span>        waitProcedure(tableLock, procedure);<a name="line.556"></a>
-<span class="sourceLineNo">557</span>        return null;<a name="line.557"></a>
-<span class="sourceLineNo">558</span>      }<a name="line.558"></a>
-<span class="sourceLineNo">559</span><a name="line.559"></a>
-<span class="sourceLineNo">560</span>      return getTableQueue(table);<a name="line.560"></a>
-<span class="sourceLineNo">561</span>    } finally {<a name="line.561"></a>
-<span class="sourceLineNo">562</span>      schedUnlock();<a name="line.562"></a>
-<span class="sourceLineNo">563</span>    }<a name="line.563"></a>
-<span class="sourceLineNo">564</span>  }<a name="line.564"></a>
-<span class="sourceLineNo">565</span><a name="line.565"></a>
-<span class="sourceLineNo">566</span>  /**<a name="line.566"></a>
-<span class="sourceLineNo">567</span>   * Wake the procedures waiting for the specified table<a name="line.567"></a>
-<span class="sourceLineNo">568</span>   * @param procedure the procedure releasing the lock<a name="line.568"></a>
-<span class="sourceLineNo">569</span>   * @param table the name of the table that has the shared lock<a name="line.569"></a>
-<span class="sourceLineNo">570</span>   */<a name="line.570"></a>
-<span class="sourceLineNo">571</span>  public void wakeTableSharedLock(final Procedure procedure, final TableName table) {<a name="line.571"></a>
-<span class="sourceLineNo">572</span>    schedLock();<a name="line.572"></a>
-<span class="sourceLineNo">573</span>    try {<a name="line.573"></a>
-<span class="sourceLineNo">574</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.574"></a>
-<span class="sourceLineNo">575</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.575"></a>
-<span class="sourceLineNo">576</span>      int waitingCount = 0;<a name="line.576"></a>
-<span class="sourceLineNo">577</span>      if (tableLock.releaseSharedLock()) {<a name="line.577"></a>
-<span class="sourceLineNo">578</span>        addToRunQueue(tableRunQueue, getTableQueue(table));<a name="line.578"></a>
-<span class="sourceLineNo">579</span>        waitingCount += wakeWaitingProcedures(tableLock);<a name="line.579"></a>
-<span class="sourceLineNo">580</span>      }<a name="line.580"></a>
-<span class="sourceLineNo">581</span>      if (namespaceLock.releaseSharedLock()) {<a name="line.581"></a>
-<span class="sourceLineNo">582</span>        waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.582"></a>
-<span class="sourceLineNo">583</span>      }<a name="line.583"></a>
-<span class="sourceLineNo">584</span>      wakePollIfNeeded(waitingCount);<a name="line.584"></a>
-<span class="sourceLineNo">585</span>    } finally {<a name="line.585"></a>
-<span class="sourceLineNo">586</span>      schedUnlock();<a name="line.586"></a>
-<span class="sourceLineNo">587</span>    }<a name="line.587"></a>
-<span class="sourceLineNo">588</span>  }<a name="line.588"></a>
-<span class="sourceLineNo">589</span><a name="line.589"></a>
-<span class="sourceLineNo">590</span>  /**<a name="line.590"></a>
-<span class="sourceLineNo">591</span>   * Tries to remove the queue and the table-lock of the specified table.<a name="line.591"></a>
-<span class="sourceLineNo">592</span>   * If there are new operations pending (e.g. a new create),<a name="line.592"></a>
-<span class="sourceLineNo">593</span>   * the remove will not be performed.<a name="line.593"></a>
-<span class="sourceLineNo">594</span>   * @param table the name of the table that should be marked as deleted<a name="line.594"></a>
-<span class="sourceLineNo">595</span>   * @param procedure the procedure that is removing the table<a name="line.595"></a>
-<span class="sourceLineNo">596</span>   * @return true if deletion succeeded, false otherwise meaning that there are<a name="line.596"></a>
-<span class="sourceLineNo">597</span>   *     other new operations pending for that table (e.g. a new create).<a name="line.597"></a>
-<span class="sourceLineNo">598</span>   */<a name="line.598"></a>
-<span class="sourceLineNo">599</span>  @VisibleForTesting<a name="line.599"></a>
-<span class="sourceLineNo">600</span>  boolean markTableAsDeleted(final TableName table, final Procedure&lt;?&gt; procedure) {<a name="line.600"></a>
-<span class="sourceLineNo">601</span>    schedLock();<a name="line.601"></a>
-<span class="sourceLineNo">602</span>    try {<a name="line.602"></a>
-<span class="sourceLineNo">603</span>      final TableQueue queue = getTableQueue(table);<a name="line.603"></a>
-<span class="sourceLineNo">604</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.604"></a>
-<span class="sourceLineNo">605</span>      if (queue == null) return true;<a name="line.605"></a>
-<span class="sourceLineNo">606</span><a name="line.606"></a>
-<span class="sourceLineNo">607</span>      if (queue.isEmpty() &amp;&amp; tableLock.tryExclusiveLock(procedure)) {<a name="line.607"></a>
-<span class="sourceLineNo">608</span>        // remove the table from the run-queue and the map<a name="line.608"></a>
-<span class="sourceLineNo">609</span>        if (AvlIterableList.isLinked(queue)) {<a name="line.609"></a>
-<span class="sourceLineNo">610</span>          tableRunQueue.remove(queue);<a name="line.610"></a>
-<span class="sourceLineNo">611</span>        }<a name="line.611"></a>
-<span class="sourceLineNo">612</span>        removeTableQueue(table);<a name="line.612"></a>
-<span class="sourceLineNo">613</span>      } else {<a name="line.613"></a>
-<span class="sourceLineNo">614</span>        // TODO: If there are no create, we can drop all the other ops<a name="line.614"></a>
-<span class="sourceLineNo">615</span>        return false;<a name="line.615"></a>
-<span class="sourceLineNo">616</span>      }<a name="line.616"></a>
-<span class="sourceLineNo">617</span>    } finally {<a name="line.617"></a>
-<span class="sourceLineNo">618</span>      schedUnlock();<a name="line.618"></a>
-<span class="sourceLineNo">619</span>    }<a name="line.619"></a>
-<span class="sourceLineNo">620</span>    return true;<a name="line.620"></a>
-<span class="sourceLineNo">621</span>  }<a name="line.621"></a>
-<span class="sourceLineNo">622</span><a name="line.622"></a>
-<span class="sourceLineNo">623</span>  // ============================================================================<a name="line.623"></a>
-<span class="sourceLineNo">624</span>  //  Region Locking Helpers<a name="line.624"></a>
-<span class="sourceLineNo">625</span>  // ============================================================================<a name="line.625"></a>
-<span class="sourceLineNo">626</span>  /**<a name="line.626"></a>
-<span class="sourceLineNo">627</span>   * Suspend the procedure if the specified region is already locked.<a name="line.627"></a>
-<span class="sourceLineNo">628</span>   * @param procedure the procedure trying to acquire the lock on the region<a name="line.628"></a>
-<span class="sourceLineNo">629</span>   * @param regionInfo the region we are trying to lock<a name="line.629"></a>
-<span class="sourceLineNo">630</span>   * @return true if the procedure has to wait for the regions to be available<a name="line.630"></a>
-<span class="sourceLineNo">631</span>   */<a name="line.631"></a>
-<span class="sourceLineNo">632</span>  public boolean waitRegion(final Procedure procedure, final RegionInfo regionInfo) {<a name="line.632"></a>
-<span class="sourceLineNo">633</span>    return waitRegions(procedure, regionInfo.getTable(), regionInfo);<a name="line.633"></a>
-<span class="sourceLineNo">634</span>  }<a name="line.634"></a>
-<span class="sourceLineNo">635</span><a name="line.635"></a>
-<span class="sourceLineNo">636</span>  /**<a name="line.636"></a>
-<span class="sourceLineNo">637</span>   * Suspend the procedure if the specified set of regions are already locked.<a name="line.637"></a>
-<span class="sourceLineNo">638</span>   * @param procedure the procedure trying to acquire the lock on the regions<a name="line.638"></a>
-<span class="sourceLineNo">639</span>   * @param table the table name of the regions we are trying to lock<a name="line.639"></a>
-<span class="sourceLineNo">640</span>   * @param regionInfo the list of regions we are trying to lock<a name="line.640"></a>
-<span class="sourceLineNo">641</span>   * @return true if the procedure has to wait for the regions to be available<a name="line.641"></a>
-<span class="sourceLineNo">642</span>   */<a name="line.642"></a>
-<span class="sourceLineNo">643</span>  public boolean waitRegions(final Procedure procedure, final TableName table,<a name="line.643"></a>
-<span class="sourceLineNo">644</span>      final RegionInfo... regionInfo) {<a name="line.644"></a>
-<span class="sourceLineNo">645</span>    Arrays.sort(regionInfo, RegionInfo.COMPARATOR);<a name="line.645"></a>
-<span class="sourceLineNo">646</span>    schedLock();<a name="line.646"></a>
-<span class="sourceLineNo">647</span>    try {<a name="line.647"></a>
-<span class="sourceLineNo">648</span>      // If there is parent procedure, it would have already taken xlock, so no need to take<a name="line.648"></a>
-<span class="sourceLineNo">649</span>      // shared lock here. Otherwise, take shared lock.<a name="line.649"></a>
-<span class="sourceLineNo">650</span>      if (!procedure.hasParent()<a name="line.650"></a>
-<span class="sourceLineNo">651</span>          &amp;&amp; waitTableQueueSharedLock(procedure, table) == null) {<a name="line.651"></a>
-<span class="sourceLineNo">652</span>          return true;<a name="line.652"></a>
-<span class="sourceLineNo">653</span>      }<a name="line.653"></a>
-<span class="sourceLineNo">654</span><a name="line.654"></a>
-<span class="sourceLineNo">655</span>      // acquire region xlocks or wait<a name="line.655"></a>
-<span class="sourceLineNo">656</span>      boolean hasLock = true;<a name="line.656"></a>
-<span class="sourceLineNo">657</span>      final LockAndQueue[] regionLocks = new LockAndQueue[regionInfo.length];<a name="line.657"></a>
-<span class="sourceLineNo">658</span>      for (int i = 0; i &lt; regionInfo.length; ++i) {<a name="line.658"></a>
-<span class="sourceLineNo">659</span>        LOG.info("{} checking lock on {}", procedure, regionInfo[i].getEncodedName());<a name="line.659"></a>
-<span class="sourceLineNo">660</span>        assert table != null;<a name="line.660"></a>
-<span class="sourceLineNo">661</span>        assert regionInfo[i] != null;<a name="line.661"></a>
-<span class="sourceLineNo">662</span>        assert regionInfo[i].getTable() != null;<a name="line.662"></a>
-<span class="sourceLineNo">663</span>        assert regionInfo[i].getTable().equals(table): regionInfo[i] + " " + procedure;<a name="line.663"></a>
-<span class="sourceLineNo">664</span>        assert i == 0 || regionInfo[i] != regionInfo[i - 1] : "duplicate region: " + regionInfo[i];<a name="line.664"></a>
-<span class="sourceLineNo">665</span><a name="line.665"></a>
-<span class="sourceLineNo">666</span>        regionLocks[i] = locking.getRegionLock(regionInfo[i].getEncodedName());<a name="line.666"></a>
-<span class="sourceLineNo">667</span>        if (!regionLocks[i].tryExclusiveLock(procedure)) {<a name="line.667"></a>
-<span class="sourceLineNo">668</span>          waitProcedure(regionLocks[i], procedure);<a name="line.668"></a>
-<span class="sourceLineNo">669</span>          hasLock = false;<a name="line.669"></a>
-<span class="sourceLineNo">670</span>          while (i-- &gt; 0) {<a name="line.670"></a>
-<span class="sourceLineNo">671</span>            regionLocks[i].releaseExclusiveLock(procedure);<a name="line.671"></a>
-<span class="sourceLineNo">672</span>          }<a name="line.672"></a>
-<span class="sourceLineNo">673</span>          break;<a name="line.673"></a>
-<span class="sourceLineNo">674</span>        }<a name="line.674"></a>
-<span class="sourceLineNo">675</span>      }<a name="line.675"></a>
-<span class="sourceLineNo">676</span><a name="line.676"></a>
-<span class="sourceLineNo">677</span>      if (!hasLock &amp;&amp; !procedure.hasParent()) {<a name="line.677"></a>
-<span class="sourceLineNo">678</span>        wakeTableSharedLock(procedure, table);<a name="line.678"></a>
-<span class="sourceLineNo">679</span>      }<a name="line.679"></a>
-<span class="sourceLineNo">680</span>      return !hasLock;<a name="line.680"></a>
-<span class="sourceLineNo">681</span>    } finally {<a name="line.681"></a>
-<span class="sourceLineNo">682</span>      schedUnlock();<a name="line.682"></a>
-<span class="sourceLineNo">683</span>    }<a name="line.683"></a>
-<span class="sourceLineNo">684</span>  }<a name="line.684"></a>
-<span class="sourceLineNo">685</span><a name="line.685"></a>
-<span class="sourceLineNo">686</span>  /**<a name="line.686"></a>
-<span class="sourceLineNo">687</span>   * Wake the procedures waiting for the specified region<a name="line.687"></a>
-<span class="sourceLineNo">688</span>   * @param procedure the procedure that was holding the region<a name="line.688"></a>
-<span class="sourceLineNo">689</span>   * @param regionInfo the region the procedure was holding<a name="line.689"></a>
-<span class="sourceLineNo">690</span>   */<a name="line.690"></a>
-<span class="sourceLineNo">691</span>  public void wakeRegion(final Procedure procedure, final RegionInfo regionInfo) {<a name="line.691"></a>
-<span class="sourceLineNo">692</span>    wakeRegions(procedure, regionInfo.getTable(), regionInfo);<a name="line.692"></a>
-<span class="sourceLineNo">693</span>  }<a name="line.693"></a>
-<span class="sourceLineNo">694</span><a name="line.694"></a>
-<span class="sourceLineNo">695</span>  /**<a name="line.695"></a>
-<span class="sourceLineNo">696</span>   * Wake the procedures waiting for the specified regions<a name="line.696"></a>
-<span class="sourceLineNo">697</span>   * @param procedure the procedure that was holding the regions<a name="line.697"></a>
-<span class="sourceLineNo">698</span>   * @param regionInfo the list of regions the procedure was holding<a name="line.698"></a>
-<span class="sourceLineNo">699</span>   */<a name="line.699"></a>
-<span class="sourceLineNo">700</span>  public void wakeRegions(final Procedure procedure,final TableName table,<a name="line.700"></a>
-<span class="sourceLineNo">701</span>      final RegionInfo... regionInfo) {<a name="line.701"></a>
-<span class="sourceLineNo">702</span>    Arrays.sort(regionInfo, RegionInfo.COMPARATOR);<a name="line.702"></a>
-<span class="sourceLineNo">703</span>    schedLock();<a name="line.703"></a>
-<span class="sourceLineNo">704</span>    try {<a name="line.704"></a>
-<span class="sourceLineNo">705</span>      int numProcs = 0;<a name="line.705"></a>
-<span class="sourceLineNo">706</span>      final Procedure[] nextProcs = new Procedure[regionInfo.length];<a name="line.706"></a>
-<span class="sourceLineNo">707</span>      for (int i = 0; i &lt; regionInfo.length; ++i) {<a name="line.707"></a>
-<span class="sourceLineNo">708</span>        assert regionInfo[i].getTable().equals(table);<a name="line.708"></a>
-<span class="sourceLineNo">709</span>        assert i == 0 || regionInfo[i] != regionInfo[i - 1] : "duplicate region: " + regionInfo[i];<a name="line.709"></a>
-<span class="sourceLineNo">710</span><a name="line.710"></a>
-<span class="sourceLineNo">711</span>        LockAndQueue regionLock = locking.getRegionLock(regionInfo[i].getEncodedName());<a name="line.711"></a>
-<span class="sourceLineNo">712</span>        if (regionLock.releaseExclusiveLock(procedure)) {<a name="line.712"></a>
-<span class="sourceLineNo">713</span>          if (!regionLock.isEmpty()) {<a name="line.713"></a>
-<span class="sourceLineNo">714</span>            // release one procedure at the time since regions has an xlock<a name="line.714"></a>
-<span class="sourceLineNo">715</span>            nextProcs[numProcs++] = regionLock.removeFirst();<a name="line.715"></a>
-<span class="sourceLineNo">716</span>          } else {<a name="line.716"></a>
-<span class="sourceLineNo">717</span>            locking.removeRegionLock(regionInfo[i].getEncodedName());<a name="line.717"></a>
-<span class="sourceLineNo">718</span>          }<a name="line.718"></a>
-<span class="sourceLineNo">719</span>        }<a name="line.719"></a>
-<span class="sourceLineNo">720</span>      }<a name="line.720"></a>
-<span class="sourceLineNo">721</span><a name="line.721"></a>
-<span class="sourceLineNo">722</span>      // awake procedures if any<a name="line.722"></a>
-<span class="sourceLineNo">723</span>      for (int i = numProcs - 1; i &gt;= 0; --i) {<a name="line.723"></a>
-<span class="sourceLineNo">724</span>        wakeProcedure(nextProcs[i]);<a name="line.724"></a>
-<span class="sourceLineNo">725</span>      }<a name="line.725"></a>
-<span class="sourceLineNo">726</span>      wakePollIfNeeded(numProcs);<a name="line.726"></a>
-<span class="sourceLineNo">727</span>      if (!procedure.hasParent()) {<a name="line.727"></a>
-<span class="sourceLineNo">728</span>        // release the table shared-lock.<a name="line.728"></a>
-<span class="sourceLineNo">729</span>        // (if we have a parent, it is holding an xlock so we didn't take the shared-lock)<a name="line.729"></a>
-<span class="sourceLineNo">730</span>        wakeTableSharedLock(procedure, table);<a name="line.730"></a>
-<span class="sourceLineNo">731</span>      }<a name="line.731"></a>
-<span class="sourceLineNo">732</span>    } finally {<a name="line.732"></a>
-<span class="sourceLineNo">733</span>      schedUnlock();<a name="line.733"></a>
-<span class="sourceLineNo">734</span>    }<a name="line.734"></a>
-<span class="sourceLineNo">735</span>  }<a name="line.735"></a>
-<span class="sourceLineNo">736</span><a name="line.736"></a>
-<span class="sourceLineNo">737</span>  // ============================================================================<a name="line.737"></a>
-<span class="sourceLineNo">738</span>  //  Namespace Locking Helpers<a name="line.738"></a>
-<span class="sourceLineNo">739</span>  // ============================================================================<a name="line.739"></a>
-<span class="sourceLineNo">740</span>  /**<a name="line.740"></a>
-<span class="sourceLineNo">741</span>   * Suspend the procedure if the specified namespace is already locked.<a name="line.741"></a>
-<span class="sourceLineNo">742</span>   * @see #wakeNamespaceExclusiveLock(Procedure,String)<a name="line.742"></a>
-<span class="sourceLineNo">743</span>   * @param procedure the procedure trying to acquire the lock<a name="line.743"></a>
-<span class="sourceLineNo">744</span>   * @param namespace Namespace to lock<a name="line.744"></a>
-<span class="sourceLineNo">745</span>   * @return true if the procedure has to wait for the namespace to be available<a name="line.745"></a>
-<span class="sourceLineNo">746</span>   */<a name="line.746"></a>
-<span class="sourceLineNo">747</span>  public boolean waitNamespaceExclusiveLock(final Procedure procedure, final String namespace) {<a name="line.747"></a>
-<span class="sourceLineNo">748</span>    schedLock();<a name="line.748"></a>
-<span class="sourceLineNo">749</span>    try {<a name="line.749"></a>
-<span class="sourceLineNo">750</span>      final LockAndQueue systemNamespaceTableLock =<a name="line.750"></a>
-<span class="sourceLineNo">751</span>          locking.getTableLock(TableName.NAMESPACE_TABLE_NAME);<a name="line.751"></a>
-<span class="sourceLineNo">752</span>      if (!systemNamespaceTableLock.trySharedLock()) {<a name="line.752"></a>
-<span class="sourceLineNo">753</span>        waitProcedure(systemNamespaceTableLock, procedure);<a name="line.753"></a>
-<span class="sourceLineNo">754</span>        logLockedResource(LockedResourceType.TABLE,<a name="line.754"></a>
-<span class="sourceLineNo">755</span>            TableName.NAMESPACE_TABLE_NAME.getNameAsString());<a name="line.755"></a>
-<span class="sourceLineNo">756</span>        return true;<a name="line.756"></a>
-<span class="sourceLineNo">757</span>      }<a name="line.757"></a>
-<span class="sourceLineNo">758</span><a name="line.758"></a>
-<span class="sourceLineNo">759</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.759"></a>
-<span class="sourceLineNo">760</span>      if (!namespaceLock.tryExclusiveLock(procedure)) {<a name="line.760"></a>
-<span class="sourceLineNo">761</span>        systemNamespaceTableLock.releaseSharedLock();<a name="line.761"></a>
-<span class="sourceLineNo">762</span>        waitProcedure(namespaceLock, procedure);<a name="line.762"></a>
-<span class="sourceLineNo">763</span>        logLockedResource(LockedResourceType.NAMESPACE, namespace);<a name="line.763"></a>
-<span class="sourceLineNo">764</span>        return true;<a name="line.764"></a>
-<span class="sourceLineNo">765</span>      }<a name="line.765"></a>
-<span class="sourceLineNo">766</span>      return false;<a name="line.766"></a>
-<span class="sourceLineNo">767</span>    } finally {<a name="line.767"></a>
-<span class="sourceLineNo">768</span>      schedUnlock();<a name="line.768"></a>
-<span class="sourceLineNo">769</span>    }<a name="line.769"></a>
-<span class="sourceLineNo">770</span>  }<a name="line.770"></a>
-<span class="sourceLineNo">771</span><a name="line.771"></a>
-<span class="sourceLineNo">772</span>  /**<a name="line.772"></a>
-<span class="sourceLineNo">773</span>   * Wake the procedures waiting for the specified namespace<a name="line.773"></a>
-<span class="sourceLineNo">774</span>   * @see #waitNamespaceExclusiveLock(Procedure,String)<a name="line.774"></a>
-<span class="sourceLineNo">775</span>   * @param procedure the procedure releasing the lock<a name="line.775"></a>
-<span class="sourceLineNo">776</span>   * @param namespace the namespace that has the exclusive lock<a name="line.776"></a>
-<span class="sourceLineNo">777</span>   */<a name="line.777"></a>
-<span class="sourceLineNo">778</span>  public void wakeNamespaceExclusiveLock(final Procedure procedure, final String namespace) {<a name="line.778"></a>
-<span class="sourceLineNo">779</span>    schedLock();<a name="line.779"></a>
-<span class="sourceLineNo">780</span>    try {<a name="line.780"></a>
-<span class="sourceLineNo">781</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.781"></a>
-<span class="sourceLineNo">782</span>      final LockAndQueue systemNamespaceTableLock =<a name="line.782"></a>
-<span class="sourceLineNo">783</span>          locking.getTableLock(TableName.NAMESPACE_TABLE_NAME);<a name="line.783"></a>
-<span class="sourceLineNo">784</span>      namespaceLock.releaseExclusiveLock(procedure);<a name="line.784"></a>
-<span class="sourceLineNo">785</span>      int waitingCount = 0;<a name="line.785"></a>
-<span class="sourceLineNo">786</span>      if (systemNamespaceTableLock.releaseSharedLock()) {<a name="line.786"></a>
-<span class="sourceLineNo">787</span>        addToRunQueue(tableRunQueue, getTableQueue(TableName.NAMESPACE_TABLE_NAME));<a name="line.787"></a>
-<span class="sourceLineNo">788</span>        waitingCount += wakeWaitingProcedures(systemNamespaceTableLock);<a name="line.788"></a>
-<span class="sourceLineNo">789</span>      }<a name="line.789"></a>
-<span class="sourceLineNo">790</span>      waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.790"></a>
-<span class="sourceLineNo">791</span>      wakePollIfNeeded(waitingCount);<a name="line.791"></a>
-<span class="sourceLineNo">792</span>    } finally {<a name="line.792"></a>
-<span class="sourceLineNo">793</span>      schedUnlock();<a name="line.793"></a>
-<span class="sourceLineNo">794</span>    }<a name="line.794"></a>
-<span class="sourceLineNo">795</span>  }<a name="line.795"></a>
-<span class="sourceLineNo">796</span><a name="line.796"></a>
-<span class="sourceLineNo">797</span>  // ============================================================================<a name="line.797"></a>
-<span class="sourceLineNo">798</span>  //  Server Locking Helpers<a name="line.798"></a>
-<span class="sourceLineNo">799</span>  // ============================================================================<a name="line.799"></a>
-<span class="sourceLineNo">800</span>  /**<a name="line.800"></a>
-<span class="sourceLineNo">801</span>   * Try to acquire the exclusive lock on the specified server.<a name="line.801"></a>
-<span class="sourceLineNo">802</span>   * @see #wakeServerExclusiveLock(Procedure,ServerName)<a name="line.802"></a>
-<span class="sourceLineNo">803</span>   * @param procedure the procedure trying to acquire the lock<a name="line.803"></a>
-<span class="sourceLineNo">804</span>   * @param serverName Server to lock<a name="line.804"></a>
-<span class="sourceLineNo">805</span>   * @return true if the procedure has to wait for the server to be available<a name="line.805"></a>
-<span class="sourceLineNo">806</span>   */<a name="line.806"></a>
-<span class="sourceLineNo">807</span>  public boolean waitServerExclusiveLock(final Procedure&lt;?&gt; procedure,<a name="line.807"></a>
-<span class="sourceLineNo">808</span>      final ServerName serverName) {<a name="line.808"></a>
-<span class="sourceLineNo">809</span>    schedLock();<a name="line.809"></a>
-<span class="sourceLineNo">810</span>    try {<a name="line.810"></a>
-<span class="sourceLineNo">811</span>      final LockAndQueue lock = locking.getServerLock(serverName);<a name="line.811"></a>
-<span class="sourceLineNo">812</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.812"></a>
-<span class="sourceLineNo">813</span>        removeFromRunQueue(serverRunQueue, getServerQueue(serverName));<a name="line.813"></a>
-<span class="sourceLineNo">814</span>        return false;<a name="line.814"></a>
-<span class="sourceLineNo">815</span>      }<a name="line.815"></a>
-<span class="sourceLineNo">816</span>      waitProcedure(lock, procedure);<a name="line.816"></a>
-<span class="sourceLineNo">817</span>      logLockedResource(LockedResourceType.SERVER, serverName.getServerName());<a name="line.817"></a>
-<span class="sourceLineNo">818</span>      return true;<a name="line.818"></a>
-<span class="sourceLineNo">819</span>    } finally {<a name="line.819"></a>
-<span class="sourceLineNo">820</span>      schedUnlock();<a name="line.820"></a>
-<span class="sourceLineNo">821</span>    }<a name="line.821"></a>
-<span class="sourceLineNo">822</span>  }<a name="line.822"></a>
-<span class="sourceLineNo">823</span><a name="line.823"></a>
-<span class="sourceLineNo">824</span>  /**<a name="line.824"></a>
-<span class="sourceLineNo">825</span>   * Wake the procedures waiting for the specified server<a name="line.825"></a>
-<span class="sourceLineNo">826</span>   * @see #waitServerExclusiveLock(Procedure,ServerName)<a name="line.826"></a>
-<span class="sourceLineNo">827</span>   * @param procedure the procedure releasing the lock<a name="line.827"></a>
-<span class="sourceLineNo">828</span>   * @param serverName the server that has the exclusive lock<a name="line.828"></a>
-<span class="sourceLineNo">829</span>   */<a name="line.829"></a>
-<span class="sourceLineNo">830</span>  public void wakeServerExclusiveLock(final Procedure&lt;?&gt; procedure, final ServerName serverName) {<a name="line.830"></a>
-<span class="sourceLineNo">831</span>    schedLock();<a name="line.831"></a>
-<span class="sourceLineNo">832</span>    try {<a name="line.832"></a>
-<span class="sourceLineNo">833</span>      final LockAndQueue lock = locking.getServerLock(serverName);<a name="line.833"></a>
-<span class="sourceLineNo">834</span>      lock.releaseExclusiveLock(procedure);<a name="line.834"></a>
-<span class="sourceLineNo">835</span>      addToRunQueue(serverRunQueue, getServerQueue(serverName));<a name="line.835"></a>
-<span class="sourceLineNo">836</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.836"></a>
-<span class="sourceLineNo">837</span>      wakePollIfNeeded(waitingCount);<a name="line.837"></a>
-<span class="sourceLineNo">838</span>    } finally {<a name="line.838"></a>
-<span class="sourceLineNo">839</span>      schedUnlock();<a name="line.839"></a>
-<span class="sourceLineNo">840</span>    }<a name="line.840"></a>
-<span class="sourceLineNo">841</span>  }<a name="line.841"></a>
-<span class="sourceLineNo">842</span><a name="line.842"></a>
-<span class="sourceLineNo">843</span>  // ============================================================================<a name="line.843"></a>
-<span class="sourceLineNo">844</span>  //  Peer Locking Helpers<a name="line.844"></a>
-<span class="sourceLineNo">845</span>  // ============================================================================<a name="line.845"></a>
-<span class="sourceLineNo">846</span>  /**<a name="line.846"></a>
-<span class="sourceLineNo">847</span>   * Try to acquire the exclusive lock on the specified peer.<a name="line.847"></a>
-<span class="sourceLineNo">848</span>   * @see #wakePeerExclusiveLock(Procedure, String)<a name="line.848"></a>
-<span class="sourceLineNo">849</span>   * @param procedure the procedure trying to acquire the lock<a name="line.849"></a>
-<span class="sourceLineNo">850</span>   * @param peerId peer to lock<a name="line.850"></a>
-<span class="sourceLineNo">851</span>   * @return true if the procedure has to wait for the peer to be available<a name="line.851"></a>
-<span class="sourceLineNo">852</span>   */<a name="line.852"></a>
-<span class="sourceLineNo">853</span>  public boolean waitPeerExclusiveLock(Procedure&lt;?&gt; procedure, String peerId) {<a name="line.853"></a>
-<span class="sourceLineNo">854</span>    schedLock();<a name="line.854"></a>
-<span class="sourceLineNo">855</span>    try {<a name="line.855"></a>
-<span class="sourceLineNo">856</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.856"></a>
-<span class="sourceLineNo">857</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.857"></a>
-<span class="sourceLineNo">858</span>        removeFromRunQueue(peerRunQueue, getPeerQueue(peerId));<a name="line.858"></a>
-<span class="sourceLineNo">859</span>        return false;<a name="line.859"></a>
-<span class="sourceLineNo">860</span>      }<a name="line.860"></a>
-<span class="sourceLineNo">861</span>      waitProcedure(lock, procedure);<a name="line.861"></a>
-<span class="sourceLineNo">862</span>      logLockedResource(LockedResourceType.PEER, peerId);<a name="line.862"></a>
-<span class="sourceLineNo">863</span>      return true;<a name="line.863"></a>
-<span class="sourceLineNo">864</span>    } finally {<a name="line.864"></a>
-<span class="sourceLineNo">865</span>      schedUnlock();<a name="line.865"></a>
-<span class="sourceLineNo">866</span>    }<a name="line.866"></a>
-<span class="sourceLineNo">867</span>  }<a name="line.867"></a>
-<span class="sourceLineNo">868</span><a name="line.868"></a>
-<span class="sourceLineNo">869</span>  /**<a name="line.869"></a>
-<span class="sourceLineNo">870</span>   * Wake the procedures waiting for the specified peer<a name="line.870"></a>
-<span class="sourceLineNo">871</span>   * @see #waitPeerExclusiveLock(Procedure, String)<a name="line.871"></a>
-<span class="sourceLineNo">872</span>   * @param procedure the procedure releasing the lock<a name="line.872"></a>
-<span class="sourceLineNo">873</span>   * @param peerId the peer that has the exclusive lock<a name="line.873"></a>
-<span class="sourceLineNo">874</span>   */<a name="line.874"></a>
-<span class="sourceLineNo">875</span>  public void wakePeerExclusiveLock(Procedure&lt;?&gt; procedure, String peerId) {<a name="line.875"></a>
-<span class="sourceLineNo">876</span>    schedLock();<a name="line.876"></a>
-<span class="sourceLineNo">877</span>    try {<a name="line.877"></a>
-<span class="sourceLineNo">878</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.878"></a>
-<span class="sourceLineNo">879</span>      lock.releaseExclusiveLock(procedure);<a name="line.879"></a>
-<span class="sourceLineNo">880</span>      addToRunQueue(peerRunQueue, getPeerQueue(peerId));<a name="line.880"></a>
-<span class="sourceLineNo">881</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.881"></a>
-<span class="sourceLineNo">882</span>      wakePollIfNeeded(waitingCount);<a name="line.882"></a>
-<span class="sourceLineNo">883</span>    } finally {<a name="line.883"></a>
-<span class="sourceLineNo">884</span>      schedUnlock();<a name="line.884"></a>
-<span class="sourceLineNo">885</span>    }<a name="line.885"></a>
-<span class="sourceLineNo">886</span>  }<a name="line.886"></a>
-<span class="sourceLineNo">887</span><a name="line.887"></a>
-<span class="sourceLineNo">888</span>  // ============================================================================<a name="line.888"></a>
-<span class="sourceLineNo">889</span>  // Meta Locking Helpers<a name="line.889"></a>
-<span class="sourceLineNo">890</span>  // ============================================================================<a name="line.890"></a>
-<span class="sourceLineNo">891</span>  /**<a name="line.891"></a>
-<span class="sourceLineNo">892</span>   * Try to acquire the exclusive lock on meta.<a name="line.892"></a>
-<span class="sourceLineNo">893</span>   * @see #wakeMetaExclusiveLock(Procedure)<a name="line.893"></a>
-<span class="sourceLineNo">894</span>   * @param procedure the procedure trying to acquire the lock<a name="line.894"></a>
-<span class="sourceLineNo">895</span>   * @return true if the procedure has to wait for meta to be available<a name="line.895"></a>
-<span class="sourceLineNo">896</span>   */<a name="line.896"></a>
-<span class="sourceLineNo">897</span>  public boolean waitMetaExclusiveLock(Procedure&lt;?&gt; procedure) {<a name="line.897"></a>
-<span class="sourceLineNo">898</span>    schedLock();<a name="line.898"></a>
-<span class="sourceLineNo">899</span>    try {<a name="line.899"></a>
-<span class="sourceLineNo">900</span>      final LockAndQueue lock = locking.getMetaLock();<a name="line.900"></a>
-<span class="sourceLineNo">901</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.901"></a>
-<span class="sourceLineNo">902</span>        removeFromRunQueue(metaRunQueue, getMetaQueue());<a name="line.902"></a>
-<span class="sourceLineNo">903</span>        return false;<a name="line.903"></a>
-<span class="sourceLineNo">904</span>      }<a name="line.904"></a>
-<span class="sourceLineNo">905</span>      waitProcedure(lock, procedure);<a name="line.905"></a>
-<span class="sourceLineNo">906</span>      logLockedResource(LockedResourceType.META, TableName.META_TABLE_NAME.getNameAsString());<a name="line.906"></a>
-<span class="sourceLineNo">907</span>      return true;<a name="line.907"></a>
-<span class="sourceLineNo">908</span>    } finally {<a name="line.908"></a>
-<span class="sourceLineNo">909</span>      schedUnlock();<a name="line.909"></a>
-<span class="sourceLineNo">910</span>    }<a name="line.910"></a>
-<span class="sourceLineNo">911</span>  }<a name="line.911"></a>
-<span class="sourceLineNo">912</span><a name="line.912"></a>
-<span class="sourceLineNo">913</span>  /**<a name="line.913"></a>
-<span class="sourceLineNo">914</span>   * Wake the procedures waiting for meta.<a name="line.914"></a>
-<span class="sourceLineNo">915</span>   * @see #waitMetaExclusiveLock(Procedure)<a name="line.915"></a>
-<span class="sourceLineNo">916</span>   * @param procedure the procedure releasing the lock<a name="line.916"></a>
-<span class="sourceLineNo">917</span>   */<a name="line.917"></a>
-<span class="sourceLineNo">918</span>  public void wakeMetaExclusiveLock(Procedure&lt;?&gt; procedure) {<a name="line.918"></a>
-<span class="sourceLineNo">919</span>    schedLock();<a name="line.919"></a>
-<span class="sourceLineNo">920</span>    try {<a name="line.920"></a>
-<span class="sourceLineNo">921</span>      final LockAndQueue lock = locking.getMetaLock();<a name="line.921"></a>
-<span class="sourceLineNo">922</span>      lock.releaseExclusiveLock(procedure);<a name="line.922"></a>
-<span class="sourceLineNo">923</span>      addToRunQueue(metaRunQueue, getMetaQueue());<a name="line.923"></a>
-<span class="sourceLineNo">924</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.924"></a>
-<span class="sourceLineNo">925</span>      wakePollIfNeeded(waitingCount);<a name="line.925"></a>
-<span class="sourceLineNo">926</span>    } finally {<a name="line.926"></a>
-<span class="sourceLineNo">927</span>      schedUnlock();<a name="line.927"></a>
-<span class="sourceLineNo">928</span>    }<a name="line.928"></a>
-<span class="sourceLineNo">929</span>  }<a name="line.929"></a>
-<span class="sourceLineNo">930</span><a name="line.930"></a>
-<span class="sourceLineNo">931</span>  /**<a name="line.931"></a>
-<span class="sourceLineNo">932</span>   * For debugging. Expensive.<a name="line.932"></a>
-<span class="sourceLineNo">933</span>   */<a name="line.933"></a>
-<span class="sourceLineNo">934</span>  @VisibleForTesting<a name="line.934"></a>
-<span class="sourceLineNo">935</span>  public String dumpLocks() throws IOException {<a name="line.935"></a>
-<span class="sourceLineNo">936</span>    schedLock();<a name="line.936"></a>
-<span class="sourceLineNo">937</span>    try {<a name="line.937"></a>
-<span class="sourceLineNo">938</span>      // TODO: Refactor so we stream out locks for case when millions; i.e. take a PrintWriter<a name="line.938"></a>
-<span class="sourceLineNo">939</span>      return this.locking.toString();<a name="line.939"></a>
-<span class="sourceLineNo">940</span>    } finally {<a name="line.940"></a>
-<span class="sourceLineNo">941</span>      schedUnlock();<a name="line.941"></a>
-<span class="sourceLineNo">942</span>    }<a name="line.942"></a>
-<span class="sourceLineNo">943</span>  }<a name="line.943"></a>
-<span class="sourceLineNo">944</span>}<a name="line.944"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.master.procedure;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.IOException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.Arrays;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.List;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import org.apache.hadoop.hbase.ServerName;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.hadoop.hbase.TableExistsException;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.TableName;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.TableNotFoundException;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.master.procedure.TableProcedureInterface.TableOperationType;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.procedure2.AbstractProcedureScheduler;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.procedure2.LockAndQueue;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.procedure2.LockedResource;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.procedure2.LockedResourceType;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.procedure2.Procedure;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlIterableList;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlKeyComparator;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlTree;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.util.AvlUtil.AvlTreeIterator;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.slf4j.Logger;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.slf4j.LoggerFactory;<a name="line.40"></a>
+<span class="sourceLineNo">041</span><a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.42"></a>
+<span class="sourceLineNo">043</span><a name="line.43"></a>
+<span class="sourceLineNo">044</span>/**<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * ProcedureScheduler for the Master Procedures.<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * This ProcedureScheduler tries to provide to the ProcedureExecutor procedures<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * that can be executed without having to wait on a lock.<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * Most of the master operations can be executed concurrently, if they<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * are operating on different tables (e.g. two create table procedures can be performed<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * at the same time) or against two different servers; say two servers that crashed at<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * about the same time.<a name="line.51"></a>
+<span class="sourceLineNo">052</span> *<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * &lt;p&gt;Each procedure should implement an Interface providing information for this queue.<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * For example table related procedures should implement TableProcedureInterface.<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * Each procedure will be pushed in its own queue, and based on the operation type<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * we may make smarter decisions: e.g. we can abort all the operations preceding<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * a delete table, or similar.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> *<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * &lt;h4&gt;Concurrency control&lt;/h4&gt;<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * Concurrent access to member variables (tableRunQueue, serverRunQueue, locking, tableMap,<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * serverBuckets) is controlled by schedLock(). This mainly includes:&lt;br&gt;<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * &lt;ul&gt;<a name="line.62"></a>
+<span class="sourceLineNo">063</span> *   &lt;li&gt;<a name="line.63"></a>
+<span class="sourceLineNo">064</span> *     {@link #push(Procedure, boolean, boolean)}: A push will add a Queue back to run-queue<a name="line.64"></a>
+<span class="sourceLineNo">065</span> *     when:<a name="line.65"></a>
+<span class="sourceLineNo">066</span> *     &lt;ol&gt;<a name="line.66"></a>
+<span class="sourceLineNo">067</span> *       &lt;li&gt;Queue was empty before push (so must have been out of run-queue)&lt;/li&gt;<a name="line.67"></a>
+<span class="sourceLineNo">068</span> *       &lt;li&gt;Child procedure is added (which means parent procedure holds exclusive lock, and it<a name="line.68"></a>
+<span class="sourceLineNo">069</span> *           must have moved Queue out of run-queue)&lt;/li&gt;<a name="line.69"></a>
+<span class="sourceLineNo">070</span> *     &lt;/ol&gt;<a name="line.70"></a>
+<span class="sourceLineNo">071</span> *   &lt;/li&gt;<a name="line.71"></a>
+<span class="sourceLineNo">072</span> *   &lt;li&gt;<a name="line.72"></a>
+<span class="sourceLineNo">073</span> *     {@link #poll(long)}: A poll will remove a Queue from run-queue when:<a name="line.73"></a>
+<span class="sourceLineNo">074</span> *     &lt;ol&gt;<a name="line.74"></a>
+<span class="sourceLineNo">075</span> *       &lt;li&gt;Queue becomes empty after poll&lt;/li&gt;<a name="line.75"></a>
+<span class="sourceLineNo">076</span> *       &lt;li&gt;Exclusive lock is requested by polled procedure and lock is available (returns the<a name="line.76"></a>
+<span class="sourceLineNo">077</span> *           procedure)&lt;/li&gt;<a name="line.77"></a>
+<span class="sourceLineNo">078</span> *       &lt;li&gt;Exclusive lock is requested but lock is not available (returns null)&lt;/li&gt;<a name="line.78"></a>
+<span class="sourceLineNo">079</span> *       &lt;li&gt;Polled procedure is child of parent holding exclusive lock and the next procedure is<a name="line.79"></a>
+<span class="sourceLineNo">080</span> *           not a child&lt;/li&gt;<a name="line.80"></a>
+<span class="sourceLineNo">081</span> *     &lt;/ol&gt;<a name="line.81"></a>
+<span class="sourceLineNo">082</span> *   &lt;/li&gt;<a name="line.82"></a>
+<span class="sourceLineNo">083</span> *   &lt;li&gt;<a name="line.83"></a>
+<span class="sourceLineNo">084</span> *     Namespace/table/region locks: Queue is added back to run-queue when lock being released is:<a name="line.84"></a>
+<span class="sourceLineNo">085</span> *     &lt;ol&gt;<a name="line.85"></a>
+<span class="sourceLineNo">086</span> *       &lt;li&gt;Exclusive lock&lt;/li&gt;<a name="line.86"></a>
+<span class="sourceLineNo">087</span> *       &lt;li&gt;Last shared lock (in case queue was removed because next procedure in queue required<a name="line.87"></a>
+<span class="sourceLineNo">088</span> *           exclusive lock)&lt;/li&gt;<a name="line.88"></a>
+<span class="sourceLineNo">089</span> *     &lt;/ol&gt;<a name="line.89"></a>
+<span class="sourceLineNo">090</span> *   &lt;/li&gt;<a name="line.90"></a>
+<span class="sourceLineNo">091</span> * &lt;/ul&gt;<a name="line.91"></a>
+<span class="sourceLineNo">092</span> */<a name="line.92"></a>
+<span class="sourceLineNo">093</span>@InterfaceAudience.Private<a name="line.93"></a>
+<span class="sourceLineNo">094</span>public class MasterProcedureScheduler extends AbstractProcedureScheduler {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  private static final Logger LOG = LoggerFactory.getLogger(MasterProcedureScheduler.class);<a name="line.95"></a>
+<span class="sourceLineNo">096</span><a name="line.96"></a>
+<span class="sourceLineNo">097</span>  private static final AvlKeyComparator&lt;ServerQueue&gt; SERVER_QUEUE_KEY_COMPARATOR =<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    (n, k) -&gt; n.compareKey((ServerName) k);<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  private final static AvlKeyComparator&lt;TableQueue&gt; TABLE_QUEUE_KEY_COMPARATOR =<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    (n, k) -&gt; n.compareKey((TableName) k);<a name="line.100"></a>
+<span class="sourceLineNo">101</span>  private final static AvlKeyComparator&lt;PeerQueue&gt; PEER_QUEUE_KEY_COMPARATOR =<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    (n, k) -&gt; n.compareKey((String) k);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>  private final static AvlKeyComparator&lt;MetaQueue&gt; META_QUEUE_KEY_COMPARATOR =<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    (n, k) -&gt; n.compareKey((TableName) k);<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  private final FairQueue&lt;ServerName&gt; serverRunQueue = new FairQueue&lt;&gt;();<a name="line.106"></a>
+<span class="sourceLineNo">107</span>  private final FairQueue&lt;TableName&gt; tableRunQueue = new FairQueue&lt;&gt;();<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private final FairQueue&lt;String&gt; peerRunQueue = new FairQueue&lt;&gt;();<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  private final FairQueue&lt;TableName&gt; metaRunQueue = new FairQueue&lt;&gt;();<a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  private final ServerQueue[] serverBuckets = new ServerQueue[128];<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  private TableQueue tableMap = null;<a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private PeerQueue peerMap = null;<a name="line.113"></a>
+<span class="sourceLineNo">114</span>  private MetaQueue metaMap = null;<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  private final SchemaLocking locking = new SchemaLocking();<a name="line.116"></a>
+<span class="sourceLineNo">117</span><a name="line.117"></a>
+<span class="sourceLineNo">118</span>  @Override<a name="line.118"></a>
+<span class="sourceLineNo">119</span>  public void yield(final Procedure proc) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    push(proc, isTableProcedure(proc), true);<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  @Override<a name="line.123"></a>
+<span class="sourceLineNo">124</span>  protected void enqueue(final Procedure proc, final boolean addFront) {<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    if (isMetaProcedure(proc)) {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      doAdd(metaRunQueue, getMetaQueue(), proc, addFront);<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    } else if (isTableProcedure(proc)) {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      doAdd(tableRunQueue, getTableQueue(getTableName(proc)), proc, addFront);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    } else if (isServerProcedure(proc)) {<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      doAdd(serverRunQueue, getServerQueue(getServerName(proc)), proc, addFront);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    } else if (isPeerProcedure(proc)) {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      doAdd(peerRunQueue, getPeerQueue(getPeerId(proc)), proc, addFront);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    } else {<a name="line.133"></a>
+<span class="sourceLineNo">134</span>      // TODO: at the moment we only have Table and Server procedures<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      // if you are implementing a non-table/non-server procedure, you have two options: create<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      // a group for all the non-table/non-server procedures or try to find a key for your<a name="line.136"></a>
+<span class="sourceLineNo">137</span>      // non-table/non-server procedures and implement something similar to the TableRunQueue.<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      throw new UnsupportedOperationException(<a name="line.138"></a>
+<span class="sourceLineNo">139</span>        "RQs for non-table/non-server procedures are not implemented yet: " + proc);<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    }<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>  private &lt;T extends Comparable&lt;T&gt;&gt; void doAdd(final FairQueue&lt;T&gt; fairq,<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      final Queue&lt;T&gt; queue, final Procedure&lt;?&gt; proc, final boolean addFront) {<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    queue.add(proc, addFront);<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    if (!queue.getLockStatus().hasExclusiveLock() || queue.getLockStatus().isLockOwner(proc.getProcId())) {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>      // if the queue was not remove for an xlock execution<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      // or the proc is the lock owner, put the queue back into execution<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      addToRunQueue(fairq, queue);<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    } else if (queue.getLockStatus().hasParentLock(proc)) {<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      assert addFront : "expected to add a child in the front";<a name="line.151"></a>
+<span class="sourceLineNo">152</span>      // our (proc) parent has the xlock,<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      // so the queue is not in the fairq (run-queue)<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      // add it back to let the child run (inherit the lock)<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      addToRunQueue(fairq, queue);<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
+<span class="sourceLineNo">157</span>  }<a name="line.157"></a>
+<span class="sourceLineNo">158</span><a name="line.158"></a>
+<span class="sourceLineNo">159</span>  @Override<a name="line.159"></a>
+<span class="sourceLineNo">160</span>  protected boolean queueHasRunnables() {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    return metaRunQueue.hasRunnables() || tableRunQueue.hasRunnables() ||<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      serverRunQueue.hasRunnables() || peerRunQueue.hasRunnables();<a name="line.162"></a>
+<span class="sourceLineNo">163</span>  }<a name="line.163"></a>
+<span class="sourceLineNo">164</span><a name="line.164"></a>
+<span class="sourceLineNo">165</span>  @Override<a name="line.165"></a>
+<span class="sourceLineNo">166</span>  protected Procedure dequeue() {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    // meta procedure is always the first priority<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    Procedure&lt;?&gt; pollResult = doPoll(metaRunQueue);<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    // For now, let server handling have precedence over table handling; presumption is that it<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    // is more important handling crashed servers than it is running the<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    // enabling/disabling tables, etc.<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    if (pollResult == null) {<a name="line.172"></a>
+<span class="sourceLineNo">173</span>      pollResult = doPoll(serverRunQueue);<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    }<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    if (pollResult == null) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      pollResult = doPoll(peerRunQueue);<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    }<a name="line.177"></a>
+<span class="sourceLineNo">178</span>    if (pollResult == null) {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      pollResult = doPoll(tableRunQueue);<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    return pollResult;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>  }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>  private &lt;T extends Comparable&lt;T&gt;&gt; Procedure&lt;?&gt; doPoll(final FairQueue&lt;T&gt; fairq) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    final Queue&lt;T&gt; rq = fairq.poll();<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    if (rq == null || !rq.isAvailable()) {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      return null;<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    }<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>    final Procedure&lt;?&gt; pollResult = rq.peek();<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    if (pollResult == null) {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      return null;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>    }<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    final boolean xlockReq = rq.requireExclusiveLock(pollResult);<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    if (xlockReq &amp;&amp; rq.getLockStatus().isLocked() &amp;&amp; !rq.getLockStatus().hasLockAccess(pollResult)) {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      // someone is already holding the lock (e.g. shared lock). avoid a yield<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      removeFromRunQueue(fairq, rq);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      return null;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
+<span class="sourceLineNo">200</span><a name="line.200"></a>
+<span class="sourceLineNo">201</span>    rq.poll();<a name="line.201"></a>
+<span class="sourceLineNo">202</span>    if (rq.isEmpty() || xlockReq) {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      removeFromRunQueue(fairq, rq);<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    } else if (rq.getLockStatus().hasParentLock(pollResult)) {<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      // if the rq is in the fairq because of runnable child<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      // check if the next procedure is still a child.<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      // if not, remove the rq from the fairq and go back to the xlock state<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      Procedure&lt;?&gt; nextProc = rq.peek();<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      if (nextProc != null &amp;&amp; !Procedure.haveSameParent(nextProc, pollResult)) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        removeFromRunQueue(fairq, rq);<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      }<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    }<a name="line.212"></a>
+<span class="sourceLineNo">213</span><a name="line.213"></a>
+<span class="sourceLineNo">214</span>    return pollResult;<a name="line.214"></a>
+<span class="sourceLineNo">215</span>  }<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>  @Override<a name="line.217"></a>
+<span class="sourceLineNo">218</span>  public List&lt;LockedResource&gt; getLocks() {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    schedLock();<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    try {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>      return locking.getLocks();<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    } finally {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      schedUnlock();<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    }<a name="line.224"></a>
+<span class="sourceLineNo">225</span>  }<a name="line.225"></a>
+<span class="sourceLineNo">226</span><a name="line.226"></a>
+<span class="sourceLineNo">227</span>  @Override<a name="line.227"></a>
+<span class="sourceLineNo">228</span>  public LockedResource getLockResource(LockedResourceType resourceType, String resourceName) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    schedLock();<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    try {<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      return locking.getLockResource(resourceType, resourceName);<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    } finally {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>      schedUnlock();<a name="line.233"></a>
+<span class="sourceLineNo">234</span>    }<a name="line.234"></a>
+<span class="sourceLineNo">235</span>  }<a name="line.235"></a>
+<span class="sourceLineNo">236</span><a name="line.236"></a>
+<span class="sourceLineNo">237</span>  @Override<a name="line.237"></a>
+<span class="sourceLineNo">238</span>  public void clear() {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>    schedLock();<a name="line.239"></a>
+<span class="sourceLineNo">240</span>    try {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      clearQueue();<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      locking.clear();<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    } finally {<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      schedUnlock();<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    }<a name="line.245"></a>
+<span class="sourceLineNo">246</span>  }<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>  private void clearQueue() {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>    // Remove Servers<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    for (int i = 0; i &lt; serverBuckets.length; ++i) {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      clear(serverBuckets[i], serverRunQueue, SERVER_QUEUE_KEY_COMPARATOR);<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      serverBuckets[i] = null;<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
+<span class="sourceLineNo">254</span><a name="line.254"></a>
+<span class="sourceLineNo">255</span>    // Remove Tables<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    clear(tableMap, tableRunQueue, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    tableMap = null;<a name="line.257"></a>
+<span class="sourceLineNo">258</span><a name="line.258"></a>
+<span class="sourceLineNo">259</span>    // Remove Peers<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    clear(peerMap, peerRunQueue, PEER_QUEUE_KEY_COMPARATOR);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    peerMap = null;<a name="line.261"></a>
+<span class="sourceLineNo">262</span><a name="line.262"></a>
+<span class="sourceLineNo">263</span>    assert size() == 0 : "expected queue size to be 0, got " + size();<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  }<a name="line.264"></a>
+<span class="sourceLineNo">265</span><a name="line.265"></a>
+<span class="sourceLineNo">266</span>  private &lt;T extends Comparable&lt;T&gt;, TNode extends Queue&lt;T&gt;&gt; void clear(TNode treeMap,<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      final FairQueue&lt;T&gt; fairq, final AvlKeyComparator&lt;TNode&gt; comparator) {<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    while (treeMap != null) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      Queue&lt;T&gt; node = AvlTree.getFirst(treeMap);<a name="line.269"></a>
+<span class="sourceLineNo">270</span>      treeMap = AvlTree.remove(treeMap, node.getKey(), comparator);<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      if (fairq != null) removeFromRunQueue(fairq, node);<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    }<a name="line.272"></a>
+<span class="sourceLineNo">273</span>  }<a name="line.273"></a>
+<span class="sourceLineNo">274</span><a name="line.274"></a>
+<span class="sourceLineNo">275</span>  private int queueSize(Queue&lt;?&gt; head) {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    int count = 0;<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    AvlTreeIterator&lt;Queue&lt;?&gt;&gt; iter = new AvlTreeIterator&lt;Queue&lt;?&gt;&gt;(head);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    while (iter.hasNext()) {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      count += iter.next().size();<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    }<a name="line.280"></a>
+<span class="sourceLineNo">281</span>    return count;<a name="line.281"></a>
+<span class="sourceLineNo">282</span>  }<a name="line.282"></a>
+<span class="sourceLineNo">283</span><a name="line.283"></a>
+<span class="sourceLineNo">284</span>  @Override<a name="line.284"></a>
+<span class="sourceLineNo">285</span>  protected int queueSize() {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    int count = 0;<a name="line.286"></a>
+<span class="sourceLineNo">287</span>    for (ServerQueue serverMap : serverBuckets) {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>      count += queueSize(serverMap);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>    }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>    count += queueSize(tableMap);<a name="line.290"></a>
+<span class="sourceLineNo">291</span>    count += queueSize(peerMap);<a name="line.291"></a>
+<span class="sourceLineNo">292</span>    count += queueSize(metaMap);<a name="line.292"></a>
+<span class="sourceLineNo">293</span>    return count;<a name="line.293"></a>
+<span class="sourceLineNo">294</span>  }<a name="line.294"></a>
+<span class="sourceLineNo">295</span><a name="line.295"></a>
+<span class="sourceLineNo">296</span>  @Override<a name="line.296"></a>
+<span class="sourceLineNo">297</span>  public void completionCleanup(final Procedure proc) {<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    if (proc instanceof TableProcedureInterface) {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>      TableProcedureInterface iProcTable = (TableProcedureInterface) proc;<a name="line.299"></a>
+<span class="sourceLineNo">300</span>      boolean tableDeleted;<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      if (proc.hasException()) {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>        Exception procEx = proc.getException().unwrapRemoteException();<a name="line.302"></a>
+<span class="sourceLineNo">303</span>        if (iProcTable.getTableOperationType() == TableOperationType.CREATE) {<a name="line.303"></a>
+<span class="sourceLineNo">304</span>          // create failed because the table already exist<a name="line.304"></a>
+<span class="sourceLineNo">305</span>          tableDeleted = !(procEx instanceof TableExistsException);<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        } else {<a name="line.306"></a>
+<span class="sourceLineNo">307</span>          // the operation failed because the table does not exist<a name="line.307"></a>
+<span class="sourceLineNo">308</span>          tableDeleted = (procEx instanceof TableNotFoundException);<a name="line.308"></a>
+<span class="sourceLineNo">309</span>        }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      } else {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>        // the table was deleted<a name="line.311"></a>
+<span class="sourceLineNo">312</span>        tableDeleted = (iProcTable.getTableOperationType() == TableOperationType.DELETE);<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      }<a name="line.313"></a>
+<span class="sourceLineNo">314</span>      if (tableDeleted) {<a name="line.314"></a>
+<span class="sourceLineNo">315</span>        markTableAsDeleted(iProcTable.getTableName(), proc);<a name="line.315"></a>
+<span class="sourceLineNo">316</span>        return;<a name="line.316"></a>
+<span class="sourceLineNo">317</span>      }<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    } else if (proc instanceof PeerProcedureInterface) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>      PeerProcedureInterface iProcPeer = (PeerProcedureInterface) proc;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>      tryCleanupPeerQueue(iProcPeer.getPeerId(), proc);<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    } else {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>      // No cleanup for ServerProcedureInterface types, yet.<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      return;<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    }<a name="line.324"></a>
+<span class="sourceLineNo">325</span>  }<a name="line.325"></a>
+<span class="sourceLineNo">326</span><a name="line.326"></a>
+<span class="sourceLineNo">327</span>  private static &lt;T extends Comparable&lt;T&gt;&gt; void addToRunQueue(FairQueue&lt;T&gt; fairq, Queue&lt;T&gt; queue) {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    if (!AvlIterableList.isLinked(queue) &amp;&amp; !queue.isEmpty()) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      fairq.add(queue);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
+<span class="sourceLineNo">331</span>  }<a name="line.331"></a>
+<span class="sourceLineNo">332</span><a name="line.332"></a>
+<span class="sourceLineNo">333</span>  private static &lt;T extends Comparable&lt;T&gt;&gt; void removeFromRunQueue(<a name="line.333"></a>
+<span class="sourceLineNo">334</span>      FairQueue&lt;T&gt; fairq, Queue&lt;T&gt; queue) {<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    if (AvlIterableList.isLinked(queue)) {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>      fairq.remove(queue);<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    }<a name="line.337"></a>
+<span class="sourceLineNo">338</span>  }<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>  // ============================================================================<a name="line.340"></a>
+<span class="sourceLineNo">341</span>  //  Table Queue Lookup Helpers<a name="line.341"></a>
+<span class="sourceLineNo">342</span>  // ============================================================================<a name="line.342"></a>
+<span class="sourceLineNo">343</span>  private TableQueue getTableQueue(TableName tableName) {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    TableQueue node = AvlTree.get(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.344"></a>
+<span class="sourceLineNo">345</span>    if (node != null) return node;<a name="line.345"></a>
+<span class="sourceLineNo">346</span><a name="line.346"></a>
+<span class="sourceLineNo">347</span>    node = new TableQueue(tableName, MasterProcedureUtil.getTablePriority(tableName),<a name="line.347"></a>
+<span class="sourceLineNo">348</span>        locking.getTableLock(tableName), locking.getNamespaceLock(tableName.getNamespaceAsString()));<a name="line.348"></a>
+<span class="sourceLineNo">349</span>    tableMap = AvlTree.insert(tableMap, node);<a name="line.349"></a>
+<span class="sourceLineNo">350</span>    return node;<a name="line.350"></a>
+<span class="sourceLineNo">351</span>  }<a name="line.351"></a>
+<span class="sourceLineNo">352</span><a name="line.352"></a>
+<span class="sourceLineNo">353</span>  private void removeTableQueue(TableName tableName) {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>    tableMap = AvlTree.remove(tableMap, tableName, TABLE_QUEUE_KEY_COMPARATOR);<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    locking.removeTableLock(tableName);<a name="line.355"></a>
+<span class="sourceLineNo">356</span>  }<a name="line.356"></a>
+<span class="sourceLineNo">357</span><a name="line.357"></a>
+<span class="sourceLineNo">358</span>  private static boolean isTableProcedure(Procedure&lt;?&gt; proc) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    return proc instanceof TableProcedureInterface;<a name="line.359"></a>
+<span class="sourceLineNo">360</span>  }<a name="line.360"></a>
+<span class="sourceLineNo">361</span><a name="line.361"></a>
+<span class="sourceLineNo">362</span>  private static TableName getTableName(Procedure&lt;?&gt; proc) {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    return ((TableProcedureInterface)proc).getTableName();<a name="line.363"></a>
+<span class="sourceLineNo">364</span>  }<a name="line.364"></a>
+<span class="sourceLineNo">365</span><a name="line.365"></a>
+<span class="sourceLineNo">366</span>  // ============================================================================<a name="line.366"></a>
+<span class="sourceLineNo">367</span>  //  Server Queue Lookup Helpers<a name="line.367"></a>
+<span class="sourceLineNo">368</span>  // ============================================================================<a name="line.368"></a>
+<span class="sourceLineNo">369</span>  private ServerQueue getServerQueue(ServerName serverName) {<a name="line.369"></a>
+<span class="sourceLineNo">370</span>    final int index = getBucketIndex(serverBuckets, serverName.hashCode());<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    ServerQueue node = AvlTree.get(serverBuckets[index], serverName, SERVER_QUEUE_KEY_COMPARATOR);<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    if (node != null) return node;<a name="line.372"></a>
+<span class="sourceLineNo">373</span><a name="line.373"></a>
+<span class="sourceLineNo">374</span>    node = new ServerQueue(serverName, locking.getServerLock(serverName));<a name="line.374"></a>
+<span class="sourceLineNo">375</span>    serverBuckets[index] = AvlTree.insert(serverBuckets[index], node);<a name="line.375"></a>
+<span class="sourceLineNo">376</span>    return node;<a name="line.376"></a>
+<span class="sourceLineNo">377</span>  }<a name="line.377"></a>
+<span class="sourceLineNo">378</span><a name="line.378"></a>
+<span class="sourceLineNo">379</span>  private static int getBucketIndex(Object[] buckets, int hashCode) {<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    return Math.abs(hashCode) % buckets.length;<a name="line.380"></a>
+<span class="sourceLineNo">381</span>  }<a name="line.381"></a>
+<span class="sourceLineNo">382</span><a name="line.382"></a>
+<span class="sourceLineNo">383</span>  private static boolean isServerProcedure(Procedure&lt;?&gt; proc) {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>    return proc instanceof ServerProcedureInterface;<a name="line.384"></a>
+<span class="sourceLineNo">385</span>  }<a name="line.385"></a>
+<span class="sourceLineNo">386</span><a name="line.386"></a>
+<span class="sourceLineNo">387</span>  private static ServerName getServerName(Procedure&lt;?&gt; proc) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>    return ((ServerProcedureInterface)proc).getServerName();<a name="line.388"></a>
+<span class="sourceLineNo">389</span>  }<a name="line.389"></a>
+<span class="sourceLineNo">390</span><a name="line.390"></a>
+<span class="sourceLineNo">391</span>  // ============================================================================<a name="line.391"></a>
+<span class="sourceLineNo">392</span>  //  Peer Queue Lookup Helpers<a name="line.392"></a>
+<span class="sourceLineNo">393</span>  // ============================================================================<a name="line.393"></a>
+<span class="sourceLineNo">394</span>  private PeerQueue getPeerQueue(String peerId) {<a name="line.394"></a>
+<span class="sourceLineNo">395</span>    PeerQueue node = AvlTree.get(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    if (node != null) {<a name="line.396"></a>
+<span class="sourceLineNo">397</span>      return node;<a name="line.397"></a>
+<span class="sourceLineNo">398</span>    }<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    node = new PeerQueue(peerId, locking.getPeerLock(peerId));<a name="line.399"></a>
+<span class="sourceLineNo">400</span>    peerMap = AvlTree.insert(peerMap, node);<a name="line.400"></a>
+<span class="sourceLineNo">401</span>    return node;<a name="line.401"></a>
+<span class="sourceLineNo">402</span>  }<a name="line.402"></a>
+<span class="sourceLineNo">403</span><a name="line.403"></a>
+<span class="sourceLineNo">404</span>  private void removePeerQueue(String peerId) {<a name="line.404"></a>
+<span class="sourceLineNo">405</span>    peerMap = AvlTree.remove(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.405"></a>
+<span class="sourceLineNo">406</span>    locking.removePeerLock(peerId);<a name="line.406"></a>
+<span class="sourceLineNo">407</span>  }<a name="line.407"></a>
+<span class="sourceLineNo">408</span><a name="line.408"></a>
+<span class="sourceLineNo">409</span>  private void tryCleanupPeerQueue(String peerId, Procedure&lt;?&gt; procedure) {<a name="line.409"></a>
+<span class="sourceLineNo">410</span>    schedLock();<a name="line.410"></a>
+<span class="sourceLineNo">411</span>    try {<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      PeerQueue queue = AvlTree.get(peerMap, peerId, PEER_QUEUE_KEY_COMPARATOR);<a name="line.412"></a>
+<span class="sourceLineNo">413</span>      if (queue == null) {<a name="line.413"></a>
+<span class="sourceLineNo">414</span>        return;<a name="line.414"></a>
+<span class="sourceLineNo">415</span>      }<a name="line.415"></a>
+<span class="sourceLineNo">416</span><a name="line.416"></a>
+<span class="sourceLineNo">417</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.417"></a>
+<span class="sourceLineNo">418</span>      if (queue.isEmpty() &amp;&amp; lock.tryExclusiveLock(procedure)) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        removeFromRunQueue(peerRunQueue, queue);<a name="line.419"></a>
+<span class="sourceLineNo">420</span>        removePeerQueue(peerId);<a name="line.420"></a>
+<span class="sourceLineNo">421</span>      }<a name="line.421"></a>
+<span class="sourceLineNo">422</span>    } finally {<a name="line.422"></a>
+<span class="sourceLineNo">423</span>      schedUnlock();<a name="line.423"></a>
+<span class="sourceLineNo">424</span>    }<a name="line.424"></a>
+<span class="sourceLineNo">425</span>  }<a name="line.425"></a>
+<span class="sourceLineNo">426</span><a name="line.426"></a>
+<span class="sourceLineNo">427</span>  private static boolean isPeerProcedure(Procedure&lt;?&gt; proc) {<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    return proc instanceof PeerProcedureInterface;<a name="line.428"></a>
+<span class="sourceLineNo">429</span>  }<a name="line.429"></a>
+<span class="sourceLineNo">430</span><a name="line.430"></a>
+<span class="sourceLineNo">431</span>  private static String getPeerId(Procedure&lt;?&gt; proc) {<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    return ((PeerProcedureInterface) proc).getPeerId();<a name="line.432"></a>
+<span class="sourceLineNo">433</span>  }<a name="line.433"></a>
+<span class="sourceLineNo">434</span><a name="line.434"></a>
+<span class="sourceLineNo">435</span>  // ============================================================================<a name="line.435"></a>
+<span class="sourceLineNo">436</span>  //  Meta Queue Lookup Helpers<a name="line.436"></a>
+<span class="sourceLineNo">437</span>  // ============================================================================<a name="line.437"></a>
+<span class="sourceLineNo">438</span>  private MetaQueue getMetaQueue() {<a name="line.438"></a>
+<span class="sourceLineNo">439</span>    MetaQueue node = AvlTree.get(metaMap, TableName.META_TABLE_NAME, META_QUEUE_KEY_COMPARATOR);<a name="line.439"></a>
+<span class="sourceLineNo">440</span>    if (node != null) {<a name="line.440"></a>
+<span class="sourceLineNo">441</span>      return node;<a name="line.441"></a>
+<span class="sourceLineNo">442</span>    }<a name="line.442"></a>
+<span class="sourceLineNo">443</span>    node = new MetaQueue(locking.getMetaLock());<a name="line.443"></a>
+<span class="sourceLineNo">444</span>    metaMap = AvlTree.insert(metaMap, node);<a name="line.444"></a>
+<span class="sourceLineNo">445</span>    return node;<a name="line.445"></a>
+<span class="sourceLineNo">446</span>  }<a name="line.446"></a>
+<span class="sourceLineNo">447</span><a name="line.447"></a>
+<span class="sourceLineNo">448</span>  private static boolean isMetaProcedure(Procedure&lt;?&gt; proc) {<a name="line.448"></a>
+<span class="sourceLineNo">449</span>    return proc instanceof MetaProcedureInterface;<a name="line.449"></a>
+<span class="sourceLineNo">450</span>  }<a name="line.450"></a>
+<span class="sourceLineNo">451</span>  // ============================================================================<a name="line.451"></a>
+<span class="sourceLineNo">452</span>  //  Table Locking Helpers<a name="line.452"></a>
+<span class="sourceLineNo">453</span>  // ============================================================================<a name="line.453"></a>
+<span class="sourceLineNo">454</span>  /**<a name="line.454"></a>
+<span class="sourceLineNo">455</span>   * Get lock info for a resource of specified type and name and log details<a name="line.455"></a>
+<span class="sourceLineNo">456</span>   */<a name="line.456"></a>
+<span class="sourceLineNo">457</span>  private void logLockedResource(LockedResourceType resourceType, String resourceName) {<a name="line.457"></a>
+<span class="sourceLineNo">458</span>    if (!LOG.isDebugEnabled()) {<a name="line.458"></a>
+<span class="sourceLineNo">459</span>      return;<a name="line.459"></a>
+<span class="sourceLineNo">460</span>    }<a name="line.460"></a>
+<span class="sourceLineNo">461</span><a name="line.461"></a>
+<span class="sourceLineNo">462</span>    LockedResource lockedResource = getLockResource(resourceType, resourceName);<a name="line.462"></a>
+<span class="sourceLineNo">463</span>    if (lockedResource != null) {<a name="line.463"></a>
+<span class="sourceLineNo">464</span>      String msg = resourceType.toString() + " '" + resourceName + "', shared lock count=" +<a name="line.464"></a>
+<span class="sourceLineNo">465</span>          lockedResource.getSharedLockCount();<a name="line.465"></a>
+<span class="sourceLineNo">466</span><a name="line.466"></a>
+<span class="sourceLineNo">467</span>      Procedure&lt;?&gt; proc = lockedResource.getExclusiveLockOwnerProcedure();<a name="line.467"></a>
+<span class="sourceLineNo">468</span>      if (proc != null) {<a name="line.468"></a>
+<span class="sourceLineNo">469</span>        msg += ", exclusively locked by procId=" + proc.getProcId();<a name="line.469"></a>
+<span class="sourceLineNo">470</span>      }<a name="line.470"></a>
+<span class="sourceLineNo">471</span>      LOG.debug(msg);<a name="line.471"></a>
+<span class="sourceLineNo">472</span>    }<a name="line.472"></a>
+<span class="sourceLineNo">473</span>  }<a name="line.473"></a>
+<span class="sourceLineNo">474</span><a name="line.474"></a>
+<span class="sourceLineNo">475</span>  /**<a name="line.475"></a>
+<span class="sourceLineNo">476</span>   * Suspend the procedure if the specified table is already locked.<a name="line.476"></a>
+<span class="sourceLineNo">477</span>   * Other operations in the table-queue will be executed after the lock is released.<a name="line.477"></a>
+<span class="sourceLineNo">478</span>   * @param procedure the procedure trying to acquire the lock<a name="line.478"></a>
+<span class="sourceLineNo">479</span>   * @param table Table to lock<a name="line.479"></a>
+<span class="sourceLineNo">480</span>   * @return true if the procedure has to wait for the table to be available<a name="line.480"></a>
+<span class="sourceLineNo">481</span>   */<a name="line.481"></a>
+<span class="sourceLineNo">482</span>  public boolean waitTableExclusiveLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.482"></a>
+<span class="sourceLineNo">483</span>    schedLock();<a name="line.483"></a>
+<span class="sourceLineNo">484</span>    try {<a name="line.484"></a>
+<span class="sourceLineNo">485</span>      final String namespace = table.getNamespaceAsString();<a name="line.485"></a>
+<span class="sourceLineNo">486</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.486"></a>
+<span class="sourceLineNo">487</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.487"></a>
+<span class="sourceLineNo">488</span>      if (!namespaceLock.trySharedLock()) {<a name="line.488"></a>
+<span class="sourceLineNo">489</span>        waitProcedure(namespaceLock, procedure);<a name="line.489"></a>
+<span class="sourceLineNo">490</span>        logLockedResource(LockedResourceType.NAMESPACE, namespace);<a name="line.490"></a>
+<span class="sourceLineNo">491</span>        return true;<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      }<a name="line.492"></a>
+<span class="sourceLineNo">493</span>      if (!tableLock.tryExclusiveLock(procedure)) {<a name="line.493"></a>
+<span class="sourceLineNo">494</span>        namespaceLock.releaseSharedLock();<a name="line.494"></a>
+<span class="sourceLineNo">495</span>        waitProcedure(tableLock, procedure);<a name="line.495"></a>
+<span class="sourceLineNo">496</span>        logLockedResource(LockedResourceType.TABLE, table.getNameAsString());<a name="line.496"></a>
+<span class="sourceLineNo">497</span>        return true;<a name="line.497"></a>
+<span class="sourceLineNo">498</span>      }<a name="line.498"></a>
+<span class="sourceLineNo">499</span>      removeFromRunQueue(tableRunQueue, getTableQueue(table));<a name="line.499"></a>
+<span class="sourceLineNo">500</span>      return false;<a name="line.500"></a>
+<span class="sourceLineNo">501</span>    } finally {<a name="line.501"></a>
+<span class="sourceLineNo">502</span>      schedUnlock();<a name="line.502"></a>
+<span class="sourceLineNo">503</span>    }<a name="line.503"></a>
+<span class="sourceLineNo">504</span>  }<a name="line.504"></a>
+<span class="sourceLineNo">505</span><a name="line.505"></a>
+<span class="sourceLineNo">506</span>  /**<a name="line.506"></a>
+<span class="sourceLineNo">507</span>   * Wake the procedures waiting for the specified table<a name="line.507"></a>
+<span class="sourceLineNo">508</span>   * @param procedure the procedure releasing the lock<a name="line.508"></a>
+<span class="sourceLineNo">509</span>   * @param table the name of the table that has the exclusive lock<a name="line.509"></a>
+<span class="sourceLineNo">510</span>   */<a name="line.510"></a>
+<span class="sourceLineNo">511</span>  public void wakeTableExclusiveLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.511"></a>
+<span class="sourceLineNo">512</span>    schedLock();<a name="line.512"></a>
+<span class="sourceLineNo">513</span>    try {<a name="line.513"></a>
+<span class="sourceLineNo">514</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      int waitingCount = 0;<a name="line.516"></a>
+<span class="sourceLineNo">517</span><a name="line.517"></a>
+<span class="sourceLineNo">518</span>      if (!tableLock.hasParentLock(procedure)) {<a name="line.518"></a>
+<span class="sourceLineNo">519</span>        tableLock.releaseExclusiveLock(procedure);<a name="line.519"></a>
+<span class="sourceLineNo">520</span>        waitingCount += wakeWaitingProcedures(tableLock);<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      }<a name="line.521"></a>
+<span class="sourceLineNo">522</span>      if (namespaceLock.releaseSharedLock()) {<a name="line.522"></a>
+<span class="sourceLineNo">523</span>        waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.523"></a>
+<span class="sourceLineNo">524</span>      }<a name="line.524"></a>
+<span class="sourceLineNo">525</span>      addToRunQueue(tableRunQueue, getTableQueue(table));<a name="line.525"></a>
+<span class="sourceLineNo">526</span>      wakePollIfNeeded(waitingCount);<a name="line.526"></a>
+<span class="sourceLineNo">527</span>    } finally {<a name="line.527"></a>
+<span class="sourceLineNo">528</span>      schedUnlock();<a name="line.528"></a>
+<span class="sourceLineNo">529</span>    }<a name="line.529"></a>
+<span class="sourceLineNo">530</span>  }<a name="line.530"></a>
+<span class="sourceLineNo">531</span><a name="line.531"></a>
+<span class="sourceLineNo">532</span>  /**<a name="line.532"></a>
+<span class="sourceLineNo">533</span>   * Suspend the procedure if the specified table is already locked.<a name="line.533"></a>
+<span class="sourceLineNo">534</span>   * other "read" operations in the table-queue may be executed concurrently,<a name="line.534"></a>
+<span class="sourceLineNo">535</span>   * @param procedure the procedure trying to acquire the lock<a name="line.535"></a>
+<span class="sourceLineNo">536</span>   * @param table Table to lock<a name="line.536"></a>
+<span class="sourceLineNo">537</span>   * @return true if the procedure has to wait for the table to be available<a name="line.537"></a>
+<span class="sourceLineNo">538</span>   */<a name="line.538"></a>
+<span class="sourceLineNo">539</span>  public boolean waitTableSharedLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.539"></a>
+<span class="sourceLineNo">540</span>    return waitTableQueueSharedLock(procedure, table) == null;<a name="line.540"></a>
+<span class="sourceLineNo">541</span>  }<a name="line.541"></a>
+<span class="sourceLineNo">542</span><a name="line.542"></a>
+<span class="sourceLineNo">543</span>  private TableQueue waitTableQueueSharedLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.543"></a>
+<span class="sourceLineNo">544</span>    schedLock();<a name="line.544"></a>
+<span class="sourceLineNo">545</span>    try {<a name="line.545"></a>
+<span class="sourceLineNo">546</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.546"></a>
+<span class="sourceLineNo">547</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.547"></a>
+<span class="sourceLineNo">548</span>      if (!namespaceLock.trySharedLock()) {<a name="line.548"></a>
+<span class="sourceLineNo">549</span>        waitProcedure(namespaceLock, procedure);<a name="line.549"></a>
+<span class="sourceLineNo">550</span>        return null;<a name="line.550"></a>
+<span class="sourceLineNo">551</span>      }<a name="line.551"></a>
+<span class="sourceLineNo">552</span><a name="line.552"></a>
+<span class="sourceLineNo">553</span>      if (!tableLock.trySharedLock()) {<a name="line.553"></a>
+<span class="sourceLineNo">554</span>        namespaceLock.releaseSharedLock();<a name="line.554"></a>
+<span class="sourceLineNo">555</span>        waitProcedure(tableLock, procedure);<a name="line.555"></a>
+<span class="sourceLineNo">556</span>        return null;<a name="line.556"></a>
+<span class="sourceLineNo">557</span>      }<a name="line.557"></a>
+<span class="sourceLineNo">558</span><a name="line.558"></a>
+<span class="sourceLineNo">559</span>      return getTableQueue(table);<a name="line.559"></a>
+<span class="sourceLineNo">560</span>    } finally {<a name="line.560"></a>
+<span class="sourceLineNo">561</span>      schedUnlock();<a name="line.561"></a>
+<span class="sourceLineNo">562</span>    }<a name="line.562"></a>
+<span class="sourceLineNo">563</span>  }<a name="line.563"></a>
+<span class="sourceLineNo">564</span><a name="line.564"></a>
+<span class="sourceLineNo">565</span>  /**<a name="line.565"></a>
+<span class="sourceLineNo">566</span>   * Wake the procedures waiting for the specified table<a name="line.566"></a>
+<span class="sourceLineNo">567</span>   * @param procedure the procedure releasing the lock<a name="line.567"></a>
+<span class="sourceLineNo">568</span>   * @param table the name of the table that has the shared lock<a name="line.568"></a>
+<span class="sourceLineNo">569</span>   */<a name="line.569"></a>
+<span class="sourceLineNo">570</span>  public void wakeTableSharedLock(final Procedure&lt;?&gt; procedure, final TableName table) {<a name="line.570"></a>
+<span class="sourceLineNo">571</span>    schedLock();<a name="line.571"></a>
+<span class="sourceLineNo">572</span>    try {<a name="line.572"></a>
+<span class="sourceLineNo">573</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(table.getNamespaceAsString());<a name="line.573"></a>
+<span class="sourceLineNo">574</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.574"></a>
+<span class="sourceLineNo">575</span>      int waitingCount = 0;<a name="line.575"></a>
+<span class="sourceLineNo">576</span>      if (tableLock.releaseSharedLock()) {<a name="line.576"></a>
+<span class="sourceLineNo">577</span>        addToRunQueue(tableRunQueue, getTableQueue(table));<a name="line.577"></a>
+<span class="sourceLineNo">578</span>        waitingCount += wakeWaitingProcedures(tableLock);<a name="line.578"></a>
+<span class="sourceLineNo">579</span>      }<a name="line.579"></a>
+<span class="sourceLineNo">580</span>      if (namespaceLock.releaseSharedLock()) {<a name="line.580"></a>
+<span class="sourceLineNo">581</span>        waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.581"></a>
+<span class="sourceLineNo">582</span>      }<a name="line.582"></a>
+<span class="sourceLineNo">583</span>      wakePollIfNeeded(waitingCount);<a name="line.583"></a>
+<span class="sourceLineNo">584</span>    } finally {<a name="line.584"></a>
+<span class="sourceLineNo">585</span>      schedUnlock();<a name="line.585"></a>
+<span class="sourceLineNo">586</span>    }<a name="line.586"></a>
+<span class="sourceLineNo">587</span>  }<a name="line.587"></a>
+<span class="sourceLineNo">588</span><a name="line.588"></a>
+<span class="sourceLineNo">589</span>  /**<a name="line.589"></a>
+<span class="sourceLineNo">590</span>   * Tries to remove the queue and the table-lock of the specified table.<a name="line.590"></a>
+<span class="sourceLineNo">591</span>   * If there are new operations pending (e.g. a new create),<a name="line.591"></a>
+<span class="sourceLineNo">592</span>   * the remove will not be performed.<a name="line.592"></a>
+<span class="sourceLineNo">593</span>   * @param table the name of the table that should be marked as deleted<a name="line.593"></a>
+<span class="sourceLineNo">594</span>   * @param procedure the procedure that is removing the table<a name="line.594"></a>
+<span class="sourceLineNo">595</span>   * @return true if deletion succeeded, false otherwise meaning that there are<a name="line.595"></a>
+<span class="sourceLineNo">596</span>   *     other new operations pending for that table (e.g. a new create).<a name="line.596"></a>
+<span class="sourceLineNo">597</span>   */<a name="line.597"></a>
+<span class="sourceLineNo">598</span>  @VisibleForTesting<a name="line.598"></a>
+<span class="sourceLineNo">599</span>  boolean markTableAsDeleted(final TableName table, final Procedure&lt;?&gt; procedure) {<a name="line.599"></a>
+<span class="sourceLineNo">600</span>    schedLock();<a name="line.600"></a>
+<span class="sourceLineNo">601</span>    try {<a name="line.601"></a>
+<span class="sourceLineNo">602</span>      final TableQueue queue = getTableQueue(table);<a name="line.602"></a>
+<span class="sourceLineNo">603</span>      final LockAndQueue tableLock = locking.getTableLock(table);<a name="line.603"></a>
+<span class="sourceLineNo">604</span>      if (queue == null) return true;<a name="line.604"></a>
+<span class="sourceLineNo">605</span><a name="line.605"></a>
+<span class="sourceLineNo">606</span>      if (queue.isEmpty() &amp;&amp; tableLock.tryExclusiveLock(procedure)) {<a name="line.606"></a>
+<span class="sourceLineNo">607</span>        // remove the table from the run-queue and the map<a name="line.607"></a>
+<span class="sourceLineNo">608</span>        if (AvlIterableList.isLinked(queue)) {<a name="line.608"></a>
+<span class="sourceLineNo">609</span>          tableRunQueue.remove(queue);<a name="line.609"></a>
+<span class="sourceLineNo">610</span>        }<a name="line.610"></a>
+<span class="sourceLineNo">611</span>        removeTableQueue(table);<a name="line.611"></a>
+<span class="sourceLineNo">612</span>      } else {<a name="line.612"></a>
+<span class="sourceLineNo">613</span>        // TODO: If there are no create, we can drop all the other ops<a name="line.613"></a>
+<span class="sourceLineNo">614</span>        return false;<a name="line.614"></a>
+<span class="sourceLineNo">615</span>      }<a name="line.615"></a>
+<span class="sourceLineNo">616</span>    } finally {<a name="line.616"></a>
+<span class="sourceLineNo">617</span>      schedUnlock();<a name="line.617"></a>
+<span class="sourceLineNo">618</span>    }<a name="line.618"></a>
+<span class="sourceLineNo">619</span>    return true;<a name="line.619"></a>
+<span class="sourceLineNo">620</span>  }<a name="line.620"></a>
+<span class="sourceLineNo">621</span><a name="line.621"></a>
+<span class="sourceLineNo">622</span>  // ============================================================================<a name="line.622"></a>
+<span class="sourceLineNo">623</span>  //  Region Locking Helpers<a name="line.623"></a>
+<span class="sourceLineNo">624</span>  // ============================================================================<a name="line.624"></a>
+<span class="sourceLineNo">625</span>  /**<a name="line.625"></a>
+<span class="sourceLineNo">626</span>   * Suspend the procedure if the specified region is already locked.<a name="line.626"></a>
+<span class="sourceLineNo">627</span>   * @param procedure the procedure trying to acquire the lock on the region<a name="line.627"></a>
+<span class="sourceLineNo">628</span>   * @param regionInfo the region we are trying to lock<a name="line.628"></a>
+<span class="sourceLineNo">629</span>   * @return true if the procedure has to wait for the regions to be available<a name="line.629"></a>
+<span class="sourceLineNo">630</span>   */<a name="line.630"></a>
+<span class="sourceLineNo">631</span>  public boolean waitRegion(final Procedure&lt;?&gt; procedure, final RegionInfo regionInfo) {<a name="line.631"></a>
+<span class="sourceLineNo">632</span>    return waitRegions(procedure, regionInfo.getTable(), regionInfo);<a name="line.632"></a>
+<span class="sourceLineNo">633</span>  }<a name="line.633"></a>
+<span class="sourceLineNo">634</span><a name="line.634"></a>
+<span class="sourceLineNo">635</span>  /**<a name="line.635"></a>
+<span class="sourceLineNo">636</span>   * Suspend the procedure if the specified set of regions are already locked.<a name="line.636"></a>
+<span class="sourceLineNo">637</span>   * @param procedure the procedure trying to acquire the lock on the regions<a name="line.637"></a>
+<span class="sourceLineNo">638</span>   * @param table the table name of the regions we are trying to lock<a name="line.638"></a>
+<span class="sourceLineNo">639</span>   * @param regionInfo the list of regions we are trying to lock<a name="line.639"></a>
+<span class="sourceLineNo">640</span>   * @return true if the procedure has to wait for the regions to be available<a name="line.640"></a>
+<span class="sourceLineNo">641</span>   */<a name="line.641"></a>
+<span class="sourceLineNo">642</span>  public boolean waitRegions(final Procedure&lt;?&gt; procedure, final TableName table,<a name="line.642"></a>
+<span class="sourceLineNo">643</span>      final RegionInfo... regionInfo) {<a name="line.643"></a>
+<span class="sourceLineNo">644</span>    Arrays.sort(regionInfo, RegionInfo.COMPARATOR);<a name="line.644"></a>
+<span class="sourceLineNo">645</span>    schedLock();<a name="line.645"></a>
+<span class="sourceLineNo">646</span>    try {<a name="line.646"></a>
+<span class="sourceLineNo">647</span>      // If there is parent procedure, it would have already taken xlock, so no need to take<a name="line.647"></a>
+<span class="sourceLineNo">648</span>      // shared lock here. Otherwise, take shared lock.<a name="line.648"></a>
+<span class="sourceLineNo">649</span>      if (!procedure.hasParent()<a name="line.649"></a>
+<span class="sourceLineNo">650</span>          &amp;&amp; waitTableQueueSharedLock(procedure, table) == null) {<a name="line.650"></a>
+<span class="sourceLineNo">651</span>          return true;<a name="line.651"></a>
+<span class="sourceLineNo">652</span>      }<a name="line.652"></a>
+<span class="sourceLineNo">653</span><a name="line.653"></a>
+<span class="sourceLineNo">654</span>      // acquire region xlocks or wait<a name="line.654"></a>
+<span class="sourceLineNo">655</span>      boolean hasLock = true;<a name="line.655"></a>
+<span class="sourceLineNo">656</span>      final LockAndQueue[] regionLocks = new LockAndQueue[regionInfo.length];<a name="line.656"></a>
+<span class="sourceLineNo">657</span>      for (int i = 0; i &lt; regionInfo.length; ++i) {<a name="line.657"></a>
+<span class="sourceLineNo">658</span>        LOG.info("{} checking lock on {}", procedure, regionInfo[i].getEncodedName());<a name="line.658"></a>
+<span class="sourceLineNo">659</span>        assert table != null;<a name="line.659"></a>
+<span class="sourceLineNo">660</span>        assert regionInfo[i] != null;<a name="line.660"></a>
+<span class="sourceLineNo">661</span>        assert regionInfo[i].getTable() != null;<a name="line.661"></a>
+<span class="sourceLineNo">662</span>        assert regionInfo[i].getTable().equals(table): regionInfo[i] + " " + procedure;<a name="line.662"></a>
+<span class="sourceLineNo">663</span>        assert i == 0 || regionInfo[i] != regionInfo[i - 1] : "duplicate region: " + regionInfo[i];<a name="line.663"></a>
+<span class="sourceLineNo">664</span><a name="line.664"></a>
+<span class="sourceLineNo">665</span>        regionLocks[i] = locking.getRegionLock(regionInfo[i].getEncodedName());<a name="line.665"></a>
+<span class="sourceLineNo">666</span>        if (!regionLocks[i].tryExclusiveLock(procedure)) {<a name="line.666"></a>
+<span class="sourceLineNo">667</span>          waitProcedure(regionLocks[i], procedure);<a name="line.667"></a>
+<span class="sourceLineNo">668</span>          hasLock = false;<a name="line.668"></a>
+<span class="sourceLineNo">669</span>          while (i-- &gt; 0) {<a name="line.669"></a>
+<span class="sourceLineNo">670</span>            regionLocks[i].releaseExclusiveLock(procedure);<a name="line.670"></a>
+<span class="sourceLineNo">671</span>          }<a name="line.671"></a>
+<span class="sourceLineNo">672</span>          break;<a name="line.672"></a>
+<span class="sourceLineNo">673</span>        }<a name="line.673"></a>
+<span class="sourceLineNo">674</span>      }<a name="line.674"></a>
+<span class="sourceLineNo">675</span><a name="line.675"></a>
+<span class="sourceLineNo">676</span>      if (!hasLock &amp;&amp; !procedure.hasParent()) {<a name="line.676"></a>
+<span class="sourceLineNo">677</span>        wakeTableSharedLock(procedure, table);<a name="line.677"></a>
+<span class="sourceLineNo">678</span>      }<a name="line.678"></a>
+<span class="sourceLineNo">679</span>      return !hasLock;<a name="line.679"></a>
+<span class="sourceLineNo">680</span>    } finally {<a name="line.680"></a>
+<span class="sourceLineNo">681</span>      schedUnlock();<a name="line.681"></a>
+<span class="sourceLineNo">682</span>    }<a name="line.682"></a>
+<span class="sourceLineNo">683</span>  }<a name="line.683"></a>
+<span class="sourceLineNo">684</span><a name="line.684"></a>
+<span class="sourceLineNo">685</span>  /**<a name="line.685"></a>
+<span class="sourceLineNo">686</span>   * Wake the procedures waiting for the specified region<a name="line.686"></a>
+<span class="sourceLineNo">687</span>   * @param procedure the procedure that was holding the region<a name="line.687"></a>
+<span class="sourceLineNo">688</span>   * @param regionInfo the region the procedure was holding<a name="line.688"></a>
+<span class="sourceLineNo">689</span>   */<a name="line.689"></a>
+<span class="sourceLineNo">690</span>  public void wakeRegion(final Procedure&lt;?&gt; procedure, final RegionInfo regionInfo) {<a name="line.690"></a>
+<span class="sourceLineNo">691</span>    wakeRegions(procedure, regionInfo.getTable(), regionInfo);<a name="line.691"></a>
+<span class="sourceLineNo">692</span>  }<a name="line.692"></a>
+<span class="sourceLineNo">693</span><a name="line.693"></a>
+<span class="sourceLineNo">694</span>  /**<a name="line.694"></a>
+<span class="sourceLineNo">695</span>   * Wake the procedures waiting for the specified regions<a name="line.695"></a>
+<span class="sourceLineNo">696</span>   * @param procedure the procedure that was holding the regions<a name="line.696"></a>
+<span class="sourceLineNo">697</span>   * @param regionInfo the list of regions the procedure was holding<a name="line.697"></a>
+<span class="sourceLineNo">698</span>   */<a name="line.698"></a>
+<span class="sourceLineNo">699</span>  public void wakeRegions(final Procedure&lt;?&gt; procedure,final TableName table,<a name="line.699"></a>
+<span class="sourceLineNo">700</span>      final RegionInfo... regionInfo) {<a name="line.700"></a>
+<span class="sourceLineNo">701</span>    Arrays.sort(regionInfo, RegionInfo.COMPARATOR);<a name="line.701"></a>
+<span class="sourceLineNo">702</span>    schedLock();<a name="line.702"></a>
+<span class="sourceLineNo">703</span>    try {<a name="line.703"></a>
+<span class="sourceLineNo">704</span>      int numProcs = 0;<a name="line.704"></a>
+<span class="sourceLineNo">705</span>      final Procedure[] nextProcs = new Procedure[regionInfo.length];<a name="line.705"></a>
+<span class="sourceLineNo">706</span>      for (int i = 0; i &lt; regionInfo.length; ++i) {<a name="line.706"></a>
+<span class="sourceLineNo">707</span>        assert regionInfo[i].getTable().equals(table);<a name="line.707"></a>
+<span class="sourceLineNo">708</span>        assert i == 0 || regionInfo[i] != regionInfo[i - 1] : "duplicate region: " + regionInfo[i];<a name="line.708"></a>
+<span class="sourceLineNo">709</span><a name="line.709"></a>
+<span class="sourceLineNo">710</span>        LockAndQueue regionLock = locking.getRegionLock(regionInfo[i].getEncodedName());<a name="line.710"></a>
+<span class="sourceLineNo">711</span>        if (regionLock.releaseExclusiveLock(procedure)) {<a name="line.711"></a>
+<span class="sourceLineNo">712</span>          if (!regionLock.isEmpty()) {<a name="line.712"></a>
+<span class="sourceLineNo">713</span>            // release one procedure at the time since regions has an xlock<a name="line.713"></a>
+<span class="sourceLineNo">714</span>            nextProcs[numProcs++] = regionLock.removeFirst();<a name="line.714"></a>
+<span class="sourceLineNo">715</span>          } else {<a name="line.715"></a>
+<span class="sourceLineNo">716</span>            locking.removeRegionLock(regionInfo[i].getEncodedName());<a name="line.716"></a>
+<span class="sourceLineNo">717</span>          }<a name="line.717"></a>
+<span class="sourceLineNo">718</span>        }<a name="line.718"></a>
+<span class="sourceLineNo">719</span>      }<a name="line.719"></a>
+<span class="sourceLineNo">720</span><a name="line.720"></a>
+<span class="sourceLineNo">721</span>      // awake procedures if any<a name="line.721"></a>
+<span class="sourceLineNo">722</span>      for (int i = numProcs - 1; i &gt;= 0; --i) {<a name="line.722"></a>
+<span class="sourceLineNo">723</span>        wakeProcedure(nextProcs[i]);<a name="line.723"></a>
+<span class="sourceLineNo">724</span>      }<a name="line.724"></a>
+<span class="sourceLineNo">725</span>      wakePollIfNeeded(numProcs);<a name="line.725"></a>
+<span class="sourceLineNo">726</span>      if (!procedure.hasParent()) {<a name="line.726"></a>
+<span class="sourceLineNo">727</span>        // release the table shared-lock.<a name="line.727"></a>
+<span class="sourceLineNo">728</span>        // (if we have a parent, it is holding an xlock so we didn't take the shared-lock)<a name="line.728"></a>
+<span class="sourceLineNo">729</span>        wakeTableSharedLock(procedure, table);<a name="line.729"></a>
+<span class="sourceLineNo">730</span>      }<a name="line.730"></a>
+<span class="sourceLineNo">731</span>    } finally {<a name="line.731"></a>
+<span class="sourceLineNo">732</span>      schedUnlock();<a name="line.732"></a>
+<span class="sourceLineNo">733</span>    }<a name="line.733"></a>
+<span class="sourceLineNo">734</span>  }<a name="line.734"></a>
+<span class="sourceLineNo">735</span><a name="line.735"></a>
+<span class="sourceLineNo">736</span>  // ============================================================================<a name="line.736"></a>
+<span class="sourceLineNo">737</span>  //  Namespace Locking Helpers<a name="line.737"></a>
+<span class="sourceLineNo">738</span>  // ============================================================================<a name="line.738"></a>
+<span class="sourceLineNo">739</span>  /**<a name="line.739"></a>
+<span class="sourceLineNo">740</span>   * Suspend the procedure if the specified namespace is already locked.<a name="line.740"></a>
+<span class="sourceLineNo">741</span>   * @see #wakeNamespaceExclusiveLock(Procedure,String)<a name="line.741"></a>
+<span class="sourceLineNo">742</span>   * @param procedure the procedure trying to acquire the lock<a name="line.742"></a>
+<span class="sourceLineNo">743</span>   * @param namespace Namespace to lock<a name="line.743"></a>
+<span class="sourceLineNo">744</span>   * @return true if the procedure has to wait for the namespace to be available<a name="line.744"></a>
+<span class="sourceLineNo">745</span>   */<a name="line.745"></a>
+<span class="sourceLineNo">746</span>  public boolean waitNamespaceExclusiveLock(final Procedure&lt;?&gt; procedure, final String namespace) {<a name="line.746"></a>
+<span class="sourceLineNo">747</span>    schedLock();<a name="line.747"></a>
+<span class="sourceLineNo">748</span>    try {<a name="line.748"></a>
+<span class="sourceLineNo">749</span>      final LockAndQueue systemNamespaceTableLock =<a name="line.749"></a>
+<span class="sourceLineNo">750</span>          locking.getTableLock(TableName.NAMESPACE_TABLE_NAME);<a name="line.750"></a>
+<span class="sourceLineNo">751</span>      if (!systemNamespaceTableLock.trySharedLock()) {<a name="line.751"></a>
+<span class="sourceLineNo">752</span>        waitProcedure(systemNamespaceTableLock, procedure);<a name="line.752"></a>
+<span class="sourceLineNo">753</span>        logLockedResource(LockedResourceType.TABLE,<a name="line.753"></a>
+<span class="sourceLineNo">754</span>            TableName.NAMESPACE_TABLE_NAME.getNameAsString());<a name="line.754"></a>
+<span class="sourceLineNo">755</span>        return true;<a name="line.755"></a>
+<span class="sourceLineNo">756</span>      }<a name="line.756"></a>
+<span class="sourceLineNo">757</span><a name="line.757"></a>
+<span class="sourceLineNo">758</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.758"></a>
+<span class="sourceLineNo">759</span>      if (!namespaceLock.tryExclusiveLock(procedure)) {<a name="line.759"></a>
+<span class="sourceLineNo">760</span>        systemNamespaceTableLock.releaseSharedLock();<a name="line.760"></a>
+<span class="sourceLineNo">761</span>        waitProcedure(namespaceLock, procedure);<a name="line.761"></a>
+<span class="sourceLineNo">762</span>        logLockedResource(LockedResourceType.NAMESPACE, namespace);<a name="line.762"></a>
+<span class="sourceLineNo">763</span>        return true;<a name="line.763"></a>
+<span class="sourceLineNo">764</span>      }<a name="line.764"></a>
+<span class="sourceLineNo">765</span>      return false;<a name="line.765"></a>
+<span class="sourceLineNo">766</span>    } finally {<a name="line.766"></a>
+<span class="sourceLineNo">767</span>      schedUnlock();<a name="line.767"></a>
+<span class="sourceLineNo">768</span>    }<a name="line.768"></a>
+<span class="sourceLineNo">769</span>  }<a name="line.769"></a>
+<span class="sourceLineNo">770</span><a name="line.770"></a>
+<span class="sourceLineNo">771</span>  /**<a name="line.771"></a>
+<span class="sourceLineNo">772</span>   * Wake the procedures waiting for the specified namespace<a name="line.772"></a>
+<span class="sourceLineNo">773</span>   * @see #waitNamespaceExclusiveLock(Procedure,String)<a name="line.773"></a>
+<span class="sourceLineNo">774</span>   * @param procedure the procedure releasing the lock<a name="line.774"></a>
+<span class="sourceLineNo">775</span>   * @param namespace the namespace that has the exclusive lock<a name="line.775"></a>
+<span class="sourceLineNo">776</span>   */<a name="line.776"></a>
+<span class="sourceLineNo">777</span>  public void wakeNamespaceExclusiveLock(final Procedure&lt;?&gt; procedure, final String namespace) {<a name="line.777"></a>
+<span class="sourceLineNo">778</span>    schedLock();<a name="line.778"></a>
+<span class="sourceLineNo">779</span>    try {<a name="line.779"></a>
+<span class="sourceLineNo">780</span>      final LockAndQueue namespaceLock = locking.getNamespaceLock(namespace);<a name="line.780"></a>
+<span class="sourceLineNo">781</span>      final LockAndQueue systemNamespaceTableLock =<a name="line.781"></a>
+<span class="sourceLineNo">782</span>          locking.getTableLock(TableName.NAMESPACE_TABLE_NAME);<a name="line.782"></a>
+<span class="sourceLineNo">783</span>      namespaceLock.releaseExclusiveLock(procedure);<a name="line.783"></a>
+<span class="sourceLineNo">784</span>      int waitingCount = 0;<a name="line.784"></a>
+<span class="sourceLineNo">785</span>      if (systemNamespaceTableLock.releaseSharedLock()) {<a name="line.785"></a>
+<span class="sourceLineNo">786</span>        addToRunQueue(tableRunQueue, getTableQueue(TableName.NAMESPACE_TABLE_NAME));<a name="line.786"></a>
+<span class="sourceLineNo">787</span>        waitingCount += wakeWaitingProcedures(systemNamespaceTableLock);<a name="line.787"></a>
+<span class="sourceLineNo">788</span>      }<a name="line.788"></a>
+<span class="sourceLineNo">789</span>      waitingCount += wakeWaitingProcedures(namespaceLock);<a name="line.789"></a>
+<span class="sourceLineNo">790</span>      wakePollIfNeeded(waitingCount);<a name="line.790"></a>
+<span class="sourceLineNo">791</span>    } finally {<a name="line.791"></a>
+<span class="sourceLineNo">792</span>      schedUnlock();<a name="line.792"></a>
+<span class="sourceLineNo">793</span>    }<a name="line.793"></a>
+<span class="sourceLineNo">794</span>  }<a name="line.794"></a>
+<span class="sourceLineNo">795</span><a name="line.795"></a>
+<span class="sourceLineNo">796</span>  // ============================================================================<a name="line.796"></a>
+<span class="sourceLineNo">797</span>  //  Server Locking Helpers<a name="line.797"></a>
+<span class="sourceLineNo">798</span>  // ============================================================================<a name="line.798"></a>
+<span class="sourceLineNo">799</span>  /**<a name="line.799"></a>
+<span class="sourceLineNo">800</span>   * Try to acquire the exclusive lock on the specified server.<a name="line.800"></a>
+<span class="sourceLineNo">801</span>   * @see #wakeServerExclusiveLock(Procedure,ServerName)<a name="line.801"></a>
+<span class="sourceLineNo">802</span>   * @param procedure the procedure trying to acquire the lock<a name="line.802"></a>
+<span class="sourceLineNo">803</span>   * @param serverName Server to lock<a name="line.803"></a>
+<span class="sourceLineNo">804</span>   * @return true if the procedure has to wait for the server to be available<a name="line.804"></a>
+<span class="sourceLineNo">805</span>   */<a name="line.805"></a>
+<span class="sourceLineNo">806</span>  public boolean waitServerExclusiveLock(final Procedure&lt;?&gt; procedure,<a name="line.806"></a>
+<span class="sourceLineNo">807</span>      final ServerName serverName) {<a name="line.807"></a>
+<span class="sourceLineNo">808</span>    schedLock();<a name="line.808"></a>
+<span class="sourceLineNo">809</span>    try {<a name="line.809"></a>
+<span class="sourceLineNo">810</span>      final LockAndQueue lock = locking.getServerLock(serverName);<a name="line.810"></a>
+<span class="sourceLineNo">811</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.811"></a>
+<span class="sourceLineNo">812</span>        removeFromRunQueue(serverRunQueue, getServerQueue(serverName));<a name="line.812"></a>
+<span class="sourceLineNo">813</span>        return false;<a name="line.813"></a>
+<span class="sourceLineNo">814</span>      }<a name="line.814"></a>
+<span class="sourceLineNo">815</span>      waitProcedure(lock, procedure);<a name="line.815"></a>
+<span class="sourceLineNo">816</span>      logLockedResource(LockedResourceType.SERVER, serverName.getServerName());<a name="line.816"></a>
+<span class="sourceLineNo">817</span>      return true;<a name="line.817"></a>
+<span class="sourceLineNo">818</span>    } finally {<a name="line.818"></a>
+<span class="sourceLineNo">819</span>      schedUnlock();<a name="line.819"></a>
+<span class="sourceLineNo">820</span>    }<a name="line.820"></a>
+<span class="sourceLineNo">821</span>  }<a name="line.821"></a>
+<span class="sourceLineNo">822</span><a name="line.822"></a>
+<span class="sourceLineNo">823</span>  /**<a name="line.823"></a>
+<span class="sourceLineNo">824</span>   * Wake the procedures waiting for the specified server<a name="line.824"></a>
+<span class="sourceLineNo">825</span>   * @see #waitServerExclusiveLock(Procedure,ServerName)<a name="line.825"></a>
+<span class="sourceLineNo">826</span>   * @param procedure the procedure releasing the lock<a name="line.826"></a>
+<span class="sourceLineNo">827</span>   * @param serverName the server that has the exclusive lock<a name="line.827"></a>
+<span class="sourceLineNo">828</span>   */<a name="line.828"></a>
+<span class="sourceLineNo">829</span>  public void wakeServerExclusiveLock(final Procedure&lt;?&gt; procedure, final ServerName serverName) {<a name="line.829"></a>
+<span class="sourceLineNo">830</span>    schedLock();<a name="line.830"></a>
+<span class="sourceLineNo">831</span>    try {<a name="line.831"></a>
+<span class="sourceLineNo">832</span>      final LockAndQueue lock = locking.getServerLock(serverName);<a name="line.832"></a>
+<span class="sourceLineNo">833</span>      lock.releaseExclusiveLock(procedure);<a name="line.833"></a>
+<span class="sourceLineNo">834</span>      addToRunQueue(serverRunQueue, getServerQueue(serverName));<a name="line.834"></a>
+<span class="sourceLineNo">835</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.835"></a>
+<span class="sourceLineNo">836</span>      wakePollIfNeeded(waitingCount);<a name="line.836"></a>
+<span class="sourceLineNo">837</span>    } finally {<a name="line.837"></a>
+<span class="sourceLineNo">838</span>      schedUnlock();<a name="line.838"></a>
+<span class="sourceLineNo">839</span>    }<a name="line.839"></a>
+<span class="sourceLineNo">840</span>  }<a name="line.840"></a>
+<span class="sourceLineNo">841</span><a name="line.841"></a>
+<span class="sourceLineNo">842</span>  // ============================================================================<a name="line.842"></a>
+<span class="sourceLineNo">843</span>  //  Peer Locking Helpers<a name="line.843"></a>
+<span class="sourceLineNo">844</span>  // ============================================================================<a name="line.844"></a>
+<span class="sourceLineNo">845</span>  /**<a name="line.845"></a>
+<span class="sourceLineNo">846</span>   * Try to acquire the exclusive lock on the specified peer.<a name="line.846"></a>
+<span class="sourceLineNo">847</span>   * @see #wakePeerExclusiveLock(Procedure, String)<a name="line.847"></a>
+<span class="sourceLineNo">848</span>   * @param procedure the procedure trying to acquire the lock<a name="line.848"></a>
+<span class="sourceLineNo">849</span>   * @param peerId peer to lock<a name="line.849"></a>
+<span class="sourceLineNo">850</span>   * @return true if the procedure has to wait for the peer to be available<a name="line.850"></a>
+<span class="sourceLineNo">851</span>   */<a name="line.851"></a>
+<span class="sourceLineNo">852</span>  public boolean waitPeerExclusiveLock(Procedure&lt;?&gt; procedure, String peerId) {<a name="line.852"></a>
+<span class="sourceLineNo">853</span>    schedLock();<a name="line.853"></a>
+<span class="sourceLineNo">854</span>    try {<a name="line.854"></a>
+<span class="sourceLineNo">855</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.855"></a>
+<span class="sourceLineNo">856</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.856"></a>
+<span class="sourceLineNo">857</span>        removeFromRunQueue(peerRunQueue, getPeerQueue(peerId));<a name="line.857"></a>
+<span class="sourceLineNo">858</span>        return false;<a name="line.858"></a>
+<span class="sourceLineNo">859</span>      }<a name="line.859"></a>
+<span class="sourceLineNo">860</span>      waitProcedure(lock, procedure);<a name="line.860"></a>
+<span class="sourceLineNo">861</span>      logLockedResource(LockedResourceType.PEER, peerId);<a name="line.861"></a>
+<span class="sourceLineNo">862</span>      return true;<a name="line.862"></a>
+<span class="sourceLineNo">863</span>    } finally {<a name="line.863"></a>
+<span class="sourceLineNo">864</span>      schedUnlock();<a name="line.864"></a>
+<span class="sourceLineNo">865</span>    }<a name="line.865"></a>
+<span class="sourceLineNo">866</span>  }<a name="line.866"></a>
+<span class="sourceLineNo">867</span><a name="line.867"></a>
+<span class="sourceLineNo">868</span>  /**<a name="line.868"></a>
+<span class="sourceLineNo">869</span>   * Wake the procedures waiting for the specified peer<a name="line.869"></a>
+<span class="sourceLineNo">870</span>   * @see #waitPeerExclusiveLock(Procedure, String)<a name="line.870"></a>
+<span class="sourceLineNo">871</span>   * @param procedure the procedure releasing the lock<a name="line.871"></a>
+<span class="sourceLineNo">872</span>   * @param peerId the peer that has the exclusive lock<a name="line.872"></a>
+<span class="sourceLineNo">873</span>   */<a name="line.873"></a>
+<span class="sourceLineNo">874</span>  public void wakePeerExclusiveLock(Procedure&lt;?&gt; procedure, String peerId) {<a name="line.874"></a>
+<span class="sourceLineNo">875</span>    schedLock();<a name="line.875"></a>
+<span class="sourceLineNo">876</span>    try {<a name="line.876"></a>
+<span class="sourceLineNo">877</span>      final LockAndQueue lock = locking.getPeerLock(peerId);<a name="line.877"></a>
+<span class="sourceLineNo">878</span>      lock.releaseExclusiveLock(procedure);<a name="line.878"></a>
+<span class="sourceLineNo">879</span>      addToRunQueue(peerRunQueue, getPeerQueue(peerId));<a name="line.879"></a>
+<span class="sourceLineNo">880</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.880"></a>
+<span class="sourceLineNo">881</span>      wakePollIfNeeded(waitingCount);<a name="line.881"></a>
+<span class="sourceLineNo">882</span>    } finally {<a name="line.882"></a>
+<span class="sourceLineNo">883</span>      schedUnlock();<a name="line.883"></a>
+<span class="sourceLineNo">884</span>    }<a name="line.884"></a>
+<span class="sourceLineNo">885</span>  }<a name="line.885"></a>
+<span class="sourceLineNo">886</span><a name="line.886"></a>
+<span class="sourceLineNo">887</span>  // ============================================================================<a name="line.887"></a>
+<span class="sourceLineNo">888</span>  // Meta Locking Helpers<a name="line.888"></a>
+<span class="sourceLineNo">889</span>  // ============================================================================<a name="line.889"></a>
+<span class="sourceLineNo">890</span>  /**<a name="line.890"></a>
+<span class="sourceLineNo">891</span>   * Try to acquire the exclusive lock on meta.<a name="line.891"></a>
+<span class="sourceLineNo">892</span>   * @see #wakeMetaExclusiveLock(Procedure)<a name="line.892"></a>
+<span class="sourceLineNo">893</span>   * @param procedure the procedure trying to acquire the lock<a name="line.893"></a>
+<span class="sourceLineNo">894</span>   * @return true if the procedure has to wait for meta to be available<a name="line.894"></a>
+<span class="sourceLineNo">895</span>   * @deprecated only used for {@link RecoverMetaProcedure}. Should be removed along with<a name="line.895"></a>
+<span class="sourceLineNo">896</span>   *             {@link RecoverMetaProcedure}.<a name="line.896"></a>
+<span class="sourceLineNo">897</span>   */<a name="line.897"></a>
+<span class="sourceLineNo">898</span>  @Deprecated<a name="line.898"></a>
+<span class="sourceLineNo">899</span>  public boolean waitMetaExclusiveLock(Procedure&lt;?&gt; procedure) {<a name="line.899"></a>
+<span class="sourceLineNo">900</span>    schedLock();<a name="line.900"></a>
+<span class="sourceLineNo">901</span>    try {<a name="line.901"></a>
+<span class="sourceLineNo">902</span>      final LockAndQueue lock = locking.getMetaLock();<a name="line.902"></a>
+<span class="sourceLineNo">903</span>      if (lock.tryExclusiveLock(procedure)) {<a name="line.903"></a>
+<span class="sourceLineNo">904</span>        removeFromRunQueue(metaRunQueue, getMetaQueue());<a name="line.904"></a>
+<span class="sourceLineNo">905</span>        return false;<a name="line.905"></a>
+<span class="sourceLineNo">906</span>      }<a name="line.906"></a>
+<span class="sourceLineNo">907</span>      waitProcedure(lock, procedure);<a name="line.907"></a>
+<span class="sourceLineNo">908</span>      logLockedResource(LockedResourceType.META, TableName.META_TABLE_NAME.getNameAsString());<a name="line.908"></a>
+<span class="sourceLineNo">909</span>      return true;<a name="line.909"></a>
+<span class="sourceLineNo">910</span>    } finally {<a name="line.910"></a>
+<span class="sourceLineNo">911</span>      schedUnlock();<a name="line.911"></a>
+<span class="sourceLineNo">912</span>    }<a name="line.912"></a>
+<span class="sourceLineNo">913</span>  }<a name="line.913"></a>
+<span class="sourceLineNo">914</span><a name="line.914"></a>
+<span class="sourceLineNo">915</span>  /**<a name="line.915"></a>
+<span class="sourceLineNo">916</span>   * Wake the procedures waiting for meta.<a name="line.916"></a>
+<span class="sourceLineNo">917</span>   * @see #waitMetaExclusiveLock(Procedure)<a name="line.917"></a>
+<span class="sourceLineNo">918</span>   * @param procedure the procedure releasing the lock<a name="line.918"></a>
+<span class="sourceLineNo">919</span>   * @deprecated only used for {@link RecoverMetaProcedure}. Should be removed along with<a name="line.919"></a>
+<span class="sourceLineNo">920</span>   *             {@link RecoverMetaProcedure}.<a name="line.920"></a>
+<span class="sourceLineNo">921</span>   */<a name="line.921"></a>
+<span class="sourceLineNo">922</span>  @Deprecated<a name="line.922"></a>
+<span class="sourceLineNo">923</span>  public void wakeMetaExclusiveLock(Procedure&lt;?&gt; procedure) {<a name="line.923"></a>
+<span class="sourceLineNo">924</span>    schedLock();<a name="line.924"></a>
+<span class="sourceLineNo">925</span>    try {<a name="line.925"></a>
+<span class="sourceLineNo">926</span>      final LockAndQueue lock = locking.getMetaLock();<a name="line.926"></a>
+<span class="sourceLineNo">927</span>      lock.releaseExclusiveLock(procedure);<a name="line.927"></a>
+<span class="sourceLineNo">928</span>      addToRunQueue(metaRunQueue, getMetaQueue());<a name="line.928"></a>
+<span class="sourceLineNo">929</span>      int waitingCount = wakeWaitingProcedures(lock);<a name="line.929"></a>
+<span class="sourceLineNo">930</span>      wakePollIfNeeded(waitingCount);<a name="line.930"></a>
+<span class="sourceLineNo">931</span>    } finally {<a name="line.931"></a>
+<span class="sourceLineNo">932</span>      schedUnlock();<a name="line.932"></a>
+<span class="sourceLineNo">933</span>    }<a name="line.933"></a>
+<span class="sourceLineNo">934</span>  }<a name="line.934"></a>
+<span class="sourceLineNo">935</span><a name="line.935"></a>
+<span class="sourceLineNo">936</span>  /**<a name="line.936"></a>
+<span class="sourceLineNo">937</span>   * For debugging. Expensive.<a name="line.937"></a>
+<span class="sourceLineNo">938</span>   */<a name="line.938"></a>
+<span class="sourceLineNo">939</span>  @VisibleForTesting<a name="line.939"></a>
+<span class="sourceLineNo">940</span>  public String dumpLocks() throws IOException {<a name="line.940"></a>
+<span class="sourceLineNo">941</span>    schedLock();<a name="line.941"></a>
+<span class="sourceLineNo">942</span>    try {<a name="line.942"></a>
+<span class="sourceLineNo">943</span>      // TODO: Refactor so we stream out locks for case when millions; i.e. take a PrintWriter<a name="line.943"></a>
+<span class="sourceLineNo">944</span>      return this.locking.toString();<a name="line.944"></a>
+<span class="sourceLineNo">945</span>    } finally {<a name="line.945"></a>
+<span class="sourceLineNo">946</span>      schedUnlock();<a name="line.946"></a>
+<span class="sourceLineNo">947</span>    }<a name="line.947"></a>
+<span class="sourceLineNo">948</span>  }<a name="line.948"></a>
+<span class="sourceLineNo">949</span>}<a name="line.949"></a>
 
 
 
