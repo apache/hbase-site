@@ -31,193 +31,269 @@
 <span class="sourceLineNo">023</span>import java.io.InterruptedIOException;<a name="line.23"></a>
 <span class="sourceLineNo">024</span>import java.net.ConnectException;<a name="line.24"></a>
 <span class="sourceLineNo">025</span>import java.net.SocketTimeoutException;<a name="line.25"></a>
-<span class="sourceLineNo">026</span><a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.slf4j.Logger;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.slf4j.LoggerFactory;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.conf.Configuration;<a name="line.30"></a>
+<span class="sourceLineNo">026</span>import java.util.Optional;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.commons.io.IOUtils;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.conf.Configuration;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.fs.FSDataInputStream;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.fs.FSDataOutputStream;<a name="line.30"></a>
 <span class="sourceLineNo">031</span>import org.apache.hadoop.fs.FileSystem;<a name="line.31"></a>
 <span class="sourceLineNo">032</span>import org.apache.hadoop.fs.Path;<a name="line.32"></a>
 <span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.NotServingRegionException;<a name="line.33"></a>
 <span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.Server;<a name="line.34"></a>
 <span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.client.RetriesExhaustedException;<a name="line.35"></a>
 <span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.coordination.SplitLogWorkerCoordination;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.wal.WALFactory;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.wal.WALSplitter;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.util.CancelableProgressable;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.util.ExceptionUtil;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.41"></a>
-<span class="sourceLineNo">042</span><a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.43"></a>
-<span class="sourceLineNo">044</span><a name="line.44"></a>
-<span class="sourceLineNo">045</span>/**<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * This worker is spawned in every regionserver, including master. The Worker waits for log<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * splitting tasks to be put up by the {@link org.apache.hadoop.hbase.master.SplitLogManager}<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * running in the master and races with other workers in other serves to acquire those tasks.<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * The coordination is done via coordination engine.<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * &lt;p&gt;<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * If a worker has successfully moved the task from state UNASSIGNED to OWNED then it owns the task.<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * It keeps heart beating the manager by periodically moving the task from UNASSIGNED to OWNED<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * state. On success it moves the task to TASK_DONE. On unrecoverable error it moves task state to<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * ERR. If it cannot continue but wants the master to retry the task then it moves the task state to<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * RESIGNED.<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * &lt;p&gt;<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * The manager can take a task away from a worker by moving the task from OWNED to UNASSIGNED. In<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * the absence of a global lock there is a unavoidable race here - a worker might have just finished<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * its task when it is stripped of its ownership. Here we rely on the idempotency of the log<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * splitting task for correctness<a name="line.60"></a>
-<span class="sourceLineNo">061</span> */<a name="line.61"></a>
-<span class="sourceLineNo">062</span>@InterfaceAudience.Private<a name="line.62"></a>
-<span class="sourceLineNo">063</span>public class SplitLogWorker implements Runnable {<a name="line.63"></a>
-<span class="sourceLineNo">064</span><a name="line.64"></a>
-<span class="sourceLineNo">065</span>  private static final Logger LOG = LoggerFactory.getLogger(SplitLogWorker.class);<a name="line.65"></a>
-<span class="sourceLineNo">066</span><a name="line.66"></a>
-<span class="sourceLineNo">067</span>  Thread worker;<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  // thread pool which executes recovery work<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  private SplitLogWorkerCoordination coordination;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>  private Configuration conf;<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  private RegionServerServices server;<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  public SplitLogWorker(Server hserver, Configuration conf, RegionServerServices server,<a name="line.73"></a>
-<span class="sourceLineNo">074</span>      TaskExecutor splitTaskExecutor) {<a name="line.74"></a>
-<span class="sourceLineNo">075</span>    this.server = server;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>    this.conf = conf;<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    this.coordination = hserver.getCoordinatedStateManager().getSplitLogWorkerCoordination();<a name="line.77"></a>
-<span class="sourceLineNo">078</span>    coordination.init(server, conf, splitTaskExecutor, this);<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  }<a name="line.79"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.regionserver.SplitLogWorker.TaskExecutor.Status;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.replication.ReplicationPeerImpl;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.replication.ReplicationUtils;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.replication.SyncReplicationState;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.util.CancelableProgressable;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.util.ExceptionUtil;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.wal.SyncReplicationWALProvider;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.wal.WALFactory;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.wal.WALSplitter;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.slf4j.Logger;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.slf4j.LoggerFactory;<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>/**<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * This worker is spawned in every regionserver, including master. The Worker waits for log<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * splitting tasks to be put up by the {@link org.apache.hadoop.hbase.master.SplitLogManager}<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * running in the master and races with other workers in other serves to acquire those tasks.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * The coordination is done via coordination engine.<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * &lt;p&gt;<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * If a worker has successfully moved the task from state UNASSIGNED to OWNED then it owns the task.<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * It keeps heart beating the manager by periodically moving the task from UNASSIGNED to OWNED<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * state. On success it moves the task to TASK_DONE. On unrecoverable error it moves task state to<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * ERR. If it cannot continue but wants the master to retry the task then it moves the task state to<a name="line.63"></a>
+<span class="sourceLineNo">064</span> * RESIGNED.<a name="line.64"></a>
+<span class="sourceLineNo">065</span> * &lt;p&gt;<a name="line.65"></a>
+<span class="sourceLineNo">066</span> * The manager can take a task away from a worker by moving the task from OWNED to UNASSIGNED. In<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * the absence of a global lock there is a unavoidable race here - a worker might have just finished<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * its task when it is stripped of its ownership. Here we rely on the idempotency of the log<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * splitting task for correctness<a name="line.69"></a>
+<span class="sourceLineNo">070</span> */<a name="line.70"></a>
+<span class="sourceLineNo">071</span>@InterfaceAudience.Private<a name="line.71"></a>
+<span class="sourceLineNo">072</span>public class SplitLogWorker implements Runnable {<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private static final Logger LOG = LoggerFactory.getLogger(SplitLogWorker.class);<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  Thread worker;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  // thread pool which executes recovery work<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private SplitLogWorkerCoordination coordination;<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  private RegionServerServices server;<a name="line.79"></a>
 <span class="sourceLineNo">080</span><a name="line.80"></a>
-<span class="sourceLineNo">081</span>  public SplitLogWorker(final Server hserver, final Configuration conf,<a name="line.81"></a>
-<span class="sourceLineNo">082</span>      final RegionServerServices server, final LastSequenceId sequenceIdChecker,<a name="line.82"></a>
-<span class="sourceLineNo">083</span>      final WALFactory factory) {<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    this(hserver, conf, server, new TaskExecutor() {<a name="line.84"></a>
-<span class="sourceLineNo">085</span>      @Override<a name="line.85"></a>
-<span class="sourceLineNo">086</span>      public Status exec(String filename, CancelableProgressable p) {<a name="line.86"></a>
-<span class="sourceLineNo">087</span>        Path walDir;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>        FileSystem fs;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>        try {<a name="line.89"></a>
-<span class="sourceLineNo">090</span>          walDir = FSUtils.getWALRootDir(conf);<a name="line.90"></a>
-<span class="sourceLineNo">091</span>          fs = walDir.getFileSystem(conf);<a name="line.91"></a>
-<span class="sourceLineNo">092</span>        } catch (IOException e) {<a name="line.92"></a>
-<span class="sourceLineNo">093</span>          LOG.warn("could not find root dir or fs", e);<a name="line.93"></a>
-<span class="sourceLineNo">094</span>          return Status.RESIGNED;<a name="line.94"></a>
-<span class="sourceLineNo">095</span>        }<a name="line.95"></a>
-<span class="sourceLineNo">096</span>        // TODO have to correctly figure out when log splitting has been<a name="line.96"></a>
-<span class="sourceLineNo">097</span>        // interrupted or has encountered a transient error and when it has<a name="line.97"></a>
-<span class="sourceLineNo">098</span>        // encountered a bad non-retry-able persistent error.<a name="line.98"></a>
-<span class="sourceLineNo">099</span>        try {<a name="line.99"></a>
-<span class="sourceLineNo">100</span>          if (!WALSplitter.splitLogFile(walDir, fs.getFileStatus(new Path(walDir, filename)),<a name="line.100"></a>
-<span class="sourceLineNo">101</span>            fs, conf, p, sequenceIdChecker,<a name="line.101"></a>
-<span class="sourceLineNo">102</span>              server.getCoordinatedStateManager().getSplitLogWorkerCoordination(), factory)) {<a name="line.102"></a>
-<span class="sourceLineNo">103</span>            return Status.PREEMPTED;<a name="line.103"></a>
-<span class="sourceLineNo">104</span>          }<a name="line.104"></a>
-<span class="sourceLineNo">105</span>        } catch (InterruptedIOException iioe) {<a name="line.105"></a>
-<span class="sourceLineNo">106</span>          LOG.warn("log splitting of " + filename + " interrupted, resigning", iioe);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>          return Status.RESIGNED;<a name="line.107"></a>
-<span class="sourceLineNo">108</span>        } catch (IOException e) {<a name="line.108"></a>
-<span class="sourceLineNo">109</span>          if (e instanceof FileNotFoundException) {<a name="line.109"></a>
-<span class="sourceLineNo">110</span>            // A wal file may not exist anymore. Nothing can be recovered so move on<a name="line.110"></a>
-<span class="sourceLineNo">111</span>            LOG.warn("WAL {} does not exist anymore", filename, e);<a name="line.111"></a>
-<span class="sourceLineNo">112</span>            return Status.DONE;<a name="line.112"></a>
-<span class="sourceLineNo">113</span>          }<a name="line.113"></a>
-<span class="sourceLineNo">114</span>          Throwable cause = e.getCause();<a name="line.114"></a>
-<span class="sourceLineNo">115</span>          if (e instanceof RetriesExhaustedException &amp;&amp; (cause instanceof NotServingRegionException<a name="line.115"></a>
-<span class="sourceLineNo">116</span>                  || cause instanceof ConnectException<a name="line.116"></a>
-<span class="sourceLineNo">117</span>                  || cause instanceof SocketTimeoutException)) {<a name="line.117"></a>
-<span class="sourceLineNo">118</span>            LOG.warn("log replaying of " + filename + " can't connect to the target regionserver, "<a name="line.118"></a>
-<span class="sourceLineNo">119</span>                + "resigning", e);<a name="line.119"></a>
-<span class="sourceLineNo">120</span>            return Status.RESIGNED;<a name="line.120"></a>
-<span class="sourceLineNo">121</span>          } else if (cause instanceof InterruptedException) {<a name="line.121"></a>
-<span class="sourceLineNo">122</span>            LOG.warn("log splitting of " + filename + " interrupted, resigning", e);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>            return Status.RESIGNED;<a name="line.123"></a>
-<span class="sourceLineNo">124</span>          }<a name="line.124"></a>
-<span class="sourceLineNo">125</span>          LOG.warn("log splitting of " + filename + " failed, returning error", e);<a name="line.125"></a>
-<span class="sourceLineNo">126</span>          return Status.ERR;<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        }<a name="line.127"></a>
-<span class="sourceLineNo">128</span>        return Status.DONE;<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      }<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    });<a name="line.130"></a>
-<span class="sourceLineNo">131</span>  }<a name="line.131"></a>
-<span class="sourceLineNo">132</span><a name="line.132"></a>
-<span class="sourceLineNo">133</span>  @Override<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  public void run() {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    try {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      LOG.info("SplitLogWorker " + server.getServerName() + " starting");<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      coordination.registerListener();<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      // wait for Coordination Engine is ready<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      boolean res = false;<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      while (!res &amp;&amp; !coordination.isStop()) {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>        res = coordination.isReady();<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      }<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      if (!coordination.isStop()) {<a name="line.143"></a>
-<span class="sourceLineNo">144</span>        coordination.taskLoop();<a name="line.144"></a>
-<span class="sourceLineNo">145</span>      }<a name="line.145"></a>
-<span class="sourceLineNo">146</span>    } catch (Throwable t) {<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      if (ExceptionUtil.isInterrupt(t)) {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>        LOG.info("SplitLogWorker interrupted. Exiting. " + (coordination.isStop() ? "" :<a name="line.148"></a>
-<span class="sourceLineNo">149</span>            " (ERROR: exitWorker is not set, exiting anyway)"));<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      } else {<a name="line.150"></a>
-<span class="sourceLineNo">151</span>        // only a logical error can cause here. Printing it out<a name="line.151"></a>
-<span class="sourceLineNo">152</span>        // to make debugging easier<a name="line.152"></a>
-<span class="sourceLineNo">153</span>        LOG.error("unexpected error ", t);<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      }<a name="line.154"></a>
-<span class="sourceLineNo">155</span>    } finally {<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      coordination.removeListener();<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      LOG.info("SplitLogWorker " + server.getServerName() + " exiting");<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    }<a name="line.158"></a>
-<span class="sourceLineNo">159</span>  }<a name="line.159"></a>
-<span class="sourceLineNo">160</span><a name="line.160"></a>
-<span class="sourceLineNo">161</span>  /**<a name="line.161"></a>
-<span class="sourceLineNo">162</span>   * If the worker is doing a task i.e. splitting a log file then stop the task.<a name="line.162"></a>
-<span class="sourceLineNo">163</span>   * It doesn't exit the worker thread.<a name="line.163"></a>
-<span class="sourceLineNo">164</span>   */<a name="line.164"></a>
-<span class="sourceLineNo">165</span>  public void stopTask() {<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    LOG.info("Sending interrupt to stop the worker thread");<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    worker.interrupt(); // TODO interrupt often gets swallowed, do what else?<a name="line.167"></a>
-<span class="sourceLineNo">168</span>  }<a name="line.168"></a>
-<span class="sourceLineNo">169</span><a name="line.169"></a>
-<span class="sourceLineNo">170</span>  /**<a name="line.170"></a>
-<span class="sourceLineNo">171</span>   * start the SplitLogWorker thread<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   */<a name="line.172"></a>
-<span class="sourceLineNo">173</span>  public void start() {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    worker = new Thread(null, this, "SplitLogWorker-" + server.getServerName().toShortString());<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    worker.start();<a name="line.175"></a>
-<span class="sourceLineNo">176</span>  }<a name="line.176"></a>
-<span class="sourceLineNo">177</span><a name="line.177"></a>
-<span class="sourceLineNo">178</span>  /**<a name="line.178"></a>
-<span class="sourceLineNo">179</span>   * stop the SplitLogWorker thread<a name="line.179"></a>
-<span class="sourceLineNo">180</span>   */<a name="line.180"></a>
-<span class="sourceLineNo">181</span>  public void stop() {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    coordination.stopProcessingTasks();<a name="line.182"></a>
-<span class="sourceLineNo">183</span>    stopTask();<a name="line.183"></a>
-<span class="sourceLineNo">184</span>  }<a name="line.184"></a>
-<span class="sourceLineNo">185</span><a name="line.185"></a>
-<span class="sourceLineNo">186</span>  /**<a name="line.186"></a>
-<span class="sourceLineNo">187</span>   * Objects implementing this interface actually do the task that has been<a name="line.187"></a>
-<span class="sourceLineNo">188</span>   * acquired by a {@link SplitLogWorker}. Since there isn't a water-tight<a name="line.188"></a>
-<span class="sourceLineNo">189</span>   * guarantee that two workers will not be executing the same task therefore it<a name="line.189"></a>
-<span class="sourceLineNo">190</span>   * is better to have workers prepare the task and then have the<a name="line.190"></a>
-<span class="sourceLineNo">191</span>   * {@link org.apache.hadoop.hbase.master.SplitLogManager} commit the work in<a name="line.191"></a>
-<span class="sourceLineNo">192</span>   * SplitLogManager.TaskFinisher<a name="line.192"></a>
-<span class="sourceLineNo">193</span>   */<a name="line.193"></a>
-<span class="sourceLineNo">194</span>  public interface TaskExecutor {<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    enum Status {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      DONE(),<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      ERR(),<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      RESIGNED(),<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      PREEMPTED()<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
-<span class="sourceLineNo">201</span>    Status exec(String name, CancelableProgressable p);<a name="line.201"></a>
-<span class="sourceLineNo">202</span>  }<a name="line.202"></a>
-<span class="sourceLineNo">203</span><a name="line.203"></a>
-<span class="sourceLineNo">204</span>  /**<a name="line.204"></a>
-<span class="sourceLineNo">205</span>   * Returns the number of tasks processed by coordination.<a name="line.205"></a>
-<span class="sourceLineNo">206</span>   * This method is used by tests only<a name="line.206"></a>
-<span class="sourceLineNo">207</span>   */<a name="line.207"></a>
-<span class="sourceLineNo">208</span>  @VisibleForTesting<a name="line.208"></a>
-<span class="sourceLineNo">209</span>  public int getTaskReadySeq() {<a name="line.209"></a>
-<span class="sourceLineNo">210</span>    return coordination.getTaskReadySeq();<a name="line.210"></a>
-<span class="sourceLineNo">211</span>  }<a name="line.211"></a>
-<span class="sourceLineNo">212</span>}<a name="line.212"></a>
+<span class="sourceLineNo">081</span>  public SplitLogWorker(Server hserver, Configuration conf, RegionServerServices server,<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      TaskExecutor splitTaskExecutor) {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    this.server = server;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    this.coordination = hserver.getCoordinatedStateManager().getSplitLogWorkerCoordination();<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    coordination.init(server, conf, splitTaskExecutor, this);<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  }<a name="line.86"></a>
+<span class="sourceLineNo">087</span><a name="line.87"></a>
+<span class="sourceLineNo">088</span>  public SplitLogWorker(Configuration conf, RegionServerServices server,<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      LastSequenceId sequenceIdChecker, WALFactory factory) {<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    this(server, conf, server, (f, p) -&gt; splitLog(f, p, conf, server, sequenceIdChecker, factory));<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  }<a name="line.91"></a>
+<span class="sourceLineNo">092</span><a name="line.92"></a>
+<span class="sourceLineNo">093</span>  // returns whether we need to continue the split work<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  private static boolean processSyncReplicationWAL(String name, Configuration conf,<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      RegionServerServices server, FileSystem fs, Path walDir) throws IOException {<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    Path walFile = new Path(walDir, name);<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    String filename = walFile.getName();<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    Optional&lt;String&gt; optSyncPeerId =<a name="line.98"></a>
+<span class="sourceLineNo">099</span>      SyncReplicationWALProvider.getSyncReplicationPeerIdFromWALName(filename);<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    if (!optSyncPeerId.isPresent()) {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      return true;<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    }<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    String peerId = optSyncPeerId.get();<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    ReplicationPeerImpl peer =<a name="line.104"></a>
+<span class="sourceLineNo">105</span>      server.getReplicationSourceService().getReplicationPeers().getPeer(peerId);<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    if (peer == null || !peer.getPeerConfig().isSyncReplication()) {<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      return true;<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    }<a name="line.108"></a>
+<span class="sourceLineNo">109</span>    Pair&lt;SyncReplicationState, SyncReplicationState&gt; stateAndNewState =<a name="line.109"></a>
+<span class="sourceLineNo">110</span>      peer.getSyncReplicationStateAndNewState();<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    if (stateAndNewState.getFirst().equals(SyncReplicationState.ACTIVE) &amp;&amp;<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      stateAndNewState.getSecond().equals(SyncReplicationState.NONE)) {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>      // copy the file to remote and overwrite the previous one<a name="line.113"></a>
+<span class="sourceLineNo">114</span>      String remoteWALDir = peer.getPeerConfig().getRemoteWALDir();<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      Path remoteWALDirForPeer = ReplicationUtils.getPeerRemoteWALDir(remoteWALDir, peerId);<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      Path tmpRemoteWAL = new Path(remoteWALDirForPeer, filename + ".tmp");<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      FileSystem remoteFs = ReplicationUtils.getRemoteWALFileSystem(conf, remoteWALDir);<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      try (FSDataInputStream in = fs.open(walFile); @SuppressWarnings("deprecation")<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      FSDataOutputStream out = remoteFs.createNonRecursive(tmpRemoteWAL, true,<a name="line.119"></a>
+<span class="sourceLineNo">120</span>        FSUtils.getDefaultBufferSize(remoteFs), remoteFs.getDefaultReplication(tmpRemoteWAL),<a name="line.120"></a>
+<span class="sourceLineNo">121</span>        remoteFs.getDefaultBlockSize(tmpRemoteWAL), null)) {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>        IOUtils.copy(in, out);<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      }<a name="line.123"></a>
+<span class="sourceLineNo">124</span>      Path toCommitRemoteWAL =<a name="line.124"></a>
+<span class="sourceLineNo">125</span>        new Path(remoteWALDirForPeer, filename + ReplicationUtils.RENAME_WAL_SUFFIX);<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      // Some FileSystem implementations may not support atomic rename so we need to do it in two<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      // phases<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      FSUtils.renameFile(remoteFs, tmpRemoteWAL, toCommitRemoteWAL);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      FSUtils.renameFile(remoteFs, toCommitRemoteWAL, new Path(remoteWALDirForPeer, filename));<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    } else if ((stateAndNewState.getFirst().equals(SyncReplicationState.ACTIVE) &amp;&amp;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      stateAndNewState.getSecond().equals(SyncReplicationState.STANDBY)) ||<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      stateAndNewState.getFirst().equals(SyncReplicationState.STANDBY)) {<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      // check whether we still need to process this file<a name="line.133"></a>
+<span class="sourceLineNo">134</span>      // actually we only write wal file which name is ended with .syncrep in A state, and after<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      // transiting to a state other than A, we will reopen all the regions so the data in the wal<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      // will be flushed so the wal file will be archived soon. But it is still possible that there<a name="line.136"></a>
+<span class="sourceLineNo">137</span>      // is a server crash when we are transiting from A to S, to simplify the logic of the transit<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      // procedure, here we will also check the remote snapshot directory in state S, so that we do<a name="line.138"></a>
+<span class="sourceLineNo">139</span>      // not need wait until all the wal files with .syncrep suffix to be archived before finishing<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      // the procedure.<a name="line.140"></a>
+<span class="sourceLineNo">141</span>      String remoteWALDir = peer.getPeerConfig().getRemoteWALDir();<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      Path remoteSnapshotDirForPeer = ReplicationUtils.getPeerSnapshotWALDir(remoteWALDir, peerId);<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      FileSystem remoteFs = ReplicationUtils.getRemoteWALFileSystem(conf, remoteWALDir);<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      if (remoteFs.exists(new Path(remoteSnapshotDirForPeer, filename))) {<a name="line.144"></a>
+<span class="sourceLineNo">145</span>        // the file has been replayed when the remote cluster was transited from S to DA, the<a name="line.145"></a>
+<span class="sourceLineNo">146</span>        // content will be replicated back to us so give up split it.<a name="line.146"></a>
+<span class="sourceLineNo">147</span>        LOG.warn("Giveup splitting {} since it has been replayed in the remote cluster and " +<a name="line.147"></a>
+<span class="sourceLineNo">148</span>          "the content will be replicated back", filename);<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        return false;<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      }<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    }<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    return true;<a name="line.152"></a>
+<span class="sourceLineNo">153</span>  }<a name="line.153"></a>
+<span class="sourceLineNo">154</span><a name="line.154"></a>
+<span class="sourceLineNo">155</span>  private static Status splitLog(String name, CancelableProgressable p, Configuration conf,<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      RegionServerServices server, LastSequenceId sequenceIdChecker, WALFactory factory) {<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    Path walDir;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    FileSystem fs;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    try {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      walDir = FSUtils.getWALRootDir(conf);<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      fs = walDir.getFileSystem(conf);<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    } catch (IOException e) {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      LOG.warn("could not find root dir or fs", e);<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      return Status.RESIGNED;<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    }<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    try {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      if (!processSyncReplicationWAL(name, conf, server, fs, walDir)) {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        return Status.DONE;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      }<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    } catch (IOException e) {<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      LOG.warn("failed to process sync replication wal {}", name, e);<a name="line.171"></a>
+<span class="sourceLineNo">172</span>      return Status.RESIGNED;<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    }<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    // TODO have to correctly figure out when log splitting has been<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    // interrupted or has encountered a transient error and when it has<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    // encountered a bad non-retry-able persistent error.<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    try {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      if (!WALSplitter.splitLogFile(walDir, fs.getFileStatus(new Path(walDir, name)), fs, conf,<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        p, sequenceIdChecker, server.getCoordinatedStateManager().getSplitLogWorkerCoordination(),<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        factory)) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>        return Status.PREEMPTED;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      }<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    } catch (InterruptedIOException iioe) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      LOG.warn("log splitting of " + name + " interrupted, resigning", iioe);<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      return Status.RESIGNED;<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    } catch (IOException e) {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      if (e instanceof FileNotFoundException) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        // A wal file may not exist anymore. Nothing can be recovered so move on<a name="line.188"></a>
+<span class="sourceLineNo">189</span>        LOG.warn("WAL {} does not exist anymore", name, e);<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        return Status.DONE;<a name="line.190"></a>
+<span class="sourceLineNo">191</span>      }<a name="line.191"></a>
+<span class="sourceLineNo">192</span>      Throwable cause = e.getCause();<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      if (e instanceof RetriesExhaustedException &amp;&amp; (cause instanceof NotServingRegionException ||<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        cause instanceof ConnectException || cause instanceof SocketTimeoutException)) {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        LOG.warn("log replaying of " + name + " can't connect to the target regionserver, " +<a name="line.195"></a>
+<span class="sourceLineNo">196</span>          "resigning", e);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>        return Status.RESIGNED;<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      } else if (cause instanceof InterruptedException) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>        LOG.warn("log splitting of " + name + " interrupted, resigning", e);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>        return Status.RESIGNED;<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      }<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      LOG.warn("log splitting of " + name + " failed, returning error", e);<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      return Status.ERR;<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    }<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    return Status.DONE;<a name="line.205"></a>
+<span class="sourceLineNo">206</span>  }<a name="line.206"></a>
+<span class="sourceLineNo">207</span><a name="line.207"></a>
+<span class="sourceLineNo">208</span>  @Override<a name="line.208"></a>
+<span class="sourceLineNo">209</span>  public void run() {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    try {<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      LOG.info("SplitLogWorker " + server.getServerName() + " starting");<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      coordination.registerListener();<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      // wait for Coordination Engine is ready<a name="line.213"></a>
+<span class="sourceLineNo">214</span>      boolean res = false;<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      while (!res &amp;&amp; !coordination.isStop()) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>        res = coordination.isReady();<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      }<a name="line.217"></a>
+<span class="sourceLineNo">218</span>      if (!coordination.isStop()) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        coordination.taskLoop();<a name="line.219"></a>
+<span class="sourceLineNo">220</span>      }<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    } catch (Throwable t) {<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      if (ExceptionUtil.isInterrupt(t)) {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>        LOG.info("SplitLogWorker interrupted. Exiting. " + (coordination.isStop() ? "" :<a name="line.223"></a>
+<span class="sourceLineNo">224</span>            " (ERROR: exitWorker is not set, exiting anyway)"));<a name="line.224"></a>
+<span class="sourceLineNo">225</span>      } else {<a name="line.225"></a>
+<span class="sourceLineNo">226</span>        // only a logical error can cause here. Printing it out<a name="line.226"></a>
+<span class="sourceLineNo">227</span>        // to make debugging easier<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        LOG.error("unexpected error ", t);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>      }<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    } finally {<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      coordination.removeListener();<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      LOG.info("SplitLogWorker " + server.getServerName() + " exiting");<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>  }<a name="line.234"></a>
+<span class="sourceLineNo">235</span><a name="line.235"></a>
+<span class="sourceLineNo">236</span>  /**<a name="line.236"></a>
+<span class="sourceLineNo">237</span>   * If the worker is doing a task i.e. splitting a log file then stop the task.<a name="line.237"></a>
+<span class="sourceLineNo">238</span>   * It doesn't exit the worker thread.<a name="line.238"></a>
+<span class="sourceLineNo">239</span>   */<a name="line.239"></a>
+<span class="sourceLineNo">240</span>  public void stopTask() {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>    LOG.info("Sending interrupt to stop the worker thread");<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    worker.interrupt(); // TODO interrupt often gets swallowed, do what else?<a name="line.242"></a>
+<span class="sourceLineNo">243</span>  }<a name="line.243"></a>
+<span class="sourceLineNo">244</span><a name="line.244"></a>
+<span class="sourceLineNo">245</span>  /**<a name="line.245"></a>
+<span class="sourceLineNo">246</span>   * start the SplitLogWorker thread<a name="line.246"></a>
+<span class="sourceLineNo">247</span>   */<a name="line.247"></a>
+<span class="sourceLineNo">248</span>  public void start() {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>    worker = new Thread(null, this, "SplitLogWorker-" + server.getServerName().toShortString());<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    worker.start();<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  }<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>  /**<a name="line.253"></a>
+<span class="sourceLineNo">254</span>   * stop the SplitLogWorker thread<a name="line.254"></a>
+<span class="sourceLineNo">255</span>   */<a name="line.255"></a>
+<span class="sourceLineNo">256</span>  public void stop() {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    coordination.stopProcessingTasks();<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    stopTask();<a name="line.258"></a>
+<span class="sourceLineNo">259</span>  }<a name="line.259"></a>
+<span class="sourceLineNo">260</span><a name="line.260"></a>
+<span class="sourceLineNo">261</span>  /**<a name="line.261"></a>
+<span class="sourceLineNo">262</span>   * Objects implementing this interface actually do the task that has been<a name="line.262"></a>
+<span class="sourceLineNo">263</span>   * acquired by a {@link SplitLogWorker}. Since there isn't a water-tight<a name="line.263"></a>
+<span class="sourceLineNo">264</span>   * guarantee that two workers will not be executing the same task therefore it<a name="line.264"></a>
+<span class="sourceLineNo">265</span>   * is better to have workers prepare the task and then have the<a name="line.265"></a>
+<span class="sourceLineNo">266</span>   * {@link org.apache.hadoop.hbase.master.SplitLogManager} commit the work in<a name="line.266"></a>
+<span class="sourceLineNo">267</span>   * SplitLogManager.TaskFinisher<a name="line.267"></a>
+<span class="sourceLineNo">268</span>   */<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  @FunctionalInterface<a name="line.269"></a>
+<span class="sourceLineNo">270</span>  public interface TaskExecutor {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    enum Status {<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      DONE(),<a name="line.272"></a>
+<span class="sourceLineNo">273</span>      ERR(),<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      RESIGNED(),<a name="line.274"></a>
+<span class="sourceLineNo">275</span>      PREEMPTED()<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    }<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    Status exec(String name, CancelableProgressable p);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>  }<a name="line.278"></a>
+<span class="sourceLineNo">279</span><a name="line.279"></a>
+<span class="sourceLineNo">280</span>  /**<a name="line.280"></a>
+<span class="sourceLineNo">281</span>   * Returns the number of tasks processed by coordination.<a name="line.281"></a>
+<span class="sourceLineNo">282</span>   * This method is used by tests only<a name="line.282"></a>
+<span class="sourceLineNo">283</span>   */<a name="line.283"></a>
+<span class="sourceLineNo">284</span>  @VisibleForTesting<a name="line.284"></a>
+<span class="sourceLineNo">285</span>  public int getTaskReadySeq() {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    return coordination.getTaskReadySeq();<a name="line.286"></a>
+<span class="sourceLineNo">287</span>  }<a name="line.287"></a>
+<span class="sourceLineNo">288</span>}<a name="line.288"></a>
 
 
 
