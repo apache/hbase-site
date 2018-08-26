@@ -31,316 +31,320 @@
 <span class="sourceLineNo">023</span>import java.util.LinkedList;<a name="line.23"></a>
 <span class="sourceLineNo">024</span>import java.util.List;<a name="line.24"></a>
 <span class="sourceLineNo">025</span><a name="line.25"></a>
-<span class="sourceLineNo">026</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.26"></a>
-<span class="sourceLineNo">027</span>import org.slf4j.Logger;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.slf4j.LoggerFactory;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.util.ClassSize;<a name="line.30"></a>
-<span class="sourceLineNo">031</span><a name="line.31"></a>
-<span class="sourceLineNo">032</span>/**<a name="line.32"></a>
-<span class="sourceLineNo">033</span> * The compaction pipeline of a {@link CompactingMemStore}, is a FIFO queue of segments.<a name="line.33"></a>
-<span class="sourceLineNo">034</span> * It supports pushing a segment at the head of the pipeline and removing a segment from the<a name="line.34"></a>
-<span class="sourceLineNo">035</span> * tail when it is flushed to disk.<a name="line.35"></a>
-<span class="sourceLineNo">036</span> * It also supports swap method to allow the in-memory compaction swap a subset of the segments<a name="line.36"></a>
-<span class="sourceLineNo">037</span> * at the tail of the pipeline with a new (compacted) one. This swap succeeds only if the version<a name="line.37"></a>
-<span class="sourceLineNo">038</span> * number passed with the list of segments to swap is the same as the current version of the<a name="line.38"></a>
-<span class="sourceLineNo">039</span> * pipeline.<a name="line.39"></a>
-<span class="sourceLineNo">040</span> * Essentially, there are two methods which can change the structure of the pipeline: pushHead()<a name="line.40"></a>
-<span class="sourceLineNo">041</span> * and swap(), the later is used both by a flush to disk and by an in-memory compaction.<a name="line.41"></a>
-<span class="sourceLineNo">042</span> * The pipeline version is updated by swap(); it allows to identify conflicting operations at the<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * suffix of the pipeline.<a name="line.43"></a>
-<span class="sourceLineNo">044</span> *<a name="line.44"></a>
-<span class="sourceLineNo">045</span> * The synchronization model is copy-on-write. Methods which change the structure of the<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * pipeline (pushHead() and swap()) apply their changes in the context of a lock. They also make<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * a read-only copy of the pipeline's list. Read methods read from a read-only copy. If a read<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * method accesses the read-only copy more than once it makes a local copy of it<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * to ensure it accesses the same copy.<a name="line.49"></a>
-<span class="sourceLineNo">050</span> *<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * The methods getVersionedList(), getVersionedTail(), and flattenOneSegment() are also<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * protected by a lock since they need to have a consistent (atomic) view of the pipeline list<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * and version number.<a name="line.53"></a>
-<span class="sourceLineNo">054</span> */<a name="line.54"></a>
-<span class="sourceLineNo">055</span>@InterfaceAudience.Private<a name="line.55"></a>
-<span class="sourceLineNo">056</span>public class CompactionPipeline {<a name="line.56"></a>
-<span class="sourceLineNo">057</span>  private static final Logger LOG = LoggerFactory.getLogger(CompactionPipeline.class);<a name="line.57"></a>
-<span class="sourceLineNo">058</span><a name="line.58"></a>
-<span class="sourceLineNo">059</span>  public final static long FIXED_OVERHEAD = ClassSize<a name="line.59"></a>
-<span class="sourceLineNo">060</span>      .align(ClassSize.OBJECT + (3 * ClassSize.REFERENCE) + Bytes.SIZEOF_LONG);<a name="line.60"></a>
-<span class="sourceLineNo">061</span>  public final static long DEEP_OVERHEAD = FIXED_OVERHEAD + (2 * ClassSize.LINKEDLIST);<a name="line.61"></a>
-<span class="sourceLineNo">062</span><a name="line.62"></a>
-<span class="sourceLineNo">063</span>  private final RegionServicesForStores region;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>  private final LinkedList&lt;ImmutableSegment&gt; pipeline = new LinkedList&lt;&gt;();<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  // The list is volatile to avoid reading a new allocated reference before the c'tor is executed<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  private volatile LinkedList&lt;ImmutableSegment&gt; readOnlyCopy = new LinkedList&lt;&gt;();<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  // Version is volatile to ensure it is atomically read when not using a lock<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  private volatile long version = 0;<a name="line.68"></a>
-<span class="sourceLineNo">069</span><a name="line.69"></a>
-<span class="sourceLineNo">070</span>  public CompactionPipeline(RegionServicesForStores region) {<a name="line.70"></a>
-<span class="sourceLineNo">071</span>    this.region = region;<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  }<a name="line.72"></a>
-<span class="sourceLineNo">073</span><a name="line.73"></a>
-<span class="sourceLineNo">074</span>  public boolean pushHead(MutableSegment segment) {<a name="line.74"></a>
-<span class="sourceLineNo">075</span>    ImmutableSegment immutableSegment = SegmentFactory.instance().<a name="line.75"></a>
-<span class="sourceLineNo">076</span>        createImmutableSegment(segment);<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    synchronized (pipeline){<a name="line.77"></a>
-<span class="sourceLineNo">078</span>      boolean res = addFirst(immutableSegment);<a name="line.78"></a>
-<span class="sourceLineNo">079</span>      readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.79"></a>
-<span class="sourceLineNo">080</span>      return res;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    }<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  }<a name="line.82"></a>
-<span class="sourceLineNo">083</span><a name="line.83"></a>
-<span class="sourceLineNo">084</span>  public VersionedSegmentsList getVersionedList() {<a name="line.84"></a>
-<span class="sourceLineNo">085</span>    synchronized (pipeline){<a name="line.85"></a>
-<span class="sourceLineNo">086</span>      return new VersionedSegmentsList(readOnlyCopy, version);<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    }<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  }<a name="line.88"></a>
-<span class="sourceLineNo">089</span><a name="line.89"></a>
-<span class="sourceLineNo">090</span>  public VersionedSegmentsList getVersionedTail() {<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    synchronized (pipeline){<a name="line.91"></a>
-<span class="sourceLineNo">092</span>      List&lt;ImmutableSegment&gt; segmentList = new ArrayList&lt;&gt;();<a name="line.92"></a>
-<span class="sourceLineNo">093</span>      if(!pipeline.isEmpty()) {<a name="line.93"></a>
-<span class="sourceLineNo">094</span>        segmentList.add(0, pipeline.getLast());<a name="line.94"></a>
-<span class="sourceLineNo">095</span>      }<a name="line.95"></a>
-<span class="sourceLineNo">096</span>      return new VersionedSegmentsList(segmentList, version);<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    }<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  /**<a name="line.100"></a>
-<span class="sourceLineNo">101</span>   * Swaps the versioned list at the tail of the pipeline with a new segment.<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   * Swapping only if there were no changes to the suffix of the list since the version list was<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * created.<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * @param versionedList suffix of the pipeline to be replaced can be tail or all the pipeline<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * @param segment new segment to replace the suffix. Can be null if the suffix just needs to be<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   *                removed.<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * @param closeSuffix whether to close the suffix (to release memory), as part of swapping it out<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   *        During index merge op this will be false and for compaction it will be true.<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   * @param updateRegionSize whether to update the region size. Update the region size,<a name="line.109"></a>
-<span class="sourceLineNo">110</span>   *                         when the pipeline is swapped as part of in-memory-flush and<a name="line.110"></a>
-<span class="sourceLineNo">111</span>   *                         further merge/compaction. Don't update the region size when the<a name="line.111"></a>
-<span class="sourceLineNo">112</span>   *                         swap is result of the snapshot (flush-to-disk).<a name="line.112"></a>
-<span class="sourceLineNo">113</span>   * @return true iff swapped tail with new segment<a name="line.113"></a>
-<span class="sourceLineNo">114</span>   */<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value="VO_VOLATILE_INCREMENT",<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      justification="Increment is done under a synchronize block so safe")<a name="line.116"></a>
-<span class="sourceLineNo">117</span>  public boolean swap(VersionedSegmentsList versionedList, ImmutableSegment segment,<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      boolean closeSuffix, boolean updateRegionSize) {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    if (versionedList.getVersion() != version) {<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      return false;<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    }<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    List&lt;ImmutableSegment&gt; suffix;<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    synchronized (pipeline){<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      if(versionedList.getVersion() != version) {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>        return false;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>      }<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      suffix = versionedList.getStoreSegments();<a name="line.127"></a>
-<span class="sourceLineNo">128</span>      LOG.debug("Swapping pipeline suffix; before={}, new segment={}",<a name="line.128"></a>
-<span class="sourceLineNo">129</span>          versionedList.getStoreSegments().size(), segment);<a name="line.129"></a>
-<span class="sourceLineNo">130</span>      swapSuffix(suffix, segment, closeSuffix);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.131"></a>
-<span class="sourceLineNo">132</span>      version++;<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    if (updateRegionSize &amp;&amp; region != null) {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>      // update the global memstore size counter<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      long suffixDataSize = getSegmentsKeySize(suffix);<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      long newDataSize = 0;<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      if(segment != null) newDataSize = segment.keySize();<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      long dataSizeDelta = suffixDataSize - newDataSize;<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      long suffixHeapSize = getSegmentsHeapSize(suffix);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      long suffixOffHeapSize = getSegmentsOffHeapSize(suffix);<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      long newHeapSize = 0;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      long newOffHeapSize = 0;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>      if(segment != null) {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        newHeapSize = segment.heapSize();<a name="line.145"></a>
-<span class="sourceLineNo">146</span>        newOffHeapSize = segment.offHeapSize();<a name="line.146"></a>
-<span class="sourceLineNo">147</span>      }<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      long offHeapSizeDelta = suffixOffHeapSize - newOffHeapSize;<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      long heapSizeDelta = suffixHeapSize - newHeapSize;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      region.addMemStoreSize(new MemStoreSize(-dataSizeDelta, -heapSizeDelta, -offHeapSizeDelta));<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      LOG.debug("Suffix data size={}, new segment data size={}, "<a name="line.151"></a>
-<span class="sourceLineNo">152</span>              + "suffix heap size={}," + "new segment heap size={}"<a name="line.152"></a>
-<span class="sourceLineNo">153</span>              + "suffix off heap size={}," + "new segment off heap size={}"<a name="line.153"></a>
-<span class="sourceLineNo">154</span>          , suffixDataSize<a name="line.154"></a>
-<span class="sourceLineNo">155</span>          , newDataSize<a name="line.155"></a>
-<span class="sourceLineNo">156</span>          , suffixHeapSize<a name="line.156"></a>
-<span class="sourceLineNo">157</span>          , newHeapSize<a name="line.157"></a>
-<span class="sourceLineNo">158</span>          , suffixOffHeapSize<a name="line.158"></a>
-<span class="sourceLineNo">159</span>          , newOffHeapSize);<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    }<a name="line.160"></a>
-<span class="sourceLineNo">161</span>    return true;<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  }<a name="line.162"></a>
-<span class="sourceLineNo">163</span><a name="line.163"></a>
-<span class="sourceLineNo">164</span>  private static long getSegmentsHeapSize(List&lt;? extends Segment&gt; list) {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    long res = 0;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    for (Segment segment : list) {<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      res += segment.heapSize();<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    }<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    return res;<a name="line.169"></a>
-<span class="sourceLineNo">170</span>  }<a name="line.170"></a>
-<span class="sourceLineNo">171</span><a name="line.171"></a>
-<span class="sourceLineNo">172</span>  private static long getSegmentsOffHeapSize(List&lt;? extends Segment&gt; list) {<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    long res = 0;<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    for (Segment segment : list) {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>      res += segment.offHeapSize();<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    }<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    return res;<a name="line.177"></a>
-<span class="sourceLineNo">178</span>  }<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>  private static long getSegmentsKeySize(List&lt;? extends Segment&gt; list) {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    long res = 0;<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    for (Segment segment : list) {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      res += segment.keySize();<a name="line.183"></a>
-<span class="sourceLineNo">184</span>    }<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    return res;<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  }<a name="line.186"></a>
-<span class="sourceLineNo">187</span><a name="line.187"></a>
-<span class="sourceLineNo">188</span>  /**<a name="line.188"></a>
-<span class="sourceLineNo">189</span>   * If the caller holds the current version, go over the the pipeline and try to flatten each<a name="line.189"></a>
-<span class="sourceLineNo">190</span>   * segment. Flattening is replacing the ConcurrentSkipListMap based CellSet to CellArrayMap based.<a name="line.190"></a>
-<span class="sourceLineNo">191</span>   * Flattening of the segment that initially is not based on ConcurrentSkipListMap has no effect.<a name="line.191"></a>
-<span class="sourceLineNo">192</span>   * Return after one segment is successfully flatten.<a name="line.192"></a>
-<span class="sourceLineNo">193</span>   *<a name="line.193"></a>
-<span class="sourceLineNo">194</span>   * @return true iff a segment was successfully flattened<a name="line.194"></a>
-<span class="sourceLineNo">195</span>   */<a name="line.195"></a>
-<span class="sourceLineNo">196</span>  public boolean flattenOneSegment(long requesterVersion,<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      CompactingMemStore.IndexType idxType,<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      MemStoreCompactionStrategy.Action action) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span><a name="line.199"></a>
-<span class="sourceLineNo">200</span>    if(requesterVersion != version) {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      LOG.warn("Segment flattening failed, because versions do not match. Requester version: "<a name="line.201"></a>
-<span class="sourceLineNo">202</span>          + requesterVersion + ", actual version: " + version);<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      return false;<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    }<a name="line.204"></a>
-<span class="sourceLineNo">205</span><a name="line.205"></a>
-<span class="sourceLineNo">206</span>    synchronized (pipeline){<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      if(requesterVersion != version) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        LOG.warn("Segment flattening failed, because versions do not match");<a name="line.208"></a>
-<span class="sourceLineNo">209</span>        return false;<a name="line.209"></a>
-<span class="sourceLineNo">210</span>      }<a name="line.210"></a>
-<span class="sourceLineNo">211</span>      int i = 0;<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      for (ImmutableSegment s : pipeline) {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>        if ( s.canBeFlattened() ) {<a name="line.213"></a>
-<span class="sourceLineNo">214</span>          MemStoreSizing newMemstoreAccounting = new MemStoreSizing(); // the size to be updated<a name="line.214"></a>
-<span class="sourceLineNo">215</span>          ImmutableSegment newS = SegmentFactory.instance().createImmutableSegmentByFlattening(<a name="line.215"></a>
-<span class="sourceLineNo">216</span>              (CSLMImmutableSegment)s,idxType,newMemstoreAccounting,action);<a name="line.216"></a>
-<span class="sourceLineNo">217</span>          replaceAtIndex(i,newS);<a name="line.217"></a>
-<span class="sourceLineNo">218</span>          if(region != null) {<a name="line.218"></a>
-<span class="sourceLineNo">219</span>            // update the global memstore size counter<a name="line.219"></a>
-<span class="sourceLineNo">220</span>            // upon flattening there is no change in the data size<a name="line.220"></a>
-<span class="sourceLineNo">221</span>            region.addMemStoreSize(new MemStoreSize(0, newMemstoreAccounting.getHeapSize(),<a name="line.221"></a>
-<span class="sourceLineNo">222</span>                newMemstoreAccounting.getOffHeapSize()));<a name="line.222"></a>
-<span class="sourceLineNo">223</span>          }<a name="line.223"></a>
-<span class="sourceLineNo">224</span>          LOG.debug("Compaction pipeline segment {} flattened", s);<a name="line.224"></a>
-<span class="sourceLineNo">225</span>          return true;<a name="line.225"></a>
-<span class="sourceLineNo">226</span>        }<a name="line.226"></a>
-<span class="sourceLineNo">227</span>        i++;<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      }<a name="line.228"></a>
-<span class="sourceLineNo">229</span><a name="line.229"></a>
-<span class="sourceLineNo">230</span>    }<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    // do not update the global memstore size counter and do not increase the version,<a name="line.231"></a>
-<span class="sourceLineNo">232</span>    // because all the cells remain in place<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    return false;<a name="line.233"></a>
-<span class="sourceLineNo">234</span>  }<a name="line.234"></a>
-<span class="sourceLineNo">235</span><a name="line.235"></a>
-<span class="sourceLineNo">236</span>  public boolean isEmpty() {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    return readOnlyCopy.isEmpty();<a name="line.237"></a>
-<span class="sourceLineNo">238</span>  }<a name="line.238"></a>
-<span class="sourceLineNo">239</span><a name="line.239"></a>
-<span class="sourceLineNo">240</span>  public List&lt;? extends Segment&gt; getSegments() {<a name="line.240"></a>
-<span class="sourceLineNo">241</span>    return readOnlyCopy;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>  }<a name="line.242"></a>
-<span class="sourceLineNo">243</span><a name="line.243"></a>
-<span class="sourceLineNo">244</span>  public long size() {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    return readOnlyCopy.size();<a name="line.245"></a>
-<span class="sourceLineNo">246</span>  }<a name="line.246"></a>
-<span class="sourceLineNo">247</span><a name="line.247"></a>
-<span class="sourceLineNo">248</span>  public long getMinSequenceId() {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    long minSequenceId = Long.MAX_VALUE;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    if (!localCopy.isEmpty()) {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      minSequenceId = localCopy.getLast().getMinSequenceId();<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    return minSequenceId;<a name="line.254"></a>
-<span class="sourceLineNo">255</span>  }<a name="line.255"></a>
-<span class="sourceLineNo">256</span><a name="line.256"></a>
-<span class="sourceLineNo">257</span>  public MemStoreSizing getTailSizing() {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.258"></a>
-<span class="sourceLineNo">259</span>    if (localCopy.isEmpty()) return new MemStoreSizing();<a name="line.259"></a>
-<span class="sourceLineNo">260</span>    return new MemStoreSizing(localCopy.peekLast().getMemStoreSize());<a name="line.260"></a>
-<span class="sourceLineNo">261</span>  }<a name="line.261"></a>
-<span class="sourceLineNo">262</span><a name="line.262"></a>
-<span class="sourceLineNo">263</span>  public MemStoreSizing getPipelineSizing() {<a name="line.263"></a>
-<span class="sourceLineNo">264</span>    MemStoreSizing memStoreSizing = new MemStoreSizing();<a name="line.264"></a>
-<span class="sourceLineNo">265</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    for (Segment segment : localCopy) {<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      memStoreSizing.incMemStoreSize(segment.getMemStoreSize());<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    }<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    return memStoreSizing;<a name="line.269"></a>
-<span class="sourceLineNo">270</span>  }<a name="line.270"></a>
-<span class="sourceLineNo">271</span><a name="line.271"></a>
-<span class="sourceLineNo">272</span>  private void swapSuffix(List&lt;? extends Segment&gt; suffix, ImmutableSegment segment,<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      boolean closeSegmentsInSuffix) {<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    pipeline.removeAll(suffix);<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    if(segment != null) pipeline.addLast(segment);<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    // During index merge we won't be closing the segments undergoing the merge. Segment#close()<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    // will release the MSLAB chunks to pool. But in case of index merge there wont be any data copy<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    // from old MSLABs. So the new cells in new segment also refers to same chunks. In case of data<a name="line.278"></a>
-<span class="sourceLineNo">279</span>    // compaction, we would have copied the cells data from old MSLAB chunks into a new chunk<a name="line.279"></a>
-<span class="sourceLineNo">280</span>    // created for the result segment. So we can release the chunks associated with the compacted<a name="line.280"></a>
-<span class="sourceLineNo">281</span>    // segments.<a name="line.281"></a>
-<span class="sourceLineNo">282</span>    if (closeSegmentsInSuffix) {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      for (Segment itemInSuffix : suffix) {<a name="line.283"></a>
-<span class="sourceLineNo">284</span>        itemInSuffix.close();<a name="line.284"></a>
-<span class="sourceLineNo">285</span>      }<a name="line.285"></a>
-<span class="sourceLineNo">286</span>    }<a name="line.286"></a>
-<span class="sourceLineNo">287</span>  }<a name="line.287"></a>
-<span class="sourceLineNo">288</span><a name="line.288"></a>
-<span class="sourceLineNo">289</span>  // replacing one segment in the pipeline with a new one exactly at the same index<a name="line.289"></a>
-<span class="sourceLineNo">290</span>  // need to be called only within synchronized block<a name="line.290"></a>
-<span class="sourceLineNo">291</span>  private void replaceAtIndex(int idx, ImmutableSegment newSegment) {<a name="line.291"></a>
-<span class="sourceLineNo">292</span>    pipeline.set(idx, newSegment);<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.293"></a>
-<span class="sourceLineNo">294</span>  }<a name="line.294"></a>
-<span class="sourceLineNo">295</span><a name="line.295"></a>
-<span class="sourceLineNo">296</span>  public Segment getTail() {<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    List&lt;? extends Segment&gt; localCopy = getSegments();<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    if(localCopy.isEmpty()) {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      return null;<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    }<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    return localCopy.get(localCopy.size() - 1);<a name="line.301"></a>
-<span class="sourceLineNo">302</span>  }<a name="line.302"></a>
-<span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>  private boolean addFirst(ImmutableSegment segment) {<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    pipeline.addFirst(segment);<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    return true;<a name="line.306"></a>
-<span class="sourceLineNo">307</span>  }<a name="line.307"></a>
-<span class="sourceLineNo">308</span><a name="line.308"></a>
-<span class="sourceLineNo">309</span>  // debug method<a name="line.309"></a>
-<span class="sourceLineNo">310</span>  private boolean validateSuffixList(LinkedList&lt;ImmutableSegment&gt; suffix) {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>    if(suffix.isEmpty()) {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>      // empty suffix is always valid<a name="line.312"></a>
-<span class="sourceLineNo">313</span>      return true;<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    }<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    Iterator&lt;ImmutableSegment&gt; pipelineBackwardIterator = pipeline.descendingIterator();<a name="line.315"></a>
-<span class="sourceLineNo">316</span>    Iterator&lt;ImmutableSegment&gt; suffixBackwardIterator = suffix.descendingIterator();<a name="line.316"></a>
-<span class="sourceLineNo">317</span>    ImmutableSegment suffixCurrent;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>    ImmutableSegment pipelineCurrent;<a name="line.318"></a>
-<span class="sourceLineNo">319</span>    for( ; suffixBackwardIterator.hasNext(); ) {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>      if(!pipelineBackwardIterator.hasNext()) {<a name="line.320"></a>
-<span class="sourceLineNo">321</span>        // a suffix longer than pipeline is invalid<a name="line.321"></a>
-<span class="sourceLineNo">322</span>        return false;<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      }<a name="line.323"></a>
-<span class="sourceLineNo">324</span>      suffixCurrent = suffixBackwardIterator.next();<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      pipelineCurrent = pipelineBackwardIterator.next();<a name="line.325"></a>
-<span class="sourceLineNo">326</span>      if(suffixCurrent != pipelineCurrent) {<a name="line.326"></a>
-<span class="sourceLineNo">327</span>        // non-matching suffix<a name="line.327"></a>
-<span class="sourceLineNo">328</span>        return false;<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      }<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    }<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    // suffix matches pipeline suffix<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    return true;<a name="line.332"></a>
-<span class="sourceLineNo">333</span>  }<a name="line.333"></a>
-<span class="sourceLineNo">334</span><a name="line.334"></a>
-<span class="sourceLineNo">335</span>}<a name="line.335"></a>
+<span class="sourceLineNo">026</span>import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.util.ClassSize;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.slf4j.Logger;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.slf4j.LoggerFactory;<a name="line.31"></a>
+<span class="sourceLineNo">032</span><a name="line.32"></a>
+<span class="sourceLineNo">033</span>/**<a name="line.33"></a>
+<span class="sourceLineNo">034</span> * The compaction pipeline of a {@link CompactingMemStore}, is a FIFO queue of segments.<a name="line.34"></a>
+<span class="sourceLineNo">035</span> * It supports pushing a segment at the head of the pipeline and removing a segment from the<a name="line.35"></a>
+<span class="sourceLineNo">036</span> * tail when it is flushed to disk.<a name="line.36"></a>
+<span class="sourceLineNo">037</span> * It also supports swap method to allow the in-memory compaction swap a subset of the segments<a name="line.37"></a>
+<span class="sourceLineNo">038</span> * at the tail of the pipeline with a new (compacted) one. This swap succeeds only if the version<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * number passed with the list of segments to swap is the same as the current version of the<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * pipeline.<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * Essentially, there are two methods which can change the structure of the pipeline: pushHead()<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * and swap(), the later is used both by a flush to disk and by an in-memory compaction.<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * The pipeline version is updated by swap(); it allows to identify conflicting operations at the<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * suffix of the pipeline.<a name="line.44"></a>
+<span class="sourceLineNo">045</span> *<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * The synchronization model is copy-on-write. Methods which change the structure of the<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * pipeline (pushHead() and swap()) apply their changes in the context of a lock. They also make<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * a read-only copy of the pipeline's list. Read methods read from a read-only copy. If a read<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * method accesses the read-only copy more than once it makes a local copy of it<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * to ensure it accesses the same copy.<a name="line.50"></a>
+<span class="sourceLineNo">051</span> *<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * The methods getVersionedList(), getVersionedTail(), and flattenOneSegment() are also<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * protected by a lock since they need to have a consistent (atomic) view of the pipeline list<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * and version number.<a name="line.54"></a>
+<span class="sourceLineNo">055</span> */<a name="line.55"></a>
+<span class="sourceLineNo">056</span>@InterfaceAudience.Private<a name="line.56"></a>
+<span class="sourceLineNo">057</span>public class CompactionPipeline {<a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private static final Logger LOG = LoggerFactory.getLogger(CompactionPipeline.class);<a name="line.58"></a>
+<span class="sourceLineNo">059</span><a name="line.59"></a>
+<span class="sourceLineNo">060</span>  public final static long FIXED_OVERHEAD = ClassSize<a name="line.60"></a>
+<span class="sourceLineNo">061</span>      .align(ClassSize.OBJECT + (3 * ClassSize.REFERENCE) + Bytes.SIZEOF_LONG);<a name="line.61"></a>
+<span class="sourceLineNo">062</span>  public final static long DEEP_OVERHEAD = FIXED_OVERHEAD + (2 * ClassSize.LINKEDLIST);<a name="line.62"></a>
+<span class="sourceLineNo">063</span><a name="line.63"></a>
+<span class="sourceLineNo">064</span>  private final RegionServicesForStores region;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private final LinkedList&lt;ImmutableSegment&gt; pipeline = new LinkedList&lt;&gt;();<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  // The list is volatile to avoid reading a new allocated reference before the c'tor is executed<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private volatile LinkedList&lt;ImmutableSegment&gt; readOnlyCopy = new LinkedList&lt;&gt;();<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  // Version is volatile to ensure it is atomically read when not using a lock<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private volatile long version = 0;<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  public CompactionPipeline(RegionServicesForStores region) {<a name="line.71"></a>
+<span class="sourceLineNo">072</span>    this.region = region;<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  }<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  public boolean pushHead(MutableSegment segment) {<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    ImmutableSegment immutableSegment = SegmentFactory.instance().<a name="line.76"></a>
+<span class="sourceLineNo">077</span>        createImmutableSegment(segment);<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    synchronized (pipeline){<a name="line.78"></a>
+<span class="sourceLineNo">079</span>      boolean res = addFirst(immutableSegment);<a name="line.79"></a>
+<span class="sourceLineNo">080</span>      readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.80"></a>
+<span class="sourceLineNo">081</span>      return res;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    }<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  }<a name="line.83"></a>
+<span class="sourceLineNo">084</span><a name="line.84"></a>
+<span class="sourceLineNo">085</span>  public VersionedSegmentsList getVersionedList() {<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    synchronized (pipeline){<a name="line.86"></a>
+<span class="sourceLineNo">087</span>      return new VersionedSegmentsList(readOnlyCopy, version);<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    }<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  }<a name="line.89"></a>
+<span class="sourceLineNo">090</span><a name="line.90"></a>
+<span class="sourceLineNo">091</span>  public VersionedSegmentsList getVersionedTail() {<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    synchronized (pipeline){<a name="line.92"></a>
+<span class="sourceLineNo">093</span>      List&lt;ImmutableSegment&gt; segmentList = new ArrayList&lt;&gt;();<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      if(!pipeline.isEmpty()) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>        segmentList.add(0, pipeline.getLast());<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      }<a name="line.96"></a>
+<span class="sourceLineNo">097</span>      return new VersionedSegmentsList(segmentList, version);<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    }<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  }<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  /**<a name="line.101"></a>
+<span class="sourceLineNo">102</span>   * Swaps the versioned list at the tail of the pipeline with a new segment.<a name="line.102"></a>
+<span class="sourceLineNo">103</span>   * Swapping only if there were no changes to the suffix of the list since the version list was<a name="line.103"></a>
+<span class="sourceLineNo">104</span>   * created.<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   * @param versionedList suffix of the pipeline to be replaced can be tail or all the pipeline<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   * @param segment new segment to replace the suffix. Can be null if the suffix just needs to be<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   *                removed.<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   * @param closeSuffix whether to close the suffix (to release memory), as part of swapping it out<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   *        During index merge op this will be false and for compaction it will be true.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   * @param updateRegionSize whether to update the region size. Update the region size,<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   *                         when the pipeline is swapped as part of in-memory-flush and<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   *                         further merge/compaction. Don't update the region size when the<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   *                         swap is result of the snapshot (flush-to-disk).<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   * @return true iff swapped tail with new segment<a name="line.114"></a>
+<span class="sourceLineNo">115</span>   */<a name="line.115"></a>
+<span class="sourceLineNo">116</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value="VO_VOLATILE_INCREMENT",<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      justification="Increment is done under a synchronize block so safe")<a name="line.117"></a>
+<span class="sourceLineNo">118</span>  public boolean swap(VersionedSegmentsList versionedList, ImmutableSegment segment,<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      boolean closeSuffix, boolean updateRegionSize) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    if (versionedList.getVersion() != version) {<a name="line.120"></a>
+<span class="sourceLineNo">121</span>      return false;<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    }<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    List&lt;ImmutableSegment&gt; suffix;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    synchronized (pipeline){<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      if(versionedList.getVersion() != version) {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>        return false;<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      }<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      suffix = versionedList.getStoreSegments();<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      LOG.debug("Swapping pipeline suffix; before={}, new segment={}",<a name="line.129"></a>
+<span class="sourceLineNo">130</span>          versionedList.getStoreSegments().size(), segment);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      swapSuffix(suffix, segment, closeSuffix);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      version++;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    }<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    if (updateRegionSize &amp;&amp; region != null) {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      // update the global memstore size counter<a name="line.136"></a>
+<span class="sourceLineNo">137</span>      long suffixDataSize = getSegmentsKeySize(suffix);<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      long newDataSize = 0;<a name="line.138"></a>
+<span class="sourceLineNo">139</span>      if(segment != null) {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>        newDataSize = segment.getDataSize();<a name="line.140"></a>
+<span class="sourceLineNo">141</span>      }<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      long dataSizeDelta = suffixDataSize - newDataSize;<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      long suffixHeapSize = getSegmentsHeapSize(suffix);<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      long suffixOffHeapSize = getSegmentsOffHeapSize(suffix);<a name="line.144"></a>
+<span class="sourceLineNo">145</span>      long newHeapSize = 0;<a name="line.145"></a>
+<span class="sourceLineNo">146</span>      long newOffHeapSize = 0;<a name="line.146"></a>
+<span class="sourceLineNo">147</span>      if(segment != null) {<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        newHeapSize = segment.getHeapSize();<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        newOffHeapSize = segment.getOffHeapSize();<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      }<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      long offHeapSizeDelta = suffixOffHeapSize - newOffHeapSize;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>      long heapSizeDelta = suffixHeapSize - newHeapSize;<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      region.addMemStoreSize(-dataSizeDelta, -heapSizeDelta, -offHeapSizeDelta);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      LOG.debug("Suffix data size={}, new segment data size={}, "<a name="line.154"></a>
+<span class="sourceLineNo">155</span>              + "suffix heap size={}," + "new segment heap size={}"<a name="line.155"></a>
+<span class="sourceLineNo">156</span>              + "suffix off heap size={}," + "new segment off heap size={}"<a name="line.156"></a>
+<span class="sourceLineNo">157</span>          , suffixDataSize<a name="line.157"></a>
+<span class="sourceLineNo">158</span>          , newDataSize<a name="line.158"></a>
+<span class="sourceLineNo">159</span>          , suffixHeapSize<a name="line.159"></a>
+<span class="sourceLineNo">160</span>          , newHeapSize<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          , suffixOffHeapSize<a name="line.161"></a>
+<span class="sourceLineNo">162</span>          , newOffHeapSize);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    }<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    return true;<a name="line.164"></a>
+<span class="sourceLineNo">165</span>  }<a name="line.165"></a>
+<span class="sourceLineNo">166</span><a name="line.166"></a>
+<span class="sourceLineNo">167</span>  private static long getSegmentsHeapSize(List&lt;? extends Segment&gt; list) {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    long res = 0;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    for (Segment segment : list) {<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      res += segment.getHeapSize();<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    return res;<a name="line.172"></a>
+<span class="sourceLineNo">173</span>  }<a name="line.173"></a>
+<span class="sourceLineNo">174</span><a name="line.174"></a>
+<span class="sourceLineNo">175</span>  private static long getSegmentsOffHeapSize(List&lt;? extends Segment&gt; list) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    long res = 0;<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    for (Segment segment : list) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      res += segment.getOffHeapSize();<a name="line.178"></a>
+<span class="sourceLineNo">179</span>    }<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    return res;<a name="line.180"></a>
+<span class="sourceLineNo">181</span>  }<a name="line.181"></a>
+<span class="sourceLineNo">182</span><a name="line.182"></a>
+<span class="sourceLineNo">183</span>  private static long getSegmentsKeySize(List&lt;? extends Segment&gt; list) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>    long res = 0;<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    for (Segment segment : list) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      res += segment.getDataSize();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>    }<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    return res;<a name="line.188"></a>
+<span class="sourceLineNo">189</span>  }<a name="line.189"></a>
+<span class="sourceLineNo">190</span><a name="line.190"></a>
+<span class="sourceLineNo">191</span>  /**<a name="line.191"></a>
+<span class="sourceLineNo">192</span>   * If the caller holds the current version, go over the the pipeline and try to flatten each<a name="line.192"></a>
+<span class="sourceLineNo">193</span>   * segment. Flattening is replacing the ConcurrentSkipListMap based CellSet to CellArrayMap based.<a name="line.193"></a>
+<span class="sourceLineNo">194</span>   * Flattening of the segment that initially is not based on ConcurrentSkipListMap has no effect.<a name="line.194"></a>
+<span class="sourceLineNo">195</span>   * Return after one segment is successfully flatten.<a name="line.195"></a>
+<span class="sourceLineNo">196</span>   *<a name="line.196"></a>
+<span class="sourceLineNo">197</span>   * @return true iff a segment was successfully flattened<a name="line.197"></a>
+<span class="sourceLineNo">198</span>   */<a name="line.198"></a>
+<span class="sourceLineNo">199</span>  public boolean flattenOneSegment(long requesterVersion,<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      CompactingMemStore.IndexType idxType,<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      MemStoreCompactionStrategy.Action action) {<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>    if(requesterVersion != version) {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      LOG.warn("Segment flattening failed, because versions do not match. Requester version: "<a name="line.204"></a>
+<span class="sourceLineNo">205</span>          + requesterVersion + ", actual version: " + version);<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      return false;<a name="line.206"></a>
+<span class="sourceLineNo">207</span>    }<a name="line.207"></a>
+<span class="sourceLineNo">208</span><a name="line.208"></a>
+<span class="sourceLineNo">209</span>    synchronized (pipeline){<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      if(requesterVersion != version) {<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        LOG.warn("Segment flattening failed, because versions do not match");<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        return false;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      }<a name="line.213"></a>
+<span class="sourceLineNo">214</span>      int i = 0;<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      for (ImmutableSegment s : pipeline) {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>        if ( s.canBeFlattened() ) {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>          // size to be updated<a name="line.217"></a>
+<span class="sourceLineNo">218</span>          MemStoreSizing newMemstoreAccounting = new NonThreadSafeMemStoreSizing();<a name="line.218"></a>
+<span class="sourceLineNo">219</span>          ImmutableSegment newS = SegmentFactory.instance().createImmutableSegmentByFlattening(<a name="line.219"></a>
+<span class="sourceLineNo">220</span>              (CSLMImmutableSegment)s,idxType,newMemstoreAccounting,action);<a name="line.220"></a>
+<span class="sourceLineNo">221</span>          replaceAtIndex(i,newS);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>          if(region != null) {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>            // Update the global memstore size counter upon flattening there is no change in the<a name="line.223"></a>
+<span class="sourceLineNo">224</span>            // data size<a name="line.224"></a>
+<span class="sourceLineNo">225</span>            MemStoreSize mss = newMemstoreAccounting.getMemStoreSize();<a name="line.225"></a>
+<span class="sourceLineNo">226</span>            Preconditions.checkArgument(mss.getDataSize() == 0, "Not zero!");<a name="line.226"></a>
+<span class="sourceLineNo">227</span>            region.addMemStoreSize(mss.getDataSize(), mss.getHeapSize(), mss.getOffHeapSize());<a name="line.227"></a>
+<span class="sourceLineNo">228</span>          }<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          LOG.debug("Compaction pipeline segment {} flattened", s);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>          return true;<a name="line.230"></a>
+<span class="sourceLineNo">231</span>        }<a name="line.231"></a>
+<span class="sourceLineNo">232</span>        i++;<a name="line.232"></a>
+<span class="sourceLineNo">233</span>      }<a name="line.233"></a>
+<span class="sourceLineNo">234</span><a name="line.234"></a>
+<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    // do not update the global memstore size counter and do not increase the version,<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    // because all the cells remain in place<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    return false;<a name="line.238"></a>
+<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
+<span class="sourceLineNo">240</span><a name="line.240"></a>
+<span class="sourceLineNo">241</span>  public boolean isEmpty() {<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    return readOnlyCopy.isEmpty();<a name="line.242"></a>
+<span class="sourceLineNo">243</span>  }<a name="line.243"></a>
+<span class="sourceLineNo">244</span><a name="line.244"></a>
+<span class="sourceLineNo">245</span>  public List&lt;? extends Segment&gt; getSegments() {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    return readOnlyCopy;<a name="line.246"></a>
+<span class="sourceLineNo">247</span>  }<a name="line.247"></a>
+<span class="sourceLineNo">248</span><a name="line.248"></a>
+<span class="sourceLineNo">249</span>  public long size() {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    return readOnlyCopy.size();<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  }<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>  public long getMinSequenceId() {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    long minSequenceId = Long.MAX_VALUE;<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    if (!localCopy.isEmpty()) {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      minSequenceId = localCopy.getLast().getMinSequenceId();<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    }<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    return minSequenceId;<a name="line.259"></a>
+<span class="sourceLineNo">260</span>  }<a name="line.260"></a>
+<span class="sourceLineNo">261</span><a name="line.261"></a>
+<span class="sourceLineNo">262</span>  public MemStoreSize getTailSize() {<a name="line.262"></a>
+<span class="sourceLineNo">263</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.263"></a>
+<span class="sourceLineNo">264</span>    return localCopy.isEmpty()? new MemStoreSize(): localCopy.peekLast().getMemStoreSize();<a name="line.264"></a>
+<span class="sourceLineNo">265</span>  }<a name="line.265"></a>
+<span class="sourceLineNo">266</span><a name="line.266"></a>
+<span class="sourceLineNo">267</span>  public MemStoreSize getPipelineSize() {<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    MemStoreSizing memStoreSizing = new NonThreadSafeMemStoreSizing();<a name="line.268"></a>
+<span class="sourceLineNo">269</span>    LinkedList&lt;? extends Segment&gt; localCopy = readOnlyCopy;<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    for (Segment segment : localCopy) {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      memStoreSizing.incMemStoreSize(segment.getMemStoreSize());<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    }<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    return memStoreSizing.getMemStoreSize();<a name="line.273"></a>
+<span class="sourceLineNo">274</span>  }<a name="line.274"></a>
+<span class="sourceLineNo">275</span><a name="line.275"></a>
+<span class="sourceLineNo">276</span>  private void swapSuffix(List&lt;? extends Segment&gt; suffix, ImmutableSegment segment,<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      boolean closeSegmentsInSuffix) {<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    pipeline.removeAll(suffix);<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    if(segment != null) pipeline.addLast(segment);<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    // During index merge we won't be closing the segments undergoing the merge. Segment#close()<a name="line.280"></a>
+<span class="sourceLineNo">281</span>    // will release the MSLAB chunks to pool. But in case of index merge there wont be any data copy<a name="line.281"></a>
+<span class="sourceLineNo">282</span>    // from old MSLABs. So the new cells in new segment also refers to same chunks. In case of data<a name="line.282"></a>
+<span class="sourceLineNo">283</span>    // compaction, we would have copied the cells data from old MSLAB chunks into a new chunk<a name="line.283"></a>
+<span class="sourceLineNo">284</span>    // created for the result segment. So we can release the chunks associated with the compacted<a name="line.284"></a>
+<span class="sourceLineNo">285</span>    // segments.<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    if (closeSegmentsInSuffix) {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      for (Segment itemInSuffix : suffix) {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        itemInSuffix.close();<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>    }<a name="line.290"></a>
+<span class="sourceLineNo">291</span>  }<a name="line.291"></a>
+<span class="sourceLineNo">292</span><a name="line.292"></a>
+<span class="sourceLineNo">293</span>  // replacing one segment in the pipeline with a new one exactly at the same index<a name="line.293"></a>
+<span class="sourceLineNo">294</span>  // need to be called only within synchronized block<a name="line.294"></a>
+<span class="sourceLineNo">295</span>  private void replaceAtIndex(int idx, ImmutableSegment newSegment) {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    pipeline.set(idx, newSegment);<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    readOnlyCopy = new LinkedList&lt;&gt;(pipeline);<a name="line.297"></a>
+<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>  public Segment getTail() {<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    List&lt;? extends Segment&gt; localCopy = getSegments();<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    if(localCopy.isEmpty()) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      return null;<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    }<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    return localCopy.get(localCopy.size() - 1);<a name="line.305"></a>
+<span class="sourceLineNo">306</span>  }<a name="line.306"></a>
+<span class="sourceLineNo">307</span><a name="line.307"></a>
+<span class="sourceLineNo">308</span>  private boolean addFirst(ImmutableSegment segment) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    pipeline.addFirst(segment);<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    return true;<a name="line.310"></a>
+<span class="sourceLineNo">311</span>  }<a name="line.311"></a>
+<span class="sourceLineNo">312</span><a name="line.312"></a>
+<span class="sourceLineNo">313</span>  // debug method<a name="line.313"></a>
+<span class="sourceLineNo">314</span>  private boolean validateSuffixList(LinkedList&lt;ImmutableSegment&gt; suffix) {<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    if(suffix.isEmpty()) {<a name="line.315"></a>
+<span class="sourceLineNo">316</span>      // empty suffix is always valid<a name="line.316"></a>
+<span class="sourceLineNo">317</span>      return true;<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    }<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    Iterator&lt;ImmutableSegment&gt; pipelineBackwardIterator = pipeline.descendingIterator();<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    Iterator&lt;ImmutableSegment&gt; suffixBackwardIterator = suffix.descendingIterator();<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    ImmutableSegment suffixCurrent;<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    ImmutableSegment pipelineCurrent;<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    for( ; suffixBackwardIterator.hasNext(); ) {<a name="line.323"></a>
+<span class="sourceLineNo">324</span>      if(!pipelineBackwardIterator.hasNext()) {<a name="line.324"></a>
+<span class="sourceLineNo">325</span>        // a suffix longer than pipeline is invalid<a name="line.325"></a>
+<span class="sourceLineNo">326</span>        return false;<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      }<a name="line.327"></a>
+<span class="sourceLineNo">328</span>      suffixCurrent = suffixBackwardIterator.next();<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      pipelineCurrent = pipelineBackwardIterator.next();<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      if(suffixCurrent != pipelineCurrent) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        // non-matching suffix<a name="line.331"></a>
+<span class="sourceLineNo">332</span>        return false;<a name="line.332"></a>
+<span class="sourceLineNo">333</span>      }<a name="line.333"></a>
+<span class="sourceLineNo">334</span>    }<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    // suffix matches pipeline suffix<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    return true;<a name="line.336"></a>
+<span class="sourceLineNo">337</span>  }<a name="line.337"></a>
+<span class="sourceLineNo">338</span><a name="line.338"></a>
+<span class="sourceLineNo">339</span>}<a name="line.339"></a>
 
 
 
