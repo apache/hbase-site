@@ -27632,7 +27632,165 @@ For performance consider the following general options:
 </div>
 </div>
 <div class="sect2">
-<h3 id="export"><a class="anchor" href="#export"></a>149.11. Export</h3>
+<h3 id="hashtable.synctable"><a class="anchor" href="#hashtable.synctable"></a>149.11. HashTable/SyncTable</h3>
+<div class="paragraph">
+<p>HashTable/SyncTable is a two steps tool for synchronizing table data, where each of the steps are implemented as MapReduce jobs.
+Similarly to CopyTable, it can be used for partial or entire table data syncing, under same or remote cluster.
+However, it performs the sync in a more efficient way than CopyTable. Instead of copying all cells
+in specified row key/time period range, HashTable (the first step) creates hashed indexes for batch of cells on source table and output those as results.
+On the next stage, SyncTable scans the source table and now calculates hash indexes for table cells,
+compares these hashes with the outputs of HashTable, then it just scans (and compares) cells for diverging hashes, only updating
+mismatching cells. This results in less network traffic/data transfers, which can be impacting when syncing large tables on remote clusters.</p>
+</div>
+<div class="sect3">
+<h4 id="_step_1_hashtable"><a class="anchor" href="#_step_1_hashtable"></a>149.11.1. Step 1, HashTable</h4>
+<div class="paragraph">
+<p>First, run HashTable on the source table cluster (this is the table whose state will be copied to its counterpart).</p>
+</div>
+<div class="paragraph">
+<p>Usage:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre>$ ./bin/hbase org.apache.hadoop.hbase.mapreduce.HashTable --help
+Usage: HashTable [options] &lt;tablename&gt; &lt;outputpath&gt;
+
+Options:
+ batchsize     the target amount of bytes to hash in each batch
+               rows are added to the batch until this size is reached
+               (defaults to 8000 bytes)
+ numhashfiles  the number of hash files to create
+               if set to fewer than number of regions then
+               the job will create this number of reducers
+               (defaults to 1/100 of regions -- at least 1)
+ startrow      the start row
+ stoprow       the stop row
+ starttime     beginning of the time range (unixtime in millis)
+               without endtime means from starttime to forever
+ endtime       end of the time range.  Ignored if no starttime specified.
+ scanbatch     scanner batch size to support intra row scans
+ versions      number of cell versions to include
+ families      comma-separated list of families to include
+
+Args:
+ tablename     Name of the table to hash
+ outputpath    Filesystem path to put the output data
+
+Examples:
+ To hash 'TestTable' in 32kB batches for a 1 hour window into 50 files:
+ $ bin/hbase org.apache.hadoop.hbase.mapreduce.HashTable --batchsize=32000 --numhashfiles=50 --starttime=1265875194289 --endtime=1265878794289 --families=cf2,cf3 TestTable /hashes/testTable</pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <strong>batchsize</strong> property defines how much cell data for a given region will be hashed together in a single hash value.
+Sizing this properly has a direct impact on the sync efficiency, as it may lead to less scans executed by mapper tasks
+of SyncTable (the next step in the process). The rule of thumb is that, the smaller the number of cells out of sync
+(lower probability of finding a diff), larger batch size values can be determined.</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_step_2_synctable"><a class="anchor" href="#_step_2_synctable"></a>149.11.2. Step 2, SyncTable</h4>
+<div class="paragraph">
+<p>Once HashTable has completed on source cluster, SyncTable can be ran on target cluster.
+Just like replication and other synchronization jobs, it requires that all RegionServers/DataNodes
+on source cluster be accessible by NodeManagers on the target cluster (where SyncTable job tasks will be running).</p>
+</div>
+<div class="paragraph">
+<p>Usage:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre>$ ./bin/hbase org.apache.hadoop.hbase.mapreduce.SyncTable --help
+Usage: SyncTable [options] &lt;sourcehashdir&gt; &lt;sourcetable&gt; &lt;targettable&gt;
+
+Options:
+ sourcezkcluster  ZK cluster key of the source table
+                  (defaults to cluster in classpath's config)
+ targetzkcluster  ZK cluster key of the target table
+                  (defaults to cluster in classpath's config)
+ dryrun           if true, output counters but no writes
+                  (defaults to false)
+ doDeletes        if false, does not perform deletes
+                  (defaults to true)
+ doPuts           if false, does not perform puts
+                  (defaults to true)
+
+Args:
+ sourcehashdir    path to HashTable output dir for source table
+                  (see org.apache.hadoop.hbase.mapreduce.HashTable)
+ sourcetable      Name of the source table to sync from
+ targettable      Name of the target table to sync to
+
+Examples:
+ For a dry run SyncTable of tableA from a remote source cluster
+ to a local target cluster:
+ $ bin/hbase org.apache.hadoop.hbase.mapreduce.SyncTable --dryrun=true --sourcezkcluster=zk1.example.com,zk2.example.com,zk3.example.com:2181:/hbase hdfs://nn:9000/hashes/tableA tableA tableA</pre>
+</div>
+</div>
+<div class="paragraph">
+<p>The <strong>dryrun</strong> option is useful when a read only, diff report is wanted, as it will produce only COUNTERS indicating the differences, but will not perform
+any actual changes. It can be used as an alternative to VerifyReplication tool.</p>
+</div>
+<div class="paragraph">
+<p>By default, SyncTable will cause target table to become an exact copy of source table (at least, for the specified startrow/stoprow or/and starttime/endtime).</p>
+</div>
+<div class="paragraph">
+<p>Setting doDeletes to false modifies default behaviour to not delete target cells that are missing on source.
+Similarly, setting doPuts to false modifies default behaviour to not add missing cells on target. Setting both doDeletes
+and doPuts to false would give same effect as setting dryrun to true.</p>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+<div class="title">Set doDeletes to false on Two-Way Replication scenarios</div>
+<div class="paragraph">
+<p>On Two-Way Replication or other scenarios where both source and target clusters can have data ingested, it&#8217;s advisable to always set doDeletes option to false,
+as any additional cell inserted on SyncTable target cluster and not yet replicated to source would be deleted, and potentially lost permanently.</p>
+</div>
+</td>
+</tr>
+</table>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+<div class="title">Set sourcezkcluster to the actual source cluster ZK quorum</div>
+<div class="paragraph">
+<p>Although not required, if sourcezkcluster is not set, SyncTable will connect to local HBase cluster for both source and target,
+which does not give any meaningful result.</p>
+</div>
+</td>
+</tr>
+</table>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<i class="fa icon-note" title="Note"></i>
+</td>
+<td class="content">
+<div class="title">Remote Clusters on different Kerberos Realms</div>
+<div class="paragraph">
+<p>Currently, SyncTable can&#8217;t be ran for remote clusters on different Kerberos realms.
+There&#8217;s some work in progress to resolve this on <a href="https://jira.apache.org/jira/browse/HBASE-20586">HBASE-20586</a></p>
+</div>
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect2">
+<h3 id="export"><a class="anchor" href="#export"></a>149.12. Export</h3>
 <div class="paragraph">
 <p>Export is a utility that will dump the contents of table to HDFS in a sequence file.
 The Export can be run via a Coprocessor Endpoint or MapReduce. Invoke via:</p>
@@ -27748,7 +27906,7 @@ specifying column families and applying filters during the export.
 </div>
 </div>
 <div class="sect2">
-<h3 id="import"><a class="anchor" href="#import"></a>149.12. Import</h3>
+<h3 id="import"><a class="anchor" href="#import"></a>149.13. Import</h3>
 <div class="paragraph">
 <p>Import is a utility that will load data that has been exported back into HBase.
 Invoke via:</p>
@@ -27780,7 +27938,7 @@ To see usage instructions, run the command with no options.
 </div>
 </div>
 <div class="sect2">
-<h3 id="importtsv"><a class="anchor" href="#importtsv"></a>149.13. ImportTsv</h3>
+<h3 id="importtsv"><a class="anchor" href="#importtsv"></a>149.14. ImportTsv</h3>
 <div class="paragraph">
 <p>ImportTsv is a utility that will load data in TSV format into HBase.
 It has two distinct usages: loading data from TSV format in HDFS into HBase via Puts, and preparing StoreFiles to be loaded via the <code>completebulkload</code>.</p>
@@ -27805,7 +27963,7 @@ It has two distinct usages: loading data from TSV format in HDFS into HBase via 
 <p>These generated StoreFiles can be loaded into HBase via <a href="#completebulkload">completebulkload</a>.</p>
 </div>
 <div class="sect3">
-<h4 id="importtsv.options"><a class="anchor" href="#importtsv.options"></a>149.13.1. ImportTsv Options</h4>
+<h4 id="importtsv.options"><a class="anchor" href="#importtsv.options"></a>149.14.1. ImportTsv Options</h4>
 <div class="paragraph">
 <p>Running <code>ImportTsv</code> with no arguments prints brief usage information:</p>
 </div>
@@ -27837,7 +27995,7 @@ Other options that may be specified with -D include:
 </div>
 </div>
 <div class="sect3">
-<h4 id="importtsv.example"><a class="anchor" href="#importtsv.example"></a>149.13.2. ImportTsv Example</h4>
+<h4 id="importtsv.example"><a class="anchor" href="#importtsv.example"></a>149.14.2. ImportTsv Example</h4>
 <div class="paragraph">
 <p>For example, assume that we are loading data into a table called 'datatsv' with a ColumnFamily called 'd' with two columns "c1" and "c2".</p>
 </div>
@@ -27872,20 +28030,20 @@ The second and third columns in the file will be imported as "d:c1" and "d:c2", 
 </div>
 </div>
 <div class="sect3">
-<h4 id="importtsv.warning"><a class="anchor" href="#importtsv.warning"></a>149.13.3. ImportTsv Warning</h4>
+<h4 id="importtsv.warning"><a class="anchor" href="#importtsv.warning"></a>149.14.3. ImportTsv Warning</h4>
 <div class="paragraph">
 <p>If you have preparing a lot of data for bulk loading, make sure the target HBase table is pre-split appropriately.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="importtsv.also"><a class="anchor" href="#importtsv.also"></a>149.13.4. See Also</h4>
+<h4 id="importtsv.also"><a class="anchor" href="#importtsv.also"></a>149.14.4. See Also</h4>
 <div class="paragraph">
 <p>For more information about bulk-loading HFiles into HBase, see <a href="#arch.bulk.load">arch.bulk.load</a></p>
 </div>
 </div>
 </div>
 <div class="sect2">
-<h3 id="completebulkload"><a class="anchor" href="#completebulkload"></a>149.14. CompleteBulkLoad</h3>
+<h3 id="completebulkload"><a class="anchor" href="#completebulkload"></a>149.15. CompleteBulkLoad</h3>
 <div class="paragraph">
 <p>The <code>completebulkload</code> utility will move generated StoreFiles into an HBase table.
 This utility is often used in conjunction with output from <a href="#importtsv">importtsv</a>.</p>
@@ -27906,7 +28064,7 @@ This utility is often used in conjunction with output from <a href="#importtsv">
 </div>
 </div>
 <div class="sect3">
-<h4 id="completebulkload.warning"><a class="anchor" href="#completebulkload.warning"></a>149.14.1. CompleteBulkLoad Warning</h4>
+<h4 id="completebulkload.warning"><a class="anchor" href="#completebulkload.warning"></a>149.15.1. CompleteBulkLoad Warning</h4>
 <div class="paragraph">
 <p>Data generated via MapReduce is often created with file permissions that are not compatible with the running HBase process.
 Assuming you&#8217;re running HDFS with permissions enabled, those permissions will need to be updated before you run CompleteBulkLoad.</p>
@@ -27917,7 +28075,7 @@ Assuming you&#8217;re running HDFS with permissions enabled, those permissions w
 </div>
 </div>
 <div class="sect2">
-<h3 id="walplayer"><a class="anchor" href="#walplayer"></a>149.15. WALPlayer</h3>
+<h3 id="walplayer"><a class="anchor" href="#walplayer"></a>149.16. WALPlayer</h3>
 <div class="paragraph">
 <p>WALPlayer is a utility to replay WAL files into HBase.</p>
 </div>
@@ -27949,7 +28107,7 @@ The output can optionally be mapped to another set of tables.</p>
 To NOT run WALPlayer as a mapreduce job on your cluster, force it to run all in the local process by adding the flags <code>-Dmapreduce.jobtracker.address=local</code> on the command line.</p>
 </div>
 <div class="sect3">
-<h4 id="walplayer.options"><a class="anchor" href="#walplayer.options"></a>149.15.1. WALPlayer Options</h4>
+<h4 id="walplayer.options"><a class="anchor" href="#walplayer.options"></a>149.16.1. WALPlayer Options</h4>
 <div class="paragraph">
 <p>Running <code>WALPlayer</code> with no arguments prints brief usage information:</p>
 </div>
@@ -27986,7 +28144,7 @@ For performance also consider the following options:
 </div>
 </div>
 <div class="sect2">
-<h3 id="rowcounter"><a class="anchor" href="#rowcounter"></a>149.16. RowCounter</h3>
+<h3 id="rowcounter"><a class="anchor" href="#rowcounter"></a>149.17. RowCounter</h3>
 <div class="paragraph">
 <p><a href="https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/mapreduce/RowCounter.html">RowCounter</a> is a mapreduce job to count all the rows of a table.
 This is a good utility to use as a sanity check to ensure that HBase can read all the blocks of a table if there are any concerns of metadata inconsistency.
@@ -28007,7 +28165,7 @@ The scanned data can be limited based on keys using the <code>--range=[startKey]
 </div>
 </div>
 <div class="sect2">
-<h3 id="cellcounter"><a class="anchor" href="#cellcounter"></a>149.17. CellCounter</h3>
+<h3 id="cellcounter"><a class="anchor" href="#cellcounter"></a>149.18. CellCounter</h3>
 <div class="paragraph">
 <p>HBase ships another diagnostic mapreduce job called <a href="https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/mapreduce/CellCounter.html">CellCounter</a>.
 Like RowCounter, it gathers more fine-grained statistics about your table.
@@ -28053,14 +28211,14 @@ Specify a time range to scan the table by using the <code>--starttime=&lt;startt
 </div>
 </div>
 <div class="sect2">
-<h3 id="_mlockall"><a class="anchor" href="#_mlockall"></a>149.18. mlockall</h3>
+<h3 id="_mlockall"><a class="anchor" href="#_mlockall"></a>149.19. mlockall</h3>
 <div class="paragraph">
 <p>It is possible to optionally pin your servers in physical memory making them less likely to be swapped out in oversubscribed environments by having the servers call <a href="http://linux.die.net/man/2/mlockall">mlockall</a> on startup.
 See <a href="https://issues.apache.org/jira/browse/HBASE-4391">HBASE-4391 Add ability to start RS as root and call mlockall</a> for how to build the optional library and have it run on startup.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="compaction.tool"><a class="anchor" href="#compaction.tool"></a>149.19. Offline Compaction Tool</h3>
+<h3 id="compaction.tool"><a class="anchor" href="#compaction.tool"></a>149.20. Offline Compaction Tool</h3>
 <div class="paragraph">
 <p>See the usage for the
 <a href="https://hbase.apache.org/devapidocs/org/apache/hadoop/hbase/regionserver/CompactionTool.html">CompactionTool</a>.
@@ -28073,7 +28231,7 @@ Run it like:</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="__code_hbase_clean_code"><a class="anchor" href="#__code_hbase_clean_code"></a>149.20. <code>hbase clean</code></h3>
+<h3 id="__code_hbase_clean_code"><a class="anchor" href="#__code_hbase_clean_code"></a>149.21. <code>hbase clean</code></h3>
 <div class="paragraph">
 <p>The <code>hbase clean</code> command cleans HBase data from ZooKeeper, HDFS, or both.
 It is appropriate to use for testing.
@@ -28092,7 +28250,7 @@ Options:
 </div>
 </div>
 <div class="sect2">
-<h3 id="__code_hbase_pe_code"><a class="anchor" href="#__code_hbase_pe_code"></a>149.21. <code>hbase pe</code></h3>
+<h3 id="__code_hbase_pe_code"><a class="anchor" href="#__code_hbase_pe_code"></a>149.22. <code>hbase pe</code></h3>
 <div class="paragraph">
 <p>The <code>hbase pe</code> command runs the PerformanceEvaluation tool, which is used for testing.</p>
 </div>
@@ -28105,7 +28263,7 @@ For usage instructions, run the command with no options.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="__code_hbase_ltt_code"><a class="anchor" href="#__code_hbase_ltt_code"></a>149.22. <code>hbase ltt</code></h3>
+<h3 id="__code_hbase_ltt_code"><a class="anchor" href="#__code_hbase_ltt_code"></a>149.23. <code>hbase ltt</code></h3>
 <div class="paragraph">
 <p>The <code>hbase ltt</code> command runs the LoadTestTool utility, which is used for testing.</p>
 </div>
@@ -28118,7 +28276,7 @@ For general usage instructions, pass the <code>-h</code> option.</p>
 </div>
 </div>
 <div class="sect2">
-<h3 id="ops.pre-upgrade"><a class="anchor" href="#ops.pre-upgrade"></a>149.23. Pre-Upgrade validator</h3>
+<h3 id="ops.pre-upgrade"><a class="anchor" href="#ops.pre-upgrade"></a>149.24. Pre-Upgrade validator</h3>
 <div class="paragraph">
 <p>Pre-Upgrade validator tool can be used to check the cluster for known incompatibilities before upgrading from HBase 1 to HBase 2.</p>
 </div>
@@ -28128,7 +28286,7 @@ For general usage instructions, pass the <code>-h</code> option.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_coprocessor_validation"><a class="anchor" href="#_coprocessor_validation"></a>149.23.1. Coprocessor validation</h4>
+<h4 id="_coprocessor_validation"><a class="anchor" href="#_coprocessor_validation"></a>149.24.1. Coprocessor validation</h4>
 <div class="paragraph">
 <p>HBase supports co-processors for a long time, but the co-processor API can be changed between major releases. Co-processor validator tries to determine
 whether the old co-processors are still compatible with the actual HBase version.</p>
@@ -28179,7 +28337,7 @@ for warnings.</p>
 </div>
 </div>
 <div class="sect3">
-<h4 id="_datablockencoding_validation"><a class="anchor" href="#_datablockencoding_validation"></a>149.23.2. DataBlockEncoding validation</h4>
+<h4 id="_datablockencoding_validation"><a class="anchor" href="#_datablockencoding_validation"></a>149.24.2. DataBlockEncoding validation</h4>
 <div class="paragraph">
 <p>HBase 2.0 removed <code>PREFIX_TREE</code> Data Block Encoding from column families. For further information
 please check <a href="#upgrade2.0.prefix-tree.removed"><em>prefix-tree</em> encoding removed</a>.
@@ -28211,7 +28369,7 @@ To verify that none of the column families are using incompatible Data Block Enc
 </div>
 </div>
 <div class="sect3">
-<h4 id="_hfile_content_validation"><a class="anchor" href="#_hfile_content_validation"></a>149.23.3. HFile Content validation</h4>
+<h4 id="_hfile_content_validation"><a class="anchor" href="#_hfile_content_validation"></a>149.24.3. HFile Content validation</h4>
 <div class="paragraph">
 <p>Even though Data Block Encoding is changed from <code>PREFIX_TREE</code> it is still possible to have HFiles that contain data encoded that way.
 To verify that HFiles are readable with HBase 2 please use <em>HFile content validator</em>.</p>
@@ -28312,7 +28470,7 @@ drop_namespace 'pre_upgrade_cleanup'</pre>
 </div>
 </div>
 <div class="sect2">
-<h3 id="_data_block_encoding_tool"><a class="anchor" href="#_data_block_encoding_tool"></a>149.24. Data Block Encoding Tool</h3>
+<h3 id="_data_block_encoding_tool"><a class="anchor" href="#_data_block_encoding_tool"></a>149.25. Data Block Encoding Tool</h3>
 <div class="paragraph">
 <p>Tests various compression algorithms with different data block encoder for key compression on an existing HFile.
 Useful for testing, debugging and benchmarking.</p>
@@ -41114,7 +41272,7 @@ org/apache/hadoop/hbase/security/access/AccessControlClient.revoke:(Lorg/apache/
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-SNAPSHOT<br>
-Last updated 2018-11-06 14:33:18 UTC
+Last updated 2018-11-07 14:33:07 UTC
 </div>
 </div>
 </body>
