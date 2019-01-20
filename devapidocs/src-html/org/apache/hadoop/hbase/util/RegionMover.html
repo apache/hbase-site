@@ -53,746 +53,750 @@
 <span class="sourceLineNo">045</span>import java.util.concurrent.TimeUnit;<a name="line.45"></a>
 <span class="sourceLineNo">046</span>import java.util.concurrent.TimeoutException;<a name="line.46"></a>
 <span class="sourceLineNo">047</span>import java.util.function.Predicate;<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.commons.io.IOUtils;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.conf.Configuration;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.ClusterMetrics.Option;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.HBaseConfiguration;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.HConstants;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.MetaTableAccessor;<a name="line.54"></a>
-<span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.ServerName;<a name="line.55"></a>
-<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.client.Admin;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.client.Connection;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.client.ConnectionFactory;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>import org.apache.hadoop.hbase.client.ResultScanner;<a name="line.60"></a>
-<span class="sourceLineNo">061</span>import org.apache.hadoop.hbase.client.Scan;<a name="line.61"></a>
-<span class="sourceLineNo">062</span>import org.apache.hadoop.hbase.client.Table;<a name="line.62"></a>
-<span class="sourceLineNo">063</span>import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.64"></a>
-<span class="sourceLineNo">065</span>import org.slf4j.Logger;<a name="line.65"></a>
-<span class="sourceLineNo">066</span>import org.slf4j.LoggerFactory;<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>import org.apache.hbase.thirdparty.org.apache.commons.cli.CommandLine;<a name="line.69"></a>
-<span class="sourceLineNo">070</span><a name="line.70"></a>
-<span class="sourceLineNo">071</span>/**<a name="line.71"></a>
-<span class="sourceLineNo">072</span> * Tool for loading/unloading regions to/from given regionserver This tool can be run from Command<a name="line.72"></a>
-<span class="sourceLineNo">073</span> * line directly as a utility. Supports Ack/No Ack mode for loading/unloading operations.Ack mode<a name="line.73"></a>
-<span class="sourceLineNo">074</span> * acknowledges if regions are online after movement while noAck mode is best effort mode that<a name="line.74"></a>
-<span class="sourceLineNo">075</span> * improves performance but will still move on if region is stuck/not moved. Motivation behind noAck<a name="line.75"></a>
-<span class="sourceLineNo">076</span> * mode being RS shutdown where even if a Region is stuck, upon shutdown master will move it<a name="line.76"></a>
-<span class="sourceLineNo">077</span> * anyways. This can also be used by constructiong an Object using the builder and then calling<a name="line.77"></a>
-<span class="sourceLineNo">078</span> * {@link #load()} or {@link #unload()} methods for the desired operations.<a name="line.78"></a>
-<span class="sourceLineNo">079</span> */<a name="line.79"></a>
-<span class="sourceLineNo">080</span>@InterfaceAudience.Public<a name="line.80"></a>
-<span class="sourceLineNo">081</span>public class RegionMover extends AbstractHBaseTool implements Closeable {<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  public static final String MOVE_RETRIES_MAX_KEY = "hbase.move.retries.max";<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  public static final String MOVE_WAIT_MAX_KEY = "hbase.move.wait.max";<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  public static final String SERVERSTART_WAIT_MAX_KEY = "hbase.serverstart.wait.max";<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  public static final int DEFAULT_MOVE_RETRIES_MAX = 5;<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  public static final int DEFAULT_MOVE_WAIT_MAX = 60;<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  public static final int DEFAULT_SERVERSTART_WAIT_MAX = 180;<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  static final Logger LOG = LoggerFactory.getLogger(RegionMover.class);<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  private RegionMoverBuilder rmbuilder;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  private boolean ack = true;<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  private int maxthreads = 1;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  private int timeout;<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  private String loadUnload;<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  private String hostname;<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  private String filename;<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  private String excludeFile;<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  private int port;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  private Connection conn;<a name="line.98"></a>
-<span class="sourceLineNo">099</span>  private Admin admin;<a name="line.99"></a>
-<span class="sourceLineNo">100</span><a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private RegionMover(RegionMoverBuilder builder) throws IOException {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    this.hostname = builder.hostname;<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    this.filename = builder.filename;<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    this.excludeFile = builder.excludeFile;<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    this.maxthreads = builder.maxthreads;<a name="line.105"></a>
-<span class="sourceLineNo">106</span>    this.ack = builder.ack;<a name="line.106"></a>
-<span class="sourceLineNo">107</span>    this.port = builder.port;<a name="line.107"></a>
-<span class="sourceLineNo">108</span>    this.timeout = builder.timeout;<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    setConf(builder.conf);<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    this.conn = ConnectionFactory.createConnection(conf);<a name="line.110"></a>
-<span class="sourceLineNo">111</span>    this.admin = conn.getAdmin();<a name="line.111"></a>
-<span class="sourceLineNo">112</span>  }<a name="line.112"></a>
-<span class="sourceLineNo">113</span><a name="line.113"></a>
-<span class="sourceLineNo">114</span>  private RegionMover() {<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  }<a name="line.115"></a>
-<span class="sourceLineNo">116</span><a name="line.116"></a>
-<span class="sourceLineNo">117</span>  @Override<a name="line.117"></a>
-<span class="sourceLineNo">118</span>  public void close() {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    IOUtils.closeQuietly(this.admin);<a name="line.119"></a>
-<span class="sourceLineNo">120</span>    IOUtils.closeQuietly(this.conn);<a name="line.120"></a>
-<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
-<span class="sourceLineNo">122</span><a name="line.122"></a>
-<span class="sourceLineNo">123</span>  /**<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   * Builder for Region mover. Use the {@link #build()} method to create RegionMover object. Has<a name="line.124"></a>
-<span class="sourceLineNo">125</span>   * {@link #filename(String)}, {@link #excludeFile(String)}, {@link #maxthreads(int)},<a name="line.125"></a>
-<span class="sourceLineNo">126</span>   * {@link #ack(boolean)}, {@link #timeout(int)} methods to set the corresponding options<a name="line.126"></a>
-<span class="sourceLineNo">127</span>   */<a name="line.127"></a>
-<span class="sourceLineNo">128</span>  public static class RegionMoverBuilder {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    private boolean ack = true;<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    private int maxthreads = 1;<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    private int timeout = Integer.MAX_VALUE;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    private String hostname;<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    private String filename;<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    private String excludeFile = null;<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    private String defaultDir = System.getProperty("java.io.tmpdir");<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    @VisibleForTesting<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    final int port;<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    private final Configuration conf;<a name="line.138"></a>
-<span class="sourceLineNo">139</span><a name="line.139"></a>
-<span class="sourceLineNo">140</span>    public RegionMoverBuilder(String hostname) {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      this(hostname, createConf());<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    }<a name="line.142"></a>
-<span class="sourceLineNo">143</span><a name="line.143"></a>
-<span class="sourceLineNo">144</span>    /**<a name="line.144"></a>
-<span class="sourceLineNo">145</span>     * Creates a new configuration and sets region mover specific overrides<a name="line.145"></a>
-<span class="sourceLineNo">146</span>     */<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    private static Configuration createConf() {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      Configuration conf = HBaseConfiguration.create();<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      conf.setInt("hbase.client.prefetch.limit", 1);<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      conf.setInt("hbase.client.pause", 500);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      conf.setInt("hbase.client.retries.number", 100);<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      return conf;<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    }<a name="line.153"></a>
-<span class="sourceLineNo">154</span><a name="line.154"></a>
-<span class="sourceLineNo">155</span>    /**<a name="line.155"></a>
-<span class="sourceLineNo">156</span>     * @param hostname Hostname to unload regions from or load regions to. Can be either hostname<a name="line.156"></a>
-<span class="sourceLineNo">157</span>     *     or hostname:port.<a name="line.157"></a>
-<span class="sourceLineNo">158</span>     * @param conf Configuration object<a name="line.158"></a>
-<span class="sourceLineNo">159</span>     */<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    public RegionMoverBuilder(String hostname, Configuration conf) {<a name="line.160"></a>
-<span class="sourceLineNo">161</span>      String[] splitHostname = hostname.toLowerCase().split(":");<a name="line.161"></a>
-<span class="sourceLineNo">162</span>      this.hostname = splitHostname[0];<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      if (splitHostname.length == 2) {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>        this.port = Integer.parseInt(splitHostname[1]);<a name="line.164"></a>
-<span class="sourceLineNo">165</span>      } else {<a name="line.165"></a>
-<span class="sourceLineNo">166</span>        this.port = conf.getInt(HConstants.REGIONSERVER_PORT, HConstants.DEFAULT_REGIONSERVER_PORT);<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      }<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      this.filename = defaultDir + File.separator + System.getProperty("user.name") + this.hostname<a name="line.168"></a>
-<span class="sourceLineNo">169</span>        + ":" + Integer.toString(this.port);<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      this.conf = conf;<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
-<span class="sourceLineNo">172</span><a name="line.172"></a>
-<span class="sourceLineNo">173</span>    /**<a name="line.173"></a>
-<span class="sourceLineNo">174</span>     * Path of file where regions will be written to during unloading/read from during loading<a name="line.174"></a>
-<span class="sourceLineNo">175</span>     * @param filename<a name="line.175"></a>
-<span class="sourceLineNo">176</span>     * @return RegionMoverBuilder object<a name="line.176"></a>
-<span class="sourceLineNo">177</span>     */<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    public RegionMoverBuilder filename(String filename) {<a name="line.178"></a>
-<span class="sourceLineNo">179</span>      this.filename = filename;<a name="line.179"></a>
-<span class="sourceLineNo">180</span>      return this;<a name="line.180"></a>
-<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
-<span class="sourceLineNo">182</span><a name="line.182"></a>
-<span class="sourceLineNo">183</span>    /**<a name="line.183"></a>
-<span class="sourceLineNo">184</span>     * Set the max number of threads that will be used to move regions<a name="line.184"></a>
-<span class="sourceLineNo">185</span>     */<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    public RegionMoverBuilder maxthreads(int threads) {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>      this.maxthreads = threads;<a name="line.187"></a>
-<span class="sourceLineNo">188</span>      return this;<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    }<a name="line.189"></a>
-<span class="sourceLineNo">190</span><a name="line.190"></a>
-<span class="sourceLineNo">191</span>    /**<a name="line.191"></a>
-<span class="sourceLineNo">192</span>     * Path of file containing hostnames to be excluded during region movement. Exclude file should<a name="line.192"></a>
-<span class="sourceLineNo">193</span>     * have 'host:port' per line. Port is mandatory here as we can have many RS running on a single<a name="line.193"></a>
-<span class="sourceLineNo">194</span>     * host.<a name="line.194"></a>
-<span class="sourceLineNo">195</span>     */<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    public RegionMoverBuilder excludeFile(String excludefile) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      this.excludeFile = excludefile;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      return this;<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
-<span class="sourceLineNo">200</span><a name="line.200"></a>
-<span class="sourceLineNo">201</span>    /**<a name="line.201"></a>
-<span class="sourceLineNo">202</span>     * Set ack/noAck mode.<a name="line.202"></a>
-<span class="sourceLineNo">203</span>     * &lt;p&gt;<a name="line.203"></a>
-<span class="sourceLineNo">204</span>     * In ack mode regions are acknowledged before and after moving and the move is retried<a name="line.204"></a>
-<span class="sourceLineNo">205</span>     * hbase.move.retries.max times, if unsuccessful we quit with exit code 1.No Ack mode is a best<a name="line.205"></a>
-<span class="sourceLineNo">206</span>     * effort mode,each region movement is tried once.This can be used during graceful shutdown as<a name="line.206"></a>
-<span class="sourceLineNo">207</span>     * even if we have a stuck region,upon shutdown it'll be reassigned anyway.<a name="line.207"></a>
-<span class="sourceLineNo">208</span>     * &lt;p&gt;<a name="line.208"></a>
-<span class="sourceLineNo">209</span>     * @param ack<a name="line.209"></a>
-<span class="sourceLineNo">210</span>     * @return RegionMoverBuilder object<a name="line.210"></a>
-<span class="sourceLineNo">211</span>     */<a name="line.211"></a>
-<span class="sourceLineNo">212</span>    public RegionMoverBuilder ack(boolean ack) {<a name="line.212"></a>
-<span class="sourceLineNo">213</span>      this.ack = ack;<a name="line.213"></a>
-<span class="sourceLineNo">214</span>      return this;<a name="line.214"></a>
-<span class="sourceLineNo">215</span>    }<a name="line.215"></a>
-<span class="sourceLineNo">216</span><a name="line.216"></a>
-<span class="sourceLineNo">217</span>    /**<a name="line.217"></a>
-<span class="sourceLineNo">218</span>     * Set the timeout for Load/Unload operation in seconds.This is a global timeout,threadpool for<a name="line.218"></a>
-<span class="sourceLineNo">219</span>     * movers also have a separate time which is hbase.move.wait.max * number of regions to<a name="line.219"></a>
-<span class="sourceLineNo">220</span>     * load/unload<a name="line.220"></a>
-<span class="sourceLineNo">221</span>     * @param timeout in seconds<a name="line.221"></a>
-<span class="sourceLineNo">222</span>     * @return RegionMoverBuilder object<a name="line.222"></a>
-<span class="sourceLineNo">223</span>     */<a name="line.223"></a>
-<span class="sourceLineNo">224</span>    public RegionMoverBuilder timeout(int timeout) {<a name="line.224"></a>
-<span class="sourceLineNo">225</span>      this.timeout = timeout;<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      return this;<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    }<a name="line.227"></a>
-<span class="sourceLineNo">228</span><a name="line.228"></a>
-<span class="sourceLineNo">229</span>    /**<a name="line.229"></a>
-<span class="sourceLineNo">230</span>     * This method builds the appropriate RegionMover object which can then be used to load/unload<a name="line.230"></a>
-<span class="sourceLineNo">231</span>     * using load and unload methods<a name="line.231"></a>
-<span class="sourceLineNo">232</span>     * @return RegionMover object<a name="line.232"></a>
-<span class="sourceLineNo">233</span>     */<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    public RegionMover build() throws IOException {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>      return new RegionMover(this);<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    }<a name="line.236"></a>
-<span class="sourceLineNo">237</span>  }<a name="line.237"></a>
-<span class="sourceLineNo">238</span><a name="line.238"></a>
-<span class="sourceLineNo">239</span>  /**<a name="line.239"></a>
-<span class="sourceLineNo">240</span>   * Move Regions and make sure that they are up on the target server.If a region movement fails we<a name="line.240"></a>
-<span class="sourceLineNo">241</span>   * exit as failure<a name="line.241"></a>
-<span class="sourceLineNo">242</span>   */<a name="line.242"></a>
-<span class="sourceLineNo">243</span>  private class MoveWithAck implements Callable&lt;Boolean&gt; {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    private RegionInfo region;<a name="line.244"></a>
-<span class="sourceLineNo">245</span>    private ServerName targetServer;<a name="line.245"></a>
-<span class="sourceLineNo">246</span>    private List&lt;RegionInfo&gt; movedRegions;<a name="line.246"></a>
-<span class="sourceLineNo">247</span>    private ServerName sourceServer;<a name="line.247"></a>
-<span class="sourceLineNo">248</span><a name="line.248"></a>
-<span class="sourceLineNo">249</span>    public MoveWithAck(RegionInfo regionInfo, ServerName sourceServer,<a name="line.249"></a>
-<span class="sourceLineNo">250</span>        ServerName targetServer, List&lt;RegionInfo&gt; movedRegions) {<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      this.region = regionInfo;<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      this.targetServer = targetServer;<a name="line.252"></a>
-<span class="sourceLineNo">253</span>      this.movedRegions = movedRegions;<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      this.sourceServer = sourceServer;<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
-<span class="sourceLineNo">256</span><a name="line.256"></a>
-<span class="sourceLineNo">257</span>    @Override<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    public Boolean call() throws IOException, InterruptedException {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      boolean moved = false;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      int count = 0;<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      int retries = admin.getConfiguration().getInt(MOVE_RETRIES_MAX_KEY, DEFAULT_MOVE_RETRIES_MAX);<a name="line.261"></a>
-<span class="sourceLineNo">262</span>      int maxWaitInSeconds =<a name="line.262"></a>
-<span class="sourceLineNo">263</span>          admin.getConfiguration().getInt(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      long startTime = EnvironmentEdgeManager.currentTime();<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      boolean sameServer = true;<a name="line.265"></a>
-<span class="sourceLineNo">266</span>      // Assert we can scan the region in its current location<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      isSuccessfulScan(region);<a name="line.267"></a>
-<span class="sourceLineNo">268</span>      LOG.info("Moving region:" + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.268"></a>
-<span class="sourceLineNo">269</span>          + targetServer);<a name="line.269"></a>
-<span class="sourceLineNo">270</span>      while (count &lt; retries &amp;&amp; sameServer) {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>        if (count &gt; 0) {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>          LOG.info("Retry " + Integer.toString(count) + " of maximum " + Integer.toString(retries));<a name="line.272"></a>
-<span class="sourceLineNo">273</span>        }<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        count = count + 1;<a name="line.274"></a>
-<span class="sourceLineNo">275</span>        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));<a name="line.275"></a>
-<span class="sourceLineNo">276</span>        long maxWait = startTime + (maxWaitInSeconds * 1000);<a name="line.276"></a>
-<span class="sourceLineNo">277</span>        while (EnvironmentEdgeManager.currentTime() &lt; maxWait) {<a name="line.277"></a>
-<span class="sourceLineNo">278</span>          sameServer = isSameServer(region, sourceServer);<a name="line.278"></a>
-<span class="sourceLineNo">279</span>          if (!sameServer) {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>            break;<a name="line.280"></a>
-<span class="sourceLineNo">281</span>          }<a name="line.281"></a>
-<span class="sourceLineNo">282</span>          Thread.sleep(100);<a name="line.282"></a>
-<span class="sourceLineNo">283</span>        }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      }<a name="line.284"></a>
-<span class="sourceLineNo">285</span>      if (sameServer) {<a name="line.285"></a>
-<span class="sourceLineNo">286</span>        LOG.error("Region: " + region.getRegionNameAsString() + " stuck on " + this.sourceServer<a name="line.286"></a>
-<span class="sourceLineNo">287</span>            + ",newServer=" + this.targetServer);<a name="line.287"></a>
-<span class="sourceLineNo">288</span>      } else {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>        isSuccessfulScan(region);<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        LOG.info("Moved Region "<a name="line.290"></a>
-<span class="sourceLineNo">291</span>            + region.getRegionNameAsString()<a name="line.291"></a>
-<span class="sourceLineNo">292</span>            + " cost:"<a name="line.292"></a>
-<span class="sourceLineNo">293</span>            + String.format("%.3f",<a name="line.293"></a>
-<span class="sourceLineNo">294</span>            (float) (EnvironmentEdgeManager.currentTime() - startTime) / 1000));<a name="line.294"></a>
-<span class="sourceLineNo">295</span>        moved = true;<a name="line.295"></a>
-<span class="sourceLineNo">296</span>        movedRegions.add(region);<a name="line.296"></a>
-<span class="sourceLineNo">297</span>      }<a name="line.297"></a>
-<span class="sourceLineNo">298</span>      return moved;<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    }<a name="line.299"></a>
-<span class="sourceLineNo">300</span>  }<a name="line.300"></a>
-<span class="sourceLineNo">301</span><a name="line.301"></a>
-<span class="sourceLineNo">302</span>  /**<a name="line.302"></a>
-<span class="sourceLineNo">303</span>   * Move Regions without Acknowledging.Usefule in case of RS shutdown as we might want to shut the<a name="line.303"></a>
-<span class="sourceLineNo">304</span>   * RS down anyways and not abort on a stuck region. Improves movement performance<a name="line.304"></a>
-<span class="sourceLineNo">305</span>   */<a name="line.305"></a>
-<span class="sourceLineNo">306</span>  private class MoveWithoutAck implements Callable&lt;Boolean&gt; {<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    private RegionInfo region;<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    private ServerName targetServer;<a name="line.308"></a>
-<span class="sourceLineNo">309</span>    private List&lt;RegionInfo&gt; movedRegions;<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    private ServerName sourceServer;<a name="line.310"></a>
-<span class="sourceLineNo">311</span><a name="line.311"></a>
-<span class="sourceLineNo">312</span>    public MoveWithoutAck(RegionInfo regionInfo, ServerName sourceServer,<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        ServerName targetServer, List&lt;RegionInfo&gt; movedRegions) {<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      this.region = regionInfo;<a name="line.314"></a>
-<span class="sourceLineNo">315</span>      this.targetServer = targetServer;<a name="line.315"></a>
-<span class="sourceLineNo">316</span>      this.movedRegions = movedRegions;<a name="line.316"></a>
-<span class="sourceLineNo">317</span>      this.sourceServer = sourceServer;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>    }<a name="line.318"></a>
-<span class="sourceLineNo">319</span><a name="line.319"></a>
-<span class="sourceLineNo">320</span>    @Override<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    public Boolean call() {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>      try {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>        LOG.info("Moving region:" + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.323"></a>
-<span class="sourceLineNo">324</span>            + targetServer);<a name="line.324"></a>
-<span class="sourceLineNo">325</span>        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));<a name="line.325"></a>
-<span class="sourceLineNo">326</span>        LOG.info("Moved " + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.326"></a>
-<span class="sourceLineNo">327</span>            + targetServer);<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      } catch (Exception e) {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>        LOG.error("Error Moving Region:" + region.getEncodedName(), e);<a name="line.329"></a>
-<span class="sourceLineNo">330</span>      } finally {<a name="line.330"></a>
-<span class="sourceLineNo">331</span>        // we add region to the moved regions list in No Ack Mode since this is best effort<a name="line.331"></a>
-<span class="sourceLineNo">332</span>        movedRegions.add(region);<a name="line.332"></a>
-<span class="sourceLineNo">333</span>      }<a name="line.333"></a>
-<span class="sourceLineNo">334</span>      return true;<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    }<a name="line.335"></a>
-<span class="sourceLineNo">336</span>  }<a name="line.336"></a>
-<span class="sourceLineNo">337</span><a name="line.337"></a>
-<span class="sourceLineNo">338</span>  /**<a name="line.338"></a>
-<span class="sourceLineNo">339</span>   * Loads the specified {@link #hostname} with regions listed in the {@link #filename} RegionMover<a name="line.339"></a>
-<span class="sourceLineNo">340</span>   * Object has to be created using {@link #RegionMover(RegionMoverBuilder)}<a name="line.340"></a>
-<span class="sourceLineNo">341</span>   * @return true if loading succeeded, false otherwise<a name="line.341"></a>
-<span class="sourceLineNo">342</span>   */<a name="line.342"></a>
-<span class="sourceLineNo">343</span>  public boolean load() throws ExecutionException, InterruptedException, TimeoutException {<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    ExecutorService loadPool = Executors.newFixedThreadPool(1);<a name="line.344"></a>
-<span class="sourceLineNo">345</span>    Future&lt;Boolean&gt; loadTask = loadPool.submit(() -&gt; {<a name="line.345"></a>
-<span class="sourceLineNo">346</span>      try {<a name="line.346"></a>
-<span class="sourceLineNo">347</span>        List&lt;RegionInfo&gt; regionsToMove = readRegionsFromFile(filename);<a name="line.347"></a>
-<span class="sourceLineNo">348</span>        if (regionsToMove.isEmpty()) {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>          LOG.info("No regions to load.Exiting");<a name="line.349"></a>
-<span class="sourceLineNo">350</span>          return true;<a name="line.350"></a>
-<span class="sourceLineNo">351</span>        }<a name="line.351"></a>
-<span class="sourceLineNo">352</span>        loadRegions(regionsToMove);<a name="line.352"></a>
-<span class="sourceLineNo">353</span>      } catch (Exception e) {<a name="line.353"></a>
-<span class="sourceLineNo">354</span>        LOG.error("Error while loading regions to " + hostname, e);<a name="line.354"></a>
-<span class="sourceLineNo">355</span>        return false;<a name="line.355"></a>
-<span class="sourceLineNo">356</span>      }<a name="line.356"></a>
-<span class="sourceLineNo">357</span>      return true;<a name="line.357"></a>
-<span class="sourceLineNo">358</span>    });<a name="line.358"></a>
-<span class="sourceLineNo">359</span>    return waitTaskToFinish(loadPool, loadTask, "loading");<a name="line.359"></a>
-<span class="sourceLineNo">360</span>  }<a name="line.360"></a>
-<span class="sourceLineNo">361</span><a name="line.361"></a>
-<span class="sourceLineNo">362</span>  private void loadRegions(List&lt;RegionInfo&gt; regionsToMove)<a name="line.362"></a>
-<span class="sourceLineNo">363</span>      throws Exception {<a name="line.363"></a>
-<span class="sourceLineNo">364</span>    ServerName server = getTargetServer();<a name="line.364"></a>
-<span class="sourceLineNo">365</span>    List&lt;RegionInfo&gt; movedRegions = Collections.synchronizedList(new ArrayList&lt;&gt;());<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    LOG.info(<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        "Moving " + regionsToMove.size() + " regions to " + server + " using " + this.maxthreads<a name="line.367"></a>
-<span class="sourceLineNo">368</span>            + " threads.Ack mode:" + this.ack);<a name="line.368"></a>
-<span class="sourceLineNo">369</span><a name="line.369"></a>
-<span class="sourceLineNo">370</span>    ExecutorService moveRegionsPool = Executors.newFixedThreadPool(this.maxthreads);<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    List&lt;Future&lt;Boolean&gt;&gt; taskList = new ArrayList&lt;&gt;();<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    int counter = 0;<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    while (counter &lt; regionsToMove.size()) {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      RegionInfo region = regionsToMove.get(counter);<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      ServerName currentServer = getServerNameForRegion(region);<a name="line.375"></a>
-<span class="sourceLineNo">376</span>      if (currentServer == null) {<a name="line.376"></a>
-<span class="sourceLineNo">377</span>        LOG.warn(<a name="line.377"></a>
-<span class="sourceLineNo">378</span>            "Could not get server for Region:" + region.getRegionNameAsString() + " moving on");<a name="line.378"></a>
-<span class="sourceLineNo">379</span>        counter++;<a name="line.379"></a>
-<span class="sourceLineNo">380</span>        continue;<a name="line.380"></a>
-<span class="sourceLineNo">381</span>      } else if (server.equals(currentServer)) {<a name="line.381"></a>
-<span class="sourceLineNo">382</span>        LOG.info(<a name="line.382"></a>
-<span class="sourceLineNo">383</span>            "Region " + region.getRegionNameAsString() + " is already on target server=" + server);<a name="line.383"></a>
-<span class="sourceLineNo">384</span>        counter++;<a name="line.384"></a>
-<span class="sourceLineNo">385</span>        continue;<a name="line.385"></a>
-<span class="sourceLineNo">386</span>      }<a name="line.386"></a>
-<span class="sourceLineNo">387</span>      if (ack) {<a name="line.387"></a>
-<span class="sourceLineNo">388</span>        Future&lt;Boolean&gt; task =<a name="line.388"></a>
-<span class="sourceLineNo">389</span>            moveRegionsPool.submit(new MoveWithAck(region, currentServer, server, movedRegions));<a name="line.389"></a>
-<span class="sourceLineNo">390</span>        taskList.add(task);<a name="line.390"></a>
-<span class="sourceLineNo">391</span>      } else {<a name="line.391"></a>
-<span class="sourceLineNo">392</span>        Future&lt;Boolean&gt; task =<a name="line.392"></a>
-<span class="sourceLineNo">393</span>            moveRegionsPool.submit(new MoveWithoutAck(region, currentServer, server, movedRegions));<a name="line.393"></a>
-<span class="sourceLineNo">394</span>        taskList.add(task);<a name="line.394"></a>
-<span class="sourceLineNo">395</span>      }<a name="line.395"></a>
-<span class="sourceLineNo">396</span>      counter++;<a name="line.396"></a>
-<span class="sourceLineNo">397</span>    }<a name="line.397"></a>
-<span class="sourceLineNo">398</span><a name="line.398"></a>
-<span class="sourceLineNo">399</span>    moveRegionsPool.shutdown();<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    long timeoutInSeconds = regionsToMove.size() * admin.getConfiguration()<a name="line.400"></a>
-<span class="sourceLineNo">401</span>        .getLong(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>    waitMoveTasksToFinish(moveRegionsPool, taskList, timeoutInSeconds);<a name="line.402"></a>
-<span class="sourceLineNo">403</span>  }<a name="line.403"></a>
-<span class="sourceLineNo">404</span><a name="line.404"></a>
-<span class="sourceLineNo">405</span>  /**<a name="line.405"></a>
-<span class="sourceLineNo">406</span>   * Unload regions from given {@link #hostname} using ack/noAck mode and {@link #maxthreads}.In<a name="line.406"></a>
-<span class="sourceLineNo">407</span>   * noAck mode we do not make sure that region is successfully online on the target region<a name="line.407"></a>
-<span class="sourceLineNo">408</span>   * server,hence it is best effort.We do not unload regions to hostnames given in<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   * {@link #excludeFile}.<a name="line.409"></a>
-<span class="sourceLineNo">410</span>   * @return true if unloading succeeded, false otherwise<a name="line.410"></a>
-<span class="sourceLineNo">411</span>   */<a name="line.411"></a>
-<span class="sourceLineNo">412</span>  public boolean unload() throws InterruptedException, ExecutionException, TimeoutException {<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    deleteFile(this.filename);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>    ExecutorService unloadPool = Executors.newFixedThreadPool(1);<a name="line.414"></a>
-<span class="sourceLineNo">415</span>    Future&lt;Boolean&gt; unloadTask = unloadPool.submit(() -&gt; {<a name="line.415"></a>
-<span class="sourceLineNo">416</span>      List&lt;RegionInfo&gt; movedRegions = Collections.synchronizedList(new ArrayList&lt;&gt;());<a name="line.416"></a>
-<span class="sourceLineNo">417</span>      try {<a name="line.417"></a>
-<span class="sourceLineNo">418</span>        // Get Online RegionServers<a name="line.418"></a>
-<span class="sourceLineNo">419</span>        List&lt;ServerName&gt; regionServers = new ArrayList&lt;&gt;();<a name="line.419"></a>
-<span class="sourceLineNo">420</span>        regionServers.addAll(<a name="line.420"></a>
-<span class="sourceLineNo">421</span>            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()<a name="line.421"></a>
-<span class="sourceLineNo">422</span>                .keySet());<a name="line.422"></a>
-<span class="sourceLineNo">423</span>        // Remove the host Region server from target Region Servers list<a name="line.423"></a>
-<span class="sourceLineNo">424</span>        ServerName server = stripServer(regionServers, hostname, port);<a name="line.424"></a>
-<span class="sourceLineNo">425</span>        // Remove RS present in the exclude file<a name="line.425"></a>
-<span class="sourceLineNo">426</span>        stripExcludes(regionServers);<a name="line.426"></a>
-<span class="sourceLineNo">427</span>        stripMaster(regionServers);<a name="line.427"></a>
-<span class="sourceLineNo">428</span>        if (regionServers.isEmpty()) {<a name="line.428"></a>
-<span class="sourceLineNo">429</span>          LOG.warn("No Regions were moved - no servers available");<a name="line.429"></a>
-<span class="sourceLineNo">430</span>          return false;<a name="line.430"></a>
-<span class="sourceLineNo">431</span>        }<a name="line.431"></a>
-<span class="sourceLineNo">432</span>        unloadRegions(server, regionServers, movedRegions);<a name="line.432"></a>
-<span class="sourceLineNo">433</span>      } catch (Exception e) {<a name="line.433"></a>
-<span class="sourceLineNo">434</span>        LOG.error("Error while unloading regions ", e);<a name="line.434"></a>
-<span class="sourceLineNo">435</span>        return false;<a name="line.435"></a>
-<span class="sourceLineNo">436</span>      } finally {<a name="line.436"></a>
-<span class="sourceLineNo">437</span>        if (movedRegions != null) {<a name="line.437"></a>
-<span class="sourceLineNo">438</span>          writeFile(filename, movedRegions);<a name="line.438"></a>
-<span class="sourceLineNo">439</span>        }<a name="line.439"></a>
-<span class="sourceLineNo">440</span>      }<a name="line.440"></a>
-<span class="sourceLineNo">441</span>      return true;<a name="line.441"></a>
-<span class="sourceLineNo">442</span>    });<a name="line.442"></a>
-<span class="sourceLineNo">443</span>    return waitTaskToFinish(unloadPool, unloadTask, "unloading");<a name="line.443"></a>
-<span class="sourceLineNo">444</span>  }<a name="line.444"></a>
-<span class="sourceLineNo">445</span><a name="line.445"></a>
-<span class="sourceLineNo">446</span>  private void unloadRegions(ServerName server, List&lt;ServerName&gt; regionServers,<a name="line.446"></a>
-<span class="sourceLineNo">447</span>      List&lt;RegionInfo&gt; movedRegions) throws Exception {<a name="line.447"></a>
-<span class="sourceLineNo">448</span>    while (true) {<a name="line.448"></a>
-<span class="sourceLineNo">449</span>      List&lt;RegionInfo&gt; regionsToMove = admin.getRegions(server);<a name="line.449"></a>
-<span class="sourceLineNo">450</span>      regionsToMove.removeAll(movedRegions);<a name="line.450"></a>
-<span class="sourceLineNo">451</span>      if (regionsToMove.isEmpty()) {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>        LOG.info("No Regions to move....Quitting now");<a name="line.452"></a>
-<span class="sourceLineNo">453</span>        break;<a name="line.453"></a>
-<span class="sourceLineNo">454</span>      }<a name="line.454"></a>
-<span class="sourceLineNo">455</span>      int counter = 0;<a name="line.455"></a>
-<span class="sourceLineNo">456</span>      LOG.info("Moving " + regionsToMove.size() + " regions from " + this.hostname + " to "<a name="line.456"></a>
-<span class="sourceLineNo">457</span>          + regionServers.size() + " servers using " + this.maxthreads + " threads .Ack Mode:"<a name="line.457"></a>
-<span class="sourceLineNo">458</span>          + ack);<a name="line.458"></a>
-<span class="sourceLineNo">459</span>      ExecutorService moveRegionsPool = Executors.newFixedThreadPool(this.maxthreads);<a name="line.459"></a>
-<span class="sourceLineNo">460</span>      List&lt;Future&lt;Boolean&gt;&gt; taskList = new ArrayList&lt;&gt;();<a name="line.460"></a>
-<span class="sourceLineNo">461</span>      int serverIndex = 0;<a name="line.461"></a>
-<span class="sourceLineNo">462</span>      while (counter &lt; regionsToMove.size()) {<a name="line.462"></a>
-<span class="sourceLineNo">463</span>        if (ack) {<a name="line.463"></a>
-<span class="sourceLineNo">464</span>          Future&lt;Boolean&gt; task = moveRegionsPool.submit(<a name="line.464"></a>
-<span class="sourceLineNo">465</span>              new MoveWithAck(regionsToMove.get(counter), server, regionServers.get(serverIndex),<a name="line.465"></a>
-<span class="sourceLineNo">466</span>                  movedRegions));<a name="line.466"></a>
-<span class="sourceLineNo">467</span>          taskList.add(task);<a name="line.467"></a>
-<span class="sourceLineNo">468</span>        } else {<a name="line.468"></a>
-<span class="sourceLineNo">469</span>          Future&lt;Boolean&gt; task = moveRegionsPool.submit(<a name="line.469"></a>
-<span class="sourceLineNo">470</span>              new MoveWithoutAck(regionsToMove.get(counter), server, regionServers.get(serverIndex),<a name="line.470"></a>
-<span class="sourceLineNo">471</span>                  movedRegions));<a name="line.471"></a>
-<span class="sourceLineNo">472</span>          taskList.add(task);<a name="line.472"></a>
-<span class="sourceLineNo">473</span>        }<a name="line.473"></a>
-<span class="sourceLineNo">474</span>        counter++;<a name="line.474"></a>
-<span class="sourceLineNo">475</span>        serverIndex = (serverIndex + 1) % regionServers.size();<a name="line.475"></a>
-<span class="sourceLineNo">476</span>      }<a name="line.476"></a>
-<span class="sourceLineNo">477</span>      moveRegionsPool.shutdown();<a name="line.477"></a>
-<span class="sourceLineNo">478</span>      long timeoutInSeconds = regionsToMove.size() * admin.getConfiguration()<a name="line.478"></a>
-<span class="sourceLineNo">479</span>          .getLong(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.479"></a>
-<span class="sourceLineNo">480</span>      waitMoveTasksToFinish(moveRegionsPool, taskList, timeoutInSeconds);<a name="line.480"></a>
-<span class="sourceLineNo">481</span>    }<a name="line.481"></a>
-<span class="sourceLineNo">482</span>  }<a name="line.482"></a>
-<span class="sourceLineNo">483</span><a name="line.483"></a>
-<span class="sourceLineNo">484</span>  private boolean waitTaskToFinish(ExecutorService pool, Future&lt;Boolean&gt; task, String operation)<a name="line.484"></a>
-<span class="sourceLineNo">485</span>      throws TimeoutException, InterruptedException, ExecutionException {<a name="line.485"></a>
-<span class="sourceLineNo">486</span>    pool.shutdown();<a name="line.486"></a>
-<span class="sourceLineNo">487</span>    try {<a name="line.487"></a>
-<span class="sourceLineNo">488</span>      if (!pool.awaitTermination((long) this.timeout, TimeUnit.SECONDS)) {<a name="line.488"></a>
-<span class="sourceLineNo">489</span>        LOG.warn(<a name="line.489"></a>
-<span class="sourceLineNo">490</span>            "Timed out before finishing the " + operation + " operation. Timeout: " + this.timeout<a name="line.490"></a>
-<span class="sourceLineNo">491</span>                + "sec");<a name="line.491"></a>
-<span class="sourceLineNo">492</span>        pool.shutdownNow();<a name="line.492"></a>
-<span class="sourceLineNo">493</span>      }<a name="line.493"></a>
-<span class="sourceLineNo">494</span>    } catch (InterruptedException e) {<a name="line.494"></a>
-<span class="sourceLineNo">495</span>      pool.shutdownNow();<a name="line.495"></a>
-<span class="sourceLineNo">496</span>      Thread.currentThread().interrupt();<a name="line.496"></a>
-<span class="sourceLineNo">497</span>    }<a name="line.497"></a>
-<span class="sourceLineNo">498</span>    try {<a name="line.498"></a>
-<span class="sourceLineNo">499</span>      return task.get(5, TimeUnit.SECONDS);<a name="line.499"></a>
-<span class="sourceLineNo">500</span>    } catch (InterruptedException e) {<a name="line.500"></a>
-<span class="sourceLineNo">501</span>      LOG.warn("Interrupted while " + operation + " Regions on " + this.hostname, e);<a name="line.501"></a>
-<span class="sourceLineNo">502</span>      throw e;<a name="line.502"></a>
-<span class="sourceLineNo">503</span>    } catch (ExecutionException e) {<a name="line.503"></a>
-<span class="sourceLineNo">504</span>      LOG.error("Error while " + operation + " regions on RegionServer " + this.hostname, e);<a name="line.504"></a>
-<span class="sourceLineNo">505</span>      throw e;<a name="line.505"></a>
-<span class="sourceLineNo">506</span>    }<a name="line.506"></a>
-<span class="sourceLineNo">507</span>  }<a name="line.507"></a>
-<span class="sourceLineNo">508</span><a name="line.508"></a>
-<span class="sourceLineNo">509</span>  private void waitMoveTasksToFinish(ExecutorService moveRegionsPool,<a name="line.509"></a>
-<span class="sourceLineNo">510</span>      List&lt;Future&lt;Boolean&gt;&gt; taskList, long timeoutInSeconds) throws Exception {<a name="line.510"></a>
-<span class="sourceLineNo">511</span>    try {<a name="line.511"></a>
-<span class="sourceLineNo">512</span>      if (!moveRegionsPool.awaitTermination(timeoutInSeconds, TimeUnit.SECONDS)) {<a name="line.512"></a>
-<span class="sourceLineNo">513</span>        moveRegionsPool.shutdownNow();<a name="line.513"></a>
-<span class="sourceLineNo">514</span>      }<a name="line.514"></a>
-<span class="sourceLineNo">515</span>    } catch (InterruptedException e) {<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      moveRegionsPool.shutdownNow();<a name="line.516"></a>
-<span class="sourceLineNo">517</span>      Thread.currentThread().interrupt();<a name="line.517"></a>
-<span class="sourceLineNo">518</span>    }<a name="line.518"></a>
-<span class="sourceLineNo">519</span>    for (Future&lt;Boolean&gt; future : taskList) {<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      try {<a name="line.520"></a>
-<span class="sourceLineNo">521</span>        // if even after shutdownNow threads are stuck we wait for 5 secs max<a name="line.521"></a>
-<span class="sourceLineNo">522</span>        if (!future.get(5, TimeUnit.SECONDS)) {<a name="line.522"></a>
-<span class="sourceLineNo">523</span>          LOG.error("Was Not able to move region....Exiting Now");<a name="line.523"></a>
-<span class="sourceLineNo">524</span>          throw new Exception("Could not move region Exception");<a name="line.524"></a>
-<span class="sourceLineNo">525</span>        }<a name="line.525"></a>
-<span class="sourceLineNo">526</span>      } catch (InterruptedException e) {<a name="line.526"></a>
-<span class="sourceLineNo">527</span>        LOG.error("Interrupted while waiting for Thread to Complete " + e.getMessage(), e);<a name="line.527"></a>
-<span class="sourceLineNo">528</span>        throw e;<a name="line.528"></a>
-<span class="sourceLineNo">529</span>      } catch (ExecutionException e) {<a name="line.529"></a>
-<span class="sourceLineNo">530</span>        LOG.error("Got Exception From Thread While moving region " + e.getMessage(), e);<a name="line.530"></a>
-<span class="sourceLineNo">531</span>        throw e;<a name="line.531"></a>
-<span class="sourceLineNo">532</span>      } catch (CancellationException e) {<a name="line.532"></a>
-<span class="sourceLineNo">533</span>        LOG.error("Thread for moving region cancelled. Timeout for cancellation:" + timeoutInSeconds<a name="line.533"></a>
-<span class="sourceLineNo">534</span>            + "secs", e);<a name="line.534"></a>
-<span class="sourceLineNo">535</span>        throw e;<a name="line.535"></a>
-<span class="sourceLineNo">536</span>      }<a name="line.536"></a>
-<span class="sourceLineNo">537</span>    }<a name="line.537"></a>
-<span class="sourceLineNo">538</span>  }<a name="line.538"></a>
-<span class="sourceLineNo">539</span><a name="line.539"></a>
-<span class="sourceLineNo">540</span>  private ServerName getTargetServer() throws Exception {<a name="line.540"></a>
-<span class="sourceLineNo">541</span>    ServerName server = null;<a name="line.541"></a>
-<span class="sourceLineNo">542</span>    int maxWaitInSeconds =<a name="line.542"></a>
-<span class="sourceLineNo">543</span>        admin.getConfiguration().getInt(SERVERSTART_WAIT_MAX_KEY, DEFAULT_SERVERSTART_WAIT_MAX);<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    long maxWait = EnvironmentEdgeManager.currentTime() + maxWaitInSeconds * 1000;<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    while (EnvironmentEdgeManager.currentTime() &lt; maxWait) {<a name="line.545"></a>
-<span class="sourceLineNo">546</span>      try {<a name="line.546"></a>
-<span class="sourceLineNo">547</span>        List&lt;ServerName&gt; regionServers = new ArrayList&lt;&gt;();<a name="line.547"></a>
-<span class="sourceLineNo">548</span>        regionServers.addAll(<a name="line.548"></a>
-<span class="sourceLineNo">549</span>            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()<a name="line.549"></a>
-<span class="sourceLineNo">550</span>                .keySet());<a name="line.550"></a>
-<span class="sourceLineNo">551</span>        // Remove the host Region server from target Region Servers list<a name="line.551"></a>
-<span class="sourceLineNo">552</span>        server = stripServer(regionServers, hostname, port);<a name="line.552"></a>
-<span class="sourceLineNo">553</span>        if (server != null) {<a name="line.553"></a>
-<span class="sourceLineNo">554</span>          break;<a name="line.554"></a>
-<span class="sourceLineNo">555</span>        } else {<a name="line.555"></a>
-<span class="sourceLineNo">556</span>          LOG.warn("Server " + hostname + ":" + port + " is not up yet, waiting");<a name="line.556"></a>
-<span class="sourceLineNo">557</span>        }<a name="line.557"></a>
-<span class="sourceLineNo">558</span>      } catch (IOException e) {<a name="line.558"></a>
-<span class="sourceLineNo">559</span>        LOG.warn("Could not get list of region servers", e);<a name="line.559"></a>
-<span class="sourceLineNo">560</span>      }<a name="line.560"></a>
-<span class="sourceLineNo">561</span>      Thread.sleep(500);<a name="line.561"></a>
-<span class="sourceLineNo">562</span>    }<a name="line.562"></a>
-<span class="sourceLineNo">563</span>    if (server == null) {<a name="line.563"></a>
-<span class="sourceLineNo">564</span>      LOG.error("Server " + hostname + ":" + port + " is not up. Giving up.");<a name="line.564"></a>
-<span class="sourceLineNo">565</span>      throw new Exception("Server " + hostname + ":" + port + " to load regions not online");<a name="line.565"></a>
-<span class="sourceLineNo">566</span>    }<a name="line.566"></a>
-<span class="sourceLineNo">567</span>    return server;<a name="line.567"></a>
-<span class="sourceLineNo">568</span>  }<a name="line.568"></a>
-<span class="sourceLineNo">569</span><a name="line.569"></a>
-<span class="sourceLineNo">570</span>  private List&lt;RegionInfo&gt; readRegionsFromFile(String filename) throws IOException {<a name="line.570"></a>
-<span class="sourceLineNo">571</span>    List&lt;RegionInfo&gt; regions = new ArrayList&lt;&gt;();<a name="line.571"></a>
-<span class="sourceLineNo">572</span>    File f = new File(filename);<a name="line.572"></a>
-<span class="sourceLineNo">573</span>    if (!f.exists()) {<a name="line.573"></a>
-<span class="sourceLineNo">574</span>      return regions;<a name="line.574"></a>
-<span class="sourceLineNo">575</span>    }<a name="line.575"></a>
-<span class="sourceLineNo">576</span>    try (DataInputStream dis = new DataInputStream(<a name="line.576"></a>
-<span class="sourceLineNo">577</span>        new BufferedInputStream(new FileInputStream(f)))) {<a name="line.577"></a>
-<span class="sourceLineNo">578</span>      int numRegions = dis.readInt();<a name="line.578"></a>
-<span class="sourceLineNo">579</span>      int index = 0;<a name="line.579"></a>
-<span class="sourceLineNo">580</span>      while (index &lt; numRegions) {<a name="line.580"></a>
-<span class="sourceLineNo">581</span>        regions.add(RegionInfo.parseFromOrNull(Bytes.readByteArray(dis)));<a name="line.581"></a>
-<span class="sourceLineNo">582</span>        index++;<a name="line.582"></a>
-<span class="sourceLineNo">583</span>      }<a name="line.583"></a>
-<span class="sourceLineNo">584</span>    } catch (IOException e) {<a name="line.584"></a>
-<span class="sourceLineNo">585</span>      LOG.error("Error while reading regions from file:" + filename, e);<a name="line.585"></a>
-<span class="sourceLineNo">586</span>      throw e;<a name="line.586"></a>
-<span class="sourceLineNo">587</span>    }<a name="line.587"></a>
-<span class="sourceLineNo">588</span>    return regions;<a name="line.588"></a>
-<span class="sourceLineNo">589</span>  }<a name="line.589"></a>
-<span class="sourceLineNo">590</span><a name="line.590"></a>
-<span class="sourceLineNo">591</span>  /**<a name="line.591"></a>
-<span class="sourceLineNo">592</span>   * Write the number of regions moved in the first line followed by regions moved in subsequent<a name="line.592"></a>
-<span class="sourceLineNo">593</span>   * lines<a name="line.593"></a>
-<span class="sourceLineNo">594</span>   */<a name="line.594"></a>
-<span class="sourceLineNo">595</span>  private void writeFile(String filename, List&lt;RegionInfo&gt; movedRegions) throws IOException {<a name="line.595"></a>
-<span class="sourceLineNo">596</span>    try (DataOutputStream dos = new DataOutputStream(<a name="line.596"></a>
-<span class="sourceLineNo">597</span>        new BufferedOutputStream(new FileOutputStream(filename)))) {<a name="line.597"></a>
-<span class="sourceLineNo">598</span>      dos.writeInt(movedRegions.size());<a name="line.598"></a>
-<span class="sourceLineNo">599</span>      for (RegionInfo region : movedRegions) {<a name="line.599"></a>
-<span class="sourceLineNo">600</span>        Bytes.writeByteArray(dos, RegionInfo.toByteArray(region));<a name="line.600"></a>
-<span class="sourceLineNo">601</span>      }<a name="line.601"></a>
-<span class="sourceLineNo">602</span>    } catch (IOException e) {<a name="line.602"></a>
-<span class="sourceLineNo">603</span>      LOG.error(<a name="line.603"></a>
-<span class="sourceLineNo">604</span>          "ERROR: Was Not able to write regions moved to output file but moved " + movedRegions<a name="line.604"></a>
-<span class="sourceLineNo">605</span>              .size() + " regions", e);<a name="line.605"></a>
-<span class="sourceLineNo">606</span>      throw e;<a name="line.606"></a>
-<span class="sourceLineNo">607</span>    }<a name="line.607"></a>
-<span class="sourceLineNo">608</span>  }<a name="line.608"></a>
-<span class="sourceLineNo">609</span><a name="line.609"></a>
-<span class="sourceLineNo">610</span>  private void deleteFile(String filename) {<a name="line.610"></a>
-<span class="sourceLineNo">611</span>    File f = new File(filename);<a name="line.611"></a>
-<span class="sourceLineNo">612</span>    if (f.exists()) {<a name="line.612"></a>
-<span class="sourceLineNo">613</span>      f.delete();<a name="line.613"></a>
-<span class="sourceLineNo">614</span>    }<a name="line.614"></a>
-<span class="sourceLineNo">615</span>  }<a name="line.615"></a>
-<span class="sourceLineNo">616</span><a name="line.616"></a>
-<span class="sourceLineNo">617</span>  /**<a name="line.617"></a>
-<span class="sourceLineNo">618</span>   * @return List of servers from the exclude file in format 'hostname:port'.<a name="line.618"></a>
-<span class="sourceLineNo">619</span>   */<a name="line.619"></a>
-<span class="sourceLineNo">620</span>  private List&lt;String&gt; readExcludes(String excludeFile) throws IOException {<a name="line.620"></a>
-<span class="sourceLineNo">621</span>    List&lt;String&gt; excludeServers = new ArrayList&lt;&gt;();<a name="line.621"></a>
-<span class="sourceLineNo">622</span>    if (excludeFile == null) {<a name="line.622"></a>
-<span class="sourceLineNo">623</span>      return excludeServers;<a name="line.623"></a>
-<span class="sourceLineNo">624</span>    } else {<a name="line.624"></a>
-<span class="sourceLineNo">625</span>      try {<a name="line.625"></a>
-<span class="sourceLineNo">626</span>        Files.readAllLines(Paths.get(excludeFile)).stream().map(String::trim)<a name="line.626"></a>
-<span class="sourceLineNo">627</span>            .filter(((Predicate&lt;String&gt;) String::isEmpty).negate()).map(String::toLowerCase)<a name="line.627"></a>
-<span class="sourceLineNo">628</span>            .forEach(excludeServers::add);<a name="line.628"></a>
-<span class="sourceLineNo">629</span>      } catch (IOException e) {<a name="line.629"></a>
-<span class="sourceLineNo">630</span>        LOG.warn("Exception while reading excludes file, continuing anyways", e);<a name="line.630"></a>
-<span class="sourceLineNo">631</span>      }<a name="line.631"></a>
-<span class="sourceLineNo">632</span>      return excludeServers;<a name="line.632"></a>
-<span class="sourceLineNo">633</span>    }<a name="line.633"></a>
-<span class="sourceLineNo">634</span>  }<a name="line.634"></a>
-<span class="sourceLineNo">635</span><a name="line.635"></a>
-<span class="sourceLineNo">636</span>  /**<a name="line.636"></a>
-<span class="sourceLineNo">637</span>   * Excludes the servername whose hostname and port portion matches the list given in exclude file<a name="line.637"></a>
-<span class="sourceLineNo">638</span>   */<a name="line.638"></a>
-<span class="sourceLineNo">639</span>  private void stripExcludes(List&lt;ServerName&gt; regionServers) throws IOException {<a name="line.639"></a>
-<span class="sourceLineNo">640</span>    if (excludeFile != null) {<a name="line.640"></a>
-<span class="sourceLineNo">641</span>      List&lt;String&gt; excludes = readExcludes(excludeFile);<a name="line.641"></a>
-<span class="sourceLineNo">642</span>      Iterator&lt;ServerName&gt; i = regionServers.iterator();<a name="line.642"></a>
-<span class="sourceLineNo">643</span>      while (i.hasNext()) {<a name="line.643"></a>
-<span class="sourceLineNo">644</span>        String rs = i.next().getServerName();<a name="line.644"></a>
-<span class="sourceLineNo">645</span>        String rsPort = rs.split(ServerName.SERVERNAME_SEPARATOR)[0].toLowerCase() + ":" + rs<a name="line.645"></a>
-<span class="sourceLineNo">646</span>            .split(ServerName.SERVERNAME_SEPARATOR)[1];<a name="line.646"></a>
-<span class="sourceLineNo">647</span>        if (excludes.contains(rsPort)) {<a name="line.647"></a>
-<span class="sourceLineNo">648</span>          i.remove();<a name="line.648"></a>
-<span class="sourceLineNo">649</span>        }<a name="line.649"></a>
-<span class="sourceLineNo">650</span>      }<a name="line.650"></a>
-<span class="sourceLineNo">651</span>      LOG.info("Valid Region server targets are:" + regionServers.toString());<a name="line.651"></a>
-<span class="sourceLineNo">652</span>      LOG.info("Excluded Servers are" + excludes.toString());<a name="line.652"></a>
-<span class="sourceLineNo">653</span>    }<a name="line.653"></a>
-<span class="sourceLineNo">654</span>  }<a name="line.654"></a>
-<span class="sourceLineNo">655</span><a name="line.655"></a>
-<span class="sourceLineNo">656</span>  /**<a name="line.656"></a>
-<span class="sourceLineNo">657</span>   * Exclude master from list of RSs to move regions to<a name="line.657"></a>
-<span class="sourceLineNo">658</span>   */<a name="line.658"></a>
-<span class="sourceLineNo">659</span>  private void stripMaster(List&lt;ServerName&gt; regionServers) throws IOException {<a name="line.659"></a>
-<span class="sourceLineNo">660</span>    ServerName master = admin.getClusterMetrics(EnumSet.of(Option.MASTER)).getMasterName();<a name="line.660"></a>
-<span class="sourceLineNo">661</span>    stripServer(regionServers, master.getHostname(), master.getPort());<a name="line.661"></a>
-<span class="sourceLineNo">662</span>  }<a name="line.662"></a>
-<span class="sourceLineNo">663</span><a name="line.663"></a>
-<span class="sourceLineNo">664</span>  /**<a name="line.664"></a>
-<span class="sourceLineNo">665</span>   * Remove the servername whose hostname and port portion matches from the passed array of servers.<a name="line.665"></a>
-<span class="sourceLineNo">666</span>   * Returns as side-effect the servername removed.<a name="line.666"></a>
-<span class="sourceLineNo">667</span>   * @return server removed from list of Region Servers<a name="line.667"></a>
-<span class="sourceLineNo">668</span>   */<a name="line.668"></a>
-<span class="sourceLineNo">669</span>  private ServerName stripServer(List&lt;ServerName&gt; regionServers, String hostname, int port) {<a name="line.669"></a>
-<span class="sourceLineNo">670</span>    ServerName server = null;<a name="line.670"></a>
-<span class="sourceLineNo">671</span>    String portString = Integer.toString(port);<a name="line.671"></a>
-<span class="sourceLineNo">672</span>    Iterator&lt;ServerName&gt; i = regionServers.iterator();<a name="line.672"></a>
-<span class="sourceLineNo">673</span>    while (i.hasNext()) {<a name="line.673"></a>
-<span class="sourceLineNo">674</span>      server = i.next();<a name="line.674"></a>
-<span class="sourceLineNo">675</span>      String[] splitServer = server.getServerName().split(ServerName.SERVERNAME_SEPARATOR);<a name="line.675"></a>
-<span class="sourceLineNo">676</span>      if (splitServer[0].equalsIgnoreCase(hostname) &amp;&amp; splitServer[1].equals(portString)) {<a name="line.676"></a>
-<span class="sourceLineNo">677</span>        i.remove();<a name="line.677"></a>
-<span class="sourceLineNo">678</span>        return server;<a name="line.678"></a>
-<span class="sourceLineNo">679</span>      }<a name="line.679"></a>
-<span class="sourceLineNo">680</span>    }<a name="line.680"></a>
-<span class="sourceLineNo">681</span>    return server;<a name="line.681"></a>
-<span class="sourceLineNo">682</span>  }<a name="line.682"></a>
-<span class="sourceLineNo">683</span><a name="line.683"></a>
-<span class="sourceLineNo">684</span>  /**<a name="line.684"></a>
-<span class="sourceLineNo">685</span>   * Tries to scan a row from passed region<a name="line.685"></a>
-<span class="sourceLineNo">686</span>   */<a name="line.686"></a>
-<span class="sourceLineNo">687</span>  private void isSuccessfulScan(RegionInfo region) throws IOException {<a name="line.687"></a>
-<span class="sourceLineNo">688</span>    Scan scan = new Scan().withStartRow(region.getStartKey()).setRaw(true).setOneRowLimit()<a name="line.688"></a>
-<span class="sourceLineNo">689</span>        .setMaxResultSize(1L).setCaching(1).setFilter(new FirstKeyOnlyFilter())<a name="line.689"></a>
-<span class="sourceLineNo">690</span>        .setCacheBlocks(false);<a name="line.690"></a>
-<span class="sourceLineNo">691</span>    try (Table table = conn.getTable(region.getTable());<a name="line.691"></a>
-<span class="sourceLineNo">692</span>        ResultScanner scanner = table.getScanner(scan)) {<a name="line.692"></a>
-<span class="sourceLineNo">693</span>      scanner.next();<a name="line.693"></a>
-<span class="sourceLineNo">694</span>    } catch (IOException e) {<a name="line.694"></a>
-<span class="sourceLineNo">695</span>      LOG.error("Could not scan region:" + region.getEncodedName(), e);<a name="line.695"></a>
-<span class="sourceLineNo">696</span>      throw e;<a name="line.696"></a>
-<span class="sourceLineNo">697</span>    }<a name="line.697"></a>
-<span class="sourceLineNo">698</span>  }<a name="line.698"></a>
-<span class="sourceLineNo">699</span><a name="line.699"></a>
-<span class="sourceLineNo">700</span>  /**<a name="line.700"></a>
-<span class="sourceLineNo">701</span>   * Returns true if passed region is still on serverName when we look at hbase:meta.<a name="line.701"></a>
-<span class="sourceLineNo">702</span>   * @return true if region is hosted on serverName otherwise false<a name="line.702"></a>
-<span class="sourceLineNo">703</span>   */<a name="line.703"></a>
-<span class="sourceLineNo">704</span>  private boolean isSameServer(RegionInfo region, ServerName serverName)<a name="line.704"></a>
-<span class="sourceLineNo">705</span>      throws IOException {<a name="line.705"></a>
-<span class="sourceLineNo">706</span>    ServerName serverForRegion = getServerNameForRegion(region);<a name="line.706"></a>
-<span class="sourceLineNo">707</span>    if (serverForRegion != null &amp;&amp; serverForRegion.equals(serverName)) {<a name="line.707"></a>
-<span class="sourceLineNo">708</span>      return true;<a name="line.708"></a>
-<span class="sourceLineNo">709</span>    }<a name="line.709"></a>
-<span class="sourceLineNo">710</span>    return false;<a name="line.710"></a>
-<span class="sourceLineNo">711</span>  }<a name="line.711"></a>
-<span class="sourceLineNo">712</span><a name="line.712"></a>
-<span class="sourceLineNo">713</span>  /**<a name="line.713"></a>
-<span class="sourceLineNo">714</span>   * Get servername that is up in hbase:meta hosting the given region. this is hostname + port +<a name="line.714"></a>
-<span class="sourceLineNo">715</span>   * startcode comma-delimited. Can return null<a name="line.715"></a>
-<span class="sourceLineNo">716</span>   * @return regionServer hosting the given region<a name="line.716"></a>
-<span class="sourceLineNo">717</span>   */<a name="line.717"></a>
-<span class="sourceLineNo">718</span>  private ServerName getServerNameForRegion(RegionInfo region) throws IOException {<a name="line.718"></a>
-<span class="sourceLineNo">719</span>    if (!admin.isTableEnabled(region.getTable())) {<a name="line.719"></a>
-<span class="sourceLineNo">720</span>      return null;<a name="line.720"></a>
-<span class="sourceLineNo">721</span>    }<a name="line.721"></a>
-<span class="sourceLineNo">722</span>    return MetaTableAccessor.getRegionLocation(conn, region).getServerName();<a name="line.722"></a>
-<span class="sourceLineNo">723</span>  }<a name="line.723"></a>
-<span class="sourceLineNo">724</span><a name="line.724"></a>
-<span class="sourceLineNo">725</span>  @Override<a name="line.725"></a>
-<span class="sourceLineNo">726</span>  protected void addOptions() {<a name="line.726"></a>
-<span class="sourceLineNo">727</span>    this.addRequiredOptWithArg("r", "regionserverhost", "region server &lt;hostname&gt;|&lt;hostname:port&gt;");<a name="line.727"></a>
-<span class="sourceLineNo">728</span>    this.addRequiredOptWithArg("o", "operation", "Expected: load/unload");<a name="line.728"></a>
-<span class="sourceLineNo">729</span>    this.addOptWithArg("m", "maxthreads",<a name="line.729"></a>
-<span class="sourceLineNo">730</span>        "Define the maximum number of threads to use to unload and reload the regions");<a name="line.730"></a>
-<span class="sourceLineNo">731</span>    this.addOptWithArg("x", "excludefile",<a name="line.731"></a>
-<span class="sourceLineNo">732</span>        "File with &lt;hostname:port&gt; per line to exclude as unload targets; default excludes only "<a name="line.732"></a>
-<span class="sourceLineNo">733</span>            + "target host; useful for rack decommisioning.");<a name="line.733"></a>
-<span class="sourceLineNo">734</span>    this.addOptWithArg("f", "filename",<a name="line.734"></a>
-<span class="sourceLineNo">735</span>        "File to save regions list into unloading, or read from loading; "<a name="line.735"></a>
-<span class="sourceLineNo">736</span>            + "default /tmp/&lt;usernamehostname:port&gt;");<a name="line.736"></a>
-<span class="sourceLineNo">737</span>    this.addOptNoArg("n", "noack",<a name="line.737"></a>
-<span class="sourceLineNo">738</span>        "Turn on No-Ack mode(default: false) which won't check if region is online on target "<a name="line.738"></a>
-<span class="sourceLineNo">739</span>            + "RegionServer, hence best effort. This is more performant in unloading and loading "<a name="line.739"></a>
-<span class="sourceLineNo">740</span>            + "but might lead to region being unavailable for some time till master reassigns it "<a name="line.740"></a>
-<span class="sourceLineNo">741</span>            + "in case the move failed");<a name="line.741"></a>
-<span class="sourceLineNo">742</span>    this.addOptWithArg("t", "timeout", "timeout in seconds after which the tool will exit "<a name="line.742"></a>
-<span class="sourceLineNo">743</span>        + "irrespective of whether it finished or not;default Integer.MAX_VALUE");<a name="line.743"></a>
-<span class="sourceLineNo">744</span>  }<a name="line.744"></a>
-<span class="sourceLineNo">745</span><a name="line.745"></a>
-<span class="sourceLineNo">746</span>  @Override<a name="line.746"></a>
-<span class="sourceLineNo">747</span>  protected void processOptions(CommandLine cmd) {<a name="line.747"></a>
-<span class="sourceLineNo">748</span>    String hostname = cmd.getOptionValue("r");<a name="line.748"></a>
-<span class="sourceLineNo">749</span>    rmbuilder = new RegionMoverBuilder(hostname);<a name="line.749"></a>
-<span class="sourceLineNo">750</span>    if (cmd.hasOption('m')) {<a name="line.750"></a>
-<span class="sourceLineNo">751</span>      rmbuilder.maxthreads(Integer.parseInt(cmd.getOptionValue('m')));<a name="line.751"></a>
-<span class="sourceLineNo">752</span>    }<a name="line.752"></a>
-<span class="sourceLineNo">753</span>    if (cmd.hasOption('n')) {<a name="line.753"></a>
-<span class="sourceLineNo">754</span>      rmbuilder.ack(false);<a name="line.754"></a>
-<span class="sourceLineNo">755</span>    }<a name="line.755"></a>
-<span class="sourceLineNo">756</span>    if (cmd.hasOption('f')) {<a name="line.756"></a>
-<span class="sourceLineNo">757</span>      rmbuilder.filename(cmd.getOptionValue('f'));<a name="line.757"></a>
-<span class="sourceLineNo">758</span>    }<a name="line.758"></a>
-<span class="sourceLineNo">759</span>    if (cmd.hasOption('x')) {<a name="line.759"></a>
-<span class="sourceLineNo">760</span>      rmbuilder.excludeFile(cmd.getOptionValue('x'));<a name="line.760"></a>
-<span class="sourceLineNo">761</span>    }<a name="line.761"></a>
-<span class="sourceLineNo">762</span>    if (cmd.hasOption('t')) {<a name="line.762"></a>
-<span class="sourceLineNo">763</span>      rmbuilder.timeout(Integer.parseInt(cmd.getOptionValue('t')));<a name="line.763"></a>
-<span class="sourceLineNo">764</span>    }<a name="line.764"></a>
-<span class="sourceLineNo">765</span>    this.loadUnload = cmd.getOptionValue("o").toLowerCase(Locale.ROOT);<a name="line.765"></a>
-<span class="sourceLineNo">766</span>  }<a name="line.766"></a>
-<span class="sourceLineNo">767</span><a name="line.767"></a>
-<span class="sourceLineNo">768</span>  @Override<a name="line.768"></a>
-<span class="sourceLineNo">769</span>  protected int doWork() throws Exception {<a name="line.769"></a>
-<span class="sourceLineNo">770</span>    boolean success;<a name="line.770"></a>
-<span class="sourceLineNo">771</span>    try (RegionMover rm = rmbuilder.build()) {<a name="line.771"></a>
-<span class="sourceLineNo">772</span>      if (loadUnload.equalsIgnoreCase("load")) {<a name="line.772"></a>
-<span class="sourceLineNo">773</span>        success = rm.load();<a name="line.773"></a>
-<span class="sourceLineNo">774</span>      } else if (loadUnload.equalsIgnoreCase("unload")) {<a name="line.774"></a>
-<span class="sourceLineNo">775</span>        success = rm.unload();<a name="line.775"></a>
-<span class="sourceLineNo">776</span>      } else {<a name="line.776"></a>
-<span class="sourceLineNo">777</span>        printUsage();<a name="line.777"></a>
-<span class="sourceLineNo">778</span>        success = false;<a name="line.778"></a>
-<span class="sourceLineNo">779</span>      }<a name="line.779"></a>
-<span class="sourceLineNo">780</span>    }<a name="line.780"></a>
-<span class="sourceLineNo">781</span>    return (success ? 0 : 1);<a name="line.781"></a>
-<span class="sourceLineNo">782</span>  }<a name="line.782"></a>
-<span class="sourceLineNo">783</span><a name="line.783"></a>
-<span class="sourceLineNo">784</span>  public static void main(String[] args) {<a name="line.784"></a>
-<span class="sourceLineNo">785</span>    new RegionMover().doStaticMain(args);<a name="line.785"></a>
-<span class="sourceLineNo">786</span>  }<a name="line.786"></a>
-<span class="sourceLineNo">787</span>}<a name="line.787"></a>
+<span class="sourceLineNo">048</span>import org.apache.commons.io.IOUtils;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.conf.Configuration;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.ClusterMetrics.Option;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.HBaseConfiguration;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.HConstants;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.HRegionLocation;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.apache.hadoop.hbase.ServerName;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>import org.apache.hadoop.hbase.client.Admin;<a name="line.55"></a>
+<span class="sourceLineNo">056</span>import org.apache.hadoop.hbase.client.Connection;<a name="line.56"></a>
+<span class="sourceLineNo">057</span>import org.apache.hadoop.hbase.client.ConnectionFactory;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>import org.apache.hadoop.hbase.client.ResultScanner;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>import org.apache.hadoop.hbase.client.Scan;<a name="line.60"></a>
+<span class="sourceLineNo">061</span>import org.apache.hadoop.hbase.client.Table;<a name="line.61"></a>
+<span class="sourceLineNo">062</span>import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;<a name="line.62"></a>
+<span class="sourceLineNo">063</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.63"></a>
+<span class="sourceLineNo">064</span>import org.slf4j.Logger;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>import org.slf4j.LoggerFactory;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.67"></a>
+<span class="sourceLineNo">068</span>import org.apache.hbase.thirdparty.org.apache.commons.cli.CommandLine;<a name="line.68"></a>
+<span class="sourceLineNo">069</span><a name="line.69"></a>
+<span class="sourceLineNo">070</span>/**<a name="line.70"></a>
+<span class="sourceLineNo">071</span> * Tool for loading/unloading regions to/from given regionserver This tool can be run from Command<a name="line.71"></a>
+<span class="sourceLineNo">072</span> * line directly as a utility. Supports Ack/No Ack mode for loading/unloading operations.Ack mode<a name="line.72"></a>
+<span class="sourceLineNo">073</span> * acknowledges if regions are online after movement while noAck mode is best effort mode that<a name="line.73"></a>
+<span class="sourceLineNo">074</span> * improves performance but will still move on if region is stuck/not moved. Motivation behind noAck<a name="line.74"></a>
+<span class="sourceLineNo">075</span> * mode being RS shutdown where even if a Region is stuck, upon shutdown master will move it<a name="line.75"></a>
+<span class="sourceLineNo">076</span> * anyways. This can also be used by constructiong an Object using the builder and then calling<a name="line.76"></a>
+<span class="sourceLineNo">077</span> * {@link #load()} or {@link #unload()} methods for the desired operations.<a name="line.77"></a>
+<span class="sourceLineNo">078</span> */<a name="line.78"></a>
+<span class="sourceLineNo">079</span>@InterfaceAudience.Public<a name="line.79"></a>
+<span class="sourceLineNo">080</span>public class RegionMover extends AbstractHBaseTool implements Closeable {<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  public static final String MOVE_RETRIES_MAX_KEY = "hbase.move.retries.max";<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  public static final String MOVE_WAIT_MAX_KEY = "hbase.move.wait.max";<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  public static final String SERVERSTART_WAIT_MAX_KEY = "hbase.serverstart.wait.max";<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  public static final int DEFAULT_MOVE_RETRIES_MAX = 5;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  public static final int DEFAULT_MOVE_WAIT_MAX = 60;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  public static final int DEFAULT_SERVERSTART_WAIT_MAX = 180;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  static final Logger LOG = LoggerFactory.getLogger(RegionMover.class);<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private RegionMoverBuilder rmbuilder;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  private boolean ack = true;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private int maxthreads = 1;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  private int timeout;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  private String loadUnload;<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  private String hostname;<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  private String filename;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  private String excludeFile;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  private int port;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  private Connection conn;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  private Admin admin;<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>  private RegionMover(RegionMoverBuilder builder) throws IOException {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    this.hostname = builder.hostname;<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    this.filename = builder.filename;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    this.excludeFile = builder.excludeFile;<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    this.maxthreads = builder.maxthreads;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    this.ack = builder.ack;<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    this.port = builder.port;<a name="line.106"></a>
+<span class="sourceLineNo">107</span>    this.timeout = builder.timeout;<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    setConf(builder.conf);<a name="line.108"></a>
+<span class="sourceLineNo">109</span>    this.conn = ConnectionFactory.createConnection(conf);<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    this.admin = conn.getAdmin();<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  }<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  private RegionMover() {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>  }<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  @Override<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  public void close() {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    IOUtils.closeQuietly(this.admin);<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    IOUtils.closeQuietly(this.conn);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  }<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  /**<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   * Builder for Region mover. Use the {@link #build()} method to create RegionMover object. Has<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * {@link #filename(String)}, {@link #excludeFile(String)}, {@link #maxthreads(int)},<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   * {@link #ack(boolean)}, {@link #timeout(int)} methods to set the corresponding options<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   */<a name="line.126"></a>
+<span class="sourceLineNo">127</span>  public static class RegionMoverBuilder {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    private boolean ack = true;<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    private int maxthreads = 1;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    private int timeout = Integer.MAX_VALUE;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    private String hostname;<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    private String filename;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    private String excludeFile = null;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    private String defaultDir = System.getProperty("java.io.tmpdir");<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    @VisibleForTesting<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    final int port;<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    private final Configuration conf;<a name="line.137"></a>
+<span class="sourceLineNo">138</span><a name="line.138"></a>
+<span class="sourceLineNo">139</span>    public RegionMoverBuilder(String hostname) {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      this(hostname, createConf());<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    }<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>    /**<a name="line.143"></a>
+<span class="sourceLineNo">144</span>     * Creates a new configuration and sets region mover specific overrides<a name="line.144"></a>
+<span class="sourceLineNo">145</span>     */<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    private static Configuration createConf() {<a name="line.146"></a>
+<span class="sourceLineNo">147</span>      Configuration conf = HBaseConfiguration.create();<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      conf.setInt("hbase.client.prefetch.limit", 1);<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      conf.setInt("hbase.client.pause", 500);<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      conf.setInt("hbase.client.retries.number", 100);<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      return conf;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    }<a name="line.152"></a>
+<span class="sourceLineNo">153</span><a name="line.153"></a>
+<span class="sourceLineNo">154</span>    /**<a name="line.154"></a>
+<span class="sourceLineNo">155</span>     * @param hostname Hostname to unload regions from or load regions to. Can be either hostname<a name="line.155"></a>
+<span class="sourceLineNo">156</span>     *     or hostname:port.<a name="line.156"></a>
+<span class="sourceLineNo">157</span>     * @param conf Configuration object<a name="line.157"></a>
+<span class="sourceLineNo">158</span>     */<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    public RegionMoverBuilder(String hostname, Configuration conf) {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      String[] splitHostname = hostname.toLowerCase().split(":");<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      this.hostname = splitHostname[0];<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      if (splitHostname.length == 2) {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>        this.port = Integer.parseInt(splitHostname[1]);<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      } else {<a name="line.164"></a>
+<span class="sourceLineNo">165</span>        this.port = conf.getInt(HConstants.REGIONSERVER_PORT, HConstants.DEFAULT_REGIONSERVER_PORT);<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      }<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      this.filename = defaultDir + File.separator + System.getProperty("user.name") + this.hostname<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        + ":" + Integer.toString(this.port);<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      this.conf = conf;<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
+<span class="sourceLineNo">171</span><a name="line.171"></a>
+<span class="sourceLineNo">172</span>    /**<a name="line.172"></a>
+<span class="sourceLineNo">173</span>     * Path of file where regions will be written to during unloading/read from during loading<a name="line.173"></a>
+<span class="sourceLineNo">174</span>     * @param filename<a name="line.174"></a>
+<span class="sourceLineNo">175</span>     * @return RegionMoverBuilder object<a name="line.175"></a>
+<span class="sourceLineNo">176</span>     */<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    public RegionMoverBuilder filename(String filename) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      this.filename = filename;<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      return this;<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
+<span class="sourceLineNo">181</span><a name="line.181"></a>
+<span class="sourceLineNo">182</span>    /**<a name="line.182"></a>
+<span class="sourceLineNo">183</span>     * Set the max number of threads that will be used to move regions<a name="line.183"></a>
+<span class="sourceLineNo">184</span>     */<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    public RegionMoverBuilder maxthreads(int threads) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      this.maxthreads = threads;<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      return this;<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    }<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>    /**<a name="line.190"></a>
+<span class="sourceLineNo">191</span>     * Path of file containing hostnames to be excluded during region movement. Exclude file should<a name="line.191"></a>
+<span class="sourceLineNo">192</span>     * have 'host:port' per line. Port is mandatory here as we can have many RS running on a single<a name="line.192"></a>
+<span class="sourceLineNo">193</span>     * host.<a name="line.193"></a>
+<span class="sourceLineNo">194</span>     */<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    public RegionMoverBuilder excludeFile(String excludefile) {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      this.excludeFile = excludefile;<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      return this;<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    }<a name="line.198"></a>
+<span class="sourceLineNo">199</span><a name="line.199"></a>
+<span class="sourceLineNo">200</span>    /**<a name="line.200"></a>
+<span class="sourceLineNo">201</span>     * Set ack/noAck mode.<a name="line.201"></a>
+<span class="sourceLineNo">202</span>     * &lt;p&gt;<a name="line.202"></a>
+<span class="sourceLineNo">203</span>     * In ack mode regions are acknowledged before and after moving and the move is retried<a name="line.203"></a>
+<span class="sourceLineNo">204</span>     * hbase.move.retries.max times, if unsuccessful we quit with exit code 1.No Ack mode is a best<a name="line.204"></a>
+<span class="sourceLineNo">205</span>     * effort mode,each region movement is tried once.This can be used during graceful shutdown as<a name="line.205"></a>
+<span class="sourceLineNo">206</span>     * even if we have a stuck region,upon shutdown it'll be reassigned anyway.<a name="line.206"></a>
+<span class="sourceLineNo">207</span>     * &lt;p&gt;<a name="line.207"></a>
+<span class="sourceLineNo">208</span>     * @param ack<a name="line.208"></a>
+<span class="sourceLineNo">209</span>     * @return RegionMoverBuilder object<a name="line.209"></a>
+<span class="sourceLineNo">210</span>     */<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    public RegionMoverBuilder ack(boolean ack) {<a name="line.211"></a>
+<span class="sourceLineNo">212</span>      this.ack = ack;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      return this;<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    }<a name="line.214"></a>
+<span class="sourceLineNo">215</span><a name="line.215"></a>
+<span class="sourceLineNo">216</span>    /**<a name="line.216"></a>
+<span class="sourceLineNo">217</span>     * Set the timeout for Load/Unload operation in seconds.This is a global timeout,threadpool for<a name="line.217"></a>
+<span class="sourceLineNo">218</span>     * movers also have a separate time which is hbase.move.wait.max * number of regions to<a name="line.218"></a>
+<span class="sourceLineNo">219</span>     * load/unload<a name="line.219"></a>
+<span class="sourceLineNo">220</span>     * @param timeout in seconds<a name="line.220"></a>
+<span class="sourceLineNo">221</span>     * @return RegionMoverBuilder object<a name="line.221"></a>
+<span class="sourceLineNo">222</span>     */<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    public RegionMoverBuilder timeout(int timeout) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>      this.timeout = timeout;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>      return this;<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    }<a name="line.226"></a>
+<span class="sourceLineNo">227</span><a name="line.227"></a>
+<span class="sourceLineNo">228</span>    /**<a name="line.228"></a>
+<span class="sourceLineNo">229</span>     * This method builds the appropriate RegionMover object which can then be used to load/unload<a name="line.229"></a>
+<span class="sourceLineNo">230</span>     * using load and unload methods<a name="line.230"></a>
+<span class="sourceLineNo">231</span>     * @return RegionMover object<a name="line.231"></a>
+<span class="sourceLineNo">232</span>     */<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    public RegionMover build() throws IOException {<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      return new RegionMover(this);<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
+<span class="sourceLineNo">236</span>  }<a name="line.236"></a>
+<span class="sourceLineNo">237</span><a name="line.237"></a>
+<span class="sourceLineNo">238</span>  /**<a name="line.238"></a>
+<span class="sourceLineNo">239</span>   * Move Regions and make sure that they are up on the target server.If a region movement fails we<a name="line.239"></a>
+<span class="sourceLineNo">240</span>   * exit as failure<a name="line.240"></a>
+<span class="sourceLineNo">241</span>   */<a name="line.241"></a>
+<span class="sourceLineNo">242</span>  private class MoveWithAck implements Callable&lt;Boolean&gt; {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    private RegionInfo region;<a name="line.243"></a>
+<span class="sourceLineNo">244</span>    private ServerName targetServer;<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    private List&lt;RegionInfo&gt; movedRegions;<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    private ServerName sourceServer;<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>    public MoveWithAck(RegionInfo regionInfo, ServerName sourceServer,<a name="line.248"></a>
+<span class="sourceLineNo">249</span>        ServerName targetServer, List&lt;RegionInfo&gt; movedRegions) {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>      this.region = regionInfo;<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      this.targetServer = targetServer;<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      this.movedRegions = movedRegions;<a name="line.252"></a>
+<span class="sourceLineNo">253</span>      this.sourceServer = sourceServer;<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    }<a name="line.254"></a>
+<span class="sourceLineNo">255</span><a name="line.255"></a>
+<span class="sourceLineNo">256</span>    @Override<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    public Boolean call() throws IOException, InterruptedException {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>      boolean moved = false;<a name="line.258"></a>
+<span class="sourceLineNo">259</span>      int count = 0;<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      int retries = admin.getConfiguration().getInt(MOVE_RETRIES_MAX_KEY, DEFAULT_MOVE_RETRIES_MAX);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>      int maxWaitInSeconds =<a name="line.261"></a>
+<span class="sourceLineNo">262</span>          admin.getConfiguration().getInt(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      long startTime = EnvironmentEdgeManager.currentTime();<a name="line.263"></a>
+<span class="sourceLineNo">264</span>      boolean sameServer = true;<a name="line.264"></a>
+<span class="sourceLineNo">265</span>      // Assert we can scan the region in its current location<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      isSuccessfulScan(region);<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      LOG.info("Moving region:" + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.267"></a>
+<span class="sourceLineNo">268</span>          + targetServer);<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      while (count &lt; retries &amp;&amp; sameServer) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>        if (count &gt; 0) {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>          LOG.info("Retry " + Integer.toString(count) + " of maximum " + Integer.toString(retries));<a name="line.271"></a>
+<span class="sourceLineNo">272</span>        }<a name="line.272"></a>
+<span class="sourceLineNo">273</span>        count = count + 1;<a name="line.273"></a>
+<span class="sourceLineNo">274</span>        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        long maxWait = startTime + (maxWaitInSeconds * 1000);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>        while (EnvironmentEdgeManager.currentTime() &lt; maxWait) {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>          sameServer = isSameServer(region, sourceServer);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>          if (!sameServer) {<a name="line.278"></a>
+<span class="sourceLineNo">279</span>            break;<a name="line.279"></a>
+<span class="sourceLineNo">280</span>          }<a name="line.280"></a>
+<span class="sourceLineNo">281</span>          Thread.sleep(100);<a name="line.281"></a>
+<span class="sourceLineNo">282</span>        }<a name="line.282"></a>
+<span class="sourceLineNo">283</span>      }<a name="line.283"></a>
+<span class="sourceLineNo">284</span>      if (sameServer) {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>        LOG.error("Region: " + region.getRegionNameAsString() + " stuck on " + this.sourceServer<a name="line.285"></a>
+<span class="sourceLineNo">286</span>            + ",newServer=" + this.targetServer);<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      } else {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        isSuccessfulScan(region);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>        LOG.info("Moved Region "<a name="line.289"></a>
+<span class="sourceLineNo">290</span>            + region.getRegionNameAsString()<a name="line.290"></a>
+<span class="sourceLineNo">291</span>            + " cost:"<a name="line.291"></a>
+<span class="sourceLineNo">292</span>            + String.format("%.3f",<a name="line.292"></a>
+<span class="sourceLineNo">293</span>            (float) (EnvironmentEdgeManager.currentTime() - startTime) / 1000));<a name="line.293"></a>
+<span class="sourceLineNo">294</span>        moved = true;<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        movedRegions.add(region);<a name="line.295"></a>
+<span class="sourceLineNo">296</span>      }<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      return moved;<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    }<a name="line.298"></a>
+<span class="sourceLineNo">299</span>  }<a name="line.299"></a>
+<span class="sourceLineNo">300</span><a name="line.300"></a>
+<span class="sourceLineNo">301</span>  /**<a name="line.301"></a>
+<span class="sourceLineNo">302</span>   * Move Regions without Acknowledging.Usefule in case of RS shutdown as we might want to shut the<a name="line.302"></a>
+<span class="sourceLineNo">303</span>   * RS down anyways and not abort on a stuck region. Improves movement performance<a name="line.303"></a>
+<span class="sourceLineNo">304</span>   */<a name="line.304"></a>
+<span class="sourceLineNo">305</span>  private class MoveWithoutAck implements Callable&lt;Boolean&gt; {<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    private RegionInfo region;<a name="line.306"></a>
+<span class="sourceLineNo">307</span>    private ServerName targetServer;<a name="line.307"></a>
+<span class="sourceLineNo">308</span>    private List&lt;RegionInfo&gt; movedRegions;<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    private ServerName sourceServer;<a name="line.309"></a>
+<span class="sourceLineNo">310</span><a name="line.310"></a>
+<span class="sourceLineNo">311</span>    public MoveWithoutAck(RegionInfo regionInfo, ServerName sourceServer,<a name="line.311"></a>
+<span class="sourceLineNo">312</span>        ServerName targetServer, List&lt;RegionInfo&gt; movedRegions) {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      this.region = regionInfo;<a name="line.313"></a>
+<span class="sourceLineNo">314</span>      this.targetServer = targetServer;<a name="line.314"></a>
+<span class="sourceLineNo">315</span>      this.movedRegions = movedRegions;<a name="line.315"></a>
+<span class="sourceLineNo">316</span>      this.sourceServer = sourceServer;<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    }<a name="line.317"></a>
+<span class="sourceLineNo">318</span><a name="line.318"></a>
+<span class="sourceLineNo">319</span>    @Override<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    public Boolean call() {<a name="line.320"></a>
+<span class="sourceLineNo">321</span>      try {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>        LOG.info("Moving region:" + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.322"></a>
+<span class="sourceLineNo">323</span>            + targetServer);<a name="line.323"></a>
+<span class="sourceLineNo">324</span>        admin.move(region.getEncodedNameAsBytes(), Bytes.toBytes(targetServer.getServerName()));<a name="line.324"></a>
+<span class="sourceLineNo">325</span>        LOG.info("Moved " + region.getEncodedName() + " from " + sourceServer + " to "<a name="line.325"></a>
+<span class="sourceLineNo">326</span>            + targetServer);<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      } catch (Exception e) {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        LOG.error("Error Moving Region:" + region.getEncodedName(), e);<a name="line.328"></a>
+<span class="sourceLineNo">329</span>      } finally {<a name="line.329"></a>
+<span class="sourceLineNo">330</span>        // we add region to the moved regions list in No Ack Mode since this is best effort<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        movedRegions.add(region);<a name="line.331"></a>
+<span class="sourceLineNo">332</span>      }<a name="line.332"></a>
+<span class="sourceLineNo">333</span>      return true;<a name="line.333"></a>
+<span class="sourceLineNo">334</span>    }<a name="line.334"></a>
+<span class="sourceLineNo">335</span>  }<a name="line.335"></a>
+<span class="sourceLineNo">336</span><a name="line.336"></a>
+<span class="sourceLineNo">337</span>  /**<a name="line.337"></a>
+<span class="sourceLineNo">338</span>   * Loads the specified {@link #hostname} with regions listed in the {@link #filename} RegionMover<a name="line.338"></a>
+<span class="sourceLineNo">339</span>   * Object has to be created using {@link #RegionMover(RegionMoverBuilder)}<a name="line.339"></a>
+<span class="sourceLineNo">340</span>   * @return true if loading succeeded, false otherwise<a name="line.340"></a>
+<span class="sourceLineNo">341</span>   */<a name="line.341"></a>
+<span class="sourceLineNo">342</span>  public boolean load() throws ExecutionException, InterruptedException, TimeoutException {<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    ExecutorService loadPool = Executors.newFixedThreadPool(1);<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    Future&lt;Boolean&gt; loadTask = loadPool.submit(() -&gt; {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      try {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        List&lt;RegionInfo&gt; regionsToMove = readRegionsFromFile(filename);<a name="line.346"></a>
+<span class="sourceLineNo">347</span>        if (regionsToMove.isEmpty()) {<a name="line.347"></a>
+<span class="sourceLineNo">348</span>          LOG.info("No regions to load.Exiting");<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          return true;<a name="line.349"></a>
+<span class="sourceLineNo">350</span>        }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>        loadRegions(regionsToMove);<a name="line.351"></a>
+<span class="sourceLineNo">352</span>      } catch (Exception e) {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>        LOG.error("Error while loading regions to " + hostname, e);<a name="line.353"></a>
+<span class="sourceLineNo">354</span>        return false;<a name="line.354"></a>
+<span class="sourceLineNo">355</span>      }<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      return true;<a name="line.356"></a>
+<span class="sourceLineNo">357</span>    });<a name="line.357"></a>
+<span class="sourceLineNo">358</span>    return waitTaskToFinish(loadPool, loadTask, "loading");<a name="line.358"></a>
+<span class="sourceLineNo">359</span>  }<a name="line.359"></a>
+<span class="sourceLineNo">360</span><a name="line.360"></a>
+<span class="sourceLineNo">361</span>  private void loadRegions(List&lt;RegionInfo&gt; regionsToMove)<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      throws Exception {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    ServerName server = getTargetServer();<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    List&lt;RegionInfo&gt; movedRegions = Collections.synchronizedList(new ArrayList&lt;&gt;());<a name="line.364"></a>
+<span class="sourceLineNo">365</span>    LOG.info(<a name="line.365"></a>
+<span class="sourceLineNo">366</span>        "Moving " + regionsToMove.size() + " regions to " + server + " using " + this.maxthreads<a name="line.366"></a>
+<span class="sourceLineNo">367</span>            + " threads.Ack mode:" + this.ack);<a name="line.367"></a>
+<span class="sourceLineNo">368</span><a name="line.368"></a>
+<span class="sourceLineNo">369</span>    ExecutorService moveRegionsPool = Executors.newFixedThreadPool(this.maxthreads);<a name="line.369"></a>
+<span class="sourceLineNo">370</span>    List&lt;Future&lt;Boolean&gt;&gt; taskList = new ArrayList&lt;&gt;();<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    int counter = 0;<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    while (counter &lt; regionsToMove.size()) {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      RegionInfo region = regionsToMove.get(counter);<a name="line.373"></a>
+<span class="sourceLineNo">374</span>      ServerName currentServer = getServerNameForRegion(region);<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      if (currentServer == null) {<a name="line.375"></a>
+<span class="sourceLineNo">376</span>        LOG.warn(<a name="line.376"></a>
+<span class="sourceLineNo">377</span>            "Could not get server for Region:" + region.getRegionNameAsString() + " moving on");<a name="line.377"></a>
+<span class="sourceLineNo">378</span>        counter++;<a name="line.378"></a>
+<span class="sourceLineNo">379</span>        continue;<a name="line.379"></a>
+<span class="sourceLineNo">380</span>      } else if (server.equals(currentServer)) {<a name="line.380"></a>
+<span class="sourceLineNo">381</span>        LOG.info(<a name="line.381"></a>
+<span class="sourceLineNo">382</span>            "Region " + region.getRegionNameAsString() + " is already on target server=" + server);<a name="line.382"></a>
+<span class="sourceLineNo">383</span>        counter++;<a name="line.383"></a>
+<span class="sourceLineNo">384</span>        continue;<a name="line.384"></a>
+<span class="sourceLineNo">385</span>      }<a name="line.385"></a>
+<span class="sourceLineNo">386</span>      if (ack) {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>        Future&lt;Boolean&gt; task =<a name="line.387"></a>
+<span class="sourceLineNo">388</span>            moveRegionsPool.submit(new MoveWithAck(region, currentServer, server, movedRegions));<a name="line.388"></a>
+<span class="sourceLineNo">389</span>        taskList.add(task);<a name="line.389"></a>
+<span class="sourceLineNo">390</span>      } else {<a name="line.390"></a>
+<span class="sourceLineNo">391</span>        Future&lt;Boolean&gt; task =<a name="line.391"></a>
+<span class="sourceLineNo">392</span>            moveRegionsPool.submit(new MoveWithoutAck(region, currentServer, server, movedRegions));<a name="line.392"></a>
+<span class="sourceLineNo">393</span>        taskList.add(task);<a name="line.393"></a>
+<span class="sourceLineNo">394</span>      }<a name="line.394"></a>
+<span class="sourceLineNo">395</span>      counter++;<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    }<a name="line.396"></a>
+<span class="sourceLineNo">397</span><a name="line.397"></a>
+<span class="sourceLineNo">398</span>    moveRegionsPool.shutdown();<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    long timeoutInSeconds = regionsToMove.size() * admin.getConfiguration()<a name="line.399"></a>
+<span class="sourceLineNo">400</span>        .getLong(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.400"></a>
+<span class="sourceLineNo">401</span>    waitMoveTasksToFinish(moveRegionsPool, taskList, timeoutInSeconds);<a name="line.401"></a>
+<span class="sourceLineNo">402</span>  }<a name="line.402"></a>
+<span class="sourceLineNo">403</span><a name="line.403"></a>
+<span class="sourceLineNo">404</span>  /**<a name="line.404"></a>
+<span class="sourceLineNo">405</span>   * Unload regions from given {@link #hostname} using ack/noAck mode and {@link #maxthreads}.In<a name="line.405"></a>
+<span class="sourceLineNo">406</span>   * noAck mode we do not make sure that region is successfully online on the target region<a name="line.406"></a>
+<span class="sourceLineNo">407</span>   * server,hence it is best effort.We do not unload regions to hostnames given in<a name="line.407"></a>
+<span class="sourceLineNo">408</span>   * {@link #excludeFile}.<a name="line.408"></a>
+<span class="sourceLineNo">409</span>   * @return true if unloading succeeded, false otherwise<a name="line.409"></a>
+<span class="sourceLineNo">410</span>   */<a name="line.410"></a>
+<span class="sourceLineNo">411</span>  public boolean unload() throws InterruptedException, ExecutionException, TimeoutException {<a name="line.411"></a>
+<span class="sourceLineNo">412</span>    deleteFile(this.filename);<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    ExecutorService unloadPool = Executors.newFixedThreadPool(1);<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    Future&lt;Boolean&gt; unloadTask = unloadPool.submit(() -&gt; {<a name="line.414"></a>
+<span class="sourceLineNo">415</span>      List&lt;RegionInfo&gt; movedRegions = Collections.synchronizedList(new ArrayList&lt;&gt;());<a name="line.415"></a>
+<span class="sourceLineNo">416</span>      try {<a name="line.416"></a>
+<span class="sourceLineNo">417</span>        // Get Online RegionServers<a name="line.417"></a>
+<span class="sourceLineNo">418</span>        List&lt;ServerName&gt; regionServers = new ArrayList&lt;&gt;();<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        regionServers.addAll(<a name="line.419"></a>
+<span class="sourceLineNo">420</span>            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()<a name="line.420"></a>
+<span class="sourceLineNo">421</span>                .keySet());<a name="line.421"></a>
+<span class="sourceLineNo">422</span>        // Remove the host Region server from target Region Servers list<a name="line.422"></a>
+<span class="sourceLineNo">423</span>        ServerName server = stripServer(regionServers, hostname, port);<a name="line.423"></a>
+<span class="sourceLineNo">424</span>        // Remove RS present in the exclude file<a name="line.424"></a>
+<span class="sourceLineNo">425</span>        stripExcludes(regionServers);<a name="line.425"></a>
+<span class="sourceLineNo">426</span>        stripMaster(regionServers);<a name="line.426"></a>
+<span class="sourceLineNo">427</span>        if (regionServers.isEmpty()) {<a name="line.427"></a>
+<span class="sourceLineNo">428</span>          LOG.warn("No Regions were moved - no servers available");<a name="line.428"></a>
+<span class="sourceLineNo">429</span>          return false;<a name="line.429"></a>
+<span class="sourceLineNo">430</span>        }<a name="line.430"></a>
+<span class="sourceLineNo">431</span>        unloadRegions(server, regionServers, movedRegions);<a name="line.431"></a>
+<span class="sourceLineNo">432</span>      } catch (Exception e) {<a name="line.432"></a>
+<span class="sourceLineNo">433</span>        LOG.error("Error while unloading regions ", e);<a name="line.433"></a>
+<span class="sourceLineNo">434</span>        return false;<a name="line.434"></a>
+<span class="sourceLineNo">435</span>      } finally {<a name="line.435"></a>
+<span class="sourceLineNo">436</span>        if (movedRegions != null) {<a name="line.436"></a>
+<span class="sourceLineNo">437</span>          writeFile(filename, movedRegions);<a name="line.437"></a>
+<span class="sourceLineNo">438</span>        }<a name="line.438"></a>
+<span class="sourceLineNo">439</span>      }<a name="line.439"></a>
+<span class="sourceLineNo">440</span>      return true;<a name="line.440"></a>
+<span class="sourceLineNo">441</span>    });<a name="line.441"></a>
+<span class="sourceLineNo">442</span>    return waitTaskToFinish(unloadPool, unloadTask, "unloading");<a name="line.442"></a>
+<span class="sourceLineNo">443</span>  }<a name="line.443"></a>
+<span class="sourceLineNo">444</span><a name="line.444"></a>
+<span class="sourceLineNo">445</span>  private void unloadRegions(ServerName server, List&lt;ServerName&gt; regionServers,<a name="line.445"></a>
+<span class="sourceLineNo">446</span>      List&lt;RegionInfo&gt; movedRegions) throws Exception {<a name="line.446"></a>
+<span class="sourceLineNo">447</span>    while (true) {<a name="line.447"></a>
+<span class="sourceLineNo">448</span>      List&lt;RegionInfo&gt; regionsToMove = admin.getRegions(server);<a name="line.448"></a>
+<span class="sourceLineNo">449</span>      regionsToMove.removeAll(movedRegions);<a name="line.449"></a>
+<span class="sourceLineNo">450</span>      if (regionsToMove.isEmpty()) {<a name="line.450"></a>
+<span class="sourceLineNo">451</span>        LOG.info("No Regions to move....Quitting now");<a name="line.451"></a>
+<span class="sourceLineNo">452</span>        break;<a name="line.452"></a>
+<span class="sourceLineNo">453</span>      }<a name="line.453"></a>
+<span class="sourceLineNo">454</span>      int counter = 0;<a name="line.454"></a>
+<span class="sourceLineNo">455</span>      LOG.info("Moving " + regionsToMove.size() + " regions from " + this.hostname + " to "<a name="line.455"></a>
+<span class="sourceLineNo">456</span>          + regionServers.size() + " servers using " + this.maxthreads + " threads .Ack Mode:"<a name="line.456"></a>
+<span class="sourceLineNo">457</span>          + ack);<a name="line.457"></a>
+<span class="sourceLineNo">458</span>      ExecutorService moveRegionsPool = Executors.newFixedThreadPool(this.maxthreads);<a name="line.458"></a>
+<span class="sourceLineNo">459</span>      List&lt;Future&lt;Boolean&gt;&gt; taskList = new ArrayList&lt;&gt;();<a name="line.459"></a>
+<span class="sourceLineNo">460</span>      int serverIndex = 0;<a name="line.460"></a>
+<span class="sourceLineNo">461</span>      while (counter &lt; regionsToMove.size()) {<a name="line.461"></a>
+<span class="sourceLineNo">462</span>        if (ack) {<a name="line.462"></a>
+<span class="sourceLineNo">463</span>          Future&lt;Boolean&gt; task = moveRegionsPool.submit(<a name="line.463"></a>
+<span class="sourceLineNo">464</span>              new MoveWithAck(regionsToMove.get(counter), server, regionServers.get(serverIndex),<a name="line.464"></a>
+<span class="sourceLineNo">465</span>                  movedRegions));<a name="line.465"></a>
+<span class="sourceLineNo">466</span>          taskList.add(task);<a name="line.466"></a>
+<span class="sourceLineNo">467</span>        } else {<a name="line.467"></a>
+<span class="sourceLineNo">468</span>          Future&lt;Boolean&gt; task = moveRegionsPool.submit(<a name="line.468"></a>
+<span class="sourceLineNo">469</span>              new MoveWithoutAck(regionsToMove.get(counter), server, regionServers.get(serverIndex),<a name="line.469"></a>
+<span class="sourceLineNo">470</span>                  movedRegions));<a name="line.470"></a>
+<span class="sourceLineNo">471</span>          taskList.add(task);<a name="line.471"></a>
+<span class="sourceLineNo">472</span>        }<a name="line.472"></a>
+<span class="sourceLineNo">473</span>        counter++;<a name="line.473"></a>
+<span class="sourceLineNo">474</span>        serverIndex = (serverIndex + 1) % regionServers.size();<a name="line.474"></a>
+<span class="sourceLineNo">475</span>      }<a name="line.475"></a>
+<span class="sourceLineNo">476</span>      moveRegionsPool.shutdown();<a name="line.476"></a>
+<span class="sourceLineNo">477</span>      long timeoutInSeconds = regionsToMove.size() * admin.getConfiguration()<a name="line.477"></a>
+<span class="sourceLineNo">478</span>          .getLong(MOVE_WAIT_MAX_KEY, DEFAULT_MOVE_WAIT_MAX);<a name="line.478"></a>
+<span class="sourceLineNo">479</span>      waitMoveTasksToFinish(moveRegionsPool, taskList, timeoutInSeconds);<a name="line.479"></a>
+<span class="sourceLineNo">480</span>    }<a name="line.480"></a>
+<span class="sourceLineNo">481</span>  }<a name="line.481"></a>
+<span class="sourceLineNo">482</span><a name="line.482"></a>
+<span class="sourceLineNo">483</span>  private boolean waitTaskToFinish(ExecutorService pool, Future&lt;Boolean&gt; task, String operation)<a name="line.483"></a>
+<span class="sourceLineNo">484</span>      throws TimeoutException, InterruptedException, ExecutionException {<a name="line.484"></a>
+<span class="sourceLineNo">485</span>    pool.shutdown();<a name="line.485"></a>
+<span class="sourceLineNo">486</span>    try {<a name="line.486"></a>
+<span class="sourceLineNo">487</span>      if (!pool.awaitTermination((long) this.timeout, TimeUnit.SECONDS)) {<a name="line.487"></a>
+<span class="sourceLineNo">488</span>        LOG.warn(<a name="line.488"></a>
+<span class="sourceLineNo">489</span>            "Timed out before finishing the " + operation + " operation. Timeout: " + this.timeout<a name="line.489"></a>
+<span class="sourceLineNo">490</span>                + "sec");<a name="line.490"></a>
+<span class="sourceLineNo">491</span>        pool.shutdownNow();<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      }<a name="line.492"></a>
+<span class="sourceLineNo">493</span>    } catch (InterruptedException e) {<a name="line.493"></a>
+<span class="sourceLineNo">494</span>      pool.shutdownNow();<a name="line.494"></a>
+<span class="sourceLineNo">495</span>      Thread.currentThread().interrupt();<a name="line.495"></a>
+<span class="sourceLineNo">496</span>    }<a name="line.496"></a>
+<span class="sourceLineNo">497</span>    try {<a name="line.497"></a>
+<span class="sourceLineNo">498</span>      return task.get(5, TimeUnit.SECONDS);<a name="line.498"></a>
+<span class="sourceLineNo">499</span>    } catch (InterruptedException e) {<a name="line.499"></a>
+<span class="sourceLineNo">500</span>      LOG.warn("Interrupted while " + operation + " Regions on " + this.hostname, e);<a name="line.500"></a>
+<span class="sourceLineNo">501</span>      throw e;<a name="line.501"></a>
+<span class="sourceLineNo">502</span>    } catch (ExecutionException e) {<a name="line.502"></a>
+<span class="sourceLineNo">503</span>      LOG.error("Error while " + operation + " regions on RegionServer " + this.hostname, e);<a name="line.503"></a>
+<span class="sourceLineNo">504</span>      throw e;<a name="line.504"></a>
+<span class="sourceLineNo">505</span>    }<a name="line.505"></a>
+<span class="sourceLineNo">506</span>  }<a name="line.506"></a>
+<span class="sourceLineNo">507</span><a name="line.507"></a>
+<span class="sourceLineNo">508</span>  private void waitMoveTasksToFinish(ExecutorService moveRegionsPool,<a name="line.508"></a>
+<span class="sourceLineNo">509</span>      List&lt;Future&lt;Boolean&gt;&gt; taskList, long timeoutInSeconds) throws Exception {<a name="line.509"></a>
+<span class="sourceLineNo">510</span>    try {<a name="line.510"></a>
+<span class="sourceLineNo">511</span>      if (!moveRegionsPool.awaitTermination(timeoutInSeconds, TimeUnit.SECONDS)) {<a name="line.511"></a>
+<span class="sourceLineNo">512</span>        moveRegionsPool.shutdownNow();<a name="line.512"></a>
+<span class="sourceLineNo">513</span>      }<a name="line.513"></a>
+<span class="sourceLineNo">514</span>    } catch (InterruptedException e) {<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      moveRegionsPool.shutdownNow();<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      Thread.currentThread().interrupt();<a name="line.516"></a>
+<span class="sourceLineNo">517</span>    }<a name="line.517"></a>
+<span class="sourceLineNo">518</span>    for (Future&lt;Boolean&gt; future : taskList) {<a name="line.518"></a>
+<span class="sourceLineNo">519</span>      try {<a name="line.519"></a>
+<span class="sourceLineNo">520</span>        // if even after shutdownNow threads are stuck we wait for 5 secs max<a name="line.520"></a>
+<span class="sourceLineNo">521</span>        if (!future.get(5, TimeUnit.SECONDS)) {<a name="line.521"></a>
+<span class="sourceLineNo">522</span>          LOG.error("Was Not able to move region....Exiting Now");<a name="line.522"></a>
+<span class="sourceLineNo">523</span>          throw new Exception("Could not move region Exception");<a name="line.523"></a>
+<span class="sourceLineNo">524</span>        }<a name="line.524"></a>
+<span class="sourceLineNo">525</span>      } catch (InterruptedException e) {<a name="line.525"></a>
+<span class="sourceLineNo">526</span>        LOG.error("Interrupted while waiting for Thread to Complete " + e.getMessage(), e);<a name="line.526"></a>
+<span class="sourceLineNo">527</span>        throw e;<a name="line.527"></a>
+<span class="sourceLineNo">528</span>      } catch (ExecutionException e) {<a name="line.528"></a>
+<span class="sourceLineNo">529</span>        LOG.error("Got Exception From Thread While moving region " + e.getMessage(), e);<a name="line.529"></a>
+<span class="sourceLineNo">530</span>        throw e;<a name="line.530"></a>
+<span class="sourceLineNo">531</span>      } catch (CancellationException e) {<a name="line.531"></a>
+<span class="sourceLineNo">532</span>        LOG.error("Thread for moving region cancelled. Timeout for cancellation:" + timeoutInSeconds<a name="line.532"></a>
+<span class="sourceLineNo">533</span>            + "secs", e);<a name="line.533"></a>
+<span class="sourceLineNo">534</span>        throw e;<a name="line.534"></a>
+<span class="sourceLineNo">535</span>      }<a name="line.535"></a>
+<span class="sourceLineNo">536</span>    }<a name="line.536"></a>
+<span class="sourceLineNo">537</span>  }<a name="line.537"></a>
+<span class="sourceLineNo">538</span><a name="line.538"></a>
+<span class="sourceLineNo">539</span>  private ServerName getTargetServer() throws Exception {<a name="line.539"></a>
+<span class="sourceLineNo">540</span>    ServerName server = null;<a name="line.540"></a>
+<span class="sourceLineNo">541</span>    int maxWaitInSeconds =<a name="line.541"></a>
+<span class="sourceLineNo">542</span>        admin.getConfiguration().getInt(SERVERSTART_WAIT_MAX_KEY, DEFAULT_SERVERSTART_WAIT_MAX);<a name="line.542"></a>
+<span class="sourceLineNo">543</span>    long maxWait = EnvironmentEdgeManager.currentTime() + maxWaitInSeconds * 1000;<a name="line.543"></a>
+<span class="sourceLineNo">544</span>    while (EnvironmentEdgeManager.currentTime() &lt; maxWait) {<a name="line.544"></a>
+<span class="sourceLineNo">545</span>      try {<a name="line.545"></a>
+<span class="sourceLineNo">546</span>        List&lt;ServerName&gt; regionServers = new ArrayList&lt;&gt;();<a name="line.546"></a>
+<span class="sourceLineNo">547</span>        regionServers.addAll(<a name="line.547"></a>
+<span class="sourceLineNo">548</span>            admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics()<a name="line.548"></a>
+<span class="sourceLineNo">549</span>                .keySet());<a name="line.549"></a>
+<span class="sourceLineNo">550</span>        // Remove the host Region server from target Region Servers list<a name="line.550"></a>
+<span class="sourceLineNo">551</span>        server = stripServer(regionServers, hostname, port);<a name="line.551"></a>
+<span class="sourceLineNo">552</span>        if (server != null) {<a name="line.552"></a>
+<span class="sourceLineNo">553</span>          break;<a name="line.553"></a>
+<span class="sourceLineNo">554</span>        } else {<a name="line.554"></a>
+<span class="sourceLineNo">555</span>          LOG.warn("Server " + hostname + ":" + port + " is not up yet, waiting");<a name="line.555"></a>
+<span class="sourceLineNo">556</span>        }<a name="line.556"></a>
+<span class="sourceLineNo">557</span>      } catch (IOException e) {<a name="line.557"></a>
+<span class="sourceLineNo">558</span>        LOG.warn("Could not get list of region servers", e);<a name="line.558"></a>
+<span class="sourceLineNo">559</span>      }<a name="line.559"></a>
+<span class="sourceLineNo">560</span>      Thread.sleep(500);<a name="line.560"></a>
+<span class="sourceLineNo">561</span>    }<a name="line.561"></a>
+<span class="sourceLineNo">562</span>    if (server == null) {<a name="line.562"></a>
+<span class="sourceLineNo">563</span>      LOG.error("Server " + hostname + ":" + port + " is not up. Giving up.");<a name="line.563"></a>
+<span class="sourceLineNo">564</span>      throw new Exception("Server " + hostname + ":" + port + " to load regions not online");<a name="line.564"></a>
+<span class="sourceLineNo">565</span>    }<a name="line.565"></a>
+<span class="sourceLineNo">566</span>    return server;<a name="line.566"></a>
+<span class="sourceLineNo">567</span>  }<a name="line.567"></a>
+<span class="sourceLineNo">568</span><a name="line.568"></a>
+<span class="sourceLineNo">569</span>  private List&lt;RegionInfo&gt; readRegionsFromFile(String filename) throws IOException {<a name="line.569"></a>
+<span class="sourceLineNo">570</span>    List&lt;RegionInfo&gt; regions = new ArrayList&lt;&gt;();<a name="line.570"></a>
+<span class="sourceLineNo">571</span>    File f = new File(filename);<a name="line.571"></a>
+<span class="sourceLineNo">572</span>    if (!f.exists()) {<a name="line.572"></a>
+<span class="sourceLineNo">573</span>      return regions;<a name="line.573"></a>
+<span class="sourceLineNo">574</span>    }<a name="line.574"></a>
+<span class="sourceLineNo">575</span>    try (DataInputStream dis = new DataInputStream(<a name="line.575"></a>
+<span class="sourceLineNo">576</span>        new BufferedInputStream(new FileInputStream(f)))) {<a name="line.576"></a>
+<span class="sourceLineNo">577</span>      int numRegions = dis.readInt();<a name="line.577"></a>
+<span class="sourceLineNo">578</span>      int index = 0;<a name="line.578"></a>
+<span class="sourceLineNo">579</span>      while (index &lt; numRegions) {<a name="line.579"></a>
+<span class="sourceLineNo">580</span>        regions.add(RegionInfo.parseFromOrNull(Bytes.readByteArray(dis)));<a name="line.580"></a>
+<span class="sourceLineNo">581</span>        index++;<a name="line.581"></a>
+<span class="sourceLineNo">582</span>      }<a name="line.582"></a>
+<span class="sourceLineNo">583</span>    } catch (IOException e) {<a name="line.583"></a>
+<span class="sourceLineNo">584</span>      LOG.error("Error while reading regions from file:" + filename, e);<a name="line.584"></a>
+<span class="sourceLineNo">585</span>      throw e;<a name="line.585"></a>
+<span class="sourceLineNo">586</span>    }<a name="line.586"></a>
+<span class="sourceLineNo">587</span>    return regions;<a name="line.587"></a>
+<span class="sourceLineNo">588</span>  }<a name="line.588"></a>
+<span class="sourceLineNo">589</span><a name="line.589"></a>
+<span class="sourceLineNo">590</span>  /**<a name="line.590"></a>
+<span class="sourceLineNo">591</span>   * Write the number of regions moved in the first line followed by regions moved in subsequent<a name="line.591"></a>
+<span class="sourceLineNo">592</span>   * lines<a name="line.592"></a>
+<span class="sourceLineNo">593</span>   */<a name="line.593"></a>
+<span class="sourceLineNo">594</span>  private void writeFile(String filename, List&lt;RegionInfo&gt; movedRegions) throws IOException {<a name="line.594"></a>
+<span class="sourceLineNo">595</span>    try (DataOutputStream dos = new DataOutputStream(<a name="line.595"></a>
+<span class="sourceLineNo">596</span>        new BufferedOutputStream(new FileOutputStream(filename)))) {<a name="line.596"></a>
+<span class="sourceLineNo">597</span>      dos.writeInt(movedRegions.size());<a name="line.597"></a>
+<span class="sourceLineNo">598</span>      for (RegionInfo region : movedRegions) {<a name="line.598"></a>
+<span class="sourceLineNo">599</span>        Bytes.writeByteArray(dos, RegionInfo.toByteArray(region));<a name="line.599"></a>
+<span class="sourceLineNo">600</span>      }<a name="line.600"></a>
+<span class="sourceLineNo">601</span>    } catch (IOException e) {<a name="line.601"></a>
+<span class="sourceLineNo">602</span>      LOG.error(<a name="line.602"></a>
+<span class="sourceLineNo">603</span>          "ERROR: Was Not able to write regions moved to output file but moved " + movedRegions<a name="line.603"></a>
+<span class="sourceLineNo">604</span>              .size() + " regions", e);<a name="line.604"></a>
+<span class="sourceLineNo">605</span>      throw e;<a name="line.605"></a>
+<span class="sourceLineNo">606</span>    }<a name="line.606"></a>
+<span class="sourceLineNo">607</span>  }<a name="line.607"></a>
+<span class="sourceLineNo">608</span><a name="line.608"></a>
+<span class="sourceLineNo">609</span>  private void deleteFile(String filename) {<a name="line.609"></a>
+<span class="sourceLineNo">610</span>    File f = new File(filename);<a name="line.610"></a>
+<span class="sourceLineNo">611</span>    if (f.exists()) {<a name="line.611"></a>
+<span class="sourceLineNo">612</span>      f.delete();<a name="line.612"></a>
+<span class="sourceLineNo">613</span>    }<a name="line.613"></a>
+<span class="sourceLineNo">614</span>  }<a name="line.614"></a>
+<span class="sourceLineNo">615</span><a name="line.615"></a>
+<span class="sourceLineNo">616</span>  /**<a name="line.616"></a>
+<span class="sourceLineNo">617</span>   * @return List of servers from the exclude file in format 'hostname:port'.<a name="line.617"></a>
+<span class="sourceLineNo">618</span>   */<a name="line.618"></a>
+<span class="sourceLineNo">619</span>  private List&lt;String&gt; readExcludes(String excludeFile) throws IOException {<a name="line.619"></a>
+<span class="sourceLineNo">620</span>    List&lt;String&gt; excludeServers = new ArrayList&lt;&gt;();<a name="line.620"></a>
+<span class="sourceLineNo">621</span>    if (excludeFile == null) {<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      return excludeServers;<a name="line.622"></a>
+<span class="sourceLineNo">623</span>    } else {<a name="line.623"></a>
+<span class="sourceLineNo">624</span>      try {<a name="line.624"></a>
+<span class="sourceLineNo">625</span>        Files.readAllLines(Paths.get(excludeFile)).stream().map(String::trim)<a name="line.625"></a>
+<span class="sourceLineNo">626</span>            .filter(((Predicate&lt;String&gt;) String::isEmpty).negate()).map(String::toLowerCase)<a name="line.626"></a>
+<span class="sourceLineNo">627</span>            .forEach(excludeServers::add);<a name="line.627"></a>
+<span class="sourceLineNo">628</span>      } catch (IOException e) {<a name="line.628"></a>
+<span class="sourceLineNo">629</span>        LOG.warn("Exception while reading excludes file, continuing anyways", e);<a name="line.629"></a>
+<span class="sourceLineNo">630</span>      }<a name="line.630"></a>
+<span class="sourceLineNo">631</span>      return excludeServers;<a name="line.631"></a>
+<span class="sourceLineNo">632</span>    }<a name="line.632"></a>
+<span class="sourceLineNo">633</span>  }<a name="line.633"></a>
+<span class="sourceLineNo">634</span><a name="line.634"></a>
+<span class="sourceLineNo">635</span>  /**<a name="line.635"></a>
+<span class="sourceLineNo">636</span>   * Excludes the servername whose hostname and port portion matches the list given in exclude file<a name="line.636"></a>
+<span class="sourceLineNo">637</span>   */<a name="line.637"></a>
+<span class="sourceLineNo">638</span>  private void stripExcludes(List&lt;ServerName&gt; regionServers) throws IOException {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>    if (excludeFile != null) {<a name="line.639"></a>
+<span class="sourceLineNo">640</span>      List&lt;String&gt; excludes = readExcludes(excludeFile);<a name="line.640"></a>
+<span class="sourceLineNo">641</span>      Iterator&lt;ServerName&gt; i = regionServers.iterator();<a name="line.641"></a>
+<span class="sourceLineNo">642</span>      while (i.hasNext()) {<a name="line.642"></a>
+<span class="sourceLineNo">643</span>        String rs = i.next().getServerName();<a name="line.643"></a>
+<span class="sourceLineNo">644</span>        String rsPort = rs.split(ServerName.SERVERNAME_SEPARATOR)[0].toLowerCase() + ":" + rs<a name="line.644"></a>
+<span class="sourceLineNo">645</span>            .split(ServerName.SERVERNAME_SEPARATOR)[1];<a name="line.645"></a>
+<span class="sourceLineNo">646</span>        if (excludes.contains(rsPort)) {<a name="line.646"></a>
+<span class="sourceLineNo">647</span>          i.remove();<a name="line.647"></a>
+<span class="sourceLineNo">648</span>        }<a name="line.648"></a>
+<span class="sourceLineNo">649</span>      }<a name="line.649"></a>
+<span class="sourceLineNo">650</span>      LOG.info("Valid Region server targets are:" + regionServers.toString());<a name="line.650"></a>
+<span class="sourceLineNo">651</span>      LOG.info("Excluded Servers are" + excludes.toString());<a name="line.651"></a>
+<span class="sourceLineNo">652</span>    }<a name="line.652"></a>
+<span class="sourceLineNo">653</span>  }<a name="line.653"></a>
+<span class="sourceLineNo">654</span><a name="line.654"></a>
+<span class="sourceLineNo">655</span>  /**<a name="line.655"></a>
+<span class="sourceLineNo">656</span>   * Exclude master from list of RSs to move regions to<a name="line.656"></a>
+<span class="sourceLineNo">657</span>   */<a name="line.657"></a>
+<span class="sourceLineNo">658</span>  private void stripMaster(List&lt;ServerName&gt; regionServers) throws IOException {<a name="line.658"></a>
+<span class="sourceLineNo">659</span>    ServerName master = admin.getClusterMetrics(EnumSet.of(Option.MASTER)).getMasterName();<a name="line.659"></a>
+<span class="sourceLineNo">660</span>    stripServer(regionServers, master.getHostname(), master.getPort());<a name="line.660"></a>
+<span class="sourceLineNo">661</span>  }<a name="line.661"></a>
+<span class="sourceLineNo">662</span><a name="line.662"></a>
+<span class="sourceLineNo">663</span>  /**<a name="line.663"></a>
+<span class="sourceLineNo">664</span>   * Remove the servername whose hostname and port portion matches from the passed array of servers.<a name="line.664"></a>
+<span class="sourceLineNo">665</span>   * Returns as side-effect the servername removed.<a name="line.665"></a>
+<span class="sourceLineNo">666</span>   * @return server removed from list of Region Servers<a name="line.666"></a>
+<span class="sourceLineNo">667</span>   */<a name="line.667"></a>
+<span class="sourceLineNo">668</span>  private ServerName stripServer(List&lt;ServerName&gt; regionServers, String hostname, int port) {<a name="line.668"></a>
+<span class="sourceLineNo">669</span>    for (Iterator&lt;ServerName&gt; iter = regionServers.iterator(); iter.hasNext();) {<a name="line.669"></a>
+<span class="sourceLineNo">670</span>      ServerName server = iter.next();<a name="line.670"></a>
+<span class="sourceLineNo">671</span>      if (server.getAddress().getHostname().equalsIgnoreCase(hostname) &amp;&amp;<a name="line.671"></a>
+<span class="sourceLineNo">672</span>        server.getAddress().getPort() == port) {<a name="line.672"></a>
+<span class="sourceLineNo">673</span>        iter.remove();<a name="line.673"></a>
+<span class="sourceLineNo">674</span>        return server;<a name="line.674"></a>
+<span class="sourceLineNo">675</span>      }<a name="line.675"></a>
+<span class="sourceLineNo">676</span>    }<a name="line.676"></a>
+<span class="sourceLineNo">677</span>    return null;<a name="line.677"></a>
+<span class="sourceLineNo">678</span>  }<a name="line.678"></a>
+<span class="sourceLineNo">679</span><a name="line.679"></a>
+<span class="sourceLineNo">680</span>  /**<a name="line.680"></a>
+<span class="sourceLineNo">681</span>   * Tries to scan a row from passed region<a name="line.681"></a>
+<span class="sourceLineNo">682</span>   */<a name="line.682"></a>
+<span class="sourceLineNo">683</span>  private void isSuccessfulScan(RegionInfo region) throws IOException {<a name="line.683"></a>
+<span class="sourceLineNo">684</span>    Scan scan = new Scan().withStartRow(region.getStartKey()).setRaw(true).setOneRowLimit()<a name="line.684"></a>
+<span class="sourceLineNo">685</span>        .setMaxResultSize(1L).setCaching(1).setFilter(new FirstKeyOnlyFilter())<a name="line.685"></a>
+<span class="sourceLineNo">686</span>        .setCacheBlocks(false);<a name="line.686"></a>
+<span class="sourceLineNo">687</span>    try (Table table = conn.getTable(region.getTable());<a name="line.687"></a>
+<span class="sourceLineNo">688</span>        ResultScanner scanner = table.getScanner(scan)) {<a name="line.688"></a>
+<span class="sourceLineNo">689</span>      scanner.next();<a name="line.689"></a>
+<span class="sourceLineNo">690</span>    } catch (IOException e) {<a name="line.690"></a>
+<span class="sourceLineNo">691</span>      LOG.error("Could not scan region:" + region.getEncodedName(), e);<a name="line.691"></a>
+<span class="sourceLineNo">692</span>      throw e;<a name="line.692"></a>
+<span class="sourceLineNo">693</span>    }<a name="line.693"></a>
+<span class="sourceLineNo">694</span>  }<a name="line.694"></a>
+<span class="sourceLineNo">695</span><a name="line.695"></a>
+<span class="sourceLineNo">696</span>  /**<a name="line.696"></a>
+<span class="sourceLineNo">697</span>   * Returns true if passed region is still on serverName when we look at hbase:meta.<a name="line.697"></a>
+<span class="sourceLineNo">698</span>   * @return true if region is hosted on serverName otherwise false<a name="line.698"></a>
+<span class="sourceLineNo">699</span>   */<a name="line.699"></a>
+<span class="sourceLineNo">700</span>  private boolean isSameServer(RegionInfo region, ServerName serverName)<a name="line.700"></a>
+<span class="sourceLineNo">701</span>      throws IOException {<a name="line.701"></a>
+<span class="sourceLineNo">702</span>    ServerName serverForRegion = getServerNameForRegion(region);<a name="line.702"></a>
+<span class="sourceLineNo">703</span>    if (serverForRegion != null &amp;&amp; serverForRegion.equals(serverName)) {<a name="line.703"></a>
+<span class="sourceLineNo">704</span>      return true;<a name="line.704"></a>
+<span class="sourceLineNo">705</span>    }<a name="line.705"></a>
+<span class="sourceLineNo">706</span>    return false;<a name="line.706"></a>
+<span class="sourceLineNo">707</span>  }<a name="line.707"></a>
+<span class="sourceLineNo">708</span><a name="line.708"></a>
+<span class="sourceLineNo">709</span>  /**<a name="line.709"></a>
+<span class="sourceLineNo">710</span>   * Get servername that is up in hbase:meta hosting the given region. this is hostname + port +<a name="line.710"></a>
+<span class="sourceLineNo">711</span>   * startcode comma-delimited. Can return null<a name="line.711"></a>
+<span class="sourceLineNo">712</span>   * @return regionServer hosting the given region<a name="line.712"></a>
+<span class="sourceLineNo">713</span>   */<a name="line.713"></a>
+<span class="sourceLineNo">714</span>  private ServerName getServerNameForRegion(RegionInfo region) throws IOException {<a name="line.714"></a>
+<span class="sourceLineNo">715</span>    if (!admin.isTableEnabled(region.getTable())) {<a name="line.715"></a>
+<span class="sourceLineNo">716</span>      return null;<a name="line.716"></a>
+<span class="sourceLineNo">717</span>    }<a name="line.717"></a>
+<span class="sourceLineNo">718</span>    HRegionLocation loc =<a name="line.718"></a>
+<span class="sourceLineNo">719</span>      conn.getRegionLocator(region.getTable()).getRegionLocation(region.getStartKey(), true);<a name="line.719"></a>
+<span class="sourceLineNo">720</span>    if (loc != null) {<a name="line.720"></a>
+<span class="sourceLineNo">721</span>      return loc.getServerName();<a name="line.721"></a>
+<span class="sourceLineNo">722</span>    } else {<a name="line.722"></a>
+<span class="sourceLineNo">723</span>      return null;<a name="line.723"></a>
+<span class="sourceLineNo">724</span>    }<a name="line.724"></a>
+<span class="sourceLineNo">725</span>  }<a name="line.725"></a>
+<span class="sourceLineNo">726</span><a name="line.726"></a>
+<span class="sourceLineNo">727</span>  @Override<a name="line.727"></a>
+<span class="sourceLineNo">728</span>  protected void addOptions() {<a name="line.728"></a>
+<span class="sourceLineNo">729</span>    this.addRequiredOptWithArg("r", "regionserverhost", "region server &lt;hostname&gt;|&lt;hostname:port&gt;");<a name="line.729"></a>
+<span class="sourceLineNo">730</span>    this.addRequiredOptWithArg("o", "operation", "Expected: load/unload");<a name="line.730"></a>
+<span class="sourceLineNo">731</span>    this.addOptWithArg("m", "maxthreads",<a name="line.731"></a>
+<span class="sourceLineNo">732</span>        "Define the maximum number of threads to use to unload and reload the regions");<a name="line.732"></a>
+<span class="sourceLineNo">733</span>    this.addOptWithArg("x", "excludefile",<a name="line.733"></a>
+<span class="sourceLineNo">734</span>        "File with &lt;hostname:port&gt; per line to exclude as unload targets; default excludes only "<a name="line.734"></a>
+<span class="sourceLineNo">735</span>            + "target host; useful for rack decommisioning.");<a name="line.735"></a>
+<span class="sourceLineNo">736</span>    this.addOptWithArg("f", "filename",<a name="line.736"></a>
+<span class="sourceLineNo">737</span>        "File to save regions list into unloading, or read from loading; "<a name="line.737"></a>
+<span class="sourceLineNo">738</span>            + "default /tmp/&lt;usernamehostname:port&gt;");<a name="line.738"></a>
+<span class="sourceLineNo">739</span>    this.addOptNoArg("n", "noack",<a name="line.739"></a>
+<span class="sourceLineNo">740</span>        "Turn on No-Ack mode(default: false) which won't check if region is online on target "<a name="line.740"></a>
+<span class="sourceLineNo">741</span>            + "RegionServer, hence best effort. This is more performant in unloading and loading "<a name="line.741"></a>
+<span class="sourceLineNo">742</span>            + "but might lead to region being unavailable for some time till master reassigns it "<a name="line.742"></a>
+<span class="sourceLineNo">743</span>            + "in case the move failed");<a name="line.743"></a>
+<span class="sourceLineNo">744</span>    this.addOptWithArg("t", "timeout", "timeout in seconds after which the tool will exit "<a name="line.744"></a>
+<span class="sourceLineNo">745</span>        + "irrespective of whether it finished or not;default Integer.MAX_VALUE");<a name="line.745"></a>
+<span class="sourceLineNo">746</span>  }<a name="line.746"></a>
+<span class="sourceLineNo">747</span><a name="line.747"></a>
+<span class="sourceLineNo">748</span>  @Override<a name="line.748"></a>
+<span class="sourceLineNo">749</span>  protected void processOptions(CommandLine cmd) {<a name="line.749"></a>
+<span class="sourceLineNo">750</span>    String hostname = cmd.getOptionValue("r");<a name="line.750"></a>
+<span class="sourceLineNo">751</span>    rmbuilder = new RegionMoverBuilder(hostname);<a name="line.751"></a>
+<span class="sourceLineNo">752</span>    if (cmd.hasOption('m')) {<a name="line.752"></a>
+<span class="sourceLineNo">753</span>      rmbuilder.maxthreads(Integer.parseInt(cmd.getOptionValue('m')));<a name="line.753"></a>
+<span class="sourceLineNo">754</span>    }<a name="line.754"></a>
+<span class="sourceLineNo">755</span>    if (cmd.hasOption('n')) {<a name="line.755"></a>
+<span class="sourceLineNo">756</span>      rmbuilder.ack(false);<a name="line.756"></a>
+<span class="sourceLineNo">757</span>    }<a name="line.757"></a>
+<span class="sourceLineNo">758</span>    if (cmd.hasOption('f')) {<a name="line.758"></a>
+<span class="sourceLineNo">759</span>      rmbuilder.filename(cmd.getOptionValue('f'));<a name="line.759"></a>
+<span class="sourceLineNo">760</span>    }<a name="line.760"></a>
+<span class="sourceLineNo">761</span>    if (cmd.hasOption('x')) {<a name="line.761"></a>
+<span class="sourceLineNo">762</span>      rmbuilder.excludeFile(cmd.getOptionValue('x'));<a name="line.762"></a>
+<span class="sourceLineNo">763</span>    }<a name="line.763"></a>
+<span class="sourceLineNo">764</span>    if (cmd.hasOption('t')) {<a name="line.764"></a>
+<span class="sourceLineNo">765</span>      rmbuilder.timeout(Integer.parseInt(cmd.getOptionValue('t')));<a name="line.765"></a>
+<span class="sourceLineNo">766</span>    }<a name="line.766"></a>
+<span class="sourceLineNo">767</span>    this.loadUnload = cmd.getOptionValue("o").toLowerCase(Locale.ROOT);<a name="line.767"></a>
+<span class="sourceLineNo">768</span>  }<a name="line.768"></a>
+<span class="sourceLineNo">769</span><a name="line.769"></a>
+<span class="sourceLineNo">770</span>  @Override<a name="line.770"></a>
+<span class="sourceLineNo">771</span>  protected int doWork() throws Exception {<a name="line.771"></a>
+<span class="sourceLineNo">772</span>    boolean success;<a name="line.772"></a>
+<span class="sourceLineNo">773</span>    try (RegionMover rm = rmbuilder.build()) {<a name="line.773"></a>
+<span class="sourceLineNo">774</span>      if (loadUnload.equalsIgnoreCase("load")) {<a name="line.774"></a>
+<span class="sourceLineNo">775</span>        success = rm.load();<a name="line.775"></a>
+<span class="sourceLineNo">776</span>      } else if (loadUnload.equalsIgnoreCase("unload")) {<a name="line.776"></a>
+<span class="sourceLineNo">777</span>        success = rm.unload();<a name="line.777"></a>
+<span class="sourceLineNo">778</span>      } else {<a name="line.778"></a>
+<span class="sourceLineNo">779</span>        printUsage();<a name="line.779"></a>
+<span class="sourceLineNo">780</span>        success = false;<a name="line.780"></a>
+<span class="sourceLineNo">781</span>      }<a name="line.781"></a>
+<span class="sourceLineNo">782</span>    }<a name="line.782"></a>
+<span class="sourceLineNo">783</span>    return (success ? 0 : 1);<a name="line.783"></a>
+<span class="sourceLineNo">784</span>  }<a name="line.784"></a>
+<span class="sourceLineNo">785</span><a name="line.785"></a>
+<span class="sourceLineNo">786</span>  public static void main(String[] args) {<a name="line.786"></a>
+<span class="sourceLineNo">787</span>    try (RegionMover mover = new RegionMover()) {<a name="line.787"></a>
+<span class="sourceLineNo">788</span>      mover.doStaticMain(args);<a name="line.788"></a>
+<span class="sourceLineNo">789</span>    }<a name="line.789"></a>
+<span class="sourceLineNo">790</span>  }<a name="line.790"></a>
+<span class="sourceLineNo">791</span>}<a name="line.791"></a>
 
 
 
