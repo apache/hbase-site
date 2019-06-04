@@ -9,5 +9,6 @@ $ rbenv global 2.5.0
 ```shell
 $ gem install jekyll bundler
 $ bundle install
+$ bundle exec jekyll build -d ../hbaseconasia
 $ bundle exec jekyll serve -w
 ```
