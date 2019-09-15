@@ -32,362 +32,362 @@
 <span class="sourceLineNo">024</span>import com.lmax.disruptor.TimeoutException;<a name="line.24"></a>
 <span class="sourceLineNo">025</span>import com.lmax.disruptor.dsl.Disruptor;<a name="line.25"></a>
 <span class="sourceLineNo">026</span>import com.lmax.disruptor.dsl.ProducerType;<a name="line.26"></a>
-<span class="sourceLineNo">027</span><a name="line.27"></a>
-<span class="sourceLineNo">028</span>import java.io.IOException;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import java.io.OutputStream;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import java.util.Arrays;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import java.util.List;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import java.util.concurrent.BlockingQueue;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import java.util.concurrent.CountDownLatch;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import java.util.concurrent.LinkedBlockingQueue;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import java.util.concurrent.TimeUnit;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import java.util.concurrent.atomic.AtomicInteger;<a name="line.36"></a>
-<span class="sourceLineNo">037</span><a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.conf.Configuration;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.fs.FSDataOutputStream;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.fs.FileSystem;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.fs.Path;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.HConstants;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.trace.TraceUtil;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.ClassSize;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.util.HasThread;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.wal.FSHLogProvider;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.wal.WALEdit;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.apache.hadoop.hbase.wal.WALKeyImpl;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.apache.hadoop.hbase.wal.WALProvider.Writer;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>import org.apache.hadoop.hdfs.DFSOutputStream;<a name="line.54"></a>
-<span class="sourceLineNo">055</span>import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;<a name="line.55"></a>
-<span class="sourceLineNo">056</span>import org.apache.hadoop.hdfs.protocol.DatanodeInfo;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>import org.apache.htrace.core.TraceScope;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>import org.slf4j.Logger;<a name="line.59"></a>
-<span class="sourceLineNo">060</span>import org.slf4j.LoggerFactory;<a name="line.60"></a>
-<span class="sourceLineNo">061</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.61"></a>
-<span class="sourceLineNo">062</span><a name="line.62"></a>
-<span class="sourceLineNo">063</span>/**<a name="line.63"></a>
-<span class="sourceLineNo">064</span> * The default implementation of FSWAL.<a name="line.64"></a>
-<span class="sourceLineNo">065</span> */<a name="line.65"></a>
-<span class="sourceLineNo">066</span>@InterfaceAudience.Private<a name="line.66"></a>
-<span class="sourceLineNo">067</span>public class FSHLog extends AbstractFSWAL&lt;Writer&gt; {<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  // IMPLEMENTATION NOTES:<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  //<a name="line.69"></a>
-<span class="sourceLineNo">070</span>  // At the core is a ring buffer. Our ring buffer is the LMAX Disruptor. It tries to<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  // minimize synchronizations and volatile writes when multiple contending threads as is the case<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  // here appending and syncing on a single WAL. The Disruptor is configured to handle multiple<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  // producers but it has one consumer only (the producers in HBase are IPC Handlers calling append<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  // and then sync). The single consumer/writer pulls the appends and syncs off the ring buffer.<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  // When a handler calls sync, it is given back a future. The producer 'blocks' on the future so<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  // it does not return until the sync completes. The future is passed over the ring buffer from<a name="line.76"></a>
-<span class="sourceLineNo">077</span>  // the producer/handler to the consumer thread where it does its best to batch up the producer<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  // syncs so one WAL sync actually spans multiple producer sync invocations. How well the<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // batching works depends on the write rate; i.e. we tend to batch more in times of<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  // high writes/syncs.<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  //<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  // Calls to append now also wait until the append has been done on the consumer side of the<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  // disruptor. We used to not wait but it makes the implementation easier to grok if we have<a name="line.83"></a>
-<span class="sourceLineNo">084</span>  // the region edit/sequence id after the append returns.<a name="line.84"></a>
-<span class="sourceLineNo">085</span>  //<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  // TODO: Handlers need to coordinate appending AND syncing. Can we have the threads contend<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  // once only? Probably hard given syncs take way longer than an append.<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  //<a name="line.88"></a>
-<span class="sourceLineNo">089</span>  // The consumer threads pass the syncs off to multiple syncing threads in a round robin fashion<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  // to ensure we keep up back-to-back FS sync calls (FS sync calls are the long poll writing the<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  // WAL). The consumer thread passes the futures to the sync threads for it to complete<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  // the futures when done.<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  //<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  // The 'sequence' in the below is the sequence of the append/sync on the ringbuffer. It<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  // acts as a sort-of transaction id. It is always incrementing.<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  //<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  // The RingBufferEventHandler class hosts the ring buffer consuming code. The threads that<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  // do the actual FS sync are implementations of SyncRunner. SafePointZigZagLatch is a<a name="line.98"></a>
-<span class="sourceLineNo">099</span>  // synchronization class used to halt the consumer at a safe point -- just after all outstanding<a name="line.99"></a>
-<span class="sourceLineNo">100</span>  // syncs and appends have completed -- so the log roller can swap the WAL out under it.<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  //<a name="line.101"></a>
-<span class="sourceLineNo">102</span>  // We use ring buffer sequence as txid of FSWALEntry and SyncFuture.<a name="line.102"></a>
-<span class="sourceLineNo">103</span>  private static final Logger LOG = LoggerFactory.getLogger(FSHLog.class);<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  /**<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   * The nexus at which all incoming handlers meet. Does appends and sync with an ordering. Appends<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * and syncs are each put on the ring which means handlers need to smash up against the ring twice<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   * (can we make it once only? ... maybe not since time to append is so different from time to sync<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   * and sometimes we don't want to sync or we want to async the sync). The ring is where we make<a name="line.109"></a>
-<span class="sourceLineNo">110</span>   * sure of our ordering and it is also where we do batching up of handler sync calls.<a name="line.110"></a>
-<span class="sourceLineNo">111</span>   */<a name="line.111"></a>
-<span class="sourceLineNo">112</span>  private final Disruptor&lt;RingBufferTruck&gt; disruptor;<a name="line.112"></a>
-<span class="sourceLineNo">113</span><a name="line.113"></a>
-<span class="sourceLineNo">114</span>  /**<a name="line.114"></a>
-<span class="sourceLineNo">115</span>   * This fellow is run by the above appendExecutor service but it is all about batching up appends<a name="line.115"></a>
-<span class="sourceLineNo">116</span>   * and syncs; it may shutdown without cleaning out the last few appends or syncs. To guard against<a name="line.116"></a>
-<span class="sourceLineNo">117</span>   * this, keep a reference to this handler and do explicit close on way out to make sure all<a name="line.117"></a>
-<span class="sourceLineNo">118</span>   * flushed out before we exit.<a name="line.118"></a>
-<span class="sourceLineNo">119</span>   */<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  private final RingBufferEventHandler ringBufferEventHandler;<a name="line.120"></a>
-<span class="sourceLineNo">121</span><a name="line.121"></a>
-<span class="sourceLineNo">122</span>  /**<a name="line.122"></a>
-<span class="sourceLineNo">123</span>   * FSDataOutputStream associated with the current SequenceFile.writer<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   */<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  private FSDataOutputStream hdfs_out;<a name="line.125"></a>
-<span class="sourceLineNo">126</span><a name="line.126"></a>
-<span class="sourceLineNo">127</span>  // All about log rolling if not enough replicas outstanding.<a name="line.127"></a>
-<span class="sourceLineNo">128</span><a name="line.128"></a>
-<span class="sourceLineNo">129</span>  // Minimum tolerable replicas, if the actual value is lower than it, rollWriter will be triggered<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  private final int minTolerableReplication;<a name="line.130"></a>
-<span class="sourceLineNo">131</span><a name="line.131"></a>
-<span class="sourceLineNo">132</span>  // If live datanode count is lower than the default replicas value,<a name="line.132"></a>
-<span class="sourceLineNo">133</span>  // RollWriter will be triggered in each sync(So the RollWriter will be<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  // triggered one by one in a short time). Using it as a workaround to slow<a name="line.134"></a>
-<span class="sourceLineNo">135</span>  // down the roll frequency triggered by checkLowReplication().<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  private final AtomicInteger consecutiveLogRolls = new AtomicInteger(0);<a name="line.136"></a>
-<span class="sourceLineNo">137</span><a name="line.137"></a>
-<span class="sourceLineNo">138</span>  private final int lowReplicationRollLimit;<a name="line.138"></a>
-<span class="sourceLineNo">139</span><a name="line.139"></a>
-<span class="sourceLineNo">140</span>  // If consecutiveLogRolls is larger than lowReplicationRollLimit,<a name="line.140"></a>
-<span class="sourceLineNo">141</span>  // then disable the rolling in checkLowReplication().<a name="line.141"></a>
-<span class="sourceLineNo">142</span>  // Enable it if the replications recover.<a name="line.142"></a>
-<span class="sourceLineNo">143</span>  private volatile boolean lowReplicationRollEnabled = true;<a name="line.143"></a>
-<span class="sourceLineNo">144</span><a name="line.144"></a>
-<span class="sourceLineNo">145</span>  /** Number of log close errors tolerated before we abort */<a name="line.145"></a>
-<span class="sourceLineNo">146</span>  private final int closeErrorsTolerated;<a name="line.146"></a>
-<span class="sourceLineNo">147</span><a name="line.147"></a>
-<span class="sourceLineNo">148</span>  private final AtomicInteger closeErrorCount = new AtomicInteger();<a name="line.148"></a>
-<span class="sourceLineNo">149</span><a name="line.149"></a>
-<span class="sourceLineNo">150</span>  /**<a name="line.150"></a>
-<span class="sourceLineNo">151</span>   * Exception handler to pass the disruptor ringbuffer. Same as native implementation only it logs<a name="line.151"></a>
-<span class="sourceLineNo">152</span>   * using our logger instead of java native logger.<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   */<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  static class RingBufferExceptionHandler implements ExceptionHandler&lt;RingBufferTruck&gt; {<a name="line.154"></a>
-<span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>    @Override<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    public void handleEventException(Throwable ex, long sequence, RingBufferTruck event) {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>      LOG.error("Sequence=" + sequence + ", event=" + event, ex);<a name="line.158"></a>
-<span class="sourceLineNo">159</span>      throw new RuntimeException(ex);<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    }<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>    @Override<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    public void handleOnStartException(Throwable ex) {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>      LOG.error(ex.toString(), ex);<a name="line.164"></a>
-<span class="sourceLineNo">165</span>      throw new RuntimeException(ex);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    }<a name="line.166"></a>
-<span class="sourceLineNo">167</span><a name="line.167"></a>
-<span class="sourceLineNo">168</span>    @Override<a name="line.168"></a>
-<span class="sourceLineNo">169</span>    public void handleOnShutdownException(Throwable ex) {<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      LOG.error(ex.toString(), ex);<a name="line.170"></a>
-<span class="sourceLineNo">171</span>      throw new RuntimeException(ex);<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
-<span class="sourceLineNo">173</span>  }<a name="line.173"></a>
-<span class="sourceLineNo">174</span><a name="line.174"></a>
-<span class="sourceLineNo">175</span>  /**<a name="line.175"></a>
-<span class="sourceLineNo">176</span>   * Constructor.<a name="line.176"></a>
-<span class="sourceLineNo">177</span>   * @param fs filesystem handle<a name="line.177"></a>
-<span class="sourceLineNo">178</span>   * @param root path for stored and archived wals<a name="line.178"></a>
-<span class="sourceLineNo">179</span>   * @param logDir dir where wals are stored<a name="line.179"></a>
-<span class="sourceLineNo">180</span>   * @param conf configuration to use<a name="line.180"></a>
-<span class="sourceLineNo">181</span>   */<a name="line.181"></a>
-<span class="sourceLineNo">182</span>  public FSHLog(final FileSystem fs, final Path root, final String logDir, final Configuration conf)<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      throws IOException {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>    this(fs, root, logDir, HConstants.HREGION_OLDLOGDIR_NAME, conf, null, true, null, null);<a name="line.184"></a>
-<span class="sourceLineNo">185</span>  }<a name="line.185"></a>
-<span class="sourceLineNo">186</span><a name="line.186"></a>
-<span class="sourceLineNo">187</span>  /**<a name="line.187"></a>
-<span class="sourceLineNo">188</span>   * Create an edit log at the given &lt;code&gt;dir&lt;/code&gt; location. You should never have to load an<a name="line.188"></a>
-<span class="sourceLineNo">189</span>   * existing log. If there is a log at startup, it should have already been processed and deleted<a name="line.189"></a>
-<span class="sourceLineNo">190</span>   * by the time the WAL object is started up.<a name="line.190"></a>
-<span class="sourceLineNo">191</span>   * @param fs filesystem handle<a name="line.191"></a>
-<span class="sourceLineNo">192</span>   * @param rootDir path to where logs and oldlogs<a name="line.192"></a>
-<span class="sourceLineNo">193</span>   * @param logDir dir where wals are stored<a name="line.193"></a>
-<span class="sourceLineNo">194</span>   * @param archiveDir dir where wals are archived<a name="line.194"></a>
-<span class="sourceLineNo">195</span>   * @param conf configuration to use<a name="line.195"></a>
-<span class="sourceLineNo">196</span>   * @param listeners Listeners on WAL events. Listeners passed here will be registered before we do<a name="line.196"></a>
-<span class="sourceLineNo">197</span>   *          anything else; e.g. the Constructor {@link #rollWriter()}.<a name="line.197"></a>
-<span class="sourceLineNo">198</span>   * @param failIfWALExists If true IOException will be thrown if files related to this wal already<a name="line.198"></a>
-<span class="sourceLineNo">199</span>   *          exist.<a name="line.199"></a>
-<span class="sourceLineNo">200</span>   * @param prefix should always be hostname and port in distributed env and it will be URL encoded<a name="line.200"></a>
-<span class="sourceLineNo">201</span>   *          before being used. If prefix is null, "wal" will be used<a name="line.201"></a>
-<span class="sourceLineNo">202</span>   * @param suffix will be url encoded. null is treated as empty. non-empty must start with<a name="line.202"></a>
-<span class="sourceLineNo">203</span>   *          {@link org.apache.hadoop.hbase.wal.AbstractFSWALProvider#WAL_FILE_NAME_DELIMITER}<a name="line.203"></a>
-<span class="sourceLineNo">204</span>   */<a name="line.204"></a>
-<span class="sourceLineNo">205</span>  public FSHLog(final FileSystem fs, final Path rootDir, final String logDir,<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      final String archiveDir, final Configuration conf, final List&lt;WALActionsListener&gt; listeners,<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      final boolean failIfWALExists, final String prefix, final String suffix) throws IOException {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>    super(fs, rootDir, logDir, archiveDir, conf, listeners, failIfWALExists, prefix, suffix);<a name="line.208"></a>
-<span class="sourceLineNo">209</span>    this.minTolerableReplication = conf.getInt("hbase.regionserver.hlog.tolerable.lowreplication",<a name="line.209"></a>
-<span class="sourceLineNo">210</span>      FSUtils.getDefaultReplication(fs, this.walDir));<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    this.lowReplicationRollLimit = conf.getInt("hbase.regionserver.hlog.lowreplication.rolllimit",<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      5);<a name="line.212"></a>
-<span class="sourceLineNo">213</span>    this.closeErrorsTolerated = conf.getInt("hbase.regionserver.logroll.errors.tolerated", 2);<a name="line.213"></a>
-<span class="sourceLineNo">214</span><a name="line.214"></a>
-<span class="sourceLineNo">215</span>    // rollWriter sets this.hdfs_out if it can.<a name="line.215"></a>
-<span class="sourceLineNo">216</span>    rollWriter();<a name="line.216"></a>
-<span class="sourceLineNo">217</span><a name="line.217"></a>
-<span class="sourceLineNo">218</span>    // This is the 'writer' -- a single threaded executor. This single thread 'consumes' what is<a name="line.218"></a>
-<span class="sourceLineNo">219</span>    // put on the ring buffer.<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    String hostingThreadName = Thread.currentThread().getName();<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    // Using BlockingWaitStrategy. Stuff that is going on here takes so long it makes no sense<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    // spinning as other strategies do.<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    this.disruptor = new Disruptor&lt;&gt;(RingBufferTruck::new,<a name="line.223"></a>
-<span class="sourceLineNo">224</span>        getPreallocatedEventCount(), Threads.getNamedThreadFactory(hostingThreadName + ".append"),<a name="line.224"></a>
-<span class="sourceLineNo">225</span>        ProducerType.MULTI, new BlockingWaitStrategy());<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    // Advance the ring buffer sequence so that it starts from 1 instead of 0,<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    // because SyncFuture.NOT_DONE = 0.<a name="line.227"></a>
-<span class="sourceLineNo">228</span>    this.disruptor.getRingBuffer().next();<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    int maxHandlersCount = conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT, 200);<a name="line.229"></a>
-<span class="sourceLineNo">230</span>    this.ringBufferEventHandler = new RingBufferEventHandler(<a name="line.230"></a>
-<span class="sourceLineNo">231</span>        conf.getInt("hbase.regionserver.hlog.syncer.count", 5), maxHandlersCount);<a name="line.231"></a>
-<span class="sourceLineNo">232</span>    this.disruptor.setDefaultExceptionHandler(new RingBufferExceptionHandler());<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    this.disruptor.handleEventsWith(new RingBufferEventHandler[] { this.ringBufferEventHandler });<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    // Starting up threads in constructor is a no no; Interface should have an init call.<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    this.disruptor.start();<a name="line.235"></a>
-<span class="sourceLineNo">236</span>  }<a name="line.236"></a>
-<span class="sourceLineNo">237</span><a name="line.237"></a>
-<span class="sourceLineNo">238</span>  /**<a name="line.238"></a>
-<span class="sourceLineNo">239</span>   * Currently, we need to expose the writer's OutputStream to tests so that they can manipulate the<a name="line.239"></a>
-<span class="sourceLineNo">240</span>   * default behavior (such as setting the maxRecoveryErrorCount value for example (see<a name="line.240"></a>
-<span class="sourceLineNo">241</span>   * {@see org.apache.hadoop.hbase.regionserver.wal.AbstractTestWALReplay#testReplayEditsWrittenIntoWAL()}). This is<a name="line.241"></a>
-<span class="sourceLineNo">242</span>   * done using reflection on the underlying HDFS OutputStream. NOTE: This could be removed once Hadoop1 support is<a name="line.242"></a>
-<span class="sourceLineNo">243</span>   * removed.<a name="line.243"></a>
-<span class="sourceLineNo">244</span>   * @return null if underlying stream is not ready.<a name="line.244"></a>
-<span class="sourceLineNo">245</span>   */<a name="line.245"></a>
-<span class="sourceLineNo">246</span>  @VisibleForTesting<a name="line.246"></a>
-<span class="sourceLineNo">247</span>  OutputStream getOutputStream() {<a name="line.247"></a>
-<span class="sourceLineNo">248</span>    FSDataOutputStream fsdos = this.hdfs_out;<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    return fsdos != null ? fsdos.getWrappedStream() : null;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>  }<a name="line.250"></a>
-<span class="sourceLineNo">251</span><a name="line.251"></a>
-<span class="sourceLineNo">252</span>  /**<a name="line.252"></a>
-<span class="sourceLineNo">253</span>   * Run a sync after opening to set up the pipeline.<a name="line.253"></a>
-<span class="sourceLineNo">254</span>   */<a name="line.254"></a>
-<span class="sourceLineNo">255</span>  private void preemptiveSync(final ProtobufLogWriter nextWriter) {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    long startTimeNanos = System.nanoTime();<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    try {<a name="line.257"></a>
-<span class="sourceLineNo">258</span>      nextWriter.sync();<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      postSync(System.nanoTime() - startTimeNanos, 0);<a name="line.259"></a>
-<span class="sourceLineNo">260</span>    } catch (IOException e) {<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      // optimization failed, no need to abort here.<a name="line.261"></a>
-<span class="sourceLineNo">262</span>      LOG.warn("pre-sync failed but an optimization so keep going", e);<a name="line.262"></a>
-<span class="sourceLineNo">263</span>    }<a name="line.263"></a>
-<span class="sourceLineNo">264</span>  }<a name="line.264"></a>
-<span class="sourceLineNo">265</span><a name="line.265"></a>
-<span class="sourceLineNo">266</span>  /**<a name="line.266"></a>
-<span class="sourceLineNo">267</span>   * This method allows subclasses to inject different writers without having to extend other<a name="line.267"></a>
-<span class="sourceLineNo">268</span>   * methods like rollWriter().<a name="line.268"></a>
-<span class="sourceLineNo">269</span>   * @return Writer instance<a name="line.269"></a>
-<span class="sourceLineNo">270</span>   */<a name="line.270"></a>
-<span class="sourceLineNo">271</span>  @Override<a name="line.271"></a>
-<span class="sourceLineNo">272</span>  protected Writer createWriterInstance(final Path path) throws IOException {<a name="line.272"></a>
-<span class="sourceLineNo">273</span>    Writer writer = FSHLogProvider.createWriter(conf, fs, path, false, this.blocksize);<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    if (writer instanceof ProtobufLogWriter) {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      preemptiveSync((ProtobufLogWriter) writer);<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    }<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    return writer;<a name="line.277"></a>
-<span class="sourceLineNo">278</span>  }<a name="line.278"></a>
-<span class="sourceLineNo">279</span><a name="line.279"></a>
-<span class="sourceLineNo">280</span>  /**<a name="line.280"></a>
-<span class="sourceLineNo">281</span>   * Used to manufacture race condition reliably. For testing only.<a name="line.281"></a>
-<span class="sourceLineNo">282</span>   * @see #beforeWaitOnSafePoint()<a name="line.282"></a>
-<span class="sourceLineNo">283</span>   */<a name="line.283"></a>
-<span class="sourceLineNo">284</span>  @VisibleForTesting<a name="line.284"></a>
-<span class="sourceLineNo">285</span>  protected void afterCreatingZigZagLatch() {<a name="line.285"></a>
-<span class="sourceLineNo">286</span>  }<a name="line.286"></a>
-<span class="sourceLineNo">287</span><a name="line.287"></a>
-<span class="sourceLineNo">288</span>  /**<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   * @see #afterCreatingZigZagLatch()<a name="line.289"></a>
-<span class="sourceLineNo">290</span>   */<a name="line.290"></a>
-<span class="sourceLineNo">291</span>  @VisibleForTesting<a name="line.291"></a>
-<span class="sourceLineNo">292</span>  protected void beforeWaitOnSafePoint() {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>  };<a name="line.293"></a>
-<span class="sourceLineNo">294</span><a name="line.294"></a>
-<span class="sourceLineNo">295</span>  @Override<a name="line.295"></a>
-<span class="sourceLineNo">296</span>  protected void doAppend(Writer writer, FSWALEntry entry) throws IOException {<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    writer.append(entry);<a name="line.297"></a>
-<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
-<span class="sourceLineNo">299</span><a name="line.299"></a>
-<span class="sourceLineNo">300</span>  @Override<a name="line.300"></a>
-<span class="sourceLineNo">301</span>  protected void doReplaceWriter(Path oldPath, Path newPath, Writer nextWriter) throws IOException {<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    // Ask the ring buffer writer to pause at a safe point. Once we do this, the writer<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    // thread will eventually pause. An error hereafter needs to release the writer thread<a name="line.303"></a>
-<span class="sourceLineNo">304</span>    // regardless -- hence the finally block below. Note, this method is called from the FSHLog<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    // constructor BEFORE the ring buffer is set running so it is null on first time through<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    // here; allow for that.<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    SyncFuture syncFuture = null;<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    SafePointZigZagLatch zigzagLatch = null;<a name="line.308"></a>
-<span class="sourceLineNo">309</span>    long sequence = -1L;<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    if (this.ringBufferEventHandler != null) {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      // Get sequence first to avoid dead lock when ring buffer is full<a name="line.311"></a>
-<span class="sourceLineNo">312</span>      // Considering below sequence<a name="line.312"></a>
-<span class="sourceLineNo">313</span>      // 1. replaceWriter is called and zigzagLatch is initialized<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      // 2. ringBufferEventHandler#onEvent is called and arrives at #attainSafePoint(long) then wait<a name="line.314"></a>
-<span class="sourceLineNo">315</span>      // on safePointReleasedLatch<a name="line.315"></a>
-<span class="sourceLineNo">316</span>      // 3. Since ring buffer is full, if we get sequence when publish sync, the replaceWriter<a name="line.316"></a>
-<span class="sourceLineNo">317</span>      // thread will wait for the ring buffer to be consumed, but the only consumer is waiting<a name="line.317"></a>
-<span class="sourceLineNo">318</span>      // replaceWriter thread to release safePointReleasedLatch, which causes a deadlock<a name="line.318"></a>
-<span class="sourceLineNo">319</span>      sequence = getSequenceOnRingBuffer();<a name="line.319"></a>
-<span class="sourceLineNo">320</span>      zigzagLatch = this.ringBufferEventHandler.attainSafePoint();<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    }<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    afterCreatingZigZagLatch();<a name="line.322"></a>
-<span class="sourceLineNo">323</span>    try {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>      // Wait on the safe point to be achieved. Send in a sync in case nothing has hit the<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      // ring buffer between the above notification of writer that we want it to go to<a name="line.325"></a>
-<span class="sourceLineNo">326</span>      // 'safe point' and then here where we are waiting on it to attain safe point. Use<a name="line.326"></a>
-<span class="sourceLineNo">327</span>      // 'sendSync' instead of 'sync' because we do not want this thread to block waiting on it<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      // to come back. Cleanup this syncFuture down below after we are ready to run again.<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      try {<a name="line.329"></a>
-<span class="sourceLineNo">330</span>        if (zigzagLatch != null) {<a name="line.330"></a>
-<span class="sourceLineNo">331</span>          // use assert to make sure no change breaks the logic that<a name="line.331"></a>
-<span class="sourceLineNo">332</span>          // sequence and zigzagLatch will be set together<a name="line.332"></a>
-<span class="sourceLineNo">333</span>          assert sequence &gt; 0L : "Failed to get sequence from ring buffer";<a name="line.333"></a>
-<span class="sourceLineNo">334</span>          TraceUtil.addTimelineAnnotation("awaiting safepoint");<a name="line.334"></a>
-<span class="sourceLineNo">335</span>          syncFuture = zigzagLatch.waitSafePoint(publishSyncOnRingBuffer(sequence));<a name="line.335"></a>
-<span class="sourceLineNo">336</span>        }<a name="line.336"></a>
-<span class="sourceLineNo">337</span>      } catch (FailedSyncBeforeLogCloseException e) {<a name="line.337"></a>
-<span class="sourceLineNo">338</span>        // If unflushed/unsynced entries on close, it is reason to abort.<a name="line.338"></a>
-<span class="sourceLineNo">339</span>        if (isUnflushedEntries()) {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>          throw e;<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        }<a name="line.341"></a>
-<span class="sourceLineNo">342</span>        LOG.warn(<a name="line.342"></a>
-<span class="sourceLineNo">343</span>          "Failed sync-before-close but no outstanding appends; closing WAL" + e.getMessage());<a name="line.343"></a>
-<span class="sourceLineNo">344</span>      }<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      long oldFileLen = 0L;<a name="line.345"></a>
-<span class="sourceLineNo">346</span>      // It is at the safe point. Swap out writer from under the blocked writer thread.<a name="line.346"></a>
-<span class="sourceLineNo">347</span>      // TODO: This is close is inline with critical section. Should happen in background?<a name="line.347"></a>
-<span class="sourceLineNo">348</span>      if (this.writer != null) {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>        oldFileLen = this.writer.getLength();<a name="line.349"></a>
-<span class="sourceLineNo">350</span>        try {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>          TraceUtil.addTimelineAnnotation("closing writer");<a name="line.351"></a>
-<span class="sourceLineNo">352</span>          this.writer.close();<a name="line.352"></a>
-<span class="sourceLineNo">353</span>          TraceUtil.addTimelineAnnotation("writer closed");<a name="line.353"></a>
-<span class="sourceLineNo">354</span>          this.closeErrorCount.set(0);<a name="line.354"></a>
-<span class="sourceLineNo">355</span>        } catch (IOException ioe) {<a name="line.355"></a>
-<span class="sourceLineNo">356</span>          int errors = closeErrorCount.incrementAndGet();<a name="line.356"></a>
-<span class="sourceLineNo">357</span>          if (!isUnflushedEntries() &amp;&amp; (errors &lt;= this.closeErrorsTolerated)) {<a name="line.357"></a>
-<span class="sourceLineNo">358</span>            LOG.warn("Riding over failed WAL close of " + oldPath + ", cause=\"" + ioe.getMessage()<a name="line.358"></a>
-<span class="sourceLineNo">359</span>                + "\", errors=" + errors<a name="line.359"></a>
-<span class="sourceLineNo">360</span>                + "; THIS FILE WAS NOT CLOSED BUT ALL EDITS SYNCED SO SHOULD BE OK");<a name="line.360"></a>
-<span class="sourceLineNo">361</span>          } else {<a name="line.361"></a>
-<span class="sourceLineNo">362</span>            throw ioe;<a name="line.362"></a>
-<span class="sourceLineNo">363</span>          }<a name="line.363"></a>
-<span class="sourceLineNo">364</span>        }<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      }<a name="line.365"></a>
-<span class="sourceLineNo">366</span>      logRollAndSetupWalProps(oldPath, newPath, oldFileLen);<a name="line.366"></a>
-<span class="sourceLineNo">367</span>      this.writer = nextWriter;<a name="line.367"></a>
-<span class="sourceLineNo">368</span>      if (nextWriter != null &amp;&amp; nextWriter instanceof ProtobufLogWriter) {<a name="line.368"></a>
-<span class="sourceLineNo">369</span>        this.hdfs_out = ((ProtobufLogWriter) nextWriter).getStream();<a name="line.369"></a>
-<span class="sourceLineNo">370</span>      } else {<a name="line.370"></a>
-<span class="sourceLineNo">371</span>        this.hdfs_out = null;<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      }<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    } catch (InterruptedException ie) {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      // Perpetuate the interrupt<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      Thread.currentThread().interrupt();<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    } catch (IOException e) {<a name="line.376"></a>
-<span class="sourceLineNo">377</span>      long count = getUnflushedEntriesCount();<a name="line.377"></a>
-<span class="sourceLineNo">378</span>      LOG.error("Failed close of WAL writer " + oldPath + ", unflushedEntries=" + count, e);<a name="line.378"></a>
-<span class="sourceLineNo">379</span>      throw new FailedLogCloseException(oldPath + ", unflushedEntries=" + count, e);<a name="line.379"></a>
-<span class="sourceLineNo">380</span>    } finally {<a name="line.380"></a>
-<span class="sourceLineNo">381</span>      // Let the writer thread go regardless, whether error or not.<a name="line.381"></a>
-<span class="sourceLineNo">382</span>      if (zigzagLatch != null) {<a name="line.382"></a>
+<span class="sourceLineNo">027</span>import java.io.IOException;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import java.io.OutputStream;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import java.util.Arrays;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import java.util.List;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.concurrent.BlockingQueue;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import java.util.concurrent.CountDownLatch;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import java.util.concurrent.LinkedBlockingQueue;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import java.util.concurrent.TimeUnit;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import java.util.concurrent.atomic.AtomicInteger;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.conf.Configuration;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.fs.FSDataOutputStream;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.fs.FileSystem;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.fs.Path;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.HConstants;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.trace.TraceUtil;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.util.ClassSize;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.HasThread;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.wal.FSHLogProvider;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.wal.WALEdit;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.wal.WALKeyImpl;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.wal.WALProvider.Writer;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.hadoop.hdfs.DFSOutputStream;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.apache.hadoop.hdfs.protocol.DatanodeInfo;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>import org.apache.htrace.core.TraceScope;<a name="line.55"></a>
+<span class="sourceLineNo">056</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.56"></a>
+<span class="sourceLineNo">057</span>import org.slf4j.Logger;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>import org.slf4j.LoggerFactory;<a name="line.58"></a>
+<span class="sourceLineNo">059</span><a name="line.59"></a>
+<span class="sourceLineNo">060</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>/**<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * The default implementation of FSWAL.<a name="line.63"></a>
+<span class="sourceLineNo">064</span> */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>@InterfaceAudience.Private<a name="line.65"></a>
+<span class="sourceLineNo">066</span>public class FSHLog extends AbstractFSWAL&lt;Writer&gt; {<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  // IMPLEMENTATION NOTES:<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  //<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  // At the core is a ring buffer. Our ring buffer is the LMAX Disruptor. It tries to<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  // minimize synchronizations and volatile writes when multiple contending threads as is the case<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  // here appending and syncing on a single WAL. The Disruptor is configured to handle multiple<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  // producers but it has one consumer only (the producers in HBase are IPC Handlers calling append<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  // and then sync). The single consumer/writer pulls the appends and syncs off the ring buffer.<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  // When a handler calls sync, it is given back a future. The producer 'blocks' on the future so<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  // it does not return until the sync completes. The future is passed over the ring buffer from<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  // the producer/handler to the consumer thread where it does its best to batch up the producer<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  // syncs so one WAL sync actually spans multiple producer sync invocations. How well the<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  // batching works depends on the write rate; i.e. we tend to batch more in times of<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  // high writes/syncs.<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  //<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  // Calls to append now also wait until the append has been done on the consumer side of the<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  // disruptor. We used to not wait but it makes the implementation easier to grok if we have<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  // the region edit/sequence id after the append returns.<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  //<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  // TODO: Handlers need to coordinate appending AND syncing. Can we have the threads contend<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  // once only? Probably hard given syncs take way longer than an append.<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  //<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  // The consumer threads pass the syncs off to multiple syncing threads in a round robin fashion<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  // to ensure we keep up back-to-back FS sync calls (FS sync calls are the long poll writing the<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  // WAL). The consumer thread passes the futures to the sync threads for it to complete<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  // the futures when done.<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  //<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  // The 'sequence' in the below is the sequence of the append/sync on the ringbuffer. It<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  // acts as a sort-of transaction id. It is always incrementing.<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  //<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  // The RingBufferEventHandler class hosts the ring buffer consuming code. The threads that<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  // do the actual FS sync are implementations of SyncRunner. SafePointZigZagLatch is a<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  // synchronization class used to halt the consumer at a safe point -- just after all outstanding<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  // syncs and appends have completed -- so the log roller can swap the WAL out under it.<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  //<a name="line.100"></a>
+<span class="sourceLineNo">101</span>  // We use ring buffer sequence as txid of FSWALEntry and SyncFuture.<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  private static final Logger LOG = LoggerFactory.getLogger(FSHLog.class);<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  /**<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   * The nexus at which all incoming handlers meet. Does appends and sync with an ordering. Appends<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   * and syncs are each put on the ring which means handlers need to smash up against the ring twice<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   * (can we make it once only? ... maybe not since time to append is so different from time to sync<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   * and sometimes we don't want to sync or we want to async the sync). The ring is where we make<a name="line.108"></a>
+<span class="sourceLineNo">109</span>   * sure of our ordering and it is also where we do batching up of handler sync calls.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>   */<a name="line.110"></a>
+<span class="sourceLineNo">111</span>  private final Disruptor&lt;RingBufferTruck&gt; disruptor;<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>  /**<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   * This fellow is run by the above appendExecutor service but it is all about batching up appends<a name="line.114"></a>
+<span class="sourceLineNo">115</span>   * and syncs; it may shutdown without cleaning out the last few appends or syncs. To guard against<a name="line.115"></a>
+<span class="sourceLineNo">116</span>   * this, keep a reference to this handler and do explicit close on way out to make sure all<a name="line.116"></a>
+<span class="sourceLineNo">117</span>   * flushed out before we exit.<a name="line.117"></a>
+<span class="sourceLineNo">118</span>   */<a name="line.118"></a>
+<span class="sourceLineNo">119</span>  private final RingBufferEventHandler ringBufferEventHandler;<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>  /**<a name="line.121"></a>
+<span class="sourceLineNo">122</span>   * FSDataOutputStream associated with the current SequenceFile.writer<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   */<a name="line.123"></a>
+<span class="sourceLineNo">124</span>  private FSDataOutputStream hdfs_out;<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>  // All about log rolling if not enough replicas outstanding.<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  // Minimum tolerable replicas, if the actual value is lower than it, rollWriter will be triggered<a name="line.128"></a>
+<span class="sourceLineNo">129</span>  private final int minTolerableReplication;<a name="line.129"></a>
+<span class="sourceLineNo">130</span><a name="line.130"></a>
+<span class="sourceLineNo">131</span>  // If live datanode count is lower than the default replicas value,<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  // RollWriter will be triggered in each sync(So the RollWriter will be<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  // triggered one by one in a short time). Using it as a workaround to slow<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  // down the roll frequency triggered by checkLowReplication().<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  private final AtomicInteger consecutiveLogRolls = new AtomicInteger(0);<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>  private final int lowReplicationRollLimit;<a name="line.137"></a>
+<span class="sourceLineNo">138</span><a name="line.138"></a>
+<span class="sourceLineNo">139</span>  // If consecutiveLogRolls is larger than lowReplicationRollLimit,<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  // then disable the rolling in checkLowReplication().<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  // Enable it if the replications recover.<a name="line.141"></a>
+<span class="sourceLineNo">142</span>  private volatile boolean lowReplicationRollEnabled = true;<a name="line.142"></a>
+<span class="sourceLineNo">143</span><a name="line.143"></a>
+<span class="sourceLineNo">144</span>  /** Number of log close errors tolerated before we abort */<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  private final int closeErrorsTolerated;<a name="line.145"></a>
+<span class="sourceLineNo">146</span><a name="line.146"></a>
+<span class="sourceLineNo">147</span>  private final AtomicInteger closeErrorCount = new AtomicInteger();<a name="line.147"></a>
+<span class="sourceLineNo">148</span><a name="line.148"></a>
+<span class="sourceLineNo">149</span>  /**<a name="line.149"></a>
+<span class="sourceLineNo">150</span>   * Exception handler to pass the disruptor ringbuffer. Same as native implementation only it logs<a name="line.150"></a>
+<span class="sourceLineNo">151</span>   * using our logger instead of java native logger.<a name="line.151"></a>
+<span class="sourceLineNo">152</span>   */<a name="line.152"></a>
+<span class="sourceLineNo">153</span>  static class RingBufferExceptionHandler implements ExceptionHandler&lt;RingBufferTruck&gt; {<a name="line.153"></a>
+<span class="sourceLineNo">154</span><a name="line.154"></a>
+<span class="sourceLineNo">155</span>    @Override<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    public void handleEventException(Throwable ex, long sequence, RingBufferTruck event) {<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      LOG.error("Sequence=" + sequence + ", event=" + event, ex);<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      throw new RuntimeException(ex);<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    }<a name="line.159"></a>
+<span class="sourceLineNo">160</span><a name="line.160"></a>
+<span class="sourceLineNo">161</span>    @Override<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    public void handleOnStartException(Throwable ex) {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      LOG.error(ex.toString(), ex);<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      throw new RuntimeException(ex);<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    }<a name="line.165"></a>
+<span class="sourceLineNo">166</span><a name="line.166"></a>
+<span class="sourceLineNo">167</span>    @Override<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    public void handleOnShutdownException(Throwable ex) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      LOG.error(ex.toString(), ex);<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      throw new RuntimeException(ex);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
+<span class="sourceLineNo">172</span>  }<a name="line.172"></a>
+<span class="sourceLineNo">173</span><a name="line.173"></a>
+<span class="sourceLineNo">174</span>  /**<a name="line.174"></a>
+<span class="sourceLineNo">175</span>   * Constructor.<a name="line.175"></a>
+<span class="sourceLineNo">176</span>   * @param fs filesystem handle<a name="line.176"></a>
+<span class="sourceLineNo">177</span>   * @param root path for stored and archived wals<a name="line.177"></a>
+<span class="sourceLineNo">178</span>   * @param logDir dir where wals are stored<a name="line.178"></a>
+<span class="sourceLineNo">179</span>   * @param conf configuration to use<a name="line.179"></a>
+<span class="sourceLineNo">180</span>   */<a name="line.180"></a>
+<span class="sourceLineNo">181</span>  public FSHLog(final FileSystem fs, final Path root, final String logDir, final Configuration conf)<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      throws IOException {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    this(fs, root, logDir, HConstants.HREGION_OLDLOGDIR_NAME, conf, null, true, null, null);<a name="line.183"></a>
+<span class="sourceLineNo">184</span>  }<a name="line.184"></a>
+<span class="sourceLineNo">185</span><a name="line.185"></a>
+<span class="sourceLineNo">186</span>  /**<a name="line.186"></a>
+<span class="sourceLineNo">187</span>   * Create an edit log at the given &lt;code&gt;dir&lt;/code&gt; location. You should never have to load an<a name="line.187"></a>
+<span class="sourceLineNo">188</span>   * existing log. If there is a log at startup, it should have already been processed and deleted<a name="line.188"></a>
+<span class="sourceLineNo">189</span>   * by the time the WAL object is started up.<a name="line.189"></a>
+<span class="sourceLineNo">190</span>   * @param fs filesystem handle<a name="line.190"></a>
+<span class="sourceLineNo">191</span>   * @param rootDir path to where logs and oldlogs<a name="line.191"></a>
+<span class="sourceLineNo">192</span>   * @param logDir dir where wals are stored<a name="line.192"></a>
+<span class="sourceLineNo">193</span>   * @param archiveDir dir where wals are archived<a name="line.193"></a>
+<span class="sourceLineNo">194</span>   * @param conf configuration to use<a name="line.194"></a>
+<span class="sourceLineNo">195</span>   * @param listeners Listeners on WAL events. Listeners passed here will be registered before we do<a name="line.195"></a>
+<span class="sourceLineNo">196</span>   *          anything else; e.g. the Constructor {@link #rollWriter()}.<a name="line.196"></a>
+<span class="sourceLineNo">197</span>   * @param failIfWALExists If true IOException will be thrown if files related to this wal already<a name="line.197"></a>
+<span class="sourceLineNo">198</span>   *          exist.<a name="line.198"></a>
+<span class="sourceLineNo">199</span>   * @param prefix should always be hostname and port in distributed env and it will be URL encoded<a name="line.199"></a>
+<span class="sourceLineNo">200</span>   *          before being used. If prefix is null, "wal" will be used<a name="line.200"></a>
+<span class="sourceLineNo">201</span>   * @param suffix will be url encoded. null is treated as empty. non-empty must start with<a name="line.201"></a>
+<span class="sourceLineNo">202</span>   *          {@link org.apache.hadoop.hbase.wal.AbstractFSWALProvider#WAL_FILE_NAME_DELIMITER}<a name="line.202"></a>
+<span class="sourceLineNo">203</span>   */<a name="line.203"></a>
+<span class="sourceLineNo">204</span>  public FSHLog(final FileSystem fs, final Path rootDir, final String logDir,<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      final String archiveDir, final Configuration conf, final List&lt;WALActionsListener&gt; listeners,<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      final boolean failIfWALExists, final String prefix, final String suffix) throws IOException {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>    super(fs, rootDir, logDir, archiveDir, conf, listeners, failIfWALExists, prefix, suffix);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>    this.minTolerableReplication = conf.getInt("hbase.regionserver.hlog.tolerable.lowreplication",<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      FSUtils.getDefaultReplication(fs, this.walDir));<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    this.lowReplicationRollLimit = conf.getInt("hbase.regionserver.hlog.lowreplication.rolllimit",<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      5);<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    this.closeErrorsTolerated = conf.getInt("hbase.regionserver.logroll.errors.tolerated", 2);<a name="line.212"></a>
+<span class="sourceLineNo">213</span><a name="line.213"></a>
+<span class="sourceLineNo">214</span>    // rollWriter sets this.hdfs_out if it can.<a name="line.214"></a>
+<span class="sourceLineNo">215</span>    rollWriter();<a name="line.215"></a>
+<span class="sourceLineNo">216</span><a name="line.216"></a>
+<span class="sourceLineNo">217</span>    // This is the 'writer' -- a single threaded executor. This single thread 'consumes' what is<a name="line.217"></a>
+<span class="sourceLineNo">218</span>    // put on the ring buffer.<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    String hostingThreadName = Thread.currentThread().getName();<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    // Using BlockingWaitStrategy. Stuff that is going on here takes so long it makes no sense<a name="line.220"></a>
+<span class="sourceLineNo">221</span>    // spinning as other strategies do.<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    this.disruptor = new Disruptor&lt;&gt;(RingBufferTruck::new,<a name="line.222"></a>
+<span class="sourceLineNo">223</span>        getPreallocatedEventCount(), Threads.getNamedThreadFactory(hostingThreadName + ".append"),<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        ProducerType.MULTI, new BlockingWaitStrategy());<a name="line.224"></a>
+<span class="sourceLineNo">225</span>    // Advance the ring buffer sequence so that it starts from 1 instead of 0,<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    // because SyncFuture.NOT_DONE = 0.<a name="line.226"></a>
+<span class="sourceLineNo">227</span>    this.disruptor.getRingBuffer().next();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    int maxHandlersCount = conf.getInt(HConstants.REGION_SERVER_HANDLER_COUNT, 200);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    this.ringBufferEventHandler = new RingBufferEventHandler(<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        conf.getInt("hbase.regionserver.hlog.syncer.count", 5), maxHandlersCount);<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    this.disruptor.setDefaultExceptionHandler(new RingBufferExceptionHandler());<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    this.disruptor.handleEventsWith(new RingBufferEventHandler[] { this.ringBufferEventHandler });<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    // Starting up threads in constructor is a no no; Interface should have an init call.<a name="line.233"></a>
+<span class="sourceLineNo">234</span>    this.disruptor.start();<a name="line.234"></a>
+<span class="sourceLineNo">235</span>  }<a name="line.235"></a>
+<span class="sourceLineNo">236</span><a name="line.236"></a>
+<span class="sourceLineNo">237</span>  /**<a name="line.237"></a>
+<span class="sourceLineNo">238</span>   * Currently, we need to expose the writer's OutputStream to tests so that they can manipulate the<a name="line.238"></a>
+<span class="sourceLineNo">239</span>   * default behavior (such as setting the maxRecoveryErrorCount value). This is<a name="line.239"></a>
+<span class="sourceLineNo">240</span>   * done using reflection on the underlying HDFS OutputStream. NOTE: This could be removed once Hadoop1 support is<a name="line.240"></a>
+<span class="sourceLineNo">241</span>   * removed.<a name="line.241"></a>
+<span class="sourceLineNo">242</span>   * @return null if underlying stream is not ready.<a name="line.242"></a>
+<span class="sourceLineNo">243</span>   */<a name="line.243"></a>
+<span class="sourceLineNo">244</span>  @VisibleForTesting<a name="line.244"></a>
+<span class="sourceLineNo">245</span>  OutputStream getOutputStream() {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    FSDataOutputStream fsdos = this.hdfs_out;<a name="line.246"></a>
+<span class="sourceLineNo">247</span>    return fsdos != null ? fsdos.getWrappedStream() : null;<a name="line.247"></a>
+<span class="sourceLineNo">248</span>  }<a name="line.248"></a>
+<span class="sourceLineNo">249</span><a name="line.249"></a>
+<span class="sourceLineNo">250</span>  /**<a name="line.250"></a>
+<span class="sourceLineNo">251</span>   * Run a sync after opening to set up the pipeline.<a name="line.251"></a>
+<span class="sourceLineNo">252</span>   */<a name="line.252"></a>
+<span class="sourceLineNo">253</span>  private void preemptiveSync(final ProtobufLogWriter nextWriter) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    long startTimeNanos = System.nanoTime();<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    try {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      nextWriter.sync();<a name="line.256"></a>
+<span class="sourceLineNo">257</span>      postSync(System.nanoTime() - startTimeNanos, 0);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    } catch (IOException e) {<a name="line.258"></a>
+<span class="sourceLineNo">259</span>      // optimization failed, no need to abort here.<a name="line.259"></a>
+<span class="sourceLineNo">260</span>      LOG.warn("pre-sync failed but an optimization so keep going", e);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    }<a name="line.261"></a>
+<span class="sourceLineNo">262</span>  }<a name="line.262"></a>
+<span class="sourceLineNo">263</span><a name="line.263"></a>
+<span class="sourceLineNo">264</span>  /**<a name="line.264"></a>
+<span class="sourceLineNo">265</span>   * This method allows subclasses to inject different writers without having to extend other<a name="line.265"></a>
+<span class="sourceLineNo">266</span>   * methods like rollWriter().<a name="line.266"></a>
+<span class="sourceLineNo">267</span>   * @return Writer instance<a name="line.267"></a>
+<span class="sourceLineNo">268</span>   */<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  @Override<a name="line.269"></a>
+<span class="sourceLineNo">270</span>  protected Writer createWriterInstance(final Path path) throws IOException {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    Writer writer = FSHLogProvider.createWriter(conf, fs, path, false, this.blocksize);<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    if (writer instanceof ProtobufLogWriter) {<a name="line.272"></a>
+<span class="sourceLineNo">273</span>      preemptiveSync((ProtobufLogWriter) writer);<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    }<a name="line.274"></a>
+<span class="sourceLineNo">275</span>    return writer;<a name="line.275"></a>
+<span class="sourceLineNo">276</span>  }<a name="line.276"></a>
+<span class="sourceLineNo">277</span><a name="line.277"></a>
+<span class="sourceLineNo">278</span>  /**<a name="line.278"></a>
+<span class="sourceLineNo">279</span>   * Used to manufacture race condition reliably. For testing only.<a name="line.279"></a>
+<span class="sourceLineNo">280</span>   * @see #beforeWaitOnSafePoint()<a name="line.280"></a>
+<span class="sourceLineNo">281</span>   */<a name="line.281"></a>
+<span class="sourceLineNo">282</span>  @VisibleForTesting<a name="line.282"></a>
+<span class="sourceLineNo">283</span>  protected void afterCreatingZigZagLatch() {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>  }<a name="line.284"></a>
+<span class="sourceLineNo">285</span><a name="line.285"></a>
+<span class="sourceLineNo">286</span>  /**<a name="line.286"></a>
+<span class="sourceLineNo">287</span>   * @see #afterCreatingZigZagLatch()<a name="line.287"></a>
+<span class="sourceLineNo">288</span>   */<a name="line.288"></a>
+<span class="sourceLineNo">289</span>  @VisibleForTesting<a name="line.289"></a>
+<span class="sourceLineNo">290</span>  protected void beforeWaitOnSafePoint() {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>  };<a name="line.291"></a>
+<span class="sourceLineNo">292</span><a name="line.292"></a>
+<span class="sourceLineNo">293</span>  @Override<a name="line.293"></a>
+<span class="sourceLineNo">294</span>  protected void doAppend(Writer writer, FSWALEntry entry) throws IOException {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    writer.append(entry);<a name="line.295"></a>
+<span class="sourceLineNo">296</span>  }<a name="line.296"></a>
+<span class="sourceLineNo">297</span><a name="line.297"></a>
+<span class="sourceLineNo">298</span>  @Override<a name="line.298"></a>
+<span class="sourceLineNo">299</span>  protected void doReplaceWriter(Path oldPath, Path newPath, Writer nextWriter) throws IOException {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    // Ask the ring buffer writer to pause at a safe point. Once we do this, the writer<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    // thread will eventually pause. An error hereafter needs to release the writer thread<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    // regardless -- hence the finally block below. Note, this method is called from the FSHLog<a name="line.302"></a>
+<span class="sourceLineNo">303</span>    // constructor BEFORE the ring buffer is set running so it is null on first time through<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    // here; allow for that.<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    SyncFuture syncFuture = null;<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    SafePointZigZagLatch zigzagLatch = null;<a name="line.306"></a>
+<span class="sourceLineNo">307</span>    long sequence = -1L;<a name="line.307"></a>
+<span class="sourceLineNo">308</span>    if (this.ringBufferEventHandler != null) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      // Get sequence first to avoid dead lock when ring buffer is full<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      // Considering below sequence<a name="line.310"></a>
+<span class="sourceLineNo">311</span>      // 1. replaceWriter is called and zigzagLatch is initialized<a name="line.311"></a>
+<span class="sourceLineNo">312</span>      // 2. ringBufferEventHandler#onEvent is called and arrives at #attainSafePoint(long) then wait<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      // on safePointReleasedLatch<a name="line.313"></a>
+<span class="sourceLineNo">314</span>      // 3. Since ring buffer is full, if we get sequence when publish sync, the replaceWriter<a name="line.314"></a>
+<span class="sourceLineNo">315</span>      // thread will wait for the ring buffer to be consumed, but the only consumer is waiting<a name="line.315"></a>
+<span class="sourceLineNo">316</span>      // replaceWriter thread to release safePointReleasedLatch, which causes a deadlock<a name="line.316"></a>
+<span class="sourceLineNo">317</span>      sequence = getSequenceOnRingBuffer();<a name="line.317"></a>
+<span class="sourceLineNo">318</span>      zigzagLatch = this.ringBufferEventHandler.attainSafePoint();<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    }<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    afterCreatingZigZagLatch();<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    try {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>      // Wait on the safe point to be achieved. Send in a sync in case nothing has hit the<a name="line.322"></a>
+<span class="sourceLineNo">323</span>      // ring buffer between the above notification of writer that we want it to go to<a name="line.323"></a>
+<span class="sourceLineNo">324</span>      // 'safe point' and then here where we are waiting on it to attain safe point. Use<a name="line.324"></a>
+<span class="sourceLineNo">325</span>      // 'sendSync' instead of 'sync' because we do not want this thread to block waiting on it<a name="line.325"></a>
+<span class="sourceLineNo">326</span>      // to come back. Cleanup this syncFuture down below after we are ready to run again.<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      try {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        if (zigzagLatch != null) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>          // use assert to make sure no change breaks the logic that<a name="line.329"></a>
+<span class="sourceLineNo">330</span>          // sequence and zigzagLatch will be set together<a name="line.330"></a>
+<span class="sourceLineNo">331</span>          assert sequence &gt; 0L : "Failed to get sequence from ring buffer";<a name="line.331"></a>
+<span class="sourceLineNo">332</span>          TraceUtil.addTimelineAnnotation("awaiting safepoint");<a name="line.332"></a>
+<span class="sourceLineNo">333</span>          syncFuture = zigzagLatch.waitSafePoint(publishSyncOnRingBuffer(sequence));<a name="line.333"></a>
+<span class="sourceLineNo">334</span>        }<a name="line.334"></a>
+<span class="sourceLineNo">335</span>      } catch (FailedSyncBeforeLogCloseException e) {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>        // If unflushed/unsynced entries on close, it is reason to abort.<a name="line.336"></a>
+<span class="sourceLineNo">337</span>        if (isUnflushedEntries()) {<a name="line.337"></a>
+<span class="sourceLineNo">338</span>          throw e;<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>        LOG.warn(<a name="line.340"></a>
+<span class="sourceLineNo">341</span>          "Failed sync-before-close but no outstanding appends; closing WAL" + e.getMessage());<a name="line.341"></a>
+<span class="sourceLineNo">342</span>      }<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      long oldFileLen = 0L;<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      // It is at the safe point. Swap out writer from under the blocked writer thread.<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      // TODO: This is close is inline with critical section. Should happen in background?<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      if (this.writer != null) {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>        oldFileLen = this.writer.getLength();<a name="line.347"></a>
+<span class="sourceLineNo">348</span>        try {<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          TraceUtil.addTimelineAnnotation("closing writer");<a name="line.349"></a>
+<span class="sourceLineNo">350</span>          this.writer.close();<a name="line.350"></a>
+<span class="sourceLineNo">351</span>          TraceUtil.addTimelineAnnotation("writer closed");<a name="line.351"></a>
+<span class="sourceLineNo">352</span>          this.closeErrorCount.set(0);<a name="line.352"></a>
+<span class="sourceLineNo">353</span>        } catch (IOException ioe) {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>          int errors = closeErrorCount.incrementAndGet();<a name="line.354"></a>
+<span class="sourceLineNo">355</span>          if (!isUnflushedEntries() &amp;&amp; (errors &lt;= this.closeErrorsTolerated)) {<a name="line.355"></a>
+<span class="sourceLineNo">356</span>            LOG.warn("Riding over failed WAL close of " + oldPath + ", cause=\"" + ioe.getMessage()<a name="line.356"></a>
+<span class="sourceLineNo">357</span>                + "\", errors=" + errors<a name="line.357"></a>
+<span class="sourceLineNo">358</span>                + "; THIS FILE WAS NOT CLOSED BUT ALL EDITS SYNCED SO SHOULD BE OK");<a name="line.358"></a>
+<span class="sourceLineNo">359</span>          } else {<a name="line.359"></a>
+<span class="sourceLineNo">360</span>            throw ioe;<a name="line.360"></a>
+<span class="sourceLineNo">361</span>          }<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        }<a name="line.362"></a>
+<span class="sourceLineNo">363</span>      }<a name="line.363"></a>
+<span class="sourceLineNo">364</span>      logRollAndSetupWalProps(oldPath, newPath, oldFileLen);<a name="line.364"></a>
+<span class="sourceLineNo">365</span>      this.writer = nextWriter;<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      if (nextWriter != null &amp;&amp; nextWriter instanceof ProtobufLogWriter) {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>        this.hdfs_out = ((ProtobufLogWriter) nextWriter).getStream();<a name="line.367"></a>
+<span class="sourceLineNo">368</span>      } else {<a name="line.368"></a>
+<span class="sourceLineNo">369</span>        this.hdfs_out = null;<a name="line.369"></a>
+<span class="sourceLineNo">370</span>      }<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    } catch (InterruptedException ie) {<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      // Perpetuate the interrupt<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      Thread.currentThread().interrupt();<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    } catch (IOException e) {<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      long count = getUnflushedEntriesCount();<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      LOG.error("Failed close of WAL writer " + oldPath + ", unflushedEntries=" + count, e);<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      throw new FailedLogCloseException(oldPath + ", unflushedEntries=" + count, e);<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    } finally {<a name="line.378"></a>
+<span class="sourceLineNo">379</span>      // Let the writer thread go regardless, whether error or not.<a name="line.379"></a>
+<span class="sourceLineNo">380</span>      if (zigzagLatch != null) {<a name="line.380"></a>
+<span class="sourceLineNo">381</span>        // Reset rollRequested status<a name="line.381"></a>
+<span class="sourceLineNo">382</span>        rollRequested.set(false);<a name="line.382"></a>
 <span class="sourceLineNo">383</span>        zigzagLatch.releaseSafePoint();<a name="line.383"></a>
 <span class="sourceLineNo">384</span>        // syncFuture will be null if we failed our wait on safe point above. Otherwise, if<a name="line.384"></a>
 <span class="sourceLineNo">385</span>        // latch was obtained successfully, the sync we threw in either trigger the latch or it<a name="line.385"></a>
@@ -958,158 +958,159 @@
 <span class="sourceLineNo">950</span>          //TODO handle htrace API change, see HBASE-18895<a name="line.950"></a>
 <span class="sourceLineNo">951</span>          //TraceScope scope = Trace.continueSpan(entry.detachSpan());<a name="line.951"></a>
 <span class="sourceLineNo">952</span>          try {<a name="line.952"></a>
-<span class="sourceLineNo">953</span><a name="line.953"></a>
-<span class="sourceLineNo">954</span>            if (this.exception != null) {<a name="line.954"></a>
-<span class="sourceLineNo">955</span>              // Return to keep processing events coming off the ringbuffer<a name="line.955"></a>
-<span class="sourceLineNo">956</span>              return;<a name="line.956"></a>
-<span class="sourceLineNo">957</span>            }<a name="line.957"></a>
-<span class="sourceLineNo">958</span>            append(entry);<a name="line.958"></a>
-<span class="sourceLineNo">959</span>          } catch (Exception e) {<a name="line.959"></a>
-<span class="sourceLineNo">960</span>            // Failed append. Record the exception.<a name="line.960"></a>
-<span class="sourceLineNo">961</span>            this.exception = e;<a name="line.961"></a>
-<span class="sourceLineNo">962</span>            // invoking cleanupOutstandingSyncsOnException when append failed with exception,<a name="line.962"></a>
-<span class="sourceLineNo">963</span>            // it will cleanup existing sync requests recorded in syncFutures but not offered to SyncRunner yet,<a name="line.963"></a>
-<span class="sourceLineNo">964</span>            // so there won't be any sync future left over if no further truck published to disruptor.<a name="line.964"></a>
-<span class="sourceLineNo">965</span>            cleanupOutstandingSyncsOnException(sequence,<a name="line.965"></a>
-<span class="sourceLineNo">966</span>                this.exception instanceof DamagedWALException ? this.exception<a name="line.966"></a>
-<span class="sourceLineNo">967</span>                    : new DamagedWALException("On sync", this.exception));<a name="line.967"></a>
-<span class="sourceLineNo">968</span>            // Return to keep processing events coming off the ringbuffer<a name="line.968"></a>
-<span class="sourceLineNo">969</span>            return;<a name="line.969"></a>
-<span class="sourceLineNo">970</span>          }<a name="line.970"></a>
-<span class="sourceLineNo">971</span>        } else {<a name="line.971"></a>
-<span class="sourceLineNo">972</span>          // What is this if not an append or sync. Fail all up to this!!!<a name="line.972"></a>
-<span class="sourceLineNo">973</span>          cleanupOutstandingSyncsOnException(sequence,<a name="line.973"></a>
-<span class="sourceLineNo">974</span>            new IllegalStateException("Neither append nor sync"));<a name="line.974"></a>
-<span class="sourceLineNo">975</span>          // Return to keep processing.<a name="line.975"></a>
-<span class="sourceLineNo">976</span>          return;<a name="line.976"></a>
-<span class="sourceLineNo">977</span>        }<a name="line.977"></a>
-<span class="sourceLineNo">978</span><a name="line.978"></a>
-<span class="sourceLineNo">979</span>        // TODO: Check size and if big go ahead and call a sync if we have enough data.<a name="line.979"></a>
-<span class="sourceLineNo">980</span>        // This is a sync. If existing exception, fall through. Else look to see if batch.<a name="line.980"></a>
-<span class="sourceLineNo">981</span>        if (this.exception == null) {<a name="line.981"></a>
-<span class="sourceLineNo">982</span>          // If not a batch, return to consume more events from the ring buffer before proceeding;<a name="line.982"></a>
-<span class="sourceLineNo">983</span>          // we want to get up a batch of syncs and appends before we go do a filesystem sync.<a name="line.983"></a>
-<span class="sourceLineNo">984</span>          if (!endOfBatch || this.syncFuturesCount.get() &lt;= 0) {<a name="line.984"></a>
-<span class="sourceLineNo">985</span>            return;<a name="line.985"></a>
-<span class="sourceLineNo">986</span>          }<a name="line.986"></a>
-<span class="sourceLineNo">987</span>          // syncRunnerIndex is bound to the range [0, Integer.MAX_INT - 1] as follows:<a name="line.987"></a>
-<span class="sourceLineNo">988</span>          //   * The maximum value possible for syncRunners.length is Integer.MAX_INT<a name="line.988"></a>
-<span class="sourceLineNo">989</span>          //   * syncRunnerIndex starts at 0 and is incremented only here<a name="line.989"></a>
-<span class="sourceLineNo">990</span>          //   * after the increment, the value is bounded by the '%' operator to<a name="line.990"></a>
-<span class="sourceLineNo">991</span>          //     [0, syncRunners.length), presuming the value was positive prior to<a name="line.991"></a>
-<span class="sourceLineNo">992</span>          //     the '%' operator.<a name="line.992"></a>
-<span class="sourceLineNo">993</span>          //   * after being bound to [0, Integer.MAX_INT - 1], the new value is stored in<a name="line.993"></a>
-<span class="sourceLineNo">994</span>          //     syncRunnerIndex ensuring that it can't grow without bound and overflow.<a name="line.994"></a>
-<span class="sourceLineNo">995</span>          //   * note that the value after the increment must be positive, because the most it<a name="line.995"></a>
-<span class="sourceLineNo">996</span>          //     could have been prior was Integer.MAX_INT - 1 and we only increment by 1.<a name="line.996"></a>
-<span class="sourceLineNo">997</span>          this.syncRunnerIndex = (this.syncRunnerIndex + 1) % this.syncRunners.length;<a name="line.997"></a>
-<span class="sourceLineNo">998</span>          try {<a name="line.998"></a>
-<span class="sourceLineNo">999</span>            // Below expects that the offer 'transfers' responsibility for the outstanding syncs to<a name="line.999"></a>
-<span class="sourceLineNo">1000</span>            // the syncRunner. We should never get an exception in here.<a name="line.1000"></a>
-<span class="sourceLineNo">1001</span>            this.syncRunners[this.syncRunnerIndex].offer(sequence, this.syncFutures,<a name="line.1001"></a>
-<span class="sourceLineNo">1002</span>              this.syncFuturesCount.get());<a name="line.1002"></a>
-<span class="sourceLineNo">1003</span>          } catch (Exception e) {<a name="line.1003"></a>
-<span class="sourceLineNo">1004</span>            // Should NEVER get here.<a name="line.1004"></a>
-<span class="sourceLineNo">1005</span>            requestLogRoll();<a name="line.1005"></a>
-<span class="sourceLineNo">1006</span>            this.exception = new DamagedWALException("Failed offering sync", e);<a name="line.1006"></a>
-<span class="sourceLineNo">1007</span>          }<a name="line.1007"></a>
-<span class="sourceLineNo">1008</span>        }<a name="line.1008"></a>
-<span class="sourceLineNo">1009</span>        // We may have picked up an exception above trying to offer sync<a name="line.1009"></a>
-<span class="sourceLineNo">1010</span>        if (this.exception != null) {<a name="line.1010"></a>
-<span class="sourceLineNo">1011</span>          cleanupOutstandingSyncsOnException(sequence, this.exception instanceof DamagedWALException<a name="line.1011"></a>
-<span class="sourceLineNo">1012</span>              ? this.exception : new DamagedWALException("On sync", this.exception));<a name="line.1012"></a>
-<span class="sourceLineNo">1013</span>        }<a name="line.1013"></a>
-<span class="sourceLineNo">1014</span>        attainSafePoint(sequence);<a name="line.1014"></a>
-<span class="sourceLineNo">1015</span>        this.syncFuturesCount.set(0);<a name="line.1015"></a>
-<span class="sourceLineNo">1016</span>      } catch (Throwable t) {<a name="line.1016"></a>
-<span class="sourceLineNo">1017</span>        LOG.error("UNEXPECTED!!! syncFutures.length=" + this.syncFutures.length, t);<a name="line.1017"></a>
-<span class="sourceLineNo">1018</span>      }<a name="line.1018"></a>
-<span class="sourceLineNo">1019</span>    }<a name="line.1019"></a>
-<span class="sourceLineNo">1020</span><a name="line.1020"></a>
-<span class="sourceLineNo">1021</span>    SafePointZigZagLatch attainSafePoint() {<a name="line.1021"></a>
-<span class="sourceLineNo">1022</span>      this.zigzagLatch = new SafePointZigZagLatch();<a name="line.1022"></a>
-<span class="sourceLineNo">1023</span>      return this.zigzagLatch;<a name="line.1023"></a>
-<span class="sourceLineNo">1024</span>    }<a name="line.1024"></a>
-<span class="sourceLineNo">1025</span><a name="line.1025"></a>
-<span class="sourceLineNo">1026</span>    /**<a name="line.1026"></a>
-<span class="sourceLineNo">1027</span>     * Check if we should attain safe point. If so, go there and then wait till signalled before we<a name="line.1027"></a>
-<span class="sourceLineNo">1028</span>     * proceeding.<a name="line.1028"></a>
-<span class="sourceLineNo">1029</span>     */<a name="line.1029"></a>
-<span class="sourceLineNo">1030</span>    private void attainSafePoint(final long currentSequence) {<a name="line.1030"></a>
-<span class="sourceLineNo">1031</span>      if (this.zigzagLatch == null || !this.zigzagLatch.isCocked()) {<a name="line.1031"></a>
-<span class="sourceLineNo">1032</span>        return;<a name="line.1032"></a>
-<span class="sourceLineNo">1033</span>      }<a name="line.1033"></a>
-<span class="sourceLineNo">1034</span>      // If here, another thread is waiting on us to get to safe point. Don't leave it hanging.<a name="line.1034"></a>
-<span class="sourceLineNo">1035</span>      beforeWaitOnSafePoint();<a name="line.1035"></a>
-<span class="sourceLineNo">1036</span>      try {<a name="line.1036"></a>
-<span class="sourceLineNo">1037</span>        // Wait on outstanding syncers; wait for them to finish syncing (unless we've been<a name="line.1037"></a>
-<span class="sourceLineNo">1038</span>        // shutdown or unless our latch has been thrown because we have been aborted or unless<a name="line.1038"></a>
-<span class="sourceLineNo">1039</span>        // this WAL is broken and we can't get a sync/append to complete).<a name="line.1039"></a>
-<span class="sourceLineNo">1040</span>        while ((!this.shutdown &amp;&amp; this.zigzagLatch.isCocked()<a name="line.1040"></a>
-<span class="sourceLineNo">1041</span>            &amp;&amp; highestSyncedTxid.get() &lt; currentSequence &amp;&amp;<a name="line.1041"></a>
-<span class="sourceLineNo">1042</span>            // We could be in here and all syncs are failing or failed. Check for this. Otherwise<a name="line.1042"></a>
-<span class="sourceLineNo">1043</span>            // we'll just be stuck here for ever. In other words, ensure there syncs running.<a name="line.1043"></a>
-<span class="sourceLineNo">1044</span>            isOutstandingSyncs())<a name="line.1044"></a>
-<span class="sourceLineNo">1045</span>            // Wait for all SyncRunners to finish their work so that we can replace the writer<a name="line.1045"></a>
-<span class="sourceLineNo">1046</span>            || isOutstandingSyncsFromRunners()) {<a name="line.1046"></a>
-<span class="sourceLineNo">1047</span>          synchronized (this.safePointWaiter) {<a name="line.1047"></a>
-<span class="sourceLineNo">1048</span>            this.safePointWaiter.wait(0, 1);<a name="line.1048"></a>
-<span class="sourceLineNo">1049</span>          }<a name="line.1049"></a>
-<span class="sourceLineNo">1050</span>        }<a name="line.1050"></a>
-<span class="sourceLineNo">1051</span>        // Tell waiting thread we've attained safe point. Can clear this.throwable if set here<a name="line.1051"></a>
-<span class="sourceLineNo">1052</span>        // because we know that next event through the ringbuffer will be going to a new WAL<a name="line.1052"></a>
-<span class="sourceLineNo">1053</span>        // after we do the zigzaglatch dance.<a name="line.1053"></a>
-<span class="sourceLineNo">1054</span>        this.exception = null;<a name="line.1054"></a>
-<span class="sourceLineNo">1055</span>        this.zigzagLatch.safePointAttained();<a name="line.1055"></a>
-<span class="sourceLineNo">1056</span>      } catch (InterruptedException e) {<a name="line.1056"></a>
-<span class="sourceLineNo">1057</span>        LOG.warn("Interrupted ", e);<a name="line.1057"></a>
-<span class="sourceLineNo">1058</span>        Thread.currentThread().interrupt();<a name="line.1058"></a>
-<span class="sourceLineNo">1059</span>      }<a name="line.1059"></a>
-<span class="sourceLineNo">1060</span>    }<a name="line.1060"></a>
-<span class="sourceLineNo">1061</span><a name="line.1061"></a>
-<span class="sourceLineNo">1062</span>    /**<a name="line.1062"></a>
-<span class="sourceLineNo">1063</span>     * Append to the WAL. Does all CP and WAL listener calls.<a name="line.1063"></a>
-<span class="sourceLineNo">1064</span>     */<a name="line.1064"></a>
-<span class="sourceLineNo">1065</span>    void append(final FSWALEntry entry) throws Exception {<a name="line.1065"></a>
-<span class="sourceLineNo">1066</span>      try {<a name="line.1066"></a>
-<span class="sourceLineNo">1067</span>        FSHLog.this.append(writer, entry);<a name="line.1067"></a>
-<span class="sourceLineNo">1068</span>      } catch (Exception e) {<a name="line.1068"></a>
-<span class="sourceLineNo">1069</span>        String msg = "Append sequenceId=" + entry.getKey().getSequenceId()<a name="line.1069"></a>
-<span class="sourceLineNo">1070</span>            + ", requesting roll of WAL";<a name="line.1070"></a>
-<span class="sourceLineNo">1071</span>        LOG.warn(msg, e);<a name="line.1071"></a>
-<span class="sourceLineNo">1072</span>        requestLogRoll();<a name="line.1072"></a>
-<span class="sourceLineNo">1073</span>        throw new DamagedWALException(msg, e);<a name="line.1073"></a>
-<span class="sourceLineNo">1074</span>      }<a name="line.1074"></a>
-<span class="sourceLineNo">1075</span>    }<a name="line.1075"></a>
-<span class="sourceLineNo">1076</span><a name="line.1076"></a>
-<span class="sourceLineNo">1077</span>    @Override<a name="line.1077"></a>
-<span class="sourceLineNo">1078</span>    public void onStart() {<a name="line.1078"></a>
-<span class="sourceLineNo">1079</span>      for (SyncRunner syncRunner : this.syncRunners) {<a name="line.1079"></a>
-<span class="sourceLineNo">1080</span>        syncRunner.start();<a name="line.1080"></a>
-<span class="sourceLineNo">1081</span>      }<a name="line.1081"></a>
-<span class="sourceLineNo">1082</span>    }<a name="line.1082"></a>
-<span class="sourceLineNo">1083</span><a name="line.1083"></a>
-<span class="sourceLineNo">1084</span>    @Override<a name="line.1084"></a>
-<span class="sourceLineNo">1085</span>    public void onShutdown() {<a name="line.1085"></a>
-<span class="sourceLineNo">1086</span>      for (SyncRunner syncRunner : this.syncRunners) {<a name="line.1086"></a>
-<span class="sourceLineNo">1087</span>        syncRunner.interrupt();<a name="line.1087"></a>
-<span class="sourceLineNo">1088</span>      }<a name="line.1088"></a>
-<span class="sourceLineNo">1089</span>    }<a name="line.1089"></a>
-<span class="sourceLineNo">1090</span>  }<a name="line.1090"></a>
-<span class="sourceLineNo">1091</span><a name="line.1091"></a>
-<span class="sourceLineNo">1092</span>  /**<a name="line.1092"></a>
-<span class="sourceLineNo">1093</span>   * This method gets the pipeline for the current WAL.<a name="line.1093"></a>
-<span class="sourceLineNo">1094</span>   */<a name="line.1094"></a>
-<span class="sourceLineNo">1095</span>  @Override<a name="line.1095"></a>
-<span class="sourceLineNo">1096</span>  DatanodeInfo[] getPipeline() {<a name="line.1096"></a>
-<span class="sourceLineNo">1097</span>    if (this.hdfs_out != null) {<a name="line.1097"></a>
-<span class="sourceLineNo">1098</span>      if (this.hdfs_out.getWrappedStream() instanceof DFSOutputStream) {<a name="line.1098"></a>
-<span class="sourceLineNo">1099</span>        return ((DFSOutputStream) this.hdfs_out.getWrappedStream()).getPipeline();<a name="line.1099"></a>
-<span class="sourceLineNo">1100</span>      }<a name="line.1100"></a>
-<span class="sourceLineNo">1101</span>    }<a name="line.1101"></a>
-<span class="sourceLineNo">1102</span>    return new DatanodeInfo[0];<a name="line.1102"></a>
-<span class="sourceLineNo">1103</span>  }<a name="line.1103"></a>
-<span class="sourceLineNo">1104</span>}<a name="line.1104"></a>
+<span class="sourceLineNo">953</span>            if (this.exception != null) {<a name="line.953"></a>
+<span class="sourceLineNo">954</span>              // Return to keep processing events coming off the ringbuffer<a name="line.954"></a>
+<span class="sourceLineNo">955</span>              return;<a name="line.955"></a>
+<span class="sourceLineNo">956</span>            }<a name="line.956"></a>
+<span class="sourceLineNo">957</span>            append(entry);<a name="line.957"></a>
+<span class="sourceLineNo">958</span>          } catch (Exception e) {<a name="line.958"></a>
+<span class="sourceLineNo">959</span>            // Failed append. Record the exception.<a name="line.959"></a>
+<span class="sourceLineNo">960</span>            this.exception = e;<a name="line.960"></a>
+<span class="sourceLineNo">961</span>            // invoking cleanupOutstandingSyncsOnException when append failed with exception,<a name="line.961"></a>
+<span class="sourceLineNo">962</span>            // it will cleanup existing sync requests recorded in syncFutures but not offered to SyncRunner yet,<a name="line.962"></a>
+<span class="sourceLineNo">963</span>            // so there won't be any sync future left over if no further truck published to disruptor.<a name="line.963"></a>
+<span class="sourceLineNo">964</span>            cleanupOutstandingSyncsOnException(sequence,<a name="line.964"></a>
+<span class="sourceLineNo">965</span>                this.exception instanceof DamagedWALException ? this.exception<a name="line.965"></a>
+<span class="sourceLineNo">966</span>                    : new DamagedWALException("On sync", this.exception));<a name="line.966"></a>
+<span class="sourceLineNo">967</span>            // Return to keep processing events coming off the ringbuffer<a name="line.967"></a>
+<span class="sourceLineNo">968</span>            return;<a name="line.968"></a>
+<span class="sourceLineNo">969</span>          } finally {<a name="line.969"></a>
+<span class="sourceLineNo">970</span>            entry.release();<a name="line.970"></a>
+<span class="sourceLineNo">971</span>          }<a name="line.971"></a>
+<span class="sourceLineNo">972</span>        } else {<a name="line.972"></a>
+<span class="sourceLineNo">973</span>          // What is this if not an append or sync. Fail all up to this!!!<a name="line.973"></a>
+<span class="sourceLineNo">974</span>          cleanupOutstandingSyncsOnException(sequence,<a name="line.974"></a>
+<span class="sourceLineNo">975</span>            new IllegalStateException("Neither append nor sync"));<a name="line.975"></a>
+<span class="sourceLineNo">976</span>          // Return to keep processing.<a name="line.976"></a>
+<span class="sourceLineNo">977</span>          return;<a name="line.977"></a>
+<span class="sourceLineNo">978</span>        }<a name="line.978"></a>
+<span class="sourceLineNo">979</span><a name="line.979"></a>
+<span class="sourceLineNo">980</span>        // TODO: Check size and if big go ahead and call a sync if we have enough data.<a name="line.980"></a>
+<span class="sourceLineNo">981</span>        // This is a sync. If existing exception, fall through. Else look to see if batch.<a name="line.981"></a>
+<span class="sourceLineNo">982</span>        if (this.exception == null) {<a name="line.982"></a>
+<span class="sourceLineNo">983</span>          // If not a batch, return to consume more events from the ring buffer before proceeding;<a name="line.983"></a>
+<span class="sourceLineNo">984</span>          // we want to get up a batch of syncs and appends before we go do a filesystem sync.<a name="line.984"></a>
+<span class="sourceLineNo">985</span>          if (!endOfBatch || this.syncFuturesCount.get() &lt;= 0) {<a name="line.985"></a>
+<span class="sourceLineNo">986</span>            return;<a name="line.986"></a>
+<span class="sourceLineNo">987</span>          }<a name="line.987"></a>
+<span class="sourceLineNo">988</span>          // syncRunnerIndex is bound to the range [0, Integer.MAX_INT - 1] as follows:<a name="line.988"></a>
+<span class="sourceLineNo">989</span>          //   * The maximum value possible for syncRunners.length is Integer.MAX_INT<a name="line.989"></a>
+<span class="sourceLineNo">990</span>          //   * syncRunnerIndex starts at 0 and is incremented only here<a name="line.990"></a>
+<span class="sourceLineNo">991</span>          //   * after the increment, the value is bounded by the '%' operator to<a name="line.991"></a>
+<span class="sourceLineNo">992</span>          //     [0, syncRunners.length), presuming the value was positive prior to<a name="line.992"></a>
+<span class="sourceLineNo">993</span>          //     the '%' operator.<a name="line.993"></a>
+<span class="sourceLineNo">994</span>          //   * after being bound to [0, Integer.MAX_INT - 1], the new value is stored in<a name="line.994"></a>
+<span class="sourceLineNo">995</span>          //     syncRunnerIndex ensuring that it can't grow without bound and overflow.<a name="line.995"></a>
+<span class="sourceLineNo">996</span>          //   * note that the value after the increment must be positive, because the most it<a name="line.996"></a>
+<span class="sourceLineNo">997</span>          //     could have been prior was Integer.MAX_INT - 1 and we only increment by 1.<a name="line.997"></a>
+<span class="sourceLineNo">998</span>          this.syncRunnerIndex = (this.syncRunnerIndex + 1) % this.syncRunners.length;<a name="line.998"></a>
+<span class="sourceLineNo">999</span>          try {<a name="line.999"></a>
+<span class="sourceLineNo">1000</span>            // Below expects that the offer 'transfers' responsibility for the outstanding syncs to<a name="line.1000"></a>
+<span class="sourceLineNo">1001</span>            // the syncRunner. We should never get an exception in here.<a name="line.1001"></a>
+<span class="sourceLineNo">1002</span>            this.syncRunners[this.syncRunnerIndex].offer(sequence, this.syncFutures,<a name="line.1002"></a>
+<span class="sourceLineNo">1003</span>              this.syncFuturesCount.get());<a name="line.1003"></a>
+<span class="sourceLineNo">1004</span>          } catch (Exception e) {<a name="line.1004"></a>
+<span class="sourceLineNo">1005</span>            // Should NEVER get here.<a name="line.1005"></a>
+<span class="sourceLineNo">1006</span>            requestLogRoll();<a name="line.1006"></a>
+<span class="sourceLineNo">1007</span>            this.exception = new DamagedWALException("Failed offering sync", e);<a name="line.1007"></a>
+<span class="sourceLineNo">1008</span>          }<a name="line.1008"></a>
+<span class="sourceLineNo">1009</span>        }<a name="line.1009"></a>
+<span class="sourceLineNo">1010</span>        // We may have picked up an exception above trying to offer sync<a name="line.1010"></a>
+<span class="sourceLineNo">1011</span>        if (this.exception != null) {<a name="line.1011"></a>
+<span class="sourceLineNo">1012</span>          cleanupOutstandingSyncsOnException(sequence, this.exception instanceof DamagedWALException<a name="line.1012"></a>
+<span class="sourceLineNo">1013</span>              ? this.exception : new DamagedWALException("On sync", this.exception));<a name="line.1013"></a>
+<span class="sourceLineNo">1014</span>        }<a name="line.1014"></a>
+<span class="sourceLineNo">1015</span>        attainSafePoint(sequence);<a name="line.1015"></a>
+<span class="sourceLineNo">1016</span>        this.syncFuturesCount.set(0);<a name="line.1016"></a>
+<span class="sourceLineNo">1017</span>      } catch (Throwable t) {<a name="line.1017"></a>
+<span class="sourceLineNo">1018</span>        LOG.error("UNEXPECTED!!! syncFutures.length=" + this.syncFutures.length, t);<a name="line.1018"></a>
+<span class="sourceLineNo">1019</span>      }<a name="line.1019"></a>
+<span class="sourceLineNo">1020</span>    }<a name="line.1020"></a>
+<span class="sourceLineNo">1021</span><a name="line.1021"></a>
+<span class="sourceLineNo">1022</span>    SafePointZigZagLatch attainSafePoint() {<a name="line.1022"></a>
+<span class="sourceLineNo">1023</span>      this.zigzagLatch = new SafePointZigZagLatch();<a name="line.1023"></a>
+<span class="sourceLineNo">1024</span>      return this.zigzagLatch;<a name="line.1024"></a>
+<span class="sourceLineNo">1025</span>    }<a name="line.1025"></a>
+<span class="sourceLineNo">1026</span><a name="line.1026"></a>
+<span class="sourceLineNo">1027</span>    /**<a name="line.1027"></a>
+<span class="sourceLineNo">1028</span>     * Check if we should attain safe point. If so, go there and then wait till signalled before we<a name="line.1028"></a>
+<span class="sourceLineNo">1029</span>     * proceeding.<a name="line.1029"></a>
+<span class="sourceLineNo">1030</span>     */<a name="line.1030"></a>
+<span class="sourceLineNo">1031</span>    private void attainSafePoint(final long currentSequence) {<a name="line.1031"></a>
+<span class="sourceLineNo">1032</span>      if (this.zigzagLatch == null || !this.zigzagLatch.isCocked()) {<a name="line.1032"></a>
+<span class="sourceLineNo">1033</span>        return;<a name="line.1033"></a>
+<span class="sourceLineNo">1034</span>      }<a name="line.1034"></a>
+<span class="sourceLineNo">1035</span>      // If here, another thread is waiting on us to get to safe point. Don't leave it hanging.<a name="line.1035"></a>
+<span class="sourceLineNo">1036</span>      beforeWaitOnSafePoint();<a name="line.1036"></a>
+<span class="sourceLineNo">1037</span>      try {<a name="line.1037"></a>
+<span class="sourceLineNo">1038</span>        // Wait on outstanding syncers; wait for them to finish syncing (unless we've been<a name="line.1038"></a>
+<span class="sourceLineNo">1039</span>        // shutdown or unless our latch has been thrown because we have been aborted or unless<a name="line.1039"></a>
+<span class="sourceLineNo">1040</span>        // this WAL is broken and we can't get a sync/append to complete).<a name="line.1040"></a>
+<span class="sourceLineNo">1041</span>        while ((!this.shutdown &amp;&amp; this.zigzagLatch.isCocked()<a name="line.1041"></a>
+<span class="sourceLineNo">1042</span>            &amp;&amp; highestSyncedTxid.get() &lt; currentSequence &amp;&amp;<a name="line.1042"></a>
+<span class="sourceLineNo">1043</span>            // We could be in here and all syncs are failing or failed. Check for this. Otherwise<a name="line.1043"></a>
+<span class="sourceLineNo">1044</span>            // we'll just be stuck here for ever. In other words, ensure there syncs running.<a name="line.1044"></a>
+<span class="sourceLineNo">1045</span>            isOutstandingSyncs())<a name="line.1045"></a>
+<span class="sourceLineNo">1046</span>            // Wait for all SyncRunners to finish their work so that we can replace the writer<a name="line.1046"></a>
+<span class="sourceLineNo">1047</span>            || isOutstandingSyncsFromRunners()) {<a name="line.1047"></a>
+<span class="sourceLineNo">1048</span>          synchronized (this.safePointWaiter) {<a name="line.1048"></a>
+<span class="sourceLineNo">1049</span>            this.safePointWaiter.wait(0, 1);<a name="line.1049"></a>
+<span class="sourceLineNo">1050</span>          }<a name="line.1050"></a>
+<span class="sourceLineNo">1051</span>        }<a name="line.1051"></a>
+<span class="sourceLineNo">1052</span>        // Tell waiting thread we've attained safe point. Can clear this.throwable if set here<a name="line.1052"></a>
+<span class="sourceLineNo">1053</span>        // because we know that next event through the ringbuffer will be going to a new WAL<a name="line.1053"></a>
+<span class="sourceLineNo">1054</span>        // after we do the zigzaglatch dance.<a name="line.1054"></a>
+<span class="sourceLineNo">1055</span>        this.exception = null;<a name="line.1055"></a>
+<span class="sourceLineNo">1056</span>        this.zigzagLatch.safePointAttained();<a name="line.1056"></a>
+<span class="sourceLineNo">1057</span>      } catch (InterruptedException e) {<a name="line.1057"></a>
+<span class="sourceLineNo">1058</span>        LOG.warn("Interrupted ", e);<a name="line.1058"></a>
+<span class="sourceLineNo">1059</span>        Thread.currentThread().interrupt();<a name="line.1059"></a>
+<span class="sourceLineNo">1060</span>      }<a name="line.1060"></a>
+<span class="sourceLineNo">1061</span>    }<a name="line.1061"></a>
+<span class="sourceLineNo">1062</span><a name="line.1062"></a>
+<span class="sourceLineNo">1063</span>    /**<a name="line.1063"></a>
+<span class="sourceLineNo">1064</span>     * Append to the WAL. Does all CP and WAL listener calls.<a name="line.1064"></a>
+<span class="sourceLineNo">1065</span>     */<a name="line.1065"></a>
+<span class="sourceLineNo">1066</span>    void append(final FSWALEntry entry) throws Exception {<a name="line.1066"></a>
+<span class="sourceLineNo">1067</span>      try {<a name="line.1067"></a>
+<span class="sourceLineNo">1068</span>        FSHLog.this.append(writer, entry);<a name="line.1068"></a>
+<span class="sourceLineNo">1069</span>      } catch (Exception e) {<a name="line.1069"></a>
+<span class="sourceLineNo">1070</span>        String msg = "Append sequenceId=" + entry.getKey().getSequenceId()<a name="line.1070"></a>
+<span class="sourceLineNo">1071</span>            + ", requesting roll of WAL";<a name="line.1071"></a>
+<span class="sourceLineNo">1072</span>        LOG.warn(msg, e);<a name="line.1072"></a>
+<span class="sourceLineNo">1073</span>        requestLogRoll();<a name="line.1073"></a>
+<span class="sourceLineNo">1074</span>        throw new DamagedWALException(msg, e);<a name="line.1074"></a>
+<span class="sourceLineNo">1075</span>      }<a name="line.1075"></a>
+<span class="sourceLineNo">1076</span>    }<a name="line.1076"></a>
+<span class="sourceLineNo">1077</span><a name="line.1077"></a>
+<span class="sourceLineNo">1078</span>    @Override<a name="line.1078"></a>
+<span class="sourceLineNo">1079</span>    public void onStart() {<a name="line.1079"></a>
+<span class="sourceLineNo">1080</span>      for (SyncRunner syncRunner : this.syncRunners) {<a name="line.1080"></a>
+<span class="sourceLineNo">1081</span>        syncRunner.start();<a name="line.1081"></a>
+<span class="sourceLineNo">1082</span>      }<a name="line.1082"></a>
+<span class="sourceLineNo">1083</span>    }<a name="line.1083"></a>
+<span class="sourceLineNo">1084</span><a name="line.1084"></a>
+<span class="sourceLineNo">1085</span>    @Override<a name="line.1085"></a>
+<span class="sourceLineNo">1086</span>    public void onShutdown() {<a name="line.1086"></a>
+<span class="sourceLineNo">1087</span>      for (SyncRunner syncRunner : this.syncRunners) {<a name="line.1087"></a>
+<span class="sourceLineNo">1088</span>        syncRunner.interrupt();<a name="line.1088"></a>
+<span class="sourceLineNo">1089</span>      }<a name="line.1089"></a>
+<span class="sourceLineNo">1090</span>    }<a name="line.1090"></a>
+<span class="sourceLineNo">1091</span>  }<a name="line.1091"></a>
+<span class="sourceLineNo">1092</span><a name="line.1092"></a>
+<span class="sourceLineNo">1093</span>  /**<a name="line.1093"></a>
+<span class="sourceLineNo">1094</span>   * This method gets the pipeline for the current WAL.<a name="line.1094"></a>
+<span class="sourceLineNo">1095</span>   */<a name="line.1095"></a>
+<span class="sourceLineNo">1096</span>  @Override<a name="line.1096"></a>
+<span class="sourceLineNo">1097</span>  DatanodeInfo[] getPipeline() {<a name="line.1097"></a>
+<span class="sourceLineNo">1098</span>    if (this.hdfs_out != null) {<a name="line.1098"></a>
+<span class="sourceLineNo">1099</span>      if (this.hdfs_out.getWrappedStream() instanceof DFSOutputStream) {<a name="line.1099"></a>
+<span class="sourceLineNo">1100</span>        return ((DFSOutputStream) this.hdfs_out.getWrappedStream()).getPipeline();<a name="line.1100"></a>
+<span class="sourceLineNo">1101</span>      }<a name="line.1101"></a>
+<span class="sourceLineNo">1102</span>    }<a name="line.1102"></a>
+<span class="sourceLineNo">1103</span>    return new DatanodeInfo[0];<a name="line.1103"></a>
+<span class="sourceLineNo">1104</span>  }<a name="line.1104"></a>
+<span class="sourceLineNo">1105</span>}<a name="line.1105"></a>
 
 
 
