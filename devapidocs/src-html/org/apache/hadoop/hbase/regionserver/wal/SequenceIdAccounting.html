@@ -47,436 +47,431 @@
 <span class="sourceLineNo">039</span>import org.apache.hbase.thirdparty.com.google.common.annotations.VisibleForTesting;<a name="line.39"></a>
 <span class="sourceLineNo">040</span><a name="line.40"></a>
 <span class="sourceLineNo">041</span>/**<a name="line.41"></a>
-<span class="sourceLineNo">042</span> * &lt;p&gt;<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * Accounting of sequence ids per region and then by column family. So we can our accounting<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * current, call startCacheFlush and then finishedCacheFlush or abortCacheFlush so this instance can<a name="line.44"></a>
-<span class="sourceLineNo">045</span> * keep abreast of the state of sequence id persistence. Also call update per append.<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * &lt;/p&gt;<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * &lt;p&gt;<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * For the implementation, we assume that all the {@code encodedRegionName} passed in is gotten by<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * {@link org.apache.hadoop.hbase.client.RegionInfo#getEncodedNameAsBytes()}. So it is safe to use<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * it as a hash key. And for family name, we use {@link ImmutableByteArray} as key. This is because<a name="line.50"></a>
-<span class="sourceLineNo">051</span> * hash based map is much faster than RBTree or CSLM and here we are on the critical write path. See<a name="line.51"></a>
-<span class="sourceLineNo">052</span> * HBASE-16278 for more details.<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * &lt;/p&gt;<a name="line.53"></a>
-<span class="sourceLineNo">054</span> */<a name="line.54"></a>
-<span class="sourceLineNo">055</span>@InterfaceAudience.Private<a name="line.55"></a>
-<span class="sourceLineNo">056</span>class SequenceIdAccounting {<a name="line.56"></a>
-<span class="sourceLineNo">057</span><a name="line.57"></a>
-<span class="sourceLineNo">058</span>  private static final Logger LOG = LoggerFactory.getLogger(SequenceIdAccounting.class);<a name="line.58"></a>
-<span class="sourceLineNo">059</span>  /**<a name="line.59"></a>
-<span class="sourceLineNo">060</span>   * This lock ties all operations on {@link SequenceIdAccounting#flushingSequenceIds} and<a name="line.60"></a>
-<span class="sourceLineNo">061</span>   * {@link #lowestUnflushedSequenceIds} Maps. {@link #lowestUnflushedSequenceIds} has the<a name="line.61"></a>
-<span class="sourceLineNo">062</span>   * lowest outstanding sequence ids EXCEPT when flushing. When we flush, the current<a name="line.62"></a>
-<span class="sourceLineNo">063</span>   * lowest set for the region/column family are moved (atomically because of this lock) to<a name="line.63"></a>
-<span class="sourceLineNo">064</span>   * {@link #flushingSequenceIds}.<a name="line.64"></a>
-<span class="sourceLineNo">065</span>   * <a name="line.65"></a>
-<span class="sourceLineNo">066</span>   * &lt;p&gt;The two Maps are tied by this locking object EXCEPT when we go to update the lowest<a name="line.66"></a>
-<span class="sourceLineNo">067</span>   * entry; see {@link #lowestUnflushedSequenceIds}. In here is a putIfAbsent call on<a name="line.67"></a>
-<span class="sourceLineNo">068</span>   * {@link #lowestUnflushedSequenceIds}. In this latter case, we will add this lowest<a name="line.68"></a>
-<span class="sourceLineNo">069</span>   * sequence id if we find that there is no entry for the current column family. There will be no<a name="line.69"></a>
-<span class="sourceLineNo">070</span>   * entry only if we just came up OR we have moved aside current set of lowest sequence ids<a name="line.70"></a>
-<span class="sourceLineNo">071</span>   * because the current set are being flushed (by putting them into {@link #flushingSequenceIds}).<a name="line.71"></a>
-<span class="sourceLineNo">072</span>   * This is how we pick up the next 'lowest' sequence id per region per column family to be used<a name="line.72"></a>
-<span class="sourceLineNo">073</span>   * figuring what is in the next flush.<a name="line.73"></a>
-<span class="sourceLineNo">074</span>   */<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private final Object tieLock = new Object();<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  /**<a name="line.77"></a>
-<span class="sourceLineNo">078</span>   * Map of encoded region names and family names to their OLDEST -- i.e. their first,<a name="line.78"></a>
-<span class="sourceLineNo">079</span>   * the longest-lived, their 'earliest', the 'lowest' -- sequence id.<a name="line.79"></a>
-<span class="sourceLineNo">080</span>   *<a name="line.80"></a>
-<span class="sourceLineNo">081</span>   * &lt;p&gt;When we flush, the current lowest sequence ids get cleared and added to<a name="line.81"></a>
-<span class="sourceLineNo">082</span>   * {@link #flushingSequenceIds}. The next append that comes in, is then added<a name="line.82"></a>
-<span class="sourceLineNo">083</span>   * here to {@link #lowestUnflushedSequenceIds} as the next lowest sequenceid.<a name="line.83"></a>
-<span class="sourceLineNo">084</span>   *<a name="line.84"></a>
-<span class="sourceLineNo">085</span>   * &lt;p&gt;If flush fails, currently server is aborted so no need to restore previous sequence ids.<a name="line.85"></a>
-<span class="sourceLineNo">086</span>   * &lt;p&gt;Needs to be concurrent Maps because we use putIfAbsent updating oldest.<a name="line.86"></a>
-<span class="sourceLineNo">087</span>   */<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  private final ConcurrentMap&lt;byte[], ConcurrentMap&lt;ImmutableByteArray, Long&gt;&gt;<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    lowestUnflushedSequenceIds = new ConcurrentHashMap&lt;&gt;();<a name="line.89"></a>
-<span class="sourceLineNo">090</span><a name="line.90"></a>
-<span class="sourceLineNo">091</span>  /**<a name="line.91"></a>
-<span class="sourceLineNo">092</span>   * Map of encoded region names and family names to their lowest or OLDEST sequence/edit id<a name="line.92"></a>
-<span class="sourceLineNo">093</span>   * currently being flushed out to hfiles. Entries are moved here from<a name="line.93"></a>
-<span class="sourceLineNo">094</span>   * {@link #lowestUnflushedSequenceIds} while the lock {@link #tieLock} is held<a name="line.94"></a>
-<span class="sourceLineNo">095</span>   * (so movement between the Maps is atomic).<a name="line.95"></a>
-<span class="sourceLineNo">096</span>   */<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  private final Map&lt;byte[], Map&lt;ImmutableByteArray, Long&gt;&gt; flushingSequenceIds = new HashMap&lt;&gt;();<a name="line.97"></a>
-<span class="sourceLineNo">098</span><a name="line.98"></a>
-<span class="sourceLineNo">099</span>  /**<a name="line.99"></a>
-<span class="sourceLineNo">100</span>   * &lt;p&gt;<a name="line.100"></a>
-<span class="sourceLineNo">101</span>   * Map of region encoded names to the latest/highest region sequence id. Updated on each call to<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   * append.<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * &lt;/p&gt;<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   * &lt;p&gt;<a name="line.104"></a>
-<span class="sourceLineNo">105</span>   * This map uses byte[] as the key, and uses reference equality. It works in our use case as we<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   * use {@link org.apache.hadoop.hbase.client.RegionInfo#getEncodedNameAsBytes()} as keys. For a<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   * given region, it always returns the same array.<a name="line.107"></a>
-<span class="sourceLineNo">108</span>   * &lt;/p&gt;<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   */<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  private Map&lt;byte[], Long&gt; highestSequenceIds = new HashMap&lt;&gt;();<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  /**<a name="line.112"></a>
-<span class="sourceLineNo">113</span>   * Returns the lowest unflushed sequence id for the region.<a name="line.113"></a>
-<span class="sourceLineNo">114</span>   * @param encodedRegionName<a name="line.114"></a>
-<span class="sourceLineNo">115</span>   * @return Lowest outstanding unflushed sequenceid for &lt;code&gt;encodedRegionName&lt;/code&gt;. Will<a name="line.115"></a>
-<span class="sourceLineNo">116</span>   * return {@link HConstants#NO_SEQNUM} when none.<a name="line.116"></a>
-<span class="sourceLineNo">117</span>   */<a name="line.117"></a>
-<span class="sourceLineNo">118</span>  long getLowestSequenceId(final byte[] encodedRegionName) {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    synchronized (this.tieLock) {<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      Map&lt;?, Long&gt; m = this.flushingSequenceIds.get(encodedRegionName);<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      long flushingLowest = m != null ? getLowestSequenceId(m) : Long.MAX_VALUE;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>      m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>      long unflushedLowest = m != null ? getLowestSequenceId(m) : HConstants.NO_SEQNUM;<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      return Math.min(flushingLowest, unflushedLowest);<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    }<a name="line.125"></a>
-<span class="sourceLineNo">126</span>  }<a name="line.126"></a>
-<span class="sourceLineNo">127</span><a name="line.127"></a>
-<span class="sourceLineNo">128</span>  /**<a name="line.128"></a>
-<span class="sourceLineNo">129</span>   * @param encodedRegionName<a name="line.129"></a>
-<span class="sourceLineNo">130</span>   * @param familyName<a name="line.130"></a>
-<span class="sourceLineNo">131</span>   * @return Lowest outstanding unflushed sequenceid for &lt;code&gt;encodedRegionname&lt;/code&gt; and<a name="line.131"></a>
-<span class="sourceLineNo">132</span>   *         &lt;code&gt;familyName&lt;/code&gt;. Returned sequenceid may be for an edit currently being<a name="line.132"></a>
-<span class="sourceLineNo">133</span>   *         flushed.<a name="line.133"></a>
-<span class="sourceLineNo">134</span>   */<a name="line.134"></a>
-<span class="sourceLineNo">135</span>  long getLowestSequenceId(final byte[] encodedRegionName, final byte[] familyName) {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap(familyName);<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    synchronized (this.tieLock) {<a name="line.137"></a>
-<span class="sourceLineNo">138</span>      Map&lt;ImmutableByteArray, Long&gt; m = this.flushingSequenceIds.get(encodedRegionName);<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      if (m != null) {<a name="line.139"></a>
-<span class="sourceLineNo">140</span>        Long lowest = m.get(familyNameWrapper);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>        if (lowest != null) {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>          return lowest;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>        }<a name="line.143"></a>
-<span class="sourceLineNo">144</span>      }<a name="line.144"></a>
-<span class="sourceLineNo">145</span>      m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.145"></a>
-<span class="sourceLineNo">146</span>      if (m != null) {<a name="line.146"></a>
-<span class="sourceLineNo">147</span>        Long lowest = m.get(familyNameWrapper);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>        if (lowest != null) {<a name="line.148"></a>
-<span class="sourceLineNo">149</span>          return lowest;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>        }<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      }<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    }<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    return HConstants.NO_SEQNUM;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  }<a name="line.154"></a>
-<span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>  /**<a name="line.156"></a>
-<span class="sourceLineNo">157</span>   * Reset the accounting of highest sequenceid by regionname.<a name="line.157"></a>
-<span class="sourceLineNo">158</span>   * @return Return the previous accounting Map of regions to the last sequence id written into<a name="line.158"></a>
-<span class="sourceLineNo">159</span>   * each.<a name="line.159"></a>
-<span class="sourceLineNo">160</span>   */<a name="line.160"></a>
-<span class="sourceLineNo">161</span>  Map&lt;byte[], Long&gt; resetHighest() {<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    Map&lt;byte[], Long&gt; old = this.highestSequenceIds;<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    this.highestSequenceIds = new HashMap&lt;&gt;();<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    return old;<a name="line.164"></a>
-<span class="sourceLineNo">165</span>  }<a name="line.165"></a>
-<span class="sourceLineNo">166</span><a name="line.166"></a>
-<span class="sourceLineNo">167</span>  /**<a name="line.167"></a>
-<span class="sourceLineNo">168</span>   * We've been passed a new sequenceid for the region. Set it as highest seen for this region and<a name="line.168"></a>
-<span class="sourceLineNo">169</span>   * if we are to record oldest, or lowest sequenceids, save it as oldest seen if nothing<a name="line.169"></a>
-<span class="sourceLineNo">170</span>   * currently older.<a name="line.170"></a>
-<span class="sourceLineNo">171</span>   * @param encodedRegionName<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   * @param families<a name="line.172"></a>
-<span class="sourceLineNo">173</span>   * @param sequenceid<a name="line.173"></a>
-<span class="sourceLineNo">174</span>   * @param lowest Whether to keep running account of oldest sequence id.<a name="line.174"></a>
-<span class="sourceLineNo">175</span>   */<a name="line.175"></a>
-<span class="sourceLineNo">176</span>  void update(byte[] encodedRegionName, Set&lt;byte[]&gt; families, long sequenceid,<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      final boolean lowest) {<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    Long l = Long.valueOf(sequenceid);<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    this.highestSequenceIds.put(encodedRegionName, l);<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    if (lowest) {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>      ConcurrentMap&lt;ImmutableByteArray, Long&gt; m = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.181"></a>
-<span class="sourceLineNo">182</span>      for (byte[] familyName : families) {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>        m.putIfAbsent(ImmutableByteArray.wrap(familyName), l);<a name="line.183"></a>
-<span class="sourceLineNo">184</span>      }<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    }<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  }<a name="line.186"></a>
-<span class="sourceLineNo">187</span><a name="line.187"></a>
-<span class="sourceLineNo">188</span>  /**<a name="line.188"></a>
-<span class="sourceLineNo">189</span>   * Clear all the records of the given region as it is going to be closed.<a name="line.189"></a>
+<span class="sourceLineNo">042</span> * Accounting of sequence ids per region and then by column family. So we can keep our accounting<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * current, call startCacheFlush and then finishedCacheFlush or abortCacheFlush so this instance can<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * keep abreast of the state of sequence id persistence. Also call update per append.<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * &lt;p&gt;<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * For the implementation, we assume that all the {@code encodedRegionName} passed in are gotten by<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * {@link org.apache.hadoop.hbase.client.RegionInfo#getEncodedNameAsBytes()}. So it is safe to use<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * it as a hash key. And for family name, we use {@link ImmutableByteArray} as key. This is because<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * hash based map is much faster than RBTree or CSLM and here we are on the critical write path. See<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * HBASE-16278 for more details.<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * &lt;/p&gt;<a name="line.51"></a>
+<span class="sourceLineNo">052</span> */<a name="line.52"></a>
+<span class="sourceLineNo">053</span>@InterfaceAudience.Private<a name="line.53"></a>
+<span class="sourceLineNo">054</span>class SequenceIdAccounting {<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  private static final Logger LOG = LoggerFactory.getLogger(SequenceIdAccounting.class);<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>  /**<a name="line.57"></a>
+<span class="sourceLineNo">058</span>   * This lock ties all operations on {@link SequenceIdAccounting#flushingSequenceIds} and<a name="line.58"></a>
+<span class="sourceLineNo">059</span>   * {@link #lowestUnflushedSequenceIds} Maps. {@link #lowestUnflushedSequenceIds} has the<a name="line.59"></a>
+<span class="sourceLineNo">060</span>   * lowest outstanding sequence ids EXCEPT when flushing. When we flush, the current<a name="line.60"></a>
+<span class="sourceLineNo">061</span>   * lowest set for the region/column family are moved (atomically because of this lock) to<a name="line.61"></a>
+<span class="sourceLineNo">062</span>   * {@link #flushingSequenceIds}.<a name="line.62"></a>
+<span class="sourceLineNo">063</span>   * <a name="line.63"></a>
+<span class="sourceLineNo">064</span>   * &lt;p&gt;The two Maps are tied by this locking object EXCEPT when we go to update the lowest<a name="line.64"></a>
+<span class="sourceLineNo">065</span>   * entry; see {@link #lowestUnflushedSequenceIds}. In here is a putIfAbsent call on<a name="line.65"></a>
+<span class="sourceLineNo">066</span>   * {@link #lowestUnflushedSequenceIds}. In this latter case, we will add this lowest<a name="line.66"></a>
+<span class="sourceLineNo">067</span>   * sequence id if we find that there is no entry for the current column family. There will be no<a name="line.67"></a>
+<span class="sourceLineNo">068</span>   * entry only if we just came up OR we have moved aside current set of lowest sequence ids<a name="line.68"></a>
+<span class="sourceLineNo">069</span>   * because the current set are being flushed (by putting them into {@link #flushingSequenceIds}).<a name="line.69"></a>
+<span class="sourceLineNo">070</span>   * This is how we pick up the next 'lowest' sequence id per region per column family to be used<a name="line.70"></a>
+<span class="sourceLineNo">071</span>   * figuring what is in the next flush.<a name="line.71"></a>
+<span class="sourceLineNo">072</span>   */<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  private final Object tieLock = new Object();<a name="line.73"></a>
+<span class="sourceLineNo">074</span><a name="line.74"></a>
+<span class="sourceLineNo">075</span>  /**<a name="line.75"></a>
+<span class="sourceLineNo">076</span>   * Map of encoded region names and family names to their OLDEST -- i.e. their first,<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   * the longest-lived, their 'earliest', the 'lowest' -- sequence id.<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   *<a name="line.78"></a>
+<span class="sourceLineNo">079</span>   * &lt;p&gt;When we flush, the current lowest sequence ids get cleared and added to<a name="line.79"></a>
+<span class="sourceLineNo">080</span>   * {@link #flushingSequenceIds}. The next append that comes in, is then added<a name="line.80"></a>
+<span class="sourceLineNo">081</span>   * here to {@link #lowestUnflushedSequenceIds} as the next lowest sequenceid.<a name="line.81"></a>
+<span class="sourceLineNo">082</span>   *<a name="line.82"></a>
+<span class="sourceLineNo">083</span>   * &lt;p&gt;If flush fails, currently server is aborted so no need to restore previous sequence ids.<a name="line.83"></a>
+<span class="sourceLineNo">084</span>   * &lt;p&gt;Needs to be concurrent Maps because we use putIfAbsent updating oldest.<a name="line.84"></a>
+<span class="sourceLineNo">085</span>   */<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private final ConcurrentMap&lt;byte[], ConcurrentMap&lt;ImmutableByteArray, Long&gt;&gt;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    lowestUnflushedSequenceIds = new ConcurrentHashMap&lt;&gt;();<a name="line.87"></a>
+<span class="sourceLineNo">088</span><a name="line.88"></a>
+<span class="sourceLineNo">089</span>  /**<a name="line.89"></a>
+<span class="sourceLineNo">090</span>   * Map of encoded region names and family names to their lowest or OLDEST sequence/edit id<a name="line.90"></a>
+<span class="sourceLineNo">091</span>   * currently being flushed out to hfiles. Entries are moved here from<a name="line.91"></a>
+<span class="sourceLineNo">092</span>   * {@link #lowestUnflushedSequenceIds} while the lock {@link #tieLock} is held<a name="line.92"></a>
+<span class="sourceLineNo">093</span>   * (so movement between the Maps is atomic).<a name="line.93"></a>
+<span class="sourceLineNo">094</span>   */<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  private final Map&lt;byte[], Map&lt;ImmutableByteArray, Long&gt;&gt; flushingSequenceIds = new HashMap&lt;&gt;();<a name="line.95"></a>
+<span class="sourceLineNo">096</span><a name="line.96"></a>
+<span class="sourceLineNo">097</span>  /**<a name="line.97"></a>
+<span class="sourceLineNo">098</span>   * &lt;p&gt;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>   * Map of region encoded names to the latest/highest region sequence id. Updated on each call to<a name="line.99"></a>
+<span class="sourceLineNo">100</span>   * append.<a name="line.100"></a>
+<span class="sourceLineNo">101</span>   * &lt;/p&gt;<a name="line.101"></a>
+<span class="sourceLineNo">102</span>   * &lt;p&gt;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>   * This map uses byte[] as the key, and uses reference equality. It works in our use case as we<a name="line.103"></a>
+<span class="sourceLineNo">104</span>   * use {@link org.apache.hadoop.hbase.client.RegionInfo#getEncodedNameAsBytes()} as keys. For a<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   * given region, it always returns the same array.<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   * &lt;/p&gt;<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   */<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private Map&lt;byte[], Long&gt; highestSequenceIds = new HashMap&lt;&gt;();<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  /**<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   * Returns the lowest unflushed sequence id for the region.<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   * @return Lowest outstanding unflushed sequenceid for &lt;code&gt;encodedRegionName&lt;/code&gt;. Will<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   * return {@link HConstants#NO_SEQNUM} when none.<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   */<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  long getLowestSequenceId(final byte[] encodedRegionName) {<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    synchronized (this.tieLock) {<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      Map&lt;?, Long&gt; m = this.flushingSequenceIds.get(encodedRegionName);<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      long flushingLowest = m != null ? getLowestSequenceId(m) : Long.MAX_VALUE;<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>      long unflushedLowest = m != null ? getLowestSequenceId(m) : HConstants.NO_SEQNUM;<a name="line.120"></a>
+<span class="sourceLineNo">121</span>      return Math.min(flushingLowest, unflushedLowest);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    }<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>  /**<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   * @return Lowest outstanding unflushed sequenceid for &lt;code&gt;encodedRegionname&lt;/code&gt; and<a name="line.126"></a>
+<span class="sourceLineNo">127</span>   *         &lt;code&gt;familyName&lt;/code&gt;. Returned sequenceid may be for an edit currently being<a name="line.127"></a>
+<span class="sourceLineNo">128</span>   *         flushed.<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   */<a name="line.129"></a>
+<span class="sourceLineNo">130</span>  long getLowestSequenceId(final byte[] encodedRegionName, final byte[] familyName) {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap(familyName);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    synchronized (this.tieLock) {<a name="line.132"></a>
+<span class="sourceLineNo">133</span>      Map&lt;ImmutableByteArray, Long&gt; m = this.flushingSequenceIds.get(encodedRegionName);<a name="line.133"></a>
+<span class="sourceLineNo">134</span>      if (m != null) {<a name="line.134"></a>
+<span class="sourceLineNo">135</span>        Long lowest = m.get(familyNameWrapper);<a name="line.135"></a>
+<span class="sourceLineNo">136</span>        if (lowest != null) {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>          return lowest;<a name="line.137"></a>
+<span class="sourceLineNo">138</span>        }<a name="line.138"></a>
+<span class="sourceLineNo">139</span>      }<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.140"></a>
+<span class="sourceLineNo">141</span>      if (m != null) {<a name="line.141"></a>
+<span class="sourceLineNo">142</span>        Long lowest = m.get(familyNameWrapper);<a name="line.142"></a>
+<span class="sourceLineNo">143</span>        if (lowest != null) {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>          return lowest;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>        }<a name="line.145"></a>
+<span class="sourceLineNo">146</span>      }<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    }<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    return HConstants.NO_SEQNUM;<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
+<span class="sourceLineNo">150</span><a name="line.150"></a>
+<span class="sourceLineNo">151</span>  /**<a name="line.151"></a>
+<span class="sourceLineNo">152</span>   * Reset the accounting of highest sequenceid by regionname.<a name="line.152"></a>
+<span class="sourceLineNo">153</span>   * @return Return the previous accounting Map of regions to the last sequence id written into<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   * each.<a name="line.154"></a>
+<span class="sourceLineNo">155</span>   */<a name="line.155"></a>
+<span class="sourceLineNo">156</span>  Map&lt;byte[], Long&gt; resetHighest() {<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    Map&lt;byte[], Long&gt; old = this.highestSequenceIds;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    this.highestSequenceIds = new HashMap&lt;&gt;();<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    return old;<a name="line.159"></a>
+<span class="sourceLineNo">160</span>  }<a name="line.160"></a>
+<span class="sourceLineNo">161</span><a name="line.161"></a>
+<span class="sourceLineNo">162</span>  /**<a name="line.162"></a>
+<span class="sourceLineNo">163</span>   * We've been passed a new sequenceid for the region. Set it as highest seen for this region and<a name="line.163"></a>
+<span class="sourceLineNo">164</span>   * if we are to record oldest, or lowest sequenceids, save it as oldest seen if nothing<a name="line.164"></a>
+<span class="sourceLineNo">165</span>   * currently older.<a name="line.165"></a>
+<span class="sourceLineNo">166</span>   * @param encodedRegionName<a name="line.166"></a>
+<span class="sourceLineNo">167</span>   * @param families<a name="line.167"></a>
+<span class="sourceLineNo">168</span>   * @param sequenceid<a name="line.168"></a>
+<span class="sourceLineNo">169</span>   * @param lowest Whether to keep running account of oldest sequence id.<a name="line.169"></a>
+<span class="sourceLineNo">170</span>   */<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  void update(byte[] encodedRegionName, Set&lt;byte[]&gt; families, long sequenceid,<a name="line.171"></a>
+<span class="sourceLineNo">172</span>      final boolean lowest) {<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    Long l = Long.valueOf(sequenceid);<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    this.highestSequenceIds.put(encodedRegionName, l);<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    if (lowest) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      ConcurrentMap&lt;ImmutableByteArray, Long&gt; m = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.176"></a>
+<span class="sourceLineNo">177</span>      for (byte[] familyName : families) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>        m.putIfAbsent(ImmutableByteArray.wrap(familyName), l);<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      }<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    }<a name="line.180"></a>
+<span class="sourceLineNo">181</span>  }<a name="line.181"></a>
+<span class="sourceLineNo">182</span><a name="line.182"></a>
+<span class="sourceLineNo">183</span>  /**<a name="line.183"></a>
+<span class="sourceLineNo">184</span>   * Clear all the records of the given region as it is going to be closed.<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   * &lt;p/&gt;<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   * We will call this once we get the region close marker. We need this because that, if we use<a name="line.186"></a>
+<span class="sourceLineNo">187</span>   * Durability.ASYNC_WAL, after calling startCacheFlush, we may still get some ongoing wal entries<a name="line.187"></a>
+<span class="sourceLineNo">188</span>   * that has not been processed yet, this will lead to orphan records in the<a name="line.188"></a>
+<span class="sourceLineNo">189</span>   * lowestUnflushedSequenceIds and then cause too many WAL files.<a name="line.189"></a>
 <span class="sourceLineNo">190</span>   * &lt;p/&gt;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>   * We will call this once we get the region close marker. We need this because that, if we use<a name="line.191"></a>
-<span class="sourceLineNo">192</span>   * Durability.ASYNC_WAL, after calling startCacheFlush, we may still get some ongoing wal entries<a name="line.192"></a>
-<span class="sourceLineNo">193</span>   * that has not been processed yet, this will lead to orphan records in the<a name="line.193"></a>
-<span class="sourceLineNo">194</span>   * lowestUnflushedSequenceIds and then cause too many WAL files.<a name="line.194"></a>
-<span class="sourceLineNo">195</span>   * &lt;p/&gt;<a name="line.195"></a>
-<span class="sourceLineNo">196</span>   * See HBASE-23157 for more details.<a name="line.196"></a>
-<span class="sourceLineNo">197</span>   */<a name="line.197"></a>
-<span class="sourceLineNo">198</span>  void onRegionClose(byte[] encodedRegionName) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    synchronized (tieLock) {<a name="line.199"></a>
-<span class="sourceLineNo">200</span>      this.lowestUnflushedSequenceIds.remove(encodedRegionName);<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      Map&lt;ImmutableByteArray, Long&gt; flushing = this.flushingSequenceIds.remove(encodedRegionName);<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      if (flushing != null) {<a name="line.202"></a>
-<span class="sourceLineNo">203</span>        LOG.warn("Still have flushing records when closing {}, {}",<a name="line.203"></a>
-<span class="sourceLineNo">204</span>          Bytes.toString(encodedRegionName),<a name="line.204"></a>
-<span class="sourceLineNo">205</span>          flushing.entrySet().stream().map(e -&gt; e.getKey().toString() + "-&gt;" + e.getValue())<a name="line.205"></a>
-<span class="sourceLineNo">206</span>            .collect(Collectors.joining(",", "{", "}")));<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      }<a name="line.207"></a>
-<span class="sourceLineNo">208</span>    }<a name="line.208"></a>
-<span class="sourceLineNo">209</span>    this.highestSequenceIds.remove(encodedRegionName);<a name="line.209"></a>
-<span class="sourceLineNo">210</span>  }<a name="line.210"></a>
-<span class="sourceLineNo">211</span><a name="line.211"></a>
-<span class="sourceLineNo">212</span>  /**<a name="line.212"></a>
-<span class="sourceLineNo">213</span>   * Update the store sequence id, e.g., upon executing in-memory compaction<a name="line.213"></a>
-<span class="sourceLineNo">214</span>   */<a name="line.214"></a>
-<span class="sourceLineNo">215</span>  void updateStore(byte[] encodedRegionName, byte[] familyName, Long sequenceId,<a name="line.215"></a>
-<span class="sourceLineNo">216</span>      boolean onlyIfGreater) {<a name="line.216"></a>
-<span class="sourceLineNo">217</span>    if (sequenceId == null) {<a name="line.217"></a>
-<span class="sourceLineNo">218</span>      return;<a name="line.218"></a>
-<span class="sourceLineNo">219</span>    }<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    Long highest = this.highestSequenceIds.get(encodedRegionName);<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    if (highest == null || sequenceId &gt; highest) {<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      this.highestSequenceIds.put(encodedRegionName, sequenceId);<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    }<a name="line.223"></a>
-<span class="sourceLineNo">224</span>    ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap(familyName);<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    synchronized (this.tieLock) {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>      ConcurrentMap&lt;ImmutableByteArray, Long&gt; m = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.226"></a>
-<span class="sourceLineNo">227</span>      boolean replaced = false;<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      while (!replaced) {<a name="line.228"></a>
-<span class="sourceLineNo">229</span>        Long oldSeqId = m.get(familyNameWrapper);<a name="line.229"></a>
-<span class="sourceLineNo">230</span>        if (oldSeqId == null) {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>          m.put(familyNameWrapper, sequenceId);<a name="line.231"></a>
-<span class="sourceLineNo">232</span>          replaced = true;<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        } else if (onlyIfGreater) {<a name="line.233"></a>
-<span class="sourceLineNo">234</span>          if (sequenceId &gt; oldSeqId) {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>            replaced = m.replace(familyNameWrapper, oldSeqId, sequenceId);<a name="line.235"></a>
-<span class="sourceLineNo">236</span>          } else {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>            return;<a name="line.237"></a>
-<span class="sourceLineNo">238</span>          }<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        } else { // replace even if sequence id is not greater than oldSeqId<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          m.put(familyNameWrapper, sequenceId);<a name="line.240"></a>
-<span class="sourceLineNo">241</span>          return;<a name="line.241"></a>
-<span class="sourceLineNo">242</span>        }<a name="line.242"></a>
-<span class="sourceLineNo">243</span>      }<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    }<a name="line.244"></a>
-<span class="sourceLineNo">245</span>  }<a name="line.245"></a>
-<span class="sourceLineNo">246</span><a name="line.246"></a>
-<span class="sourceLineNo">247</span>  @VisibleForTesting<a name="line.247"></a>
-<span class="sourceLineNo">248</span>  ConcurrentMap&lt;ImmutableByteArray, Long&gt; getOrCreateLowestSequenceIds(byte[] encodedRegionName) {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    // Intentionally, this access is done outside of this.regionSequenceIdLock. Done per append.<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    return computeIfAbsent(this.lowestUnflushedSequenceIds, encodedRegionName,<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      ConcurrentHashMap::new);<a name="line.251"></a>
-<span class="sourceLineNo">252</span>  }<a name="line.252"></a>
-<span class="sourceLineNo">253</span><a name="line.253"></a>
-<span class="sourceLineNo">254</span>  /**<a name="line.254"></a>
-<span class="sourceLineNo">255</span>   * @param sequenceids Map to search for lowest value.<a name="line.255"></a>
-<span class="sourceLineNo">256</span>   * @return Lowest value found in &lt;code&gt;sequenceids&lt;/code&gt;.<a name="line.256"></a>
-<span class="sourceLineNo">257</span>   */<a name="line.257"></a>
-<span class="sourceLineNo">258</span>  private static long getLowestSequenceId(Map&lt;?, Long&gt; sequenceids) {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>    long lowest = HConstants.NO_SEQNUM;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>    for (Long sid: sequenceids.values()) {<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      if (lowest == HConstants.NO_SEQNUM || sid.longValue() &lt; lowest) {<a name="line.261"></a>
-<span class="sourceLineNo">262</span>        lowest = sid.longValue();<a name="line.262"></a>
-<span class="sourceLineNo">263</span>      }<a name="line.263"></a>
-<span class="sourceLineNo">264</span>    }<a name="line.264"></a>
-<span class="sourceLineNo">265</span>    return lowest;<a name="line.265"></a>
-<span class="sourceLineNo">266</span>  }<a name="line.266"></a>
-<span class="sourceLineNo">267</span><a name="line.267"></a>
-<span class="sourceLineNo">268</span>  /**<a name="line.268"></a>
-<span class="sourceLineNo">269</span>   * @param src<a name="line.269"></a>
-<span class="sourceLineNo">270</span>   * @return New Map that has same keys as &lt;code&gt;src&lt;/code&gt; but instead of a Map for a value, it<a name="line.270"></a>
-<span class="sourceLineNo">271</span>   *         instead has found the smallest sequence id and it returns that as the value instead.<a name="line.271"></a>
-<span class="sourceLineNo">272</span>   */<a name="line.272"></a>
-<span class="sourceLineNo">273</span>  private &lt;T extends Map&lt;?, Long&gt;&gt; Map&lt;byte[], Long&gt; flattenToLowestSequenceId(Map&lt;byte[], T&gt; src) {<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    if (src == null || src.isEmpty()) {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      return null;<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    }<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    Map&lt;byte[], Long&gt; tgt = new HashMap&lt;&gt;();<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    for (Map.Entry&lt;byte[], T&gt; entry : src.entrySet()) {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>      long lowestSeqId = getLowestSequenceId(entry.getValue());<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      if (lowestSeqId != HConstants.NO_SEQNUM) {<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        tgt.put(entry.getKey(), lowestSeqId);<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      }<a name="line.282"></a>
-<span class="sourceLineNo">283</span>    }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>    return tgt;<a name="line.284"></a>
-<span class="sourceLineNo">285</span>  }<a name="line.285"></a>
-<span class="sourceLineNo">286</span><a name="line.286"></a>
-<span class="sourceLineNo">287</span>  /**<a name="line.287"></a>
-<span class="sourceLineNo">288</span>   * @param encodedRegionName Region to flush.<a name="line.288"></a>
-<span class="sourceLineNo">289</span>   * @param families Families to flush. May be a subset of all families in the region.<a name="line.289"></a>
-<span class="sourceLineNo">290</span>   * @return Returns {@link HConstants#NO_SEQNUM} if we are flushing the whole region OR if<a name="line.290"></a>
-<span class="sourceLineNo">291</span>   * we are flushing a subset of all families but there are no edits in those families not<a name="line.291"></a>
-<span class="sourceLineNo">292</span>   * being flushed; in other words, this is effectively same as a flush of all of the region<a name="line.292"></a>
-<span class="sourceLineNo">293</span>   * though we were passed a subset of regions. Otherwise, it returns the sequence id of the<a name="line.293"></a>
-<span class="sourceLineNo">294</span>   * oldest/lowest outstanding edit.<a name="line.294"></a>
-<span class="sourceLineNo">295</span>   */<a name="line.295"></a>
-<span class="sourceLineNo">296</span>  Long startCacheFlush(final byte[] encodedRegionName, final Set&lt;byte[]&gt; families) {<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    Map&lt;byte[],Long&gt; familytoSeq = new HashMap&lt;&gt;();<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    for (byte[] familyName : families){<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      familytoSeq.put(familyName,HConstants.NO_SEQNUM);<a name="line.299"></a>
-<span class="sourceLineNo">300</span>    }<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    return startCacheFlush(encodedRegionName,familytoSeq);<a name="line.301"></a>
-<span class="sourceLineNo">302</span>  }<a name="line.302"></a>
-<span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>  Long startCacheFlush(final byte[] encodedRegionName, final Map&lt;byte[], Long&gt; familyToSeq) {<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    Map&lt;ImmutableByteArray, Long&gt; oldSequenceIds = null;<a name="line.305"></a>
-<span class="sourceLineNo">306</span>    Long lowestUnflushedInRegion = HConstants.NO_SEQNUM;<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    synchronized (tieLock) {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>      Map&lt;ImmutableByteArray, Long&gt; m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.308"></a>
-<span class="sourceLineNo">309</span>      if (m != null) {<a name="line.309"></a>
-<span class="sourceLineNo">310</span>        // NOTE: Removal from this.lowestUnflushedSequenceIds must be done in controlled<a name="line.310"></a>
-<span class="sourceLineNo">311</span>        // circumstance because another concurrent thread now may add sequenceids for this family<a name="line.311"></a>
-<span class="sourceLineNo">312</span>        // (see above in getOrCreateLowestSequenceId). Make sure you are ok with this. Usually it<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        // is fine because updates are blocked when this method is called. Make sure!!!<a name="line.313"></a>
-<span class="sourceLineNo">314</span>        for (Map.Entry&lt;byte[], Long&gt; entry : familyToSeq.entrySet()) {<a name="line.314"></a>
-<span class="sourceLineNo">315</span>          ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap((byte[]) entry.getKey());<a name="line.315"></a>
-<span class="sourceLineNo">316</span>          Long seqId = null;<a name="line.316"></a>
-<span class="sourceLineNo">317</span>          if(entry.getValue() == HConstants.NO_SEQNUM) {<a name="line.317"></a>
-<span class="sourceLineNo">318</span>            seqId = m.remove(familyNameWrapper);<a name="line.318"></a>
-<span class="sourceLineNo">319</span>          } else {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>            seqId = m.replace(familyNameWrapper, entry.getValue());<a name="line.320"></a>
-<span class="sourceLineNo">321</span>          }<a name="line.321"></a>
-<span class="sourceLineNo">322</span>          if (seqId != null) {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>            if (oldSequenceIds == null) {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>              oldSequenceIds = new HashMap&lt;&gt;();<a name="line.324"></a>
-<span class="sourceLineNo">325</span>            }<a name="line.325"></a>
-<span class="sourceLineNo">326</span>            oldSequenceIds.put(familyNameWrapper, seqId);<a name="line.326"></a>
-<span class="sourceLineNo">327</span>          }<a name="line.327"></a>
-<span class="sourceLineNo">328</span>        }<a name="line.328"></a>
-<span class="sourceLineNo">329</span>        if (oldSequenceIds != null &amp;&amp; !oldSequenceIds.isEmpty()) {<a name="line.329"></a>
-<span class="sourceLineNo">330</span>          if (this.flushingSequenceIds.put(encodedRegionName, oldSequenceIds) != null) {<a name="line.330"></a>
-<span class="sourceLineNo">331</span>            LOG.warn("Flushing Map not cleaned up for " + Bytes.toString(encodedRegionName) +<a name="line.331"></a>
-<span class="sourceLineNo">332</span>              ", sequenceid=" + oldSequenceIds);<a name="line.332"></a>
-<span class="sourceLineNo">333</span>          }<a name="line.333"></a>
-<span class="sourceLineNo">334</span>        }<a name="line.334"></a>
-<span class="sourceLineNo">335</span>        if (m.isEmpty()) {<a name="line.335"></a>
-<span class="sourceLineNo">336</span>          // Remove it otherwise it will be in oldestUnflushedStoreSequenceIds for ever<a name="line.336"></a>
-<span class="sourceLineNo">337</span>          // even if the region is already moved to other server.<a name="line.337"></a>
-<span class="sourceLineNo">338</span>          // Do not worry about data racing, we held write lock of region when calling<a name="line.338"></a>
-<span class="sourceLineNo">339</span>          // startCacheFlush, so no one can add value to the map we removed.<a name="line.339"></a>
-<span class="sourceLineNo">340</span>          this.lowestUnflushedSequenceIds.remove(encodedRegionName);<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        } else {<a name="line.341"></a>
-<span class="sourceLineNo">342</span>          // Flushing a subset of the region families. Return the sequence id of the oldest entry.<a name="line.342"></a>
-<span class="sourceLineNo">343</span>          lowestUnflushedInRegion = Collections.min(m.values());<a name="line.343"></a>
-<span class="sourceLineNo">344</span>        }<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      }<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    }<a name="line.346"></a>
-<span class="sourceLineNo">347</span>    // Do this check outside lock.<a name="line.347"></a>
-<span class="sourceLineNo">348</span>    if (oldSequenceIds != null &amp;&amp; oldSequenceIds.isEmpty()) {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>      // TODO: if we have no oldStoreSeqNum, and WAL is not disabled, presumably either<a name="line.349"></a>
-<span class="sourceLineNo">350</span>      // the region is already flushing (which would make this call invalid), or there<a name="line.350"></a>
-<span class="sourceLineNo">351</span>      // were no appends after last flush, so why are we starting flush? Maybe we should<a name="line.351"></a>
-<span class="sourceLineNo">352</span>      // assert not empty. Less rigorous, but safer, alternative is telling the caller to stop.<a name="line.352"></a>
-<span class="sourceLineNo">353</span>      // For now preserve old logic.<a name="line.353"></a>
-<span class="sourceLineNo">354</span>      LOG.warn("Couldn't find oldest sequenceid for " + Bytes.toString(encodedRegionName));<a name="line.354"></a>
-<span class="sourceLineNo">355</span>    }<a name="line.355"></a>
-<span class="sourceLineNo">356</span>    return lowestUnflushedInRegion;<a name="line.356"></a>
-<span class="sourceLineNo">357</span>  }<a name="line.357"></a>
-<span class="sourceLineNo">358</span><a name="line.358"></a>
-<span class="sourceLineNo">359</span>  void completeCacheFlush(final byte[] encodedRegionName) {<a name="line.359"></a>
-<span class="sourceLineNo">360</span>    synchronized (tieLock) {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      this.flushingSequenceIds.remove(encodedRegionName);<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    }<a name="line.362"></a>
-<span class="sourceLineNo">363</span>  }<a name="line.363"></a>
-<span class="sourceLineNo">364</span><a name="line.364"></a>
-<span class="sourceLineNo">365</span>  void abortCacheFlush(final byte[] encodedRegionName) {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    // Method is called when we are crashing down because failed write flush AND it is called<a name="line.366"></a>
-<span class="sourceLineNo">367</span>    // if we fail prepare. The below is for the fail prepare case; we restore the old sequence ids.<a name="line.367"></a>
-<span class="sourceLineNo">368</span>    Map&lt;ImmutableByteArray, Long&gt; flushing = null;<a name="line.368"></a>
-<span class="sourceLineNo">369</span>    Map&lt;ImmutableByteArray, Long&gt; tmpMap = new HashMap&lt;&gt;();<a name="line.369"></a>
-<span class="sourceLineNo">370</span>    // Here we are moving sequenceids from flushing back to unflushed; doing opposite of what<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    // happened in startCacheFlush. During prepare phase, we have update lock on the region so<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    // no edits should be coming in via append.<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    synchronized (tieLock) {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      flushing = this.flushingSequenceIds.remove(encodedRegionName);<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      if (flushing != null) {<a name="line.375"></a>
-<span class="sourceLineNo">376</span>        Map&lt;ImmutableByteArray, Long&gt; unflushed = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>        for (Map.Entry&lt;ImmutableByteArray, Long&gt; e: flushing.entrySet()) {<a name="line.377"></a>
-<span class="sourceLineNo">378</span>          // Set into unflushed the 'old' oldest sequenceid and if any value in flushed with this<a name="line.378"></a>
-<span class="sourceLineNo">379</span>          // value, it will now be in tmpMap.<a name="line.379"></a>
-<span class="sourceLineNo">380</span>          tmpMap.put(e.getKey(), unflushed.put(e.getKey(), e.getValue()));<a name="line.380"></a>
-<span class="sourceLineNo">381</span>        }<a name="line.381"></a>
-<span class="sourceLineNo">382</span>      }<a name="line.382"></a>
-<span class="sourceLineNo">383</span>    }<a name="line.383"></a>
-<span class="sourceLineNo">384</span><a name="line.384"></a>
-<span class="sourceLineNo">385</span>    // Here we are doing some 'test' to see if edits are going in out of order. What is it for?<a name="line.385"></a>
-<span class="sourceLineNo">386</span>    // Carried over from old code.<a name="line.386"></a>
-<span class="sourceLineNo">387</span>    if (flushing != null) {<a name="line.387"></a>
-<span class="sourceLineNo">388</span>      for (Map.Entry&lt;ImmutableByteArray, Long&gt; e : flushing.entrySet()) {<a name="line.388"></a>
-<span class="sourceLineNo">389</span>        Long currentId = tmpMap.get(e.getKey());<a name="line.389"></a>
-<span class="sourceLineNo">390</span>        if (currentId != null &amp;&amp; currentId.longValue() &lt; e.getValue().longValue()) {<a name="line.390"></a>
-<span class="sourceLineNo">391</span>          String errorStr = Bytes.toString(encodedRegionName) + " family "<a name="line.391"></a>
-<span class="sourceLineNo">392</span>              + e.getKey().toString() + " acquired edits out of order current memstore seq="<a name="line.392"></a>
-<span class="sourceLineNo">393</span>              + currentId + ", previous oldest unflushed id=" + e.getValue();<a name="line.393"></a>
-<span class="sourceLineNo">394</span>          LOG.error(errorStr);<a name="line.394"></a>
-<span class="sourceLineNo">395</span>          Runtime.getRuntime().halt(1);<a name="line.395"></a>
-<span class="sourceLineNo">396</span>        }<a name="line.396"></a>
-<span class="sourceLineNo">397</span>      }<a name="line.397"></a>
-<span class="sourceLineNo">398</span>    }<a name="line.398"></a>
-<span class="sourceLineNo">399</span>  }<a name="line.399"></a>
-<span class="sourceLineNo">400</span><a name="line.400"></a>
-<span class="sourceLineNo">401</span>  /**<a name="line.401"></a>
-<span class="sourceLineNo">402</span>   * See if passed &lt;code&gt;sequenceids&lt;/code&gt; are lower -- i.e. earlier -- than any outstanding<a name="line.402"></a>
-<span class="sourceLineNo">403</span>   * sequenceids, sequenceids we are holding on to in this accounting instance.<a name="line.403"></a>
-<span class="sourceLineNo">404</span>   * @param sequenceids Keyed by encoded region name. Cannot be null (doesn't make sense for it to<a name="line.404"></a>
-<span class="sourceLineNo">405</span>   *          be null).<a name="line.405"></a>
-<span class="sourceLineNo">406</span>   * @param keysBlocking An optional collection that is used to return the specific keys that are<a name="line.406"></a>
-<span class="sourceLineNo">407</span>   *          causing this method to return false.<a name="line.407"></a>
-<span class="sourceLineNo">408</span>   * @return true if all sequenceids are lower, older than, the old sequenceids in this instance.<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   */<a name="line.409"></a>
-<span class="sourceLineNo">410</span>  boolean areAllLower(Map&lt;byte[], Long&gt; sequenceids, Collection&lt;byte[]&gt; keysBlocking) {<a name="line.410"></a>
-<span class="sourceLineNo">411</span>    Map&lt;byte[], Long&gt; flushing = null;<a name="line.411"></a>
-<span class="sourceLineNo">412</span>    Map&lt;byte[], Long&gt; unflushed = null;<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    synchronized (this.tieLock) {<a name="line.413"></a>
-<span class="sourceLineNo">414</span>      // Get a flattened -- only the oldest sequenceid -- copy of current flushing and unflushed<a name="line.414"></a>
-<span class="sourceLineNo">415</span>      // data structures to use in tests below.<a name="line.415"></a>
-<span class="sourceLineNo">416</span>      flushing = flattenToLowestSequenceId(this.flushingSequenceIds);<a name="line.416"></a>
-<span class="sourceLineNo">417</span>      unflushed = flattenToLowestSequenceId(this.lowestUnflushedSequenceIds);<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    }<a name="line.418"></a>
-<span class="sourceLineNo">419</span>    boolean result = true;<a name="line.419"></a>
-<span class="sourceLineNo">420</span>    for (Map.Entry&lt;byte[], Long&gt; e : sequenceids.entrySet()) {<a name="line.420"></a>
-<span class="sourceLineNo">421</span>      long oldestFlushing = Long.MAX_VALUE;<a name="line.421"></a>
-<span class="sourceLineNo">422</span>      long oldestUnflushed = Long.MAX_VALUE;<a name="line.422"></a>
-<span class="sourceLineNo">423</span>      if (flushing != null &amp;&amp; flushing.containsKey(e.getKey())) {<a name="line.423"></a>
-<span class="sourceLineNo">424</span>        oldestFlushing = flushing.get(e.getKey());<a name="line.424"></a>
-<span class="sourceLineNo">425</span>      }<a name="line.425"></a>
-<span class="sourceLineNo">426</span>      if (unflushed != null &amp;&amp; unflushed.containsKey(e.getKey())) {<a name="line.426"></a>
-<span class="sourceLineNo">427</span>        oldestUnflushed = unflushed.get(e.getKey());<a name="line.427"></a>
-<span class="sourceLineNo">428</span>      }<a name="line.428"></a>
-<span class="sourceLineNo">429</span>      long min = Math.min(oldestFlushing, oldestUnflushed);<a name="line.429"></a>
-<span class="sourceLineNo">430</span>      if (min &lt;= e.getValue()) {<a name="line.430"></a>
-<span class="sourceLineNo">431</span>        if (keysBlocking == null) {<a name="line.431"></a>
-<span class="sourceLineNo">432</span>          return false;<a name="line.432"></a>
-<span class="sourceLineNo">433</span>        }<a name="line.433"></a>
-<span class="sourceLineNo">434</span>        result = false;<a name="line.434"></a>
-<span class="sourceLineNo">435</span>        keysBlocking.add(e.getKey());<a name="line.435"></a>
-<span class="sourceLineNo">436</span>        // Continue examining the map so we could log all regions blocking this WAL.<a name="line.436"></a>
-<span class="sourceLineNo">437</span>      }<a name="line.437"></a>
-<span class="sourceLineNo">438</span>    }<a name="line.438"></a>
-<span class="sourceLineNo">439</span>    return result;<a name="line.439"></a>
-<span class="sourceLineNo">440</span>  }<a name="line.440"></a>
-<span class="sourceLineNo">441</span><a name="line.441"></a>
-<span class="sourceLineNo">442</span>  /**<a name="line.442"></a>
-<span class="sourceLineNo">443</span>   * Iterates over the given Map and compares sequence ids with corresponding entries in<a name="line.443"></a>
-<span class="sourceLineNo">444</span>   * {@link #lowestUnflushedSequenceIds}. If a region in<a name="line.444"></a>
-<span class="sourceLineNo">445</span>   * {@link #lowestUnflushedSequenceIds} has a sequence id less than that passed in<a name="line.445"></a>
-<span class="sourceLineNo">446</span>   * &lt;code&gt;sequenceids&lt;/code&gt; then return it.<a name="line.446"></a>
-<span class="sourceLineNo">447</span>   * @param sequenceids Sequenceids keyed by encoded region name.<a name="line.447"></a>
-<span class="sourceLineNo">448</span>   * @return regions found in this instance with sequence ids less than those passed in.<a name="line.448"></a>
-<span class="sourceLineNo">449</span>   */<a name="line.449"></a>
-<span class="sourceLineNo">450</span>  byte[][] findLower(Map&lt;byte[], Long&gt; sequenceids) {<a name="line.450"></a>
-<span class="sourceLineNo">451</span>    List&lt;byte[]&gt; toFlush = null;<a name="line.451"></a>
-<span class="sourceLineNo">452</span>    // Keeping the old behavior of iterating unflushedSeqNums under oldestSeqNumsLock.<a name="line.452"></a>
-<span class="sourceLineNo">453</span>    synchronized (tieLock) {<a name="line.453"></a>
-<span class="sourceLineNo">454</span>      for (Map.Entry&lt;byte[], Long&gt; e : sequenceids.entrySet()) {<a name="line.454"></a>
-<span class="sourceLineNo">455</span>        Map&lt;ImmutableByteArray, Long&gt; m = this.lowestUnflushedSequenceIds.get(e.getKey());<a name="line.455"></a>
-<span class="sourceLineNo">456</span>        if (m == null) {<a name="line.456"></a>
-<span class="sourceLineNo">457</span>          continue;<a name="line.457"></a>
-<span class="sourceLineNo">458</span>        }<a name="line.458"></a>
-<span class="sourceLineNo">459</span>        // The lowest sequence id outstanding for this region.<a name="line.459"></a>
-<span class="sourceLineNo">460</span>        long lowest = getLowestSequenceId(m);<a name="line.460"></a>
-<span class="sourceLineNo">461</span>        if (lowest != HConstants.NO_SEQNUM &amp;&amp; lowest &lt;= e.getValue()) {<a name="line.461"></a>
-<span class="sourceLineNo">462</span>          if (toFlush == null) {<a name="line.462"></a>
-<span class="sourceLineNo">463</span>            toFlush = new ArrayList&lt;&gt;();<a name="line.463"></a>
-<span class="sourceLineNo">464</span>          }<a name="line.464"></a>
-<span class="sourceLineNo">465</span>          toFlush.add(e.getKey());<a name="line.465"></a>
-<span class="sourceLineNo">466</span>        }<a name="line.466"></a>
-<span class="sourceLineNo">467</span>      }<a name="line.467"></a>
-<span class="sourceLineNo">468</span>    }<a name="line.468"></a>
-<span class="sourceLineNo">469</span>    return toFlush == null ? null : toFlush.toArray(new byte[0][]);<a name="line.469"></a>
-<span class="sourceLineNo">470</span>  }<a name="line.470"></a>
-<span class="sourceLineNo">471</span>}<a name="line.471"></a>
+<span class="sourceLineNo">191</span>   * See HBASE-23157 for more details.<a name="line.191"></a>
+<span class="sourceLineNo">192</span>   */<a name="line.192"></a>
+<span class="sourceLineNo">193</span>  void onRegionClose(byte[] encodedRegionName) {<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    synchronized (tieLock) {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>      this.lowestUnflushedSequenceIds.remove(encodedRegionName);<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      Map&lt;ImmutableByteArray, Long&gt; flushing = this.flushingSequenceIds.remove(encodedRegionName);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      if (flushing != null) {<a name="line.197"></a>
+<span class="sourceLineNo">198</span>        LOG.warn("Still have flushing records when closing {}, {}",<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          Bytes.toString(encodedRegionName),<a name="line.199"></a>
+<span class="sourceLineNo">200</span>          flushing.entrySet().stream().map(e -&gt; e.getKey().toString() + "-&gt;" + e.getValue())<a name="line.200"></a>
+<span class="sourceLineNo">201</span>            .collect(Collectors.joining(",", "{", "}")));<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      }<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    }<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    this.highestSequenceIds.remove(encodedRegionName);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>  }<a name="line.205"></a>
+<span class="sourceLineNo">206</span><a name="line.206"></a>
+<span class="sourceLineNo">207</span>  /**<a name="line.207"></a>
+<span class="sourceLineNo">208</span>   * Update the store sequence id, e.g., upon executing in-memory compaction<a name="line.208"></a>
+<span class="sourceLineNo">209</span>   */<a name="line.209"></a>
+<span class="sourceLineNo">210</span>  void updateStore(byte[] encodedRegionName, byte[] familyName, Long sequenceId,<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      boolean onlyIfGreater) {<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    if (sequenceId == null) {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      return;<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    }<a name="line.214"></a>
+<span class="sourceLineNo">215</span>    Long highest = this.highestSequenceIds.get(encodedRegionName);<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    if (highest == null || sequenceId &gt; highest) {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      this.highestSequenceIds.put(encodedRegionName, sequenceId);<a name="line.217"></a>
+<span class="sourceLineNo">218</span>    }<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap(familyName);<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    synchronized (this.tieLock) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>      ConcurrentMap&lt;ImmutableByteArray, Long&gt; m = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      boolean replaced = false;<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      while (!replaced) {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        Long oldSeqId = m.get(familyNameWrapper);<a name="line.224"></a>
+<span class="sourceLineNo">225</span>        if (oldSeqId == null) {<a name="line.225"></a>
+<span class="sourceLineNo">226</span>          m.put(familyNameWrapper, sequenceId);<a name="line.226"></a>
+<span class="sourceLineNo">227</span>          replaced = true;<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        } else if (onlyIfGreater) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>          if (sequenceId &gt; oldSeqId) {<a name="line.229"></a>
+<span class="sourceLineNo">230</span>            replaced = m.replace(familyNameWrapper, oldSeqId, sequenceId);<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          } else {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>            return;<a name="line.232"></a>
+<span class="sourceLineNo">233</span>          }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        } else { // replace even if sequence id is not greater than oldSeqId<a name="line.234"></a>
+<span class="sourceLineNo">235</span>          m.put(familyNameWrapper, sequenceId);<a name="line.235"></a>
+<span class="sourceLineNo">236</span>          return;<a name="line.236"></a>
+<span class="sourceLineNo">237</span>        }<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      }<a name="line.238"></a>
+<span class="sourceLineNo">239</span>    }<a name="line.239"></a>
+<span class="sourceLineNo">240</span>  }<a name="line.240"></a>
+<span class="sourceLineNo">241</span><a name="line.241"></a>
+<span class="sourceLineNo">242</span>  @VisibleForTesting<a name="line.242"></a>
+<span class="sourceLineNo">243</span>  ConcurrentMap&lt;ImmutableByteArray, Long&gt; getOrCreateLowestSequenceIds(byte[] encodedRegionName) {<a name="line.243"></a>
+<span class="sourceLineNo">244</span>    // Intentionally, this access is done outside of this.regionSequenceIdLock. Done per append.<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    return computeIfAbsent(this.lowestUnflushedSequenceIds, encodedRegionName,<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      ConcurrentHashMap::new);<a name="line.246"></a>
+<span class="sourceLineNo">247</span>  }<a name="line.247"></a>
+<span class="sourceLineNo">248</span><a name="line.248"></a>
+<span class="sourceLineNo">249</span>  /**<a name="line.249"></a>
+<span class="sourceLineNo">250</span>   * @param sequenceids Map to search for lowest value.<a name="line.250"></a>
+<span class="sourceLineNo">251</span>   * @return Lowest value found in &lt;code&gt;sequenceids&lt;/code&gt;.<a name="line.251"></a>
+<span class="sourceLineNo">252</span>   */<a name="line.252"></a>
+<span class="sourceLineNo">253</span>  private static long getLowestSequenceId(Map&lt;?, Long&gt; sequenceids) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    long lowest = HConstants.NO_SEQNUM;<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    for (Long sid: sequenceids.values()) {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      if (lowest == HConstants.NO_SEQNUM || sid.longValue() &lt; lowest) {<a name="line.256"></a>
+<span class="sourceLineNo">257</span>        lowest = sid.longValue();<a name="line.257"></a>
+<span class="sourceLineNo">258</span>      }<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    }<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    return lowest;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>  }<a name="line.261"></a>
+<span class="sourceLineNo">262</span><a name="line.262"></a>
+<span class="sourceLineNo">263</span>  /**<a name="line.263"></a>
+<span class="sourceLineNo">264</span>   * @param src<a name="line.264"></a>
+<span class="sourceLineNo">265</span>   * @return New Map that has same keys as &lt;code&gt;src&lt;/code&gt; but instead of a Map for a value, it<a name="line.265"></a>
+<span class="sourceLineNo">266</span>   *         instead has found the smallest sequence id and it returns that as the value instead.<a name="line.266"></a>
+<span class="sourceLineNo">267</span>   */<a name="line.267"></a>
+<span class="sourceLineNo">268</span>  private &lt;T extends Map&lt;?, Long&gt;&gt; Map&lt;byte[], Long&gt; flattenToLowestSequenceId(Map&lt;byte[], T&gt; src) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>    if (src == null || src.isEmpty()) {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>      return null;<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    }<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    Map&lt;byte[], Long&gt; tgt = new HashMap&lt;&gt;();<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    for (Map.Entry&lt;byte[], T&gt; entry : src.entrySet()) {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      long lowestSeqId = getLowestSequenceId(entry.getValue());<a name="line.274"></a>
+<span class="sourceLineNo">275</span>      if (lowestSeqId != HConstants.NO_SEQNUM) {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>        tgt.put(entry.getKey(), lowestSeqId);<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      }<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    }<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    return tgt;<a name="line.279"></a>
+<span class="sourceLineNo">280</span>  }<a name="line.280"></a>
+<span class="sourceLineNo">281</span><a name="line.281"></a>
+<span class="sourceLineNo">282</span>  /**<a name="line.282"></a>
+<span class="sourceLineNo">283</span>   * @param encodedRegionName Region to flush.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>   * @param families Families to flush. May be a subset of all families in the region.<a name="line.284"></a>
+<span class="sourceLineNo">285</span>   * @return Returns {@link HConstants#NO_SEQNUM} if we are flushing the whole region OR if<a name="line.285"></a>
+<span class="sourceLineNo">286</span>   * we are flushing a subset of all families but there are no edits in those families not<a name="line.286"></a>
+<span class="sourceLineNo">287</span>   * being flushed; in other words, this is effectively same as a flush of all of the region<a name="line.287"></a>
+<span class="sourceLineNo">288</span>   * though we were passed a subset of regions. Otherwise, it returns the sequence id of the<a name="line.288"></a>
+<span class="sourceLineNo">289</span>   * oldest/lowest outstanding edit.<a name="line.289"></a>
+<span class="sourceLineNo">290</span>   */<a name="line.290"></a>
+<span class="sourceLineNo">291</span>  Long startCacheFlush(final byte[] encodedRegionName, final Set&lt;byte[]&gt; families) {<a name="line.291"></a>
+<span class="sourceLineNo">292</span>    Map&lt;byte[],Long&gt; familytoSeq = new HashMap&lt;&gt;();<a name="line.292"></a>
+<span class="sourceLineNo">293</span>    for (byte[] familyName : families){<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      familytoSeq.put(familyName,HConstants.NO_SEQNUM);<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    }<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    return startCacheFlush(encodedRegionName,familytoSeq);<a name="line.296"></a>
+<span class="sourceLineNo">297</span>  }<a name="line.297"></a>
+<span class="sourceLineNo">298</span><a name="line.298"></a>
+<span class="sourceLineNo">299</span>  Long startCacheFlush(final byte[] encodedRegionName, final Map&lt;byte[], Long&gt; familyToSeq) {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    Map&lt;ImmutableByteArray, Long&gt; oldSequenceIds = null;<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    Long lowestUnflushedInRegion = HConstants.NO_SEQNUM;<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    synchronized (tieLock) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      Map&lt;ImmutableByteArray, Long&gt; m = this.lowestUnflushedSequenceIds.get(encodedRegionName);<a name="line.303"></a>
+<span class="sourceLineNo">304</span>      if (m != null) {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>        // NOTE: Removal from this.lowestUnflushedSequenceIds must be done in controlled<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        // circumstance because another concurrent thread now may add sequenceids for this family<a name="line.306"></a>
+<span class="sourceLineNo">307</span>        // (see above in getOrCreateLowestSequenceId). Make sure you are ok with this. Usually it<a name="line.307"></a>
+<span class="sourceLineNo">308</span>        // is fine because updates are blocked when this method is called. Make sure!!!<a name="line.308"></a>
+<span class="sourceLineNo">309</span>        for (Map.Entry&lt;byte[], Long&gt; entry : familyToSeq.entrySet()) {<a name="line.309"></a>
+<span class="sourceLineNo">310</span>          ImmutableByteArray familyNameWrapper = ImmutableByteArray.wrap((byte[]) entry.getKey());<a name="line.310"></a>
+<span class="sourceLineNo">311</span>          Long seqId = null;<a name="line.311"></a>
+<span class="sourceLineNo">312</span>          if(entry.getValue() == HConstants.NO_SEQNUM) {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>            seqId = m.remove(familyNameWrapper);<a name="line.313"></a>
+<span class="sourceLineNo">314</span>          } else {<a name="line.314"></a>
+<span class="sourceLineNo">315</span>            seqId = m.replace(familyNameWrapper, entry.getValue());<a name="line.315"></a>
+<span class="sourceLineNo">316</span>          }<a name="line.316"></a>
+<span class="sourceLineNo">317</span>          if (seqId != null) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>            if (oldSequenceIds == null) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>              oldSequenceIds = new HashMap&lt;&gt;();<a name="line.319"></a>
+<span class="sourceLineNo">320</span>            }<a name="line.320"></a>
+<span class="sourceLineNo">321</span>            oldSequenceIds.put(familyNameWrapper, seqId);<a name="line.321"></a>
+<span class="sourceLineNo">322</span>          }<a name="line.322"></a>
+<span class="sourceLineNo">323</span>        }<a name="line.323"></a>
+<span class="sourceLineNo">324</span>        if (oldSequenceIds != null &amp;&amp; !oldSequenceIds.isEmpty()) {<a name="line.324"></a>
+<span class="sourceLineNo">325</span>          if (this.flushingSequenceIds.put(encodedRegionName, oldSequenceIds) != null) {<a name="line.325"></a>
+<span class="sourceLineNo">326</span>            LOG.warn("Flushing Map not cleaned up for " + Bytes.toString(encodedRegionName) +<a name="line.326"></a>
+<span class="sourceLineNo">327</span>              ", sequenceid=" + oldSequenceIds);<a name="line.327"></a>
+<span class="sourceLineNo">328</span>          }<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        }<a name="line.329"></a>
+<span class="sourceLineNo">330</span>        if (m.isEmpty()) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>          // Remove it otherwise it will be in oldestUnflushedStoreSequenceIds for ever<a name="line.331"></a>
+<span class="sourceLineNo">332</span>          // even if the region is already moved to other server.<a name="line.332"></a>
+<span class="sourceLineNo">333</span>          // Do not worry about data racing, we held write lock of region when calling<a name="line.333"></a>
+<span class="sourceLineNo">334</span>          // startCacheFlush, so no one can add value to the map we removed.<a name="line.334"></a>
+<span class="sourceLineNo">335</span>          this.lowestUnflushedSequenceIds.remove(encodedRegionName);<a name="line.335"></a>
+<span class="sourceLineNo">336</span>        } else {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          // Flushing a subset of the region families. Return the sequence id of the oldest entry.<a name="line.337"></a>
+<span class="sourceLineNo">338</span>          lowestUnflushedInRegion = Collections.min(m.values());<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>      }<a name="line.340"></a>
+<span class="sourceLineNo">341</span>    }<a name="line.341"></a>
+<span class="sourceLineNo">342</span>    // Do this check outside lock.<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    if (oldSequenceIds != null &amp;&amp; oldSequenceIds.isEmpty()) {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      // TODO: if we have no oldStoreSeqNum, and WAL is not disabled, presumably either<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      // the region is already flushing (which would make this call invalid), or there<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      // were no appends after last flush, so why are we starting flush? Maybe we should<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      // assert not empty. Less rigorous, but safer, alternative is telling the caller to stop.<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      // For now preserve old logic.<a name="line.348"></a>
+<span class="sourceLineNo">349</span>      LOG.warn("Couldn't find oldest sequenceid for " + Bytes.toString(encodedRegionName));<a name="line.349"></a>
+<span class="sourceLineNo">350</span>    }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    return lowestUnflushedInRegion;<a name="line.351"></a>
+<span class="sourceLineNo">352</span>  }<a name="line.352"></a>
+<span class="sourceLineNo">353</span><a name="line.353"></a>
+<span class="sourceLineNo">354</span>  void completeCacheFlush(final byte[] encodedRegionName) {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    synchronized (tieLock) {<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      this.flushingSequenceIds.remove(encodedRegionName);<a name="line.356"></a>
+<span class="sourceLineNo">357</span>    }<a name="line.357"></a>
+<span class="sourceLineNo">358</span>  }<a name="line.358"></a>
+<span class="sourceLineNo">359</span><a name="line.359"></a>
+<span class="sourceLineNo">360</span>  void abortCacheFlush(final byte[] encodedRegionName) {<a name="line.360"></a>
+<span class="sourceLineNo">361</span>    // Method is called when we are crashing down because failed write flush AND it is called<a name="line.361"></a>
+<span class="sourceLineNo">362</span>    // if we fail prepare. The below is for the fail prepare case; we restore the old sequence ids.<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    Map&lt;ImmutableByteArray, Long&gt; flushing = null;<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    Map&lt;ImmutableByteArray, Long&gt; tmpMap = new HashMap&lt;&gt;();<a name="line.364"></a>
+<span class="sourceLineNo">365</span>    // Here we are moving sequenceids from flushing back to unflushed; doing opposite of what<a name="line.365"></a>
+<span class="sourceLineNo">366</span>    // happened in startCacheFlush. During prepare phase, we have update lock on the region so<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    // no edits should be coming in via append.<a name="line.367"></a>
+<span class="sourceLineNo">368</span>    synchronized (tieLock) {<a name="line.368"></a>
+<span class="sourceLineNo">369</span>      flushing = this.flushingSequenceIds.remove(encodedRegionName);<a name="line.369"></a>
+<span class="sourceLineNo">370</span>      if (flushing != null) {<a name="line.370"></a>
+<span class="sourceLineNo">371</span>        Map&lt;ImmutableByteArray, Long&gt; unflushed = getOrCreateLowestSequenceIds(encodedRegionName);<a name="line.371"></a>
+<span class="sourceLineNo">372</span>        for (Map.Entry&lt;ImmutableByteArray, Long&gt; e: flushing.entrySet()) {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>          // Set into unflushed the 'old' oldest sequenceid and if any value in flushed with this<a name="line.373"></a>
+<span class="sourceLineNo">374</span>          // value, it will now be in tmpMap.<a name="line.374"></a>
+<span class="sourceLineNo">375</span>          tmpMap.put(e.getKey(), unflushed.put(e.getKey(), e.getValue()));<a name="line.375"></a>
+<span class="sourceLineNo">376</span>        }<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      }<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    }<a name="line.378"></a>
+<span class="sourceLineNo">379</span><a name="line.379"></a>
+<span class="sourceLineNo">380</span>    // Here we are doing some 'test' to see if edits are going in out of order. What is it for?<a name="line.380"></a>
+<span class="sourceLineNo">381</span>    // Carried over from old code.<a name="line.381"></a>
+<span class="sourceLineNo">382</span>    if (flushing != null) {<a name="line.382"></a>
+<span class="sourceLineNo">383</span>      for (Map.Entry&lt;ImmutableByteArray, Long&gt; e : flushing.entrySet()) {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>        Long currentId = tmpMap.get(e.getKey());<a name="line.384"></a>
+<span class="sourceLineNo">385</span>        if (currentId != null &amp;&amp; currentId.longValue() &lt; e.getValue().longValue()) {<a name="line.385"></a>
+<span class="sourceLineNo">386</span>          String errorStr = Bytes.toString(encodedRegionName) + " family "<a name="line.386"></a>
+<span class="sourceLineNo">387</span>              + e.getKey().toString() + " acquired edits out of order current memstore seq="<a name="line.387"></a>
+<span class="sourceLineNo">388</span>              + currentId + ", previous oldest unflushed id=" + e.getValue();<a name="line.388"></a>
+<span class="sourceLineNo">389</span>          LOG.error(errorStr);<a name="line.389"></a>
+<span class="sourceLineNo">390</span>          Runtime.getRuntime().halt(1);<a name="line.390"></a>
+<span class="sourceLineNo">391</span>        }<a name="line.391"></a>
+<span class="sourceLineNo">392</span>      }<a name="line.392"></a>
+<span class="sourceLineNo">393</span>    }<a name="line.393"></a>
+<span class="sourceLineNo">394</span>  }<a name="line.394"></a>
+<span class="sourceLineNo">395</span><a name="line.395"></a>
+<span class="sourceLineNo">396</span>  /**<a name="line.396"></a>
+<span class="sourceLineNo">397</span>   * See if passed &lt;code&gt;sequenceids&lt;/code&gt; are lower -- i.e. earlier -- than any outstanding<a name="line.397"></a>
+<span class="sourceLineNo">398</span>   * sequenceids, sequenceids we are holding on to in this accounting instance.<a name="line.398"></a>
+<span class="sourceLineNo">399</span>   * @param sequenceids Keyed by encoded region name. Cannot be null (doesn't make sense for it to<a name="line.399"></a>
+<span class="sourceLineNo">400</span>   *          be null).<a name="line.400"></a>
+<span class="sourceLineNo">401</span>   * @param keysBlocking An optional collection that is used to return the specific keys that are<a name="line.401"></a>
+<span class="sourceLineNo">402</span>   *          causing this method to return false.<a name="line.402"></a>
+<span class="sourceLineNo">403</span>   * @return true if all sequenceids are lower, older than, the old sequenceids in this instance.<a name="line.403"></a>
+<span class="sourceLineNo">404</span>   */<a name="line.404"></a>
+<span class="sourceLineNo">405</span>  boolean areAllLower(Map&lt;byte[], Long&gt; sequenceids, Collection&lt;byte[]&gt; keysBlocking) {<a name="line.405"></a>
+<span class="sourceLineNo">406</span>    Map&lt;byte[], Long&gt; flushing = null;<a name="line.406"></a>
+<span class="sourceLineNo">407</span>    Map&lt;byte[], Long&gt; unflushed = null;<a name="line.407"></a>
+<span class="sourceLineNo">408</span>    synchronized (this.tieLock) {<a name="line.408"></a>
+<span class="sourceLineNo">409</span>      // Get a flattened -- only the oldest sequenceid -- copy of current flushing and unflushed<a name="line.409"></a>
+<span class="sourceLineNo">410</span>      // data structures to use in tests below.<a name="line.410"></a>
+<span class="sourceLineNo">411</span>      flushing = flattenToLowestSequenceId(this.flushingSequenceIds);<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      unflushed = flattenToLowestSequenceId(this.lowestUnflushedSequenceIds);<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    }<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    boolean result = true;<a name="line.414"></a>
+<span class="sourceLineNo">415</span>    for (Map.Entry&lt;byte[], Long&gt; e : sequenceids.entrySet()) {<a name="line.415"></a>
+<span class="sourceLineNo">416</span>      long oldestFlushing = Long.MAX_VALUE;<a name="line.416"></a>
+<span class="sourceLineNo">417</span>      long oldestUnflushed = Long.MAX_VALUE;<a name="line.417"></a>
+<span class="sourceLineNo">418</span>      if (flushing != null &amp;&amp; flushing.containsKey(e.getKey())) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        oldestFlushing = flushing.get(e.getKey());<a name="line.419"></a>
+<span class="sourceLineNo">420</span>      }<a name="line.420"></a>
+<span class="sourceLineNo">421</span>      if (unflushed != null &amp;&amp; unflushed.containsKey(e.getKey())) {<a name="line.421"></a>
+<span class="sourceLineNo">422</span>        oldestUnflushed = unflushed.get(e.getKey());<a name="line.422"></a>
+<span class="sourceLineNo">423</span>      }<a name="line.423"></a>
+<span class="sourceLineNo">424</span>      long min = Math.min(oldestFlushing, oldestUnflushed);<a name="line.424"></a>
+<span class="sourceLineNo">425</span>      if (min &lt;= e.getValue()) {<a name="line.425"></a>
+<span class="sourceLineNo">426</span>        if (keysBlocking == null) {<a name="line.426"></a>
+<span class="sourceLineNo">427</span>          return false;<a name="line.427"></a>
+<span class="sourceLineNo">428</span>        }<a name="line.428"></a>
+<span class="sourceLineNo">429</span>        result = false;<a name="line.429"></a>
+<span class="sourceLineNo">430</span>        keysBlocking.add(e.getKey());<a name="line.430"></a>
+<span class="sourceLineNo">431</span>        // Continue examining the map so we could log all regions blocking this WAL.<a name="line.431"></a>
+<span class="sourceLineNo">432</span>      }<a name="line.432"></a>
+<span class="sourceLineNo">433</span>    }<a name="line.433"></a>
+<span class="sourceLineNo">434</span>    return result;<a name="line.434"></a>
+<span class="sourceLineNo">435</span>  }<a name="line.435"></a>
+<span class="sourceLineNo">436</span><a name="line.436"></a>
+<span class="sourceLineNo">437</span>  /**<a name="line.437"></a>
+<span class="sourceLineNo">438</span>   * Iterates over the given Map and compares sequence ids with corresponding entries in<a name="line.438"></a>
+<span class="sourceLineNo">439</span>   * {@link #lowestUnflushedSequenceIds}. If a region in<a name="line.439"></a>
+<span class="sourceLineNo">440</span>   * {@link #lowestUnflushedSequenceIds} has a sequence id less than that passed in<a name="line.440"></a>
+<span class="sourceLineNo">441</span>   * &lt;code&gt;sequenceids&lt;/code&gt; then return it.<a name="line.441"></a>
+<span class="sourceLineNo">442</span>   * @param sequenceids Sequenceids keyed by encoded region name.<a name="line.442"></a>
+<span class="sourceLineNo">443</span>   * @return regions found in this instance with sequence ids less than those passed in.<a name="line.443"></a>
+<span class="sourceLineNo">444</span>   */<a name="line.444"></a>
+<span class="sourceLineNo">445</span>  byte[][] findLower(Map&lt;byte[], Long&gt; sequenceids) {<a name="line.445"></a>
+<span class="sourceLineNo">446</span>    List&lt;byte[]&gt; toFlush = null;<a name="line.446"></a>
+<span class="sourceLineNo">447</span>    // Keeping the old behavior of iterating unflushedSeqNums under oldestSeqNumsLock.<a name="line.447"></a>
+<span class="sourceLineNo">448</span>    synchronized (tieLock) {<a name="line.448"></a>
+<span class="sourceLineNo">449</span>      for (Map.Entry&lt;byte[], Long&gt; e : sequenceids.entrySet()) {<a name="line.449"></a>
+<span class="sourceLineNo">450</span>        Map&lt;ImmutableByteArray, Long&gt; m = this.lowestUnflushedSequenceIds.get(e.getKey());<a name="line.450"></a>
+<span class="sourceLineNo">451</span>        if (m == null) {<a name="line.451"></a>
+<span class="sourceLineNo">452</span>          continue;<a name="line.452"></a>
+<span class="sourceLineNo">453</span>        }<a name="line.453"></a>
+<span class="sourceLineNo">454</span>        // The lowest sequence id outstanding for this region.<a name="line.454"></a>
+<span class="sourceLineNo">455</span>        long lowest = getLowestSequenceId(m);<a name="line.455"></a>
+<span class="sourceLineNo">456</span>        if (lowest != HConstants.NO_SEQNUM &amp;&amp; lowest &lt;= e.getValue()) {<a name="line.456"></a>
+<span class="sourceLineNo">457</span>          if (toFlush == null) {<a name="line.457"></a>
+<span class="sourceLineNo">458</span>            toFlush = new ArrayList&lt;&gt;();<a name="line.458"></a>
+<span class="sourceLineNo">459</span>          }<a name="line.459"></a>
+<span class="sourceLineNo">460</span>          toFlush.add(e.getKey());<a name="line.460"></a>
+<span class="sourceLineNo">461</span>        }<a name="line.461"></a>
+<span class="sourceLineNo">462</span>      }<a name="line.462"></a>
+<span class="sourceLineNo">463</span>    }<a name="line.463"></a>
+<span class="sourceLineNo">464</span>    return toFlush == null ? null : toFlush.toArray(new byte[0][]);<a name="line.464"></a>
+<span class="sourceLineNo">465</span>  }<a name="line.465"></a>
+<span class="sourceLineNo">466</span>}<a name="line.466"></a>
 
 
 
