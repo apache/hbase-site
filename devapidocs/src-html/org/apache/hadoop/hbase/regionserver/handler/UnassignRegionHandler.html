@@ -41,95 +41,95 @@
 <span class="sourceLineNo">033</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.33"></a>
 <span class="sourceLineNo">034</span>import org.slf4j.Logger;<a name="line.34"></a>
 <span class="sourceLineNo">035</span>import org.slf4j.LoggerFactory;<a name="line.35"></a>
-<span class="sourceLineNo">036</span><a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.37"></a>
-<span class="sourceLineNo">038</span><a name="line.38"></a>
-<span class="sourceLineNo">039</span>/**<a name="line.39"></a>
-<span class="sourceLineNo">040</span> * Handles closing of a region on a region server.<a name="line.40"></a>
-<span class="sourceLineNo">041</span> * &lt;p/&gt;<a name="line.41"></a>
-<span class="sourceLineNo">042</span> * Just done the same thing with the old {@link CloseRegionHandler}, with some modifications on<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * fencing and retrying. But we need to keep the {@link CloseRegionHandler} as is to keep compatible<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * with the zk less assignment for 1.x, otherwise it is not possible to do rolling upgrade.<a name="line.44"></a>
-<span class="sourceLineNo">045</span> */<a name="line.45"></a>
-<span class="sourceLineNo">046</span>@InterfaceAudience.Private<a name="line.46"></a>
-<span class="sourceLineNo">047</span>public class UnassignRegionHandler extends EventHandler {<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>  private static final Logger LOG = LoggerFactory.getLogger(UnassignRegionHandler.class);<a name="line.49"></a>
-<span class="sourceLineNo">050</span><a name="line.50"></a>
-<span class="sourceLineNo">051</span>  private final String encodedName;<a name="line.51"></a>
-<span class="sourceLineNo">052</span><a name="line.52"></a>
-<span class="sourceLineNo">053</span>  private final long closeProcId;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>  // If true, the hosting server is aborting. Region close process is different<a name="line.54"></a>
-<span class="sourceLineNo">055</span>  // when we are aborting.<a name="line.55"></a>
-<span class="sourceLineNo">056</span>  // TODO: not used yet, we still use the old CloseRegionHandler when aborting<a name="line.56"></a>
-<span class="sourceLineNo">057</span>  private final boolean abort;<a name="line.57"></a>
-<span class="sourceLineNo">058</span><a name="line.58"></a>
-<span class="sourceLineNo">059</span>  private final ServerName destination;<a name="line.59"></a>
-<span class="sourceLineNo">060</span><a name="line.60"></a>
-<span class="sourceLineNo">061</span>  private final RetryCounter retryCounter;<a name="line.61"></a>
-<span class="sourceLineNo">062</span><a name="line.62"></a>
-<span class="sourceLineNo">063</span>  public UnassignRegionHandler(HRegionServer server, String encodedName, long closeProcId,<a name="line.63"></a>
-<span class="sourceLineNo">064</span>      boolean abort, @Nullable ServerName destination, EventType eventType) {<a name="line.64"></a>
-<span class="sourceLineNo">065</span>    super(server, eventType);<a name="line.65"></a>
-<span class="sourceLineNo">066</span>    this.encodedName = encodedName;<a name="line.66"></a>
-<span class="sourceLineNo">067</span>    this.closeProcId = closeProcId;<a name="line.67"></a>
-<span class="sourceLineNo">068</span>    this.abort = abort;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    this.destination = destination;<a name="line.69"></a>
-<span class="sourceLineNo">070</span>    this.retryCounter = HandlerUtil.getRetryCounter();<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  }<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private HRegionServer getServer() {<a name="line.73"></a>
-<span class="sourceLineNo">074</span>    return (HRegionServer) server;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  }<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  @Override<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  public void process() throws IOException {<a name="line.78"></a>
-<span class="sourceLineNo">079</span>    HRegionServer rs = getServer();<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    byte[] encodedNameBytes = Bytes.toBytes(encodedName);<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    Boolean previous = rs.getRegionsInTransitionInRS().putIfAbsent(encodedNameBytes, Boolean.FALSE);<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    if (previous != null) {<a name="line.82"></a>
-<span class="sourceLineNo">083</span>      if (previous) {<a name="line.83"></a>
-<span class="sourceLineNo">084</span>        // This could happen as we will update the region state to OPEN when calling<a name="line.84"></a>
-<span class="sourceLineNo">085</span>        // reportRegionStateTransition, so the HMaster will think the region is online, before we<a name="line.85"></a>
-<span class="sourceLineNo">086</span>        // actually open the region, as reportRegionStateTransition is part of the opening process.<a name="line.86"></a>
-<span class="sourceLineNo">087</span>        long backoff = retryCounter.getBackoffTimeAndIncrementAttempts();<a name="line.87"></a>
-<span class="sourceLineNo">088</span>        LOG.warn("Received CLOSE for the region: {}, which we are already " +<a name="line.88"></a>
-<span class="sourceLineNo">089</span>          "trying to OPEN. try again after {}ms", encodedName, backoff);<a name="line.89"></a>
-<span class="sourceLineNo">090</span>        rs.getExecutorService().delayedSubmit(this, backoff, TimeUnit.MILLISECONDS);<a name="line.90"></a>
-<span class="sourceLineNo">091</span>      } else {<a name="line.91"></a>
-<span class="sourceLineNo">092</span>        LOG.info("Received CLOSE for the region: {}, which we are already trying to CLOSE," +<a name="line.92"></a>
-<span class="sourceLineNo">093</span>          " but not completed yet", encodedName);<a name="line.93"></a>
-<span class="sourceLineNo">094</span>      }<a name="line.94"></a>
-<span class="sourceLineNo">095</span>      return;<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    }<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    HRegion region = rs.getRegion(encodedName);<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    if (region == null) {<a name="line.98"></a>
-<span class="sourceLineNo">099</span>      LOG.debug(<a name="line.99"></a>
-<span class="sourceLineNo">100</span>        "Received CLOSE for a region {} which is not online, and we're not opening/closing.",<a name="line.100"></a>
-<span class="sourceLineNo">101</span>        encodedName);<a name="line.101"></a>
-<span class="sourceLineNo">102</span>      rs.getRegionsInTransitionInRS().remove(encodedNameBytes, Boolean.FALSE);<a name="line.102"></a>
-<span class="sourceLineNo">103</span>      return;<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    }<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    String regionName = region.getRegionInfo().getEncodedName();<a name="line.105"></a>
-<span class="sourceLineNo">106</span>    LOG.info("Close {}", regionName);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>    if (region.getCoprocessorHost() != null) {<a name="line.107"></a>
-<span class="sourceLineNo">108</span>      // XXX: The behavior is a bit broken. At master side there is no FAILED_CLOSE state, so if<a name="line.108"></a>
-<span class="sourceLineNo">109</span>      // there are exception thrown from the CP, we can not report the error to master, and if here<a name="line.109"></a>
-<span class="sourceLineNo">110</span>      // we just return without calling reportRegionStateTransition, the TRSP at master side will<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      // hang there for ever. So here if the CP throws an exception out, the only way is to abort<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      // the RS...<a name="line.112"></a>
-<span class="sourceLineNo">113</span>      region.getCoprocessorHost().preClose(abort);<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    }<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    if (region.close(abort) == null) {<a name="line.115"></a>
-<span class="sourceLineNo">116</span>      // XXX: Is this still possible? The old comment says about split, but now split is done at<a name="line.116"></a>
-<span class="sourceLineNo">117</span>      // master side, so...<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      LOG.warn("Can't close region {}, was already closed during close()", regionName);<a name="line.118"></a>
-<span class="sourceLineNo">119</span>      rs.getRegionsInTransitionInRS().remove(encodedNameBytes, Boolean.FALSE);<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      return;<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    }<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    rs.removeRegion(region, destination);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    if (!rs.reportRegionStateTransition(new RegionStateTransitionContext(TransitionCode.CLOSED,<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      HConstants.NO_SEQNUM, closeProcId, -1, region.getRegionInfo()))) {<a name="line.124"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;<a name="line.36"></a>
+<span class="sourceLineNo">037</span><a name="line.37"></a>
+<span class="sourceLineNo">038</span>/**<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * Handles closing of a region on a region server.<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * &lt;p/&gt;<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * Just done the same thing with the old {@link CloseRegionHandler}, with some modifications on<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * fencing and retrying. But we need to keep the {@link CloseRegionHandler} as is to keep compatible<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * with the zk less assignment for 1.x, otherwise it is not possible to do rolling upgrade.<a name="line.43"></a>
+<span class="sourceLineNo">044</span> */<a name="line.44"></a>
+<span class="sourceLineNo">045</span>@InterfaceAudience.Private<a name="line.45"></a>
+<span class="sourceLineNo">046</span>public class UnassignRegionHandler extends EventHandler {<a name="line.46"></a>
+<span class="sourceLineNo">047</span><a name="line.47"></a>
+<span class="sourceLineNo">048</span>  private static final Logger LOG = LoggerFactory.getLogger(UnassignRegionHandler.class);<a name="line.48"></a>
+<span class="sourceLineNo">049</span><a name="line.49"></a>
+<span class="sourceLineNo">050</span>  private final String encodedName;<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>  private final long closeProcId;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  // If true, the hosting server is aborting. Region close process is different<a name="line.53"></a>
+<span class="sourceLineNo">054</span>  // when we are aborting.<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  // TODO: not used yet, we still use the old CloseRegionHandler when aborting<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  private final boolean abort;<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private final ServerName destination;<a name="line.58"></a>
+<span class="sourceLineNo">059</span><a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private final RetryCounter retryCounter;<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  public UnassignRegionHandler(HRegionServer server, String encodedName, long closeProcId,<a name="line.62"></a>
+<span class="sourceLineNo">063</span>      boolean abort, @Nullable ServerName destination, EventType eventType) {<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    super(server, eventType);<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    this.encodedName = encodedName;<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    this.closeProcId = closeProcId;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>    this.abort = abort;<a name="line.67"></a>
+<span class="sourceLineNo">068</span>    this.destination = destination;<a name="line.68"></a>
+<span class="sourceLineNo">069</span>    this.retryCounter = HandlerUtil.getRetryCounter();<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  }<a name="line.70"></a>
+<span class="sourceLineNo">071</span><a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private HRegionServer getServer() {<a name="line.72"></a>
+<span class="sourceLineNo">073</span>    return (HRegionServer) server;<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  }<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  @Override<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  public void process() throws IOException {<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    HRegionServer rs = getServer();<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    byte[] encodedNameBytes = Bytes.toBytes(encodedName);<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    Boolean previous = rs.getRegionsInTransitionInRS().putIfAbsent(encodedNameBytes, Boolean.FALSE);<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    if (previous != null) {<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      if (previous) {<a name="line.82"></a>
+<span class="sourceLineNo">083</span>        // This could happen as we will update the region state to OPEN when calling<a name="line.83"></a>
+<span class="sourceLineNo">084</span>        // reportRegionStateTransition, so the HMaster will think the region is online, before we<a name="line.84"></a>
+<span class="sourceLineNo">085</span>        // actually open the region, as reportRegionStateTransition is part of the opening process.<a name="line.85"></a>
+<span class="sourceLineNo">086</span>        long backoff = retryCounter.getBackoffTimeAndIncrementAttempts();<a name="line.86"></a>
+<span class="sourceLineNo">087</span>        LOG.warn("Received CLOSE for the region: {}, which we are already " +<a name="line.87"></a>
+<span class="sourceLineNo">088</span>          "trying to OPEN. try again after {}ms", encodedName, backoff);<a name="line.88"></a>
+<span class="sourceLineNo">089</span>        rs.getExecutorService().delayedSubmit(this, backoff, TimeUnit.MILLISECONDS);<a name="line.89"></a>
+<span class="sourceLineNo">090</span>      } else {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>        LOG.info("Received CLOSE for the region: {}, which we are already trying to CLOSE," +<a name="line.91"></a>
+<span class="sourceLineNo">092</span>          " but not completed yet", encodedName);<a name="line.92"></a>
+<span class="sourceLineNo">093</span>      }<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      return;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    }<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    HRegion region = rs.getRegion(encodedName);<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    if (region == null) {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      LOG.debug(<a name="line.98"></a>
+<span class="sourceLineNo">099</span>        "Received CLOSE for a region {} which is not online, and we're not opening/closing.",<a name="line.99"></a>
+<span class="sourceLineNo">100</span>        encodedName);<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      rs.getRegionsInTransitionInRS().remove(encodedNameBytes, Boolean.FALSE);<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      return;<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    }<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    String regionName = region.getRegionInfo().getEncodedName();<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    LOG.info("Close {}", regionName);<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    if (region.getCoprocessorHost() != null) {<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      // XXX: The behavior is a bit broken. At master side there is no FAILED_CLOSE state, so if<a name="line.107"></a>
+<span class="sourceLineNo">108</span>      // there are exception thrown from the CP, we can not report the error to master, and if<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      // here we just return without calling reportRegionStateTransition, the TRSP at master side<a name="line.109"></a>
+<span class="sourceLineNo">110</span>      // will hang there for ever. So here if the CP throws an exception out, the only way is to<a name="line.110"></a>
+<span class="sourceLineNo">111</span>      // abort the RS...<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      region.getCoprocessorHost().preClose(abort);<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    }<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    if (region.close(abort) == null) {<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      // XXX: Is this still possible? The old comment says about split, but now split is done at<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      // master side, so...<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      LOG.warn("Can't close region {}, was already closed during close()", regionName);<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      rs.getRegionsInTransitionInRS().remove(encodedNameBytes, Boolean.FALSE);<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      return;<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    }<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    rs.removeRegion(region, destination);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    if (!rs.reportRegionStateTransition(<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      new RegionStateTransitionContext(TransitionCode.CLOSED, HConstants.NO_SEQNUM, closeProcId,<a name="line.123"></a>
+<span class="sourceLineNo">124</span>        -1, region.getRegionInfo()))) {<a name="line.124"></a>
 <span class="sourceLineNo">125</span>      throw new IOException("Failed to report close to master: " + regionName);<a name="line.125"></a>
 <span class="sourceLineNo">126</span>    }<a name="line.126"></a>
 <span class="sourceLineNo">127</span>    // Cache the close region procedure id after report region transition succeed.<a name="line.127"></a>
@@ -141,21 +141,24 @@
 <span class="sourceLineNo">133</span>  @Override<a name="line.133"></a>
 <span class="sourceLineNo">134</span>  protected void handleException(Throwable t) {<a name="line.134"></a>
 <span class="sourceLineNo">135</span>    LOG.warn("Fatal error occurred while closing region {}, aborting...", encodedName, t);<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    getServer().abort("Failed to close region " + encodedName + " and can not recover", t);<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  }<a name="line.137"></a>
-<span class="sourceLineNo">138</span><a name="line.138"></a>
-<span class="sourceLineNo">139</span>  public static UnassignRegionHandler create(HRegionServer server, String encodedName,<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      long closeProcId, boolean abort, @Nullable ServerName destination) {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    // Just try our best to determine whether it is for closing meta. It is not the end of the world<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    // if we put the handler into a wrong executor.<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    Region region = server.getRegion(encodedName);<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    EventType eventType =<a name="line.144"></a>
-<span class="sourceLineNo">145</span>      region != null &amp;&amp; region.getRegionInfo().isMetaRegion() ? EventType.M_RS_CLOSE_META<a name="line.145"></a>
-<span class="sourceLineNo">146</span>        : EventType.M_RS_CLOSE_REGION;<a name="line.146"></a>
-<span class="sourceLineNo">147</span>    return new UnassignRegionHandler(server, encodedName, closeProcId, abort, destination,<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      eventType);<a name="line.148"></a>
-<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
-<span class="sourceLineNo">150</span>}<a name="line.150"></a>
+<span class="sourceLineNo">136</span>    // Clear any reference in getServer().getRegionsInTransitionInRS() otherwise can hold up<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    // regionserver abort on cluster shutdown. HBASE-23984.<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    getServer().getRegionsInTransitionInRS().remove(Bytes.toBytes(this.encodedName));<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    getServer().abort("Failed to close region " + encodedName + " and can not recover", t);<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  }<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>  public static UnassignRegionHandler create(HRegionServer server, String encodedName,<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      long closeProcId, boolean abort, @Nullable ServerName destination) {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    // Just try our best to determine whether it is for closing meta. It is not the end of the world<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    // if we put the handler into a wrong executor.<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    Region region = server.getRegion(encodedName);<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    EventType eventType =<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      region != null &amp;&amp; region.getRegionInfo().isMetaRegion() ? EventType.M_RS_CLOSE_META<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        : EventType.M_RS_CLOSE_REGION;<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    return new UnassignRegionHandler(server, encodedName, closeProcId, abort, destination,<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      eventType);<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  }<a name="line.152"></a>
+<span class="sourceLineNo">153</span>}<a name="line.153"></a>
 
 
 
