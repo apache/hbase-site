@@ -44,688 +44,690 @@
 <span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.ZooKeeperConnectionException;<a name="line.36"></a>
 <span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.security.Superusers;<a name="line.37"></a>
 <span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.security.UserGroupInformation;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.zookeeper.KeeperException;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.zookeeper.WatchedEvent;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.zookeeper.Watcher;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.zookeeper.ZooDefs.Ids;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.zookeeper.ZooDefs.Perms;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.zookeeper.data.ACL;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.zookeeper.data.Id;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.zookeeper.data.Stat;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.slf4j.Logger;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.slf4j.LoggerFactory;<a name="line.51"></a>
-<span class="sourceLineNo">052</span><a name="line.52"></a>
-<span class="sourceLineNo">053</span>/**<a name="line.53"></a>
-<span class="sourceLineNo">054</span> * Acts as the single ZooKeeper Watcher.  One instance of this is instantiated<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * for each Master, RegionServer, and client process.<a name="line.55"></a>
-<span class="sourceLineNo">056</span> *<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * &lt;p&gt;This is the only class that implements {@link Watcher}.  Other internal<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * classes which need to be notified of ZooKeeper events must register with<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * the local instance of this watcher via {@link #registerListener}.<a name="line.59"></a>
-<span class="sourceLineNo">060</span> *<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * &lt;p&gt;This class also holds and manages the connection to ZooKeeper.  Code to<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * deal with connection related events and exceptions are handled here.<a name="line.62"></a>
-<span class="sourceLineNo">063</span> */<a name="line.63"></a>
-<span class="sourceLineNo">064</span>@InterfaceAudience.Private<a name="line.64"></a>
-<span class="sourceLineNo">065</span>public class ZKWatcher implements Watcher, Abortable, Closeable {<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  private static final Logger LOG = LoggerFactory.getLogger(ZKWatcher.class);<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>  // Identifier for this watcher (for logging only).  It is made of the prefix<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  // passed on construction and the zookeeper sessionid.<a name="line.69"></a>
-<span class="sourceLineNo">070</span>  private String prefix;<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  private String identifier;<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  // zookeeper quorum<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private String quorum;<a name="line.74"></a>
-<span class="sourceLineNo">075</span><a name="line.75"></a>
-<span class="sourceLineNo">076</span>  // zookeeper connection<a name="line.76"></a>
-<span class="sourceLineNo">077</span>  private final RecoverableZooKeeper recoverableZooKeeper;<a name="line.77"></a>
-<span class="sourceLineNo">078</span><a name="line.78"></a>
-<span class="sourceLineNo">079</span>  // abortable in case of zk failure<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  protected Abortable abortable;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  // Used if abortable is null<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  private boolean aborted = false;<a name="line.82"></a>
-<span class="sourceLineNo">083</span><a name="line.83"></a>
-<span class="sourceLineNo">084</span>  private final ZNodePaths znodePaths;<a name="line.84"></a>
-<span class="sourceLineNo">085</span><a name="line.85"></a>
-<span class="sourceLineNo">086</span>  // listeners to be notified<a name="line.86"></a>
-<span class="sourceLineNo">087</span>  private final List&lt;ZKListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();<a name="line.87"></a>
-<span class="sourceLineNo">088</span><a name="line.88"></a>
-<span class="sourceLineNo">089</span>  // Single threaded executor pool that processes event notifications from Zookeeper. Events are<a name="line.89"></a>
-<span class="sourceLineNo">090</span>  // processed in the order in which they arrive (pool backed by an unbounded fifo queue). We do<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  // this to decouple the event processing from Zookeeper's ClientCnxn's EventThread context.<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  // EventThread internally runs a single while loop to serially process all the events. When events<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  // are processed by the listeners in the same thread, that blocks the EventThread from processing<a name="line.93"></a>
-<span class="sourceLineNo">094</span>  // subsequent events. Processing events in a separate thread frees up the event thread to continue<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  // and further prevents deadlocks if the process method itself makes other zookeeper calls.<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  // It is ok to do it in a single thread because the Zookeeper ClientCnxn already serializes the<a name="line.96"></a>
-<span class="sourceLineNo">097</span>  // requests using a single while loop and hence there is no performance degradation.<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  private final ExecutorService zkEventProcessor = Executors.newSingleThreadExecutor(<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    new ThreadFactoryBuilder().setNameFormat("zk-event-processor-pool-%d").build());<a name="line.99"></a>
-<span class="sourceLineNo">100</span><a name="line.100"></a>
-<span class="sourceLineNo">101</span>  private final Configuration conf;<a name="line.101"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.security.UserGroupInformation;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.zookeeper.KeeperException;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.zookeeper.WatchedEvent;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.zookeeper.Watcher;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.zookeeper.ZooDefs.Ids;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.zookeeper.ZooDefs.Perms;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.zookeeper.data.ACL;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.zookeeper.data.Id;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.zookeeper.data.Stat;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.slf4j.Logger;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.slf4j.LoggerFactory;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>/**<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * Acts as the single ZooKeeper Watcher.  One instance of this is instantiated<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * for each Master, RegionServer, and client process.<a name="line.56"></a>
+<span class="sourceLineNo">057</span> *<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * &lt;p&gt;This is the only class that implements {@link Watcher}.  Other internal<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * classes which need to be notified of ZooKeeper events must register with<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * the local instance of this watcher via {@link #registerListener}.<a name="line.60"></a>
+<span class="sourceLineNo">061</span> *<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * &lt;p&gt;This class also holds and manages the connection to ZooKeeper.  Code to<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * deal with connection related events and exceptions are handled here.<a name="line.63"></a>
+<span class="sourceLineNo">064</span> */<a name="line.64"></a>
+<span class="sourceLineNo">065</span>@InterfaceAudience.Private<a name="line.65"></a>
+<span class="sourceLineNo">066</span>public class ZKWatcher implements Watcher, Abortable, Closeable {<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private static final Logger LOG = LoggerFactory.getLogger(ZKWatcher.class);<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  // Identifier for this watcher (for logging only).  It is made of the prefix<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  // passed on construction and the zookeeper sessionid.<a name="line.70"></a>
+<span class="sourceLineNo">071</span>  private String prefix;<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private String identifier;<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  // zookeeper quorum<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private String quorum;<a name="line.75"></a>
+<span class="sourceLineNo">076</span><a name="line.76"></a>
+<span class="sourceLineNo">077</span>  // zookeeper connection<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private final RecoverableZooKeeper recoverableZooKeeper;<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>  // abortable in case of zk failure<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  protected Abortable abortable;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  // Used if abortable is null<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private boolean aborted = false;<a name="line.83"></a>
+<span class="sourceLineNo">084</span><a name="line.84"></a>
+<span class="sourceLineNo">085</span>  private final ZNodePaths znodePaths;<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>  // listeners to be notified<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private final List&lt;ZKListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  // Single threaded executor pool that processes event notifications from Zookeeper. Events are<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  // processed in the order in which they arrive (pool backed by an unbounded fifo queue). We do<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  // this to decouple the event processing from Zookeeper's ClientCnxn's EventThread context.<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  // EventThread internally runs a single while loop to serially process all the events. When events<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  // are processed by the listeners in the same thread, that blocks the EventThread from processing<a name="line.94"></a>
+<span class="sourceLineNo">095</span>  // subsequent events. Processing events in a separate thread frees up the event thread to continue<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  // and further prevents deadlocks if the process method itself makes other zookeeper calls.<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  // It is ok to do it in a single thread because the Zookeeper ClientCnxn already serializes the<a name="line.97"></a>
+<span class="sourceLineNo">098</span>  // requests using a single while loop and hence there is no performance degradation.<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  private final ExecutorService zkEventProcessor = Executors.newSingleThreadExecutor(<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    new ThreadFactoryBuilder().setNameFormat("zk-event-processor-pool-%d")<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());<a name="line.101"></a>
 <span class="sourceLineNo">102</span><a name="line.102"></a>
-<span class="sourceLineNo">103</span>  private final long zkSyncTimeout;<a name="line.103"></a>
+<span class="sourceLineNo">103</span>  private final Configuration conf;<a name="line.103"></a>
 <span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  /* A pattern that matches a Kerberos name, borrowed from Hadoop's KerberosName */<a name="line.105"></a>
-<span class="sourceLineNo">106</span>  private static final Pattern NAME_PATTERN = Pattern.compile("([^/@]*)(/([^/@]*))?@([^/@]*)");<a name="line.106"></a>
-<span class="sourceLineNo">107</span><a name="line.107"></a>
-<span class="sourceLineNo">108</span>  /**<a name="line.108"></a>
-<span class="sourceLineNo">109</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.109"></a>
-<span class="sourceLineNo">110</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as<a name="line.110"></a>
-<span class="sourceLineNo">111</span>   *                   identifier for this instance. Use null for default.<a name="line.111"></a>
-<span class="sourceLineNo">112</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.112"></a>
-<span class="sourceLineNo">113</span>   * @throws ZooKeeperConnectionException if the client can't connect to ZooKeeper<a name="line.113"></a>
-<span class="sourceLineNo">114</span>   */<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  public ZKWatcher(Configuration conf, String identifier,<a name="line.115"></a>
-<span class="sourceLineNo">116</span>                   Abortable abortable) throws ZooKeeperConnectionException, IOException {<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    this(conf, identifier, abortable, false);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>  }<a name="line.118"></a>
-<span class="sourceLineNo">119</span><a name="line.119"></a>
-<span class="sourceLineNo">120</span>  /**<a name="line.120"></a>
-<span class="sourceLineNo">121</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.121"></a>
-<span class="sourceLineNo">122</span>   * @param conf the configuration to use<a name="line.122"></a>
-<span class="sourceLineNo">123</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as identifier for<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   *          this instance. Use null for default.<a name="line.124"></a>
-<span class="sourceLineNo">125</span>   * @param abortable Can be null if there is on error there is no host to abort: e.g. client<a name="line.125"></a>
-<span class="sourceLineNo">126</span>   *          context.<a name="line.126"></a>
-<span class="sourceLineNo">127</span>   * @param canCreateBaseZNode true if a base ZNode can be created<a name="line.127"></a>
-<span class="sourceLineNo">128</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.128"></a>
-<span class="sourceLineNo">129</span>   * @throws ZooKeeperConnectionException if the client can't connect to ZooKeeper<a name="line.129"></a>
-<span class="sourceLineNo">130</span>   */<a name="line.130"></a>
-<span class="sourceLineNo">131</span>  public ZKWatcher(Configuration conf, String identifier,<a name="line.131"></a>
-<span class="sourceLineNo">132</span>                   Abortable abortable, boolean canCreateBaseZNode)<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    throws IOException, ZooKeeperConnectionException {<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    this(conf, identifier, abortable, canCreateBaseZNode, false);<a name="line.134"></a>
-<span class="sourceLineNo">135</span>  }<a name="line.135"></a>
-<span class="sourceLineNo">136</span><a name="line.136"></a>
-<span class="sourceLineNo">137</span>  /**<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.138"></a>
-<span class="sourceLineNo">139</span>   * @param conf the configuration to use<a name="line.139"></a>
-<span class="sourceLineNo">140</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as identifier for<a name="line.140"></a>
-<span class="sourceLineNo">141</span>   *          this instance. Use null for default.<a name="line.141"></a>
-<span class="sourceLineNo">142</span>   * @param abortable Can be null if there is on error there is no host to abort: e.g. client<a name="line.142"></a>
-<span class="sourceLineNo">143</span>   *          context.<a name="line.143"></a>
-<span class="sourceLineNo">144</span>   * @param canCreateBaseZNode true if a base ZNode can be created<a name="line.144"></a>
-<span class="sourceLineNo">145</span>   * @param clientZK whether this watcher is set to access client ZK<a name="line.145"></a>
-<span class="sourceLineNo">146</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.146"></a>
-<span class="sourceLineNo">147</span>   * @throws ZooKeeperConnectionException if the connection to Zookeeper fails when create base<a name="line.147"></a>
-<span class="sourceLineNo">148</span>   *           ZNodes<a name="line.148"></a>
-<span class="sourceLineNo">149</span>   */<a name="line.149"></a>
-<span class="sourceLineNo">150</span>  public ZKWatcher(Configuration conf, String identifier, Abortable abortable,<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      boolean canCreateBaseZNode, boolean clientZK)<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      throws IOException, ZooKeeperConnectionException {<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    this.conf = conf;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    if (clientZK) {<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      String clientZkQuorumServers = ZKConfig.getClientZKQuorumServersString(conf);<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      String serverZkQuorumServers = ZKConfig.getZKQuorumServersString(conf);<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      if (clientZkQuorumServers != null) {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>        if (clientZkQuorumServers.equals(serverZkQuorumServers)) {<a name="line.158"></a>
-<span class="sourceLineNo">159</span>          // Don't allow same settings to avoid dead loop when master trying<a name="line.159"></a>
-<span class="sourceLineNo">160</span>          // to sync meta information from server ZK to client ZK<a name="line.160"></a>
-<span class="sourceLineNo">161</span>          throw new IllegalArgumentException(<a name="line.161"></a>
-<span class="sourceLineNo">162</span>              "The quorum settings for client ZK should be different from those for server");<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        }<a name="line.163"></a>
-<span class="sourceLineNo">164</span>        this.quorum = clientZkQuorumServers;<a name="line.164"></a>
-<span class="sourceLineNo">165</span>      } else {<a name="line.165"></a>
-<span class="sourceLineNo">166</span>        this.quorum = serverZkQuorumServers;<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      }<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    } else {<a name="line.168"></a>
-<span class="sourceLineNo">169</span>      this.quorum = ZKConfig.getZKQuorumServersString(conf);<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    this.prefix = identifier;<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    // Identifier will get the sessionid appended later below down when we<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    // handle the syncconnect event.<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    this.identifier = identifier + "0x0";<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    this.abortable = abortable;<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    this.znodePaths = new ZNodePaths(conf);<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    PendingWatcher pendingWatcher = new PendingWatcher();<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    this.recoverableZooKeeper = ZKUtil.connect(conf, quorum, pendingWatcher, identifier);<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    pendingWatcher.prepare(this);<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    if (canCreateBaseZNode) {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>      try {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>        createBaseZNodes();<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      } catch (ZooKeeperConnectionException zce) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>        try {<a name="line.184"></a>
-<span class="sourceLineNo">185</span>          this.recoverableZooKeeper.close();<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        } catch (InterruptedException ie) {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>          LOG.debug("Encountered InterruptedException when closing {}", this.recoverableZooKeeper);<a name="line.187"></a>
-<span class="sourceLineNo">188</span>          Thread.currentThread().interrupt();<a name="line.188"></a>
-<span class="sourceLineNo">189</span>        }<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        throw zce;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>      }<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    }<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    this.zkSyncTimeout = conf.getLong(HConstants.ZK_SYNC_BLOCKING_TIMEOUT_MS,<a name="line.193"></a>
-<span class="sourceLineNo">194</span>        HConstants.ZK_SYNC_BLOCKING_TIMEOUT_DEFAULT_MS);<a name="line.194"></a>
-<span class="sourceLineNo">195</span>  }<a name="line.195"></a>
-<span class="sourceLineNo">196</span><a name="line.196"></a>
-<span class="sourceLineNo">197</span>  private void createBaseZNodes() throws ZooKeeperConnectionException {<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    try {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      // Create all the necessary "directories" of znodes<a name="line.199"></a>
-<span class="sourceLineNo">200</span>      ZKUtil.createWithParents(this, znodePaths.baseZNode);<a name="line.200"></a>
-<span class="sourceLineNo">201</span>      ZKUtil.createAndFailSilent(this, znodePaths.rsZNode);<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      ZKUtil.createAndFailSilent(this, znodePaths.drainingZNode);<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      ZKUtil.createAndFailSilent(this, znodePaths.tableZNode);<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      ZKUtil.createAndFailSilent(this, znodePaths.splitLogZNode);<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      ZKUtil.createAndFailSilent(this, znodePaths.backupMasterAddressesZNode);<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      ZKUtil.createAndFailSilent(this, znodePaths.masterMaintZNode);<a name="line.206"></a>
-<span class="sourceLineNo">207</span>    } catch (KeeperException e) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>      throw new ZooKeeperConnectionException(<a name="line.208"></a>
-<span class="sourceLineNo">209</span>          prefix("Unexpected KeeperException creating base node"), e);<a name="line.209"></a>
-<span class="sourceLineNo">210</span>    }<a name="line.210"></a>
-<span class="sourceLineNo">211</span>  }<a name="line.211"></a>
-<span class="sourceLineNo">212</span><a name="line.212"></a>
-<span class="sourceLineNo">213</span>  /**<a name="line.213"></a>
-<span class="sourceLineNo">214</span>   * On master start, we check the znode ACLs under the root directory and set the ACLs properly<a name="line.214"></a>
-<span class="sourceLineNo">215</span>   * if needed. If the cluster goes from an unsecure setup to a secure setup, this step is needed<a name="line.215"></a>
-<span class="sourceLineNo">216</span>   * so that the existing znodes created with open permissions are now changed with restrictive<a name="line.216"></a>
-<span class="sourceLineNo">217</span>   * perms.<a name="line.217"></a>
-<span class="sourceLineNo">218</span>   */<a name="line.218"></a>
-<span class="sourceLineNo">219</span>  public void checkAndSetZNodeAcls() {<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    if (!ZKUtil.isSecureZooKeeper(getConfiguration())) {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>      LOG.info("not a secure deployment, proceeding");<a name="line.221"></a>
-<span class="sourceLineNo">222</span>      return;<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    }<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>    // Check the base znodes permission first. Only do the recursion if base znode's perms are not<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    // correct.<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    try {<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      List&lt;ACL&gt; actualAcls = recoverableZooKeeper.getAcl(znodePaths.baseZNode, new Stat());<a name="line.228"></a>
-<span class="sourceLineNo">229</span><a name="line.229"></a>
-<span class="sourceLineNo">230</span>      if (!isBaseZnodeAclSetup(actualAcls)) {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>        LOG.info("setting znode ACLs");<a name="line.231"></a>
-<span class="sourceLineNo">232</span>        setZnodeAclsRecursive(znodePaths.baseZNode);<a name="line.232"></a>
-<span class="sourceLineNo">233</span>      }<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    } catch(KeeperException.NoNodeException nne) {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>      return;<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    } catch(InterruptedException ie) {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>      interruptedExceptionNoThrow(ie, false);<a name="line.237"></a>
-<span class="sourceLineNo">238</span>    } catch (IOException|KeeperException e) {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>      LOG.warn("Received exception while checking and setting zookeeper ACLs", e);<a name="line.239"></a>
-<span class="sourceLineNo">240</span>    }<a name="line.240"></a>
-<span class="sourceLineNo">241</span>  }<a name="line.241"></a>
-<span class="sourceLineNo">242</span><a name="line.242"></a>
-<span class="sourceLineNo">243</span>  /**<a name="line.243"></a>
-<span class="sourceLineNo">244</span>   * Set the znode perms recursively. This will do post-order recursion, so that baseZnode ACLs<a name="line.244"></a>
-<span class="sourceLineNo">245</span>   * will be set last in case the master fails in between.<a name="line.245"></a>
-<span class="sourceLineNo">246</span>   * @param znode the ZNode to set the permissions for<a name="line.246"></a>
-<span class="sourceLineNo">247</span>   */<a name="line.247"></a>
-<span class="sourceLineNo">248</span>  private void setZnodeAclsRecursive(String znode) throws KeeperException, InterruptedException {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    List&lt;String&gt; children = recoverableZooKeeper.getChildren(znode, false);<a name="line.249"></a>
-<span class="sourceLineNo">250</span><a name="line.250"></a>
-<span class="sourceLineNo">251</span>    for (String child : children) {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      setZnodeAclsRecursive(ZNodePaths.joinZNode(znode, child));<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    }<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    List&lt;ACL&gt; acls = ZKUtil.createACL(this, znode, true);<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    LOG.info("Setting ACLs for znode:{} , acl:{}", znode, acls);<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    recoverableZooKeeper.setAcl(znode, acls, -1);<a name="line.256"></a>
-<span class="sourceLineNo">257</span>  }<a name="line.257"></a>
-<span class="sourceLineNo">258</span><a name="line.258"></a>
-<span class="sourceLineNo">259</span>  /**<a name="line.259"></a>
-<span class="sourceLineNo">260</span>   * Checks whether the ACLs returned from the base znode (/hbase) is set for secure setup.<a name="line.260"></a>
-<span class="sourceLineNo">261</span>   * @param acls acls from zookeeper<a name="line.261"></a>
-<span class="sourceLineNo">262</span>   * @return whether ACLs are set for the base znode<a name="line.262"></a>
-<span class="sourceLineNo">263</span>   * @throws IOException if getting the current user fails<a name="line.263"></a>
-<span class="sourceLineNo">264</span>   */<a name="line.264"></a>
-<span class="sourceLineNo">265</span>  private boolean isBaseZnodeAclSetup(List&lt;ACL&gt; acls) throws IOException {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    if (LOG.isDebugEnabled()) {<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      LOG.debug("Checking znode ACLs");<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    }<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    String[] superUsers = conf.getStrings(Superusers.SUPERUSER_CONF_KEY);<a name="line.269"></a>
-<span class="sourceLineNo">270</span>    // Check whether ACL set for all superusers<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    if (superUsers != null &amp;&amp; !checkACLForSuperUsers(superUsers, acls)) {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      return false;<a name="line.272"></a>
-<span class="sourceLineNo">273</span>    }<a name="line.273"></a>
-<span class="sourceLineNo">274</span><a name="line.274"></a>
-<span class="sourceLineNo">275</span>    // this assumes that current authenticated user is the same as zookeeper client user<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    // configured via JAAS<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    String hbaseUser = UserGroupInformation.getCurrentUser().getShortUserName();<a name="line.277"></a>
-<span class="sourceLineNo">278</span><a name="line.278"></a>
-<span class="sourceLineNo">279</span>    if (acls.isEmpty()) {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      if (LOG.isDebugEnabled()) {<a name="line.280"></a>
-<span class="sourceLineNo">281</span>        LOG.debug("ACL is empty");<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      }<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      return false;<a name="line.283"></a>
-<span class="sourceLineNo">284</span>    }<a name="line.284"></a>
-<span class="sourceLineNo">285</span><a name="line.285"></a>
-<span class="sourceLineNo">286</span>    for (ACL acl : acls) {<a name="line.286"></a>
-<span class="sourceLineNo">287</span>      int perms = acl.getPerms();<a name="line.287"></a>
-<span class="sourceLineNo">288</span>      Id id = acl.getId();<a name="line.288"></a>
-<span class="sourceLineNo">289</span>      // We should only set at most 3 possible ACLs for 3 Ids. One for everyone, one for superuser<a name="line.289"></a>
-<span class="sourceLineNo">290</span>      // and one for the hbase user<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      if (Ids.ANYONE_ID_UNSAFE.equals(id)) {<a name="line.291"></a>
-<span class="sourceLineNo">292</span>        if (perms != Perms.READ) {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>          if (LOG.isDebugEnabled()) {<a name="line.293"></a>
-<span class="sourceLineNo">294</span>            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.294"></a>
-<span class="sourceLineNo">295</span>              id, perms, Perms.READ));<a name="line.295"></a>
-<span class="sourceLineNo">296</span>          }<a name="line.296"></a>
-<span class="sourceLineNo">297</span>          return false;<a name="line.297"></a>
-<span class="sourceLineNo">298</span>        }<a name="line.298"></a>
-<span class="sourceLineNo">299</span>      } else if (superUsers != null &amp;&amp; isSuperUserId(superUsers, id)) {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>        if (perms != Perms.ALL) {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>          if (LOG.isDebugEnabled()) {<a name="line.301"></a>
-<span class="sourceLineNo">302</span>            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.302"></a>
-<span class="sourceLineNo">303</span>              id, perms, Perms.ALL));<a name="line.303"></a>
-<span class="sourceLineNo">304</span>          }<a name="line.304"></a>
-<span class="sourceLineNo">305</span>          return false;<a name="line.305"></a>
-<span class="sourceLineNo">306</span>        }<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      } else if ("sasl".equals(id.getScheme())) {<a name="line.307"></a>
-<span class="sourceLineNo">308</span>        String name = id.getId();<a name="line.308"></a>
-<span class="sourceLineNo">309</span>        // If ZooKeeper recorded the Kerberos full name in the ACL, use only the shortname<a name="line.309"></a>
-<span class="sourceLineNo">310</span>        Matcher match = NAME_PATTERN.matcher(name);<a name="line.310"></a>
-<span class="sourceLineNo">311</span>        if (match.matches()) {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>          name = match.group(1);<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        }<a name="line.313"></a>
-<span class="sourceLineNo">314</span>        if (name.equals(hbaseUser)) {<a name="line.314"></a>
-<span class="sourceLineNo">315</span>          if (perms != Perms.ALL) {<a name="line.315"></a>
-<span class="sourceLineNo">316</span>            if (LOG.isDebugEnabled()) {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>              LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.317"></a>
-<span class="sourceLineNo">318</span>                id, perms, Perms.ALL));<a name="line.318"></a>
-<span class="sourceLineNo">319</span>            }<a name="line.319"></a>
-<span class="sourceLineNo">320</span>            return false;<a name="line.320"></a>
-<span class="sourceLineNo">321</span>          }<a name="line.321"></a>
-<span class="sourceLineNo">322</span>        } else {<a name="line.322"></a>
-<span class="sourceLineNo">323</span>          if (LOG.isDebugEnabled()) {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>            LOG.debug("Unexpected shortname in SASL ACL: {}", id);<a name="line.324"></a>
-<span class="sourceLineNo">325</span>          }<a name="line.325"></a>
-<span class="sourceLineNo">326</span>          return false;<a name="line.326"></a>
-<span class="sourceLineNo">327</span>        }<a name="line.327"></a>
-<span class="sourceLineNo">328</span>      } else {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>        if (LOG.isDebugEnabled()) {<a name="line.329"></a>
-<span class="sourceLineNo">330</span>          LOG.debug("unexpected ACL id '{}'", id);<a name="line.330"></a>
-<span class="sourceLineNo">331</span>        }<a name="line.331"></a>
-<span class="sourceLineNo">332</span>        return false;<a name="line.332"></a>
-<span class="sourceLineNo">333</span>      }<a name="line.333"></a>
-<span class="sourceLineNo">334</span>    }<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    return true;<a name="line.335"></a>
-<span class="sourceLineNo">336</span>  }<a name="line.336"></a>
-<span class="sourceLineNo">337</span><a name="line.337"></a>
-<span class="sourceLineNo">338</span>  /*<a name="line.338"></a>
-<span class="sourceLineNo">339</span>   * Validate whether ACL set for all superusers.<a name="line.339"></a>
-<span class="sourceLineNo">340</span>   */<a name="line.340"></a>
-<span class="sourceLineNo">341</span>  private boolean checkACLForSuperUsers(String[] superUsers, List&lt;ACL&gt; acls) {<a name="line.341"></a>
-<span class="sourceLineNo">342</span>    for (String user : superUsers) {<a name="line.342"></a>
-<span class="sourceLineNo">343</span>      boolean hasAccess = false;<a name="line.343"></a>
-<span class="sourceLineNo">344</span>      // TODO: Validate super group members also when ZK supports setting node ACL for groups.<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      if (!AuthUtil.isGroupPrincipal(user)) {<a name="line.345"></a>
-<span class="sourceLineNo">346</span>        for (ACL acl : acls) {<a name="line.346"></a>
-<span class="sourceLineNo">347</span>          if (user.equals(acl.getId().getId())) {<a name="line.347"></a>
-<span class="sourceLineNo">348</span>            if (acl.getPerms() == Perms.ALL) {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>              hasAccess = true;<a name="line.349"></a>
-<span class="sourceLineNo">350</span>            } else {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>              if (LOG.isDebugEnabled()) {<a name="line.351"></a>
-<span class="sourceLineNo">352</span>                LOG.debug(String.format(<a name="line.352"></a>
-<span class="sourceLineNo">353</span>                  "superuser '%s' does not have correct permissions: have 0x%x, want 0x%x",<a name="line.353"></a>
-<span class="sourceLineNo">354</span>                  acl.getId().getId(), acl.getPerms(), Perms.ALL));<a name="line.354"></a>
-<span class="sourceLineNo">355</span>              }<a name="line.355"></a>
-<span class="sourceLineNo">356</span>            }<a name="line.356"></a>
-<span class="sourceLineNo">357</span>            break;<a name="line.357"></a>
-<span class="sourceLineNo">358</span>          }<a name="line.358"></a>
-<span class="sourceLineNo">359</span>        }<a name="line.359"></a>
-<span class="sourceLineNo">360</span>        if (!hasAccess) {<a name="line.360"></a>
-<span class="sourceLineNo">361</span>          return false;<a name="line.361"></a>
-<span class="sourceLineNo">362</span>        }<a name="line.362"></a>
-<span class="sourceLineNo">363</span>      }<a name="line.363"></a>
-<span class="sourceLineNo">364</span>    }<a name="line.364"></a>
-<span class="sourceLineNo">365</span>    return true;<a name="line.365"></a>
-<span class="sourceLineNo">366</span>  }<a name="line.366"></a>
-<span class="sourceLineNo">367</span><a name="line.367"></a>
-<span class="sourceLineNo">368</span>  /*<a name="line.368"></a>
-<span class="sourceLineNo">369</span>   * Validate whether ACL ID is superuser.<a name="line.369"></a>
-<span class="sourceLineNo">370</span>   */<a name="line.370"></a>
-<span class="sourceLineNo">371</span>  public static boolean isSuperUserId(String[] superUsers, Id id) {<a name="line.371"></a>
-<span class="sourceLineNo">372</span>    for (String user : superUsers) {<a name="line.372"></a>
-<span class="sourceLineNo">373</span>      // TODO: Validate super group members also when ZK supports setting node ACL for groups.<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      if (!AuthUtil.isGroupPrincipal(user) &amp;&amp; new Id("sasl", user).equals(id)) {<a name="line.374"></a>
-<span class="sourceLineNo">375</span>        return true;<a name="line.375"></a>
-<span class="sourceLineNo">376</span>      }<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    }<a name="line.377"></a>
-<span class="sourceLineNo">378</span>    return false;<a name="line.378"></a>
-<span class="sourceLineNo">379</span>  }<a name="line.379"></a>
-<span class="sourceLineNo">380</span><a name="line.380"></a>
-<span class="sourceLineNo">381</span>  @Override<a name="line.381"></a>
-<span class="sourceLineNo">382</span>  public String toString() {<a name="line.382"></a>
-<span class="sourceLineNo">383</span>    return this.identifier + ", quorum=" + quorum + ", baseZNode=" + znodePaths.baseZNode;<a name="line.383"></a>
-<span class="sourceLineNo">384</span>  }<a name="line.384"></a>
-<span class="sourceLineNo">385</span><a name="line.385"></a>
-<span class="sourceLineNo">386</span>  /**<a name="line.386"></a>
-<span class="sourceLineNo">387</span>   * Adds this instance's identifier as a prefix to the passed &lt;code&gt;str&lt;/code&gt;<a name="line.387"></a>
-<span class="sourceLineNo">388</span>   * @param str String to amend.<a name="line.388"></a>
-<span class="sourceLineNo">389</span>   * @return A new string with this instance's identifier as prefix: e.g.<a name="line.389"></a>
-<span class="sourceLineNo">390</span>   *         if passed 'hello world', the returned string could be<a name="line.390"></a>
-<span class="sourceLineNo">391</span>   */<a name="line.391"></a>
-<span class="sourceLineNo">392</span>  public String prefix(final String str) {<a name="line.392"></a>
-<span class="sourceLineNo">393</span>    return this.toString() + " " + str;<a name="line.393"></a>
-<span class="sourceLineNo">394</span>  }<a name="line.394"></a>
-<span class="sourceLineNo">395</span><a name="line.395"></a>
-<span class="sourceLineNo">396</span>  /**<a name="line.396"></a>
-<span class="sourceLineNo">397</span>   * Get the znodes corresponding to the meta replicas from ZK<a name="line.397"></a>
-<span class="sourceLineNo">398</span>   * @return list of znodes<a name="line.398"></a>
-<span class="sourceLineNo">399</span>   * @throws KeeperException if a ZooKeeper operation fails<a name="line.399"></a>
-<span class="sourceLineNo">400</span>   */<a name="line.400"></a>
-<span class="sourceLineNo">401</span>  public List&lt;String&gt; getMetaReplicaNodes() throws KeeperException {<a name="line.401"></a>
-<span class="sourceLineNo">402</span>    List&lt;String&gt; childrenOfBaseNode = ZKUtil.listChildrenNoWatch(this, znodePaths.baseZNode);<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    return filterMetaReplicaNodes(childrenOfBaseNode);<a name="line.403"></a>
-<span class="sourceLineNo">404</span>  }<a name="line.404"></a>
-<span class="sourceLineNo">405</span><a name="line.405"></a>
-<span class="sourceLineNo">406</span>  /**<a name="line.406"></a>
-<span class="sourceLineNo">407</span>   * Same as {@link #getMetaReplicaNodes()} except that this also registers a watcher on base znode<a name="line.407"></a>
-<span class="sourceLineNo">408</span>   * for subsequent CREATE/DELETE operations on child nodes.<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   */<a name="line.409"></a>
-<span class="sourceLineNo">410</span>  public List&lt;String&gt; getMetaReplicaNodesAndWatchChildren() throws KeeperException {<a name="line.410"></a>
-<span class="sourceLineNo">411</span>    List&lt;String&gt; childrenOfBaseNode =<a name="line.411"></a>
-<span class="sourceLineNo">412</span>        ZKUtil.listChildrenAndWatchForNewChildren(this, znodePaths.baseZNode);<a name="line.412"></a>
-<span class="sourceLineNo">413</span>    return filterMetaReplicaNodes(childrenOfBaseNode);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>  }<a name="line.414"></a>
-<span class="sourceLineNo">415</span><a name="line.415"></a>
-<span class="sourceLineNo">416</span>  /**<a name="line.416"></a>
-<span class="sourceLineNo">417</span>   * @param nodes Input list of znodes<a name="line.417"></a>
-<span class="sourceLineNo">418</span>   * @return Filtered list of znodes from nodes that belong to meta replica(s).<a name="line.418"></a>
-<span class="sourceLineNo">419</span>   */<a name="line.419"></a>
-<span class="sourceLineNo">420</span>  private List&lt;String&gt; filterMetaReplicaNodes(List&lt;String&gt; nodes) {<a name="line.420"></a>
-<span class="sourceLineNo">421</span>    if (nodes == null || nodes.isEmpty()) {<a name="line.421"></a>
-<span class="sourceLineNo">422</span>      return new ArrayList&lt;&gt;();<a name="line.422"></a>
-<span class="sourceLineNo">423</span>    }<a name="line.423"></a>
-<span class="sourceLineNo">424</span>    List&lt;String&gt; metaReplicaNodes = new ArrayList&lt;&gt;(2);<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    String pattern = conf.get(ZNodePaths.META_ZNODE_PREFIX_CONF_KEY, ZNodePaths.META_ZNODE_PREFIX);<a name="line.425"></a>
-<span class="sourceLineNo">426</span>    for (String child : nodes) {<a name="line.426"></a>
-<span class="sourceLineNo">427</span>      if (child.startsWith(pattern)) {<a name="line.427"></a>
-<span class="sourceLineNo">428</span>        metaReplicaNodes.add(child);<a name="line.428"></a>
-<span class="sourceLineNo">429</span>      }<a name="line.429"></a>
-<span class="sourceLineNo">430</span>    }<a name="line.430"></a>
-<span class="sourceLineNo">431</span>    return metaReplicaNodes;<a name="line.431"></a>
-<span class="sourceLineNo">432</span>  }<a name="line.432"></a>
-<span class="sourceLineNo">433</span><a name="line.433"></a>
-<span class="sourceLineNo">434</span>  /**<a name="line.434"></a>
-<span class="sourceLineNo">435</span>   * Register the specified listener to receive ZooKeeper events.<a name="line.435"></a>
-<span class="sourceLineNo">436</span>   * @param listener the listener to register<a name="line.436"></a>
-<span class="sourceLineNo">437</span>   */<a name="line.437"></a>
-<span class="sourceLineNo">438</span>  public void registerListener(ZKListener listener) {<a name="line.438"></a>
-<span class="sourceLineNo">439</span>    listeners.add(listener);<a name="line.439"></a>
-<span class="sourceLineNo">440</span>  }<a name="line.440"></a>
-<span class="sourceLineNo">441</span><a name="line.441"></a>
-<span class="sourceLineNo">442</span>  /**<a name="line.442"></a>
-<span class="sourceLineNo">443</span>   * Register the specified listener to receive ZooKeeper events and add it as<a name="line.443"></a>
-<span class="sourceLineNo">444</span>   * the first in the list of current listeners.<a name="line.444"></a>
-<span class="sourceLineNo">445</span>   * @param listener the listener to register<a name="line.445"></a>
-<span class="sourceLineNo">446</span>   */<a name="line.446"></a>
-<span class="sourceLineNo">447</span>  public void registerListenerFirst(ZKListener listener) {<a name="line.447"></a>
-<span class="sourceLineNo">448</span>    listeners.add(0, listener);<a name="line.448"></a>
-<span class="sourceLineNo">449</span>  }<a name="line.449"></a>
-<span class="sourceLineNo">450</span><a name="line.450"></a>
-<span class="sourceLineNo">451</span>  public void unregisterListener(ZKListener listener) {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>    listeners.remove(listener);<a name="line.452"></a>
-<span class="sourceLineNo">453</span>  }<a name="line.453"></a>
-<span class="sourceLineNo">454</span><a name="line.454"></a>
-<span class="sourceLineNo">455</span>  /**<a name="line.455"></a>
-<span class="sourceLineNo">456</span>   * Clean all existing listeners<a name="line.456"></a>
-<span class="sourceLineNo">457</span>   */<a name="line.457"></a>
-<span class="sourceLineNo">458</span>  public void unregisterAllListeners() {<a name="line.458"></a>
-<span class="sourceLineNo">459</span>    listeners.clear();<a name="line.459"></a>
-<span class="sourceLineNo">460</span>  }<a name="line.460"></a>
-<span class="sourceLineNo">461</span><a name="line.461"></a>
-<span class="sourceLineNo">462</span>  /**<a name="line.462"></a>
-<span class="sourceLineNo">463</span>   * Get a copy of current registered listeners<a name="line.463"></a>
-<span class="sourceLineNo">464</span>   */<a name="line.464"></a>
-<span class="sourceLineNo">465</span>  public List&lt;ZKListener&gt; getListeners() {<a name="line.465"></a>
-<span class="sourceLineNo">466</span>    return new ArrayList&lt;&gt;(listeners);<a name="line.466"></a>
-<span class="sourceLineNo">467</span>  }<a name="line.467"></a>
-<span class="sourceLineNo">468</span><a name="line.468"></a>
-<span class="sourceLineNo">469</span>  /**<a name="line.469"></a>
-<span class="sourceLineNo">470</span>   * @return The number of currently registered listeners<a name="line.470"></a>
-<span class="sourceLineNo">471</span>   */<a name="line.471"></a>
-<span class="sourceLineNo">472</span>  public int getNumberOfListeners() {<a name="line.472"></a>
-<span class="sourceLineNo">473</span>    return listeners.size();<a name="line.473"></a>
-<span class="sourceLineNo">474</span>  }<a name="line.474"></a>
-<span class="sourceLineNo">475</span><a name="line.475"></a>
-<span class="sourceLineNo">476</span>  /**<a name="line.476"></a>
-<span class="sourceLineNo">477</span>   * Get the connection to ZooKeeper.<a name="line.477"></a>
-<span class="sourceLineNo">478</span>   * @return connection reference to zookeeper<a name="line.478"></a>
-<span class="sourceLineNo">479</span>   */<a name="line.479"></a>
-<span class="sourceLineNo">480</span>  public RecoverableZooKeeper getRecoverableZooKeeper() {<a name="line.480"></a>
-<span class="sourceLineNo">481</span>    return recoverableZooKeeper;<a name="line.481"></a>
-<span class="sourceLineNo">482</span>  }<a name="line.482"></a>
-<span class="sourceLineNo">483</span><a name="line.483"></a>
-<span class="sourceLineNo">484</span>  public void reconnectAfterExpiration() throws IOException, KeeperException, InterruptedException {<a name="line.484"></a>
-<span class="sourceLineNo">485</span>    recoverableZooKeeper.reconnectAfterExpiration();<a name="line.485"></a>
-<span class="sourceLineNo">486</span>  }<a name="line.486"></a>
-<span class="sourceLineNo">487</span><a name="line.487"></a>
-<span class="sourceLineNo">488</span>  /**<a name="line.488"></a>
-<span class="sourceLineNo">489</span>   * Get the quorum address of this instance.<a name="line.489"></a>
-<span class="sourceLineNo">490</span>   * @return quorum string of this zookeeper connection instance<a name="line.490"></a>
-<span class="sourceLineNo">491</span>   */<a name="line.491"></a>
-<span class="sourceLineNo">492</span>  public String getQuorum() {<a name="line.492"></a>
-<span class="sourceLineNo">493</span>    return quorum;<a name="line.493"></a>
-<span class="sourceLineNo">494</span>  }<a name="line.494"></a>
-<span class="sourceLineNo">495</span><a name="line.495"></a>
-<span class="sourceLineNo">496</span>  /**<a name="line.496"></a>
-<span class="sourceLineNo">497</span>   * Get the znodePaths.<a name="line.497"></a>
-<span class="sourceLineNo">498</span>   * &lt;p&gt;<a name="line.498"></a>
-<span class="sourceLineNo">499</span>   * Mainly used for mocking as mockito can not mock a field access.<a name="line.499"></a>
-<span class="sourceLineNo">500</span>   */<a name="line.500"></a>
-<span class="sourceLineNo">501</span>  public ZNodePaths getZNodePaths() {<a name="line.501"></a>
-<span class="sourceLineNo">502</span>    return znodePaths;<a name="line.502"></a>
-<span class="sourceLineNo">503</span>  }<a name="line.503"></a>
-<span class="sourceLineNo">504</span><a name="line.504"></a>
-<span class="sourceLineNo">505</span>  private void processEvent(WatchedEvent event) {<a name="line.505"></a>
-<span class="sourceLineNo">506</span>    switch(event.getType()) {<a name="line.506"></a>
-<span class="sourceLineNo">507</span>      // If event type is NONE, this is a connection status change<a name="line.507"></a>
-<span class="sourceLineNo">508</span>      case None: {<a name="line.508"></a>
-<span class="sourceLineNo">509</span>        connectionEvent(event);<a name="line.509"></a>
-<span class="sourceLineNo">510</span>        break;<a name="line.510"></a>
-<span class="sourceLineNo">511</span>      }<a name="line.511"></a>
-<span class="sourceLineNo">512</span><a name="line.512"></a>
-<span class="sourceLineNo">513</span>      // Otherwise pass along to the listeners<a name="line.513"></a>
-<span class="sourceLineNo">514</span>      case NodeCreated: {<a name="line.514"></a>
-<span class="sourceLineNo">515</span>        for(ZKListener listener : listeners) {<a name="line.515"></a>
-<span class="sourceLineNo">516</span>          listener.nodeCreated(event.getPath());<a name="line.516"></a>
-<span class="sourceLineNo">517</span>        }<a name="line.517"></a>
-<span class="sourceLineNo">518</span>        break;<a name="line.518"></a>
-<span class="sourceLineNo">519</span>      }<a name="line.519"></a>
-<span class="sourceLineNo">520</span><a name="line.520"></a>
-<span class="sourceLineNo">521</span>      case NodeDeleted: {<a name="line.521"></a>
-<span class="sourceLineNo">522</span>        for(ZKListener listener : listeners) {<a name="line.522"></a>
-<span class="sourceLineNo">523</span>          listener.nodeDeleted(event.getPath());<a name="line.523"></a>
-<span class="sourceLineNo">524</span>        }<a name="line.524"></a>
-<span class="sourceLineNo">525</span>        break;<a name="line.525"></a>
-<span class="sourceLineNo">526</span>      }<a name="line.526"></a>
-<span class="sourceLineNo">527</span><a name="line.527"></a>
-<span class="sourceLineNo">528</span>      case NodeDataChanged: {<a name="line.528"></a>
-<span class="sourceLineNo">529</span>        for(ZKListener listener : listeners) {<a name="line.529"></a>
-<span class="sourceLineNo">530</span>          listener.nodeDataChanged(event.getPath());<a name="line.530"></a>
-<span class="sourceLineNo">531</span>        }<a name="line.531"></a>
-<span class="sourceLineNo">532</span>        break;<a name="line.532"></a>
-<span class="sourceLineNo">533</span>      }<a name="line.533"></a>
-<span class="sourceLineNo">534</span><a name="line.534"></a>
-<span class="sourceLineNo">535</span>      case NodeChildrenChanged: {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>        for(ZKListener listener : listeners) {<a name="line.536"></a>
-<span class="sourceLineNo">537</span>          listener.nodeChildrenChanged(event.getPath());<a name="line.537"></a>
-<span class="sourceLineNo">538</span>        }<a name="line.538"></a>
-<span class="sourceLineNo">539</span>        break;<a name="line.539"></a>
-<span class="sourceLineNo">540</span>      }<a name="line.540"></a>
-<span class="sourceLineNo">541</span>      default:<a name="line.541"></a>
-<span class="sourceLineNo">542</span>        LOG.error("Invalid event of type {} received for path {}. Ignoring.",<a name="line.542"></a>
-<span class="sourceLineNo">543</span>            event.getState(), event.getPath());<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    }<a name="line.544"></a>
-<span class="sourceLineNo">545</span>  }<a name="line.545"></a>
-<span class="sourceLineNo">546</span><a name="line.546"></a>
-<span class="sourceLineNo">547</span>  /**<a name="line.547"></a>
-<span class="sourceLineNo">548</span>   * Method called from ZooKeeper for events and connection status.<a name="line.548"></a>
-<span class="sourceLineNo">549</span>   * &lt;p&gt;<a name="line.549"></a>
-<span class="sourceLineNo">550</span>   * Valid events are passed along to listeners.  Connection status changes<a name="line.550"></a>
-<span class="sourceLineNo">551</span>   * are dealt with locally.<a name="line.551"></a>
-<span class="sourceLineNo">552</span>   */<a name="line.552"></a>
-<span class="sourceLineNo">553</span>  @Override<a name="line.553"></a>
-<span class="sourceLineNo">554</span>  public void process(WatchedEvent event) {<a name="line.554"></a>
-<span class="sourceLineNo">555</span>    LOG.debug(prefix("Received ZooKeeper Event, " +<a name="line.555"></a>
-<span class="sourceLineNo">556</span>        "type=" + event.getType() + ", " +<a name="line.556"></a>
-<span class="sourceLineNo">557</span>        "state=" + event.getState() + ", " +<a name="line.557"></a>
-<span class="sourceLineNo">558</span>        "path=" + event.getPath()));<a name="line.558"></a>
-<span class="sourceLineNo">559</span>    zkEventProcessor.submit(() -&gt; processEvent(event));<a name="line.559"></a>
-<span class="sourceLineNo">560</span>  }<a name="line.560"></a>
-<span class="sourceLineNo">561</span><a name="line.561"></a>
-<span class="sourceLineNo">562</span>  // Connection management<a name="line.562"></a>
+<span class="sourceLineNo">105</span>  private final long zkSyncTimeout;<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  /* A pattern that matches a Kerberos name, borrowed from Hadoop's KerberosName */<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  private static final Pattern NAME_PATTERN = Pattern.compile("([^/@]*)(/([^/@]*))?@([^/@]*)");<a name="line.108"></a>
+<span class="sourceLineNo">109</span><a name="line.109"></a>
+<span class="sourceLineNo">110</span>  /**<a name="line.110"></a>
+<span class="sourceLineNo">111</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   *                   identifier for this instance. Use null for default.<a name="line.113"></a>
+<span class="sourceLineNo">114</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.114"></a>
+<span class="sourceLineNo">115</span>   * @throws ZooKeeperConnectionException if the client can't connect to ZooKeeper<a name="line.115"></a>
+<span class="sourceLineNo">116</span>   */<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  public ZKWatcher(Configuration conf, String identifier,<a name="line.117"></a>
+<span class="sourceLineNo">118</span>                   Abortable abortable) throws ZooKeeperConnectionException, IOException {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    this(conf, identifier, abortable, false);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  }<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  /**<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * @param conf the configuration to use<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as identifier for<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   *          this instance. Use null for default.<a name="line.126"></a>
+<span class="sourceLineNo">127</span>   * @param abortable Can be null if there is on error there is no host to abort: e.g. client<a name="line.127"></a>
+<span class="sourceLineNo">128</span>   *          context.<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   * @param canCreateBaseZNode true if a base ZNode can be created<a name="line.129"></a>
+<span class="sourceLineNo">130</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.130"></a>
+<span class="sourceLineNo">131</span>   * @throws ZooKeeperConnectionException if the client can't connect to ZooKeeper<a name="line.131"></a>
+<span class="sourceLineNo">132</span>   */<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  public ZKWatcher(Configuration conf, String identifier,<a name="line.133"></a>
+<span class="sourceLineNo">134</span>                   Abortable abortable, boolean canCreateBaseZNode)<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    throws IOException, ZooKeeperConnectionException {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    this(conf, identifier, abortable, canCreateBaseZNode, false);<a name="line.136"></a>
+<span class="sourceLineNo">137</span>  }<a name="line.137"></a>
+<span class="sourceLineNo">138</span><a name="line.138"></a>
+<span class="sourceLineNo">139</span>  /**<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   * Instantiate a ZooKeeper connection and watcher.<a name="line.140"></a>
+<span class="sourceLineNo">141</span>   * @param conf the configuration to use<a name="line.141"></a>
+<span class="sourceLineNo">142</span>   * @param identifier string that is passed to RecoverableZookeeper to be used as identifier for<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   *          this instance. Use null for default.<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   * @param abortable Can be null if there is on error there is no host to abort: e.g. client<a name="line.144"></a>
+<span class="sourceLineNo">145</span>   *          context.<a name="line.145"></a>
+<span class="sourceLineNo">146</span>   * @param canCreateBaseZNode true if a base ZNode can be created<a name="line.146"></a>
+<span class="sourceLineNo">147</span>   * @param clientZK whether this watcher is set to access client ZK<a name="line.147"></a>
+<span class="sourceLineNo">148</span>   * @throws IOException if the connection to ZooKeeper fails<a name="line.148"></a>
+<span class="sourceLineNo">149</span>   * @throws ZooKeeperConnectionException if the connection to Zookeeper fails when create base<a name="line.149"></a>
+<span class="sourceLineNo">150</span>   *           ZNodes<a name="line.150"></a>
+<span class="sourceLineNo">151</span>   */<a name="line.151"></a>
+<span class="sourceLineNo">152</span>  public ZKWatcher(Configuration conf, String identifier, Abortable abortable,<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      boolean canCreateBaseZNode, boolean clientZK)<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      throws IOException, ZooKeeperConnectionException {<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    this.conf = conf;<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    if (clientZK) {<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      String clientZkQuorumServers = ZKConfig.getClientZKQuorumServersString(conf);<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      String serverZkQuorumServers = ZKConfig.getZKQuorumServersString(conf);<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      if (clientZkQuorumServers != null) {<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        if (clientZkQuorumServers.equals(serverZkQuorumServers)) {<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          // Don't allow same settings to avoid dead loop when master trying<a name="line.161"></a>
+<span class="sourceLineNo">162</span>          // to sync meta information from server ZK to client ZK<a name="line.162"></a>
+<span class="sourceLineNo">163</span>          throw new IllegalArgumentException(<a name="line.163"></a>
+<span class="sourceLineNo">164</span>              "The quorum settings for client ZK should be different from those for server");<a name="line.164"></a>
+<span class="sourceLineNo">165</span>        }<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        this.quorum = clientZkQuorumServers;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      } else {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        this.quorum = serverZkQuorumServers;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      }<a name="line.169"></a>
+<span class="sourceLineNo">170</span>    } else {<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      this.quorum = ZKConfig.getZKQuorumServersString(conf);<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    this.prefix = identifier;<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    // Identifier will get the sessionid appended later below down when we<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    // handle the syncconnect event.<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    this.identifier = identifier + "0x0";<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    this.abortable = abortable;<a name="line.177"></a>
+<span class="sourceLineNo">178</span>    this.znodePaths = new ZNodePaths(conf);<a name="line.178"></a>
+<span class="sourceLineNo">179</span>    PendingWatcher pendingWatcher = new PendingWatcher();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    this.recoverableZooKeeper = ZKUtil.connect(conf, quorum, pendingWatcher, identifier);<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    pendingWatcher.prepare(this);<a name="line.181"></a>
+<span class="sourceLineNo">182</span>    if (canCreateBaseZNode) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      try {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        createBaseZNodes();<a name="line.184"></a>
+<span class="sourceLineNo">185</span>      } catch (ZooKeeperConnectionException zce) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>        try {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>          this.recoverableZooKeeper.close();<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        } catch (InterruptedException ie) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>          LOG.debug("Encountered InterruptedException when closing {}", this.recoverableZooKeeper);<a name="line.189"></a>
+<span class="sourceLineNo">190</span>          Thread.currentThread().interrupt();<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        }<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        throw zce;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      }<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    this.zkSyncTimeout = conf.getLong(HConstants.ZK_SYNC_BLOCKING_TIMEOUT_MS,<a name="line.195"></a>
+<span class="sourceLineNo">196</span>        HConstants.ZK_SYNC_BLOCKING_TIMEOUT_DEFAULT_MS);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>  }<a name="line.197"></a>
+<span class="sourceLineNo">198</span><a name="line.198"></a>
+<span class="sourceLineNo">199</span>  private void createBaseZNodes() throws ZooKeeperConnectionException {<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    try {<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      // Create all the necessary "directories" of znodes<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      ZKUtil.createWithParents(this, znodePaths.baseZNode);<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      ZKUtil.createAndFailSilent(this, znodePaths.rsZNode);<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      ZKUtil.createAndFailSilent(this, znodePaths.drainingZNode);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      ZKUtil.createAndFailSilent(this, znodePaths.tableZNode);<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      ZKUtil.createAndFailSilent(this, znodePaths.splitLogZNode);<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      ZKUtil.createAndFailSilent(this, znodePaths.backupMasterAddressesZNode);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      ZKUtil.createAndFailSilent(this, znodePaths.masterMaintZNode);<a name="line.208"></a>
+<span class="sourceLineNo">209</span>    } catch (KeeperException e) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      throw new ZooKeeperConnectionException(<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          prefix("Unexpected KeeperException creating base node"), e);<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    }<a name="line.212"></a>
+<span class="sourceLineNo">213</span>  }<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>  /**<a name="line.215"></a>
+<span class="sourceLineNo">216</span>   * On master start, we check the znode ACLs under the root directory and set the ACLs properly<a name="line.216"></a>
+<span class="sourceLineNo">217</span>   * if needed. If the cluster goes from an unsecure setup to a secure setup, this step is needed<a name="line.217"></a>
+<span class="sourceLineNo">218</span>   * so that the existing znodes created with open permissions are now changed with restrictive<a name="line.218"></a>
+<span class="sourceLineNo">219</span>   * perms.<a name="line.219"></a>
+<span class="sourceLineNo">220</span>   */<a name="line.220"></a>
+<span class="sourceLineNo">221</span>  public void checkAndSetZNodeAcls() {<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    if (!ZKUtil.isSecureZooKeeper(getConfiguration())) {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>      LOG.info("not a secure deployment, proceeding");<a name="line.223"></a>
+<span class="sourceLineNo">224</span>      return;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>    }<a name="line.225"></a>
+<span class="sourceLineNo">226</span><a name="line.226"></a>
+<span class="sourceLineNo">227</span>    // Check the base znodes permission first. Only do the recursion if base znode's perms are not<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    // correct.<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    try {<a name="line.229"></a>
+<span class="sourceLineNo">230</span>      List&lt;ACL&gt; actualAcls = recoverableZooKeeper.getAcl(znodePaths.baseZNode, new Stat());<a name="line.230"></a>
+<span class="sourceLineNo">231</span><a name="line.231"></a>
+<span class="sourceLineNo">232</span>      if (!isBaseZnodeAclSetup(actualAcls)) {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>        LOG.info("setting znode ACLs");<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        setZnodeAclsRecursive(znodePaths.baseZNode);<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      }<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    } catch(KeeperException.NoNodeException nne) {<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      return;<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    } catch(InterruptedException ie) {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      interruptedExceptionNoThrow(ie, false);<a name="line.239"></a>
+<span class="sourceLineNo">240</span>    } catch (IOException|KeeperException e) {<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      LOG.warn("Received exception while checking and setting zookeeper ACLs", e);<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    }<a name="line.242"></a>
+<span class="sourceLineNo">243</span>  }<a name="line.243"></a>
+<span class="sourceLineNo">244</span><a name="line.244"></a>
+<span class="sourceLineNo">245</span>  /**<a name="line.245"></a>
+<span class="sourceLineNo">246</span>   * Set the znode perms recursively. This will do post-order recursion, so that baseZnode ACLs<a name="line.246"></a>
+<span class="sourceLineNo">247</span>   * will be set last in case the master fails in between.<a name="line.247"></a>
+<span class="sourceLineNo">248</span>   * @param znode the ZNode to set the permissions for<a name="line.248"></a>
+<span class="sourceLineNo">249</span>   */<a name="line.249"></a>
+<span class="sourceLineNo">250</span>  private void setZnodeAclsRecursive(String znode) throws KeeperException, InterruptedException {<a name="line.250"></a>
+<span class="sourceLineNo">251</span>    List&lt;String&gt; children = recoverableZooKeeper.getChildren(znode, false);<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>    for (String child : children) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>      setZnodeAclsRecursive(ZNodePaths.joinZNode(znode, child));<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    List&lt;ACL&gt; acls = ZKUtil.createACL(this, znode, true);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    LOG.info("Setting ACLs for znode:{} , acl:{}", znode, acls);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    recoverableZooKeeper.setAcl(znode, acls, -1);<a name="line.258"></a>
+<span class="sourceLineNo">259</span>  }<a name="line.259"></a>
+<span class="sourceLineNo">260</span><a name="line.260"></a>
+<span class="sourceLineNo">261</span>  /**<a name="line.261"></a>
+<span class="sourceLineNo">262</span>   * Checks whether the ACLs returned from the base znode (/hbase) is set for secure setup.<a name="line.262"></a>
+<span class="sourceLineNo">263</span>   * @param acls acls from zookeeper<a name="line.263"></a>
+<span class="sourceLineNo">264</span>   * @return whether ACLs are set for the base znode<a name="line.264"></a>
+<span class="sourceLineNo">265</span>   * @throws IOException if getting the current user fails<a name="line.265"></a>
+<span class="sourceLineNo">266</span>   */<a name="line.266"></a>
+<span class="sourceLineNo">267</span>  private boolean isBaseZnodeAclSetup(List&lt;ACL&gt; acls) throws IOException {<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    if (LOG.isDebugEnabled()) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      LOG.debug("Checking znode ACLs");<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    }<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    String[] superUsers = conf.getStrings(Superusers.SUPERUSER_CONF_KEY);<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    // Check whether ACL set for all superusers<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    if (superUsers != null &amp;&amp; !checkACLForSuperUsers(superUsers, acls)) {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      return false;<a name="line.274"></a>
+<span class="sourceLineNo">275</span>    }<a name="line.275"></a>
+<span class="sourceLineNo">276</span><a name="line.276"></a>
+<span class="sourceLineNo">277</span>    // this assumes that current authenticated user is the same as zookeeper client user<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    // configured via JAAS<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    String hbaseUser = UserGroupInformation.getCurrentUser().getShortUserName();<a name="line.279"></a>
+<span class="sourceLineNo">280</span><a name="line.280"></a>
+<span class="sourceLineNo">281</span>    if (acls.isEmpty()) {<a name="line.281"></a>
+<span class="sourceLineNo">282</span>      if (LOG.isDebugEnabled()) {<a name="line.282"></a>
+<span class="sourceLineNo">283</span>        LOG.debug("ACL is empty");<a name="line.283"></a>
+<span class="sourceLineNo">284</span>      }<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      return false;<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    }<a name="line.286"></a>
+<span class="sourceLineNo">287</span><a name="line.287"></a>
+<span class="sourceLineNo">288</span>    for (ACL acl : acls) {<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      int perms = acl.getPerms();<a name="line.289"></a>
+<span class="sourceLineNo">290</span>      Id id = acl.getId();<a name="line.290"></a>
+<span class="sourceLineNo">291</span>      // We should only set at most 3 possible ACLs for 3 Ids. One for everyone, one for superuser<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      // and one for the hbase user<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      if (Ids.ANYONE_ID_UNSAFE.equals(id)) {<a name="line.293"></a>
+<span class="sourceLineNo">294</span>        if (perms != Perms.READ) {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>          if (LOG.isDebugEnabled()) {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.296"></a>
+<span class="sourceLineNo">297</span>              id, perms, Perms.READ));<a name="line.297"></a>
+<span class="sourceLineNo">298</span>          }<a name="line.298"></a>
+<span class="sourceLineNo">299</span>          return false;<a name="line.299"></a>
+<span class="sourceLineNo">300</span>        }<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      } else if (superUsers != null &amp;&amp; isSuperUserId(superUsers, id)) {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>        if (perms != Perms.ALL) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>          if (LOG.isDebugEnabled()) {<a name="line.303"></a>
+<span class="sourceLineNo">304</span>            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.304"></a>
+<span class="sourceLineNo">305</span>              id, perms, Perms.ALL));<a name="line.305"></a>
+<span class="sourceLineNo">306</span>          }<a name="line.306"></a>
+<span class="sourceLineNo">307</span>          return false;<a name="line.307"></a>
+<span class="sourceLineNo">308</span>        }<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      } else if ("sasl".equals(id.getScheme())) {<a name="line.309"></a>
+<span class="sourceLineNo">310</span>        String name = id.getId();<a name="line.310"></a>
+<span class="sourceLineNo">311</span>        // If ZooKeeper recorded the Kerberos full name in the ACL, use only the shortname<a name="line.311"></a>
+<span class="sourceLineNo">312</span>        Matcher match = NAME_PATTERN.matcher(name);<a name="line.312"></a>
+<span class="sourceLineNo">313</span>        if (match.matches()) {<a name="line.313"></a>
+<span class="sourceLineNo">314</span>          name = match.group(1);<a name="line.314"></a>
+<span class="sourceLineNo">315</span>        }<a name="line.315"></a>
+<span class="sourceLineNo">316</span>        if (name.equals(hbaseUser)) {<a name="line.316"></a>
+<span class="sourceLineNo">317</span>          if (perms != Perms.ALL) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>            if (LOG.isDebugEnabled()) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>              LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",<a name="line.319"></a>
+<span class="sourceLineNo">320</span>                id, perms, Perms.ALL));<a name="line.320"></a>
+<span class="sourceLineNo">321</span>            }<a name="line.321"></a>
+<span class="sourceLineNo">322</span>            return false;<a name="line.322"></a>
+<span class="sourceLineNo">323</span>          }<a name="line.323"></a>
+<span class="sourceLineNo">324</span>        } else {<a name="line.324"></a>
+<span class="sourceLineNo">325</span>          if (LOG.isDebugEnabled()) {<a name="line.325"></a>
+<span class="sourceLineNo">326</span>            LOG.debug("Unexpected shortname in SASL ACL: {}", id);<a name="line.326"></a>
+<span class="sourceLineNo">327</span>          }<a name="line.327"></a>
+<span class="sourceLineNo">328</span>          return false;<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        }<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      } else {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        if (LOG.isDebugEnabled()) {<a name="line.331"></a>
+<span class="sourceLineNo">332</span>          LOG.debug("unexpected ACL id '{}'", id);<a name="line.332"></a>
+<span class="sourceLineNo">333</span>        }<a name="line.333"></a>
+<span class="sourceLineNo">334</span>        return false;<a name="line.334"></a>
+<span class="sourceLineNo">335</span>      }<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    }<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    return true;<a name="line.337"></a>
+<span class="sourceLineNo">338</span>  }<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>  /*<a name="line.340"></a>
+<span class="sourceLineNo">341</span>   * Validate whether ACL set for all superusers.<a name="line.341"></a>
+<span class="sourceLineNo">342</span>   */<a name="line.342"></a>
+<span class="sourceLineNo">343</span>  private boolean checkACLForSuperUsers(String[] superUsers, List&lt;ACL&gt; acls) {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>    for (String user : superUsers) {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      boolean hasAccess = false;<a name="line.345"></a>
+<span class="sourceLineNo">346</span>      // TODO: Validate super group members also when ZK supports setting node ACL for groups.<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      if (!AuthUtil.isGroupPrincipal(user)) {<a name="line.347"></a>
+<span class="sourceLineNo">348</span>        for (ACL acl : acls) {<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          if (user.equals(acl.getId().getId())) {<a name="line.349"></a>
+<span class="sourceLineNo">350</span>            if (acl.getPerms() == Perms.ALL) {<a name="line.350"></a>
+<span class="sourceLineNo">351</span>              hasAccess = true;<a name="line.351"></a>
+<span class="sourceLineNo">352</span>            } else {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>              if (LOG.isDebugEnabled()) {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>                LOG.debug(String.format(<a name="line.354"></a>
+<span class="sourceLineNo">355</span>                  "superuser '%s' does not have correct permissions: have 0x%x, want 0x%x",<a name="line.355"></a>
+<span class="sourceLineNo">356</span>                  acl.getId().getId(), acl.getPerms(), Perms.ALL));<a name="line.356"></a>
+<span class="sourceLineNo">357</span>              }<a name="line.357"></a>
+<span class="sourceLineNo">358</span>            }<a name="line.358"></a>
+<span class="sourceLineNo">359</span>            break;<a name="line.359"></a>
+<span class="sourceLineNo">360</span>          }<a name="line.360"></a>
+<span class="sourceLineNo">361</span>        }<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        if (!hasAccess) {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>          return false;<a name="line.363"></a>
+<span class="sourceLineNo">364</span>        }<a name="line.364"></a>
+<span class="sourceLineNo">365</span>      }<a name="line.365"></a>
+<span class="sourceLineNo">366</span>    }<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    return true;<a name="line.367"></a>
+<span class="sourceLineNo">368</span>  }<a name="line.368"></a>
+<span class="sourceLineNo">369</span><a name="line.369"></a>
+<span class="sourceLineNo">370</span>  /*<a name="line.370"></a>
+<span class="sourceLineNo">371</span>   * Validate whether ACL ID is superuser.<a name="line.371"></a>
+<span class="sourceLineNo">372</span>   */<a name="line.372"></a>
+<span class="sourceLineNo">373</span>  public static boolean isSuperUserId(String[] superUsers, Id id) {<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    for (String user : superUsers) {<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      // TODO: Validate super group members also when ZK supports setting node ACL for groups.<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      if (!AuthUtil.isGroupPrincipal(user) &amp;&amp; new Id("sasl", user).equals(id)) {<a name="line.376"></a>
+<span class="sourceLineNo">377</span>        return true;<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      }<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    }<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    return false;<a name="line.380"></a>
+<span class="sourceLineNo">381</span>  }<a name="line.381"></a>
+<span class="sourceLineNo">382</span><a name="line.382"></a>
+<span class="sourceLineNo">383</span>  @Override<a name="line.383"></a>
+<span class="sourceLineNo">384</span>  public String toString() {<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    return this.identifier + ", quorum=" + quorum + ", baseZNode=" + znodePaths.baseZNode;<a name="line.385"></a>
+<span class="sourceLineNo">386</span>  }<a name="line.386"></a>
+<span class="sourceLineNo">387</span><a name="line.387"></a>
+<span class="sourceLineNo">388</span>  /**<a name="line.388"></a>
+<span class="sourceLineNo">389</span>   * Adds this instance's identifier as a prefix to the passed &lt;code&gt;str&lt;/code&gt;<a name="line.389"></a>
+<span class="sourceLineNo">390</span>   * @param str String to amend.<a name="line.390"></a>
+<span class="sourceLineNo">391</span>   * @return A new string with this instance's identifier as prefix: e.g.<a name="line.391"></a>
+<span class="sourceLineNo">392</span>   *         if passed 'hello world', the returned string could be<a name="line.392"></a>
+<span class="sourceLineNo">393</span>   */<a name="line.393"></a>
+<span class="sourceLineNo">394</span>  public String prefix(final String str) {<a name="line.394"></a>
+<span class="sourceLineNo">395</span>    return this.toString() + " " + str;<a name="line.395"></a>
+<span class="sourceLineNo">396</span>  }<a name="line.396"></a>
+<span class="sourceLineNo">397</span><a name="line.397"></a>
+<span class="sourceLineNo">398</span>  /**<a name="line.398"></a>
+<span class="sourceLineNo">399</span>   * Get the znodes corresponding to the meta replicas from ZK<a name="line.399"></a>
+<span class="sourceLineNo">400</span>   * @return list of znodes<a name="line.400"></a>
+<span class="sourceLineNo">401</span>   * @throws KeeperException if a ZooKeeper operation fails<a name="line.401"></a>
+<span class="sourceLineNo">402</span>   */<a name="line.402"></a>
+<span class="sourceLineNo">403</span>  public List&lt;String&gt; getMetaReplicaNodes() throws KeeperException {<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    List&lt;String&gt; childrenOfBaseNode = ZKUtil.listChildrenNoWatch(this, znodePaths.baseZNode);<a name="line.404"></a>
+<span class="sourceLineNo">405</span>    return filterMetaReplicaNodes(childrenOfBaseNode);<a name="line.405"></a>
+<span class="sourceLineNo">406</span>  }<a name="line.406"></a>
+<span class="sourceLineNo">407</span><a name="line.407"></a>
+<span class="sourceLineNo">408</span>  /**<a name="line.408"></a>
+<span class="sourceLineNo">409</span>   * Same as {@link #getMetaReplicaNodes()} except that this also registers a watcher on base znode<a name="line.409"></a>
+<span class="sourceLineNo">410</span>   * for subsequent CREATE/DELETE operations on child nodes.<a name="line.410"></a>
+<span class="sourceLineNo">411</span>   */<a name="line.411"></a>
+<span class="sourceLineNo">412</span>  public List&lt;String&gt; getMetaReplicaNodesAndWatchChildren() throws KeeperException {<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    List&lt;String&gt; childrenOfBaseNode =<a name="line.413"></a>
+<span class="sourceLineNo">414</span>        ZKUtil.listChildrenAndWatchForNewChildren(this, znodePaths.baseZNode);<a name="line.414"></a>
+<span class="sourceLineNo">415</span>    return filterMetaReplicaNodes(childrenOfBaseNode);<a name="line.415"></a>
+<span class="sourceLineNo">416</span>  }<a name="line.416"></a>
+<span class="sourceLineNo">417</span><a name="line.417"></a>
+<span class="sourceLineNo">418</span>  /**<a name="line.418"></a>
+<span class="sourceLineNo">419</span>   * @param nodes Input list of znodes<a name="line.419"></a>
+<span class="sourceLineNo">420</span>   * @return Filtered list of znodes from nodes that belong to meta replica(s).<a name="line.420"></a>
+<span class="sourceLineNo">421</span>   */<a name="line.421"></a>
+<span class="sourceLineNo">422</span>  private List&lt;String&gt; filterMetaReplicaNodes(List&lt;String&gt; nodes) {<a name="line.422"></a>
+<span class="sourceLineNo">423</span>    if (nodes == null || nodes.isEmpty()) {<a name="line.423"></a>
+<span class="sourceLineNo">424</span>      return new ArrayList&lt;&gt;();<a name="line.424"></a>
+<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
+<span class="sourceLineNo">426</span>    List&lt;String&gt; metaReplicaNodes = new ArrayList&lt;&gt;(2);<a name="line.426"></a>
+<span class="sourceLineNo">427</span>    String pattern = conf.get(ZNodePaths.META_ZNODE_PREFIX_CONF_KEY, ZNodePaths.META_ZNODE_PREFIX);<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    for (String child : nodes) {<a name="line.428"></a>
+<span class="sourceLineNo">429</span>      if (child.startsWith(pattern)) {<a name="line.429"></a>
+<span class="sourceLineNo">430</span>        metaReplicaNodes.add(child);<a name="line.430"></a>
+<span class="sourceLineNo">431</span>      }<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    }<a name="line.432"></a>
+<span class="sourceLineNo">433</span>    return metaReplicaNodes;<a name="line.433"></a>
+<span class="sourceLineNo">434</span>  }<a name="line.434"></a>
+<span class="sourceLineNo">435</span><a name="line.435"></a>
+<span class="sourceLineNo">436</span>  /**<a name="line.436"></a>
+<span class="sourceLineNo">437</span>   * Register the specified listener to receive ZooKeeper events.<a name="line.437"></a>
+<span class="sourceLineNo">438</span>   * @param listener the listener to register<a name="line.438"></a>
+<span class="sourceLineNo">439</span>   */<a name="line.439"></a>
+<span class="sourceLineNo">440</span>  public void registerListener(ZKListener listener) {<a name="line.440"></a>
+<span class="sourceLineNo">441</span>    listeners.add(listener);<a name="line.441"></a>
+<span class="sourceLineNo">442</span>  }<a name="line.442"></a>
+<span class="sourceLineNo">443</span><a name="line.443"></a>
+<span class="sourceLineNo">444</span>  /**<a name="line.444"></a>
+<span class="sourceLineNo">445</span>   * Register the specified listener to receive ZooKeeper events and add it as<a name="line.445"></a>
+<span class="sourceLineNo">446</span>   * the first in the list of current listeners.<a name="line.446"></a>
+<span class="sourceLineNo">447</span>   * @param listener the listener to register<a name="line.447"></a>
+<span class="sourceLineNo">448</span>   */<a name="line.448"></a>
+<span class="sourceLineNo">449</span>  public void registerListenerFirst(ZKListener listener) {<a name="line.449"></a>
+<span class="sourceLineNo">450</span>    listeners.add(0, listener);<a name="line.450"></a>
+<span class="sourceLineNo">451</span>  }<a name="line.451"></a>
+<span class="sourceLineNo">452</span><a name="line.452"></a>
+<span class="sourceLineNo">453</span>  public void unregisterListener(ZKListener listener) {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>    listeners.remove(listener);<a name="line.454"></a>
+<span class="sourceLineNo">455</span>  }<a name="line.455"></a>
+<span class="sourceLineNo">456</span><a name="line.456"></a>
+<span class="sourceLineNo">457</span>  /**<a name="line.457"></a>
+<span class="sourceLineNo">458</span>   * Clean all existing listeners<a name="line.458"></a>
+<span class="sourceLineNo">459</span>   */<a name="line.459"></a>
+<span class="sourceLineNo">460</span>  public void unregisterAllListeners() {<a name="line.460"></a>
+<span class="sourceLineNo">461</span>    listeners.clear();<a name="line.461"></a>
+<span class="sourceLineNo">462</span>  }<a name="line.462"></a>
+<span class="sourceLineNo">463</span><a name="line.463"></a>
+<span class="sourceLineNo">464</span>  /**<a name="line.464"></a>
+<span class="sourceLineNo">465</span>   * Get a copy of current registered listeners<a name="line.465"></a>
+<span class="sourceLineNo">466</span>   */<a name="line.466"></a>
+<span class="sourceLineNo">467</span>  public List&lt;ZKListener&gt; getListeners() {<a name="line.467"></a>
+<span class="sourceLineNo">468</span>    return new ArrayList&lt;&gt;(listeners);<a name="line.468"></a>
+<span class="sourceLineNo">469</span>  }<a name="line.469"></a>
+<span class="sourceLineNo">470</span><a name="line.470"></a>
+<span class="sourceLineNo">471</span>  /**<a name="line.471"></a>
+<span class="sourceLineNo">472</span>   * @return The number of currently registered listeners<a name="line.472"></a>
+<span class="sourceLineNo">473</span>   */<a name="line.473"></a>
+<span class="sourceLineNo">474</span>  public int getNumberOfListeners() {<a name="line.474"></a>
+<span class="sourceLineNo">475</span>    return listeners.size();<a name="line.475"></a>
+<span class="sourceLineNo">476</span>  }<a name="line.476"></a>
+<span class="sourceLineNo">477</span><a name="line.477"></a>
+<span class="sourceLineNo">478</span>  /**<a name="line.478"></a>
+<span class="sourceLineNo">479</span>   * Get the connection to ZooKeeper.<a name="line.479"></a>
+<span class="sourceLineNo">480</span>   * @return connection reference to zookeeper<a name="line.480"></a>
+<span class="sourceLineNo">481</span>   */<a name="line.481"></a>
+<span class="sourceLineNo">482</span>  public RecoverableZooKeeper getRecoverableZooKeeper() {<a name="line.482"></a>
+<span class="sourceLineNo">483</span>    return recoverableZooKeeper;<a name="line.483"></a>
+<span class="sourceLineNo">484</span>  }<a name="line.484"></a>
+<span class="sourceLineNo">485</span><a name="line.485"></a>
+<span class="sourceLineNo">486</span>  public void reconnectAfterExpiration() throws IOException, KeeperException, InterruptedException {<a name="line.486"></a>
+<span class="sourceLineNo">487</span>    recoverableZooKeeper.reconnectAfterExpiration();<a name="line.487"></a>
+<span class="sourceLineNo">488</span>  }<a name="line.488"></a>
+<span class="sourceLineNo">489</span><a name="line.489"></a>
+<span class="sourceLineNo">490</span>  /**<a name="line.490"></a>
+<span class="sourceLineNo">491</span>   * Get the quorum address of this instance.<a name="line.491"></a>
+<span class="sourceLineNo">492</span>   * @return quorum string of this zookeeper connection instance<a name="line.492"></a>
+<span class="sourceLineNo">493</span>   */<a name="line.493"></a>
+<span class="sourceLineNo">494</span>  public String getQuorum() {<a name="line.494"></a>
+<span class="sourceLineNo">495</span>    return quorum;<a name="line.495"></a>
+<span class="sourceLineNo">496</span>  }<a name="line.496"></a>
+<span class="sourceLineNo">497</span><a name="line.497"></a>
+<span class="sourceLineNo">498</span>  /**<a name="line.498"></a>
+<span class="sourceLineNo">499</span>   * Get the znodePaths.<a name="line.499"></a>
+<span class="sourceLineNo">500</span>   * &lt;p&gt;<a name="line.500"></a>
+<span class="sourceLineNo">501</span>   * Mainly used for mocking as mockito can not mock a field access.<a name="line.501"></a>
+<span class="sourceLineNo">502</span>   */<a name="line.502"></a>
+<span class="sourceLineNo">503</span>  public ZNodePaths getZNodePaths() {<a name="line.503"></a>
+<span class="sourceLineNo">504</span>    return znodePaths;<a name="line.504"></a>
+<span class="sourceLineNo">505</span>  }<a name="line.505"></a>
+<span class="sourceLineNo">506</span><a name="line.506"></a>
+<span class="sourceLineNo">507</span>  private void processEvent(WatchedEvent event) {<a name="line.507"></a>
+<span class="sourceLineNo">508</span>    switch(event.getType()) {<a name="line.508"></a>
+<span class="sourceLineNo">509</span>      // If event type is NONE, this is a connection status change<a name="line.509"></a>
+<span class="sourceLineNo">510</span>      case None: {<a name="line.510"></a>
+<span class="sourceLineNo">511</span>        connectionEvent(event);<a name="line.511"></a>
+<span class="sourceLineNo">512</span>        break;<a name="line.512"></a>
+<span class="sourceLineNo">513</span>      }<a name="line.513"></a>
+<span class="sourceLineNo">514</span><a name="line.514"></a>
+<span class="sourceLineNo">515</span>      // Otherwise pass along to the listeners<a name="line.515"></a>
+<span class="sourceLineNo">516</span>      case NodeCreated: {<a name="line.516"></a>
+<span class="sourceLineNo">517</span>        for(ZKListener listener : listeners) {<a name="line.517"></a>
+<span class="sourceLineNo">518</span>          listener.nodeCreated(event.getPath());<a name="line.518"></a>
+<span class="sourceLineNo">519</span>        }<a name="line.519"></a>
+<span class="sourceLineNo">520</span>        break;<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      }<a name="line.521"></a>
+<span class="sourceLineNo">522</span><a name="line.522"></a>
+<span class="sourceLineNo">523</span>      case NodeDeleted: {<a name="line.523"></a>
+<span class="sourceLineNo">524</span>        for(ZKListener listener : listeners) {<a name="line.524"></a>
+<span class="sourceLineNo">525</span>          listener.nodeDeleted(event.getPath());<a name="line.525"></a>
+<span class="sourceLineNo">526</span>        }<a name="line.526"></a>
+<span class="sourceLineNo">527</span>        break;<a name="line.527"></a>
+<span class="sourceLineNo">528</span>      }<a name="line.528"></a>
+<span class="sourceLineNo">529</span><a name="line.529"></a>
+<span class="sourceLineNo">530</span>      case NodeDataChanged: {<a name="line.530"></a>
+<span class="sourceLineNo">531</span>        for(ZKListener listener : listeners) {<a name="line.531"></a>
+<span class="sourceLineNo">532</span>          listener.nodeDataChanged(event.getPath());<a name="line.532"></a>
+<span class="sourceLineNo">533</span>        }<a name="line.533"></a>
+<span class="sourceLineNo">534</span>        break;<a name="line.534"></a>
+<span class="sourceLineNo">535</span>      }<a name="line.535"></a>
+<span class="sourceLineNo">536</span><a name="line.536"></a>
+<span class="sourceLineNo">537</span>      case NodeChildrenChanged: {<a name="line.537"></a>
+<span class="sourceLineNo">538</span>        for(ZKListener listener : listeners) {<a name="line.538"></a>
+<span class="sourceLineNo">539</span>          listener.nodeChildrenChanged(event.getPath());<a name="line.539"></a>
+<span class="sourceLineNo">540</span>        }<a name="line.540"></a>
+<span class="sourceLineNo">541</span>        break;<a name="line.541"></a>
+<span class="sourceLineNo">542</span>      }<a name="line.542"></a>
+<span class="sourceLineNo">543</span>      default:<a name="line.543"></a>
+<span class="sourceLineNo">544</span>        LOG.error("Invalid event of type {} received for path {}. Ignoring.",<a name="line.544"></a>
+<span class="sourceLineNo">545</span>            event.getState(), event.getPath());<a name="line.545"></a>
+<span class="sourceLineNo">546</span>    }<a name="line.546"></a>
+<span class="sourceLineNo">547</span>  }<a name="line.547"></a>
+<span class="sourceLineNo">548</span><a name="line.548"></a>
+<span class="sourceLineNo">549</span>  /**<a name="line.549"></a>
+<span class="sourceLineNo">550</span>   * Method called from ZooKeeper for events and connection status.<a name="line.550"></a>
+<span class="sourceLineNo">551</span>   * &lt;p&gt;<a name="line.551"></a>
+<span class="sourceLineNo">552</span>   * Valid events are passed along to listeners.  Connection status changes<a name="line.552"></a>
+<span class="sourceLineNo">553</span>   * are dealt with locally.<a name="line.553"></a>
+<span class="sourceLineNo">554</span>   */<a name="line.554"></a>
+<span class="sourceLineNo">555</span>  @Override<a name="line.555"></a>
+<span class="sourceLineNo">556</span>  public void process(WatchedEvent event) {<a name="line.556"></a>
+<span class="sourceLineNo">557</span>    LOG.debug(prefix("Received ZooKeeper Event, " +<a name="line.557"></a>
+<span class="sourceLineNo">558</span>        "type=" + event.getType() + ", " +<a name="line.558"></a>
+<span class="sourceLineNo">559</span>        "state=" + event.getState() + ", " +<a name="line.559"></a>
+<span class="sourceLineNo">560</span>        "path=" + event.getPath()));<a name="line.560"></a>
+<span class="sourceLineNo">561</span>    zkEventProcessor.submit(() -&gt; processEvent(event));<a name="line.561"></a>
+<span class="sourceLineNo">562</span>  }<a name="line.562"></a>
 <span class="sourceLineNo">563</span><a name="line.563"></a>
-<span class="sourceLineNo">564</span>  /**<a name="line.564"></a>
-<span class="sourceLineNo">565</span>   * Called when there is a connection-related event via the Watcher callback.<a name="line.565"></a>
-<span class="sourceLineNo">566</span>   * &lt;p&gt;<a name="line.566"></a>
-<span class="sourceLineNo">567</span>   * If Disconnected or Expired, this should shutdown the cluster. But, since<a name="line.567"></a>
-<span class="sourceLineNo">568</span>   * we send a KeeperException.SessionExpiredException along with the abort<a name="line.568"></a>
-<span class="sourceLineNo">569</span>   * call, it's possible for the Abortable to catch it and try to create a new<a name="line.569"></a>
-<span class="sourceLineNo">570</span>   * session with ZooKeeper. This is what the client does in HCM.<a name="line.570"></a>
-<span class="sourceLineNo">571</span>   * &lt;p&gt;<a name="line.571"></a>
-<span class="sourceLineNo">572</span>   * @param event the connection-related event<a name="line.572"></a>
-<span class="sourceLineNo">573</span>   */<a name="line.573"></a>
-<span class="sourceLineNo">574</span>  private void connectionEvent(WatchedEvent event) {<a name="line.574"></a>
-<span class="sourceLineNo">575</span>    switch(event.getState()) {<a name="line.575"></a>
-<span class="sourceLineNo">576</span>      case SyncConnected:<a name="line.576"></a>
-<span class="sourceLineNo">577</span>        this.identifier = this.prefix + "-0x" +<a name="line.577"></a>
-<span class="sourceLineNo">578</span>          Long.toHexString(this.recoverableZooKeeper.getSessionId());<a name="line.578"></a>
-<span class="sourceLineNo">579</span>        // Update our identifier.  Otherwise ignore.<a name="line.579"></a>
-<span class="sourceLineNo">580</span>        LOG.debug("{} connected", this.identifier);<a name="line.580"></a>
-<span class="sourceLineNo">581</span>        break;<a name="line.581"></a>
-<span class="sourceLineNo">582</span><a name="line.582"></a>
-<span class="sourceLineNo">583</span>      // Abort the server if Disconnected or Expired<a name="line.583"></a>
-<span class="sourceLineNo">584</span>      case Disconnected:<a name="line.584"></a>
-<span class="sourceLineNo">585</span>        LOG.debug(prefix("Received Disconnected from ZooKeeper, ignoring"));<a name="line.585"></a>
-<span class="sourceLineNo">586</span>        break;<a name="line.586"></a>
-<span class="sourceLineNo">587</span><a name="line.587"></a>
-<span class="sourceLineNo">588</span>      case Closed:<a name="line.588"></a>
-<span class="sourceLineNo">589</span>        LOG.debug(prefix("ZooKeeper client closed, ignoring"));<a name="line.589"></a>
-<span class="sourceLineNo">590</span>        break;<a name="line.590"></a>
-<span class="sourceLineNo">591</span><a name="line.591"></a>
-<span class="sourceLineNo">592</span>      case Expired:<a name="line.592"></a>
-<span class="sourceLineNo">593</span>        String msg = prefix(this.identifier + " received expired from " +<a name="line.593"></a>
-<span class="sourceLineNo">594</span>          "ZooKeeper, aborting");<a name="line.594"></a>
-<span class="sourceLineNo">595</span>        // TODO: One thought is to add call to ZKListener so say,<a name="line.595"></a>
-<span class="sourceLineNo">596</span>        // ZKNodeTracker can zero out its data values.<a name="line.596"></a>
-<span class="sourceLineNo">597</span>        if (this.abortable != null) {<a name="line.597"></a>
-<span class="sourceLineNo">598</span>          this.abortable.abort(msg, new KeeperException.SessionExpiredException());<a name="line.598"></a>
-<span class="sourceLineNo">599</span>        }<a name="line.599"></a>
-<span class="sourceLineNo">600</span>        break;<a name="line.600"></a>
-<span class="sourceLineNo">601</span><a name="line.601"></a>
-<span class="sourceLineNo">602</span>      case ConnectedReadOnly:<a name="line.602"></a>
-<span class="sourceLineNo">603</span>      case SaslAuthenticated:<a name="line.603"></a>
-<span class="sourceLineNo">604</span>      case AuthFailed:<a name="line.604"></a>
-<span class="sourceLineNo">605</span>        break;<a name="line.605"></a>
-<span class="sourceLineNo">606</span><a name="line.606"></a>
-<span class="sourceLineNo">607</span>      default:<a name="line.607"></a>
-<span class="sourceLineNo">608</span>        throw new IllegalStateException("Received event is not valid: " + event.getState());<a name="line.608"></a>
-<span class="sourceLineNo">609</span>    }<a name="line.609"></a>
-<span class="sourceLineNo">610</span>  }<a name="line.610"></a>
-<span class="sourceLineNo">611</span><a name="line.611"></a>
-<span class="sourceLineNo">612</span>  /**<a name="line.612"></a>
-<span class="sourceLineNo">613</span>   * Forces a synchronization of this ZooKeeper client connection within a timeout. Enforcing a<a name="line.613"></a>
-<span class="sourceLineNo">614</span>   * timeout lets the callers fail-fast rather than wait forever for the sync to finish.<a name="line.614"></a>
-<span class="sourceLineNo">615</span>   * &lt;p&gt;<a name="line.615"></a>
-<span class="sourceLineNo">616</span>   * Executing this method before running other methods will ensure that the<a name="line.616"></a>
-<span class="sourceLineNo">617</span>   * subsequent operations are up-to-date and consistent as of the time that<a name="line.617"></a>
-<span class="sourceLineNo">618</span>   * the sync is complete.<a name="line.618"></a>
-<span class="sourceLineNo">619</span>   * &lt;p&gt;<a name="line.619"></a>
-<span class="sourceLineNo">620</span>   * This is used for compareAndSwap type operations where we need to read the<a name="line.620"></a>
-<span class="sourceLineNo">621</span>   * data of an existing node and delete or transition that node, utilizing the<a name="line.621"></a>
-<span class="sourceLineNo">622</span>   * previously read version and data.  We want to ensure that the version read<a name="line.622"></a>
-<span class="sourceLineNo">623</span>   * is up-to-date from when we begin the operation.<a name="line.623"></a>
-<span class="sourceLineNo">624</span>   * &lt;p&gt;<a name="line.624"></a>
-<span class="sourceLineNo">625</span>   */<a name="line.625"></a>
-<span class="sourceLineNo">626</span>  public void syncOrTimeout(String path) throws KeeperException {<a name="line.626"></a>
-<span class="sourceLineNo">627</span>    final CountDownLatch latch = new CountDownLatch(1);<a name="line.627"></a>
-<span class="sourceLineNo">628</span>    long startTime = EnvironmentEdgeManager.currentTime();<a name="line.628"></a>
-<span class="sourceLineNo">629</span>    this.recoverableZooKeeper.sync(path, (i, s, o) -&gt; latch.countDown(), null);<a name="line.629"></a>
-<span class="sourceLineNo">630</span>    try {<a name="line.630"></a>
-<span class="sourceLineNo">631</span>      if (!latch.await(zkSyncTimeout, TimeUnit.MILLISECONDS)) {<a name="line.631"></a>
-<span class="sourceLineNo">632</span>        LOG.warn("sync() operation to ZK timed out. Configured timeout: {}ms. This usually points "<a name="line.632"></a>
-<span class="sourceLineNo">633</span>            + "to a ZK side issue. Check ZK server logs and metrics.", zkSyncTimeout);<a name="line.633"></a>
-<span class="sourceLineNo">634</span>        throw new KeeperException.RequestTimeoutException();<a name="line.634"></a>
-<span class="sourceLineNo">635</span>      }<a name="line.635"></a>
-<span class="sourceLineNo">636</span>    } catch (InterruptedException e) {<a name="line.636"></a>
-<span class="sourceLineNo">637</span>      LOG.warn("Interrupted waiting for ZK sync() to finish.", e);<a name="line.637"></a>
-<span class="sourceLineNo">638</span>      Thread.currentThread().interrupt();<a name="line.638"></a>
-<span class="sourceLineNo">639</span>      return;<a name="line.639"></a>
-<span class="sourceLineNo">640</span>    }<a name="line.640"></a>
-<span class="sourceLineNo">641</span>    if (LOG.isDebugEnabled()) {<a name="line.641"></a>
-<span class="sourceLineNo">642</span>      // TODO: Switch to a metric once server side ZK watcher metrics are implemented. This is a<a name="line.642"></a>
-<span class="sourceLineNo">643</span>      // useful metric to have since the latency of sync() impacts the callers.<a name="line.643"></a>
-<span class="sourceLineNo">644</span>      LOG.debug("ZK sync() operation took {}ms", EnvironmentEdgeManager.currentTime() - startTime);<a name="line.644"></a>
-<span class="sourceLineNo">645</span>    }<a name="line.645"></a>
-<span class="sourceLineNo">646</span>  }<a name="line.646"></a>
-<span class="sourceLineNo">647</span><a name="line.647"></a>
-<span class="sourceLineNo">648</span>  /**<a name="line.648"></a>
-<span class="sourceLineNo">649</span>   * Handles KeeperExceptions in client calls.<a name="line.649"></a>
-<span class="sourceLineNo">650</span>   * &lt;p&gt;<a name="line.650"></a>
-<span class="sourceLineNo">651</span>   * This may be temporary but for now this gives one place to deal with these.<a name="line.651"></a>
+<span class="sourceLineNo">564</span>  // Connection management<a name="line.564"></a>
+<span class="sourceLineNo">565</span><a name="line.565"></a>
+<span class="sourceLineNo">566</span>  /**<a name="line.566"></a>
+<span class="sourceLineNo">567</span>   * Called when there is a connection-related event via the Watcher callback.<a name="line.567"></a>
+<span class="sourceLineNo">568</span>   * &lt;p&gt;<a name="line.568"></a>
+<span class="sourceLineNo">569</span>   * If Disconnected or Expired, this should shutdown the cluster. But, since<a name="line.569"></a>
+<span class="sourceLineNo">570</span>   * we send a KeeperException.SessionExpiredException along with the abort<a name="line.570"></a>
+<span class="sourceLineNo">571</span>   * call, it's possible for the Abortable to catch it and try to create a new<a name="line.571"></a>
+<span class="sourceLineNo">572</span>   * session with ZooKeeper. This is what the client does in HCM.<a name="line.572"></a>
+<span class="sourceLineNo">573</span>   * &lt;p&gt;<a name="line.573"></a>
+<span class="sourceLineNo">574</span>   * @param event the connection-related event<a name="line.574"></a>
+<span class="sourceLineNo">575</span>   */<a name="line.575"></a>
+<span class="sourceLineNo">576</span>  private void connectionEvent(WatchedEvent event) {<a name="line.576"></a>
+<span class="sourceLineNo">577</span>    switch(event.getState()) {<a name="line.577"></a>
+<span class="sourceLineNo">578</span>      case SyncConnected:<a name="line.578"></a>
+<span class="sourceLineNo">579</span>        this.identifier = this.prefix + "-0x" +<a name="line.579"></a>
+<span class="sourceLineNo">580</span>          Long.toHexString(this.recoverableZooKeeper.getSessionId());<a name="line.580"></a>
+<span class="sourceLineNo">581</span>        // Update our identifier.  Otherwise ignore.<a name="line.581"></a>
+<span class="sourceLineNo">582</span>        LOG.debug("{} connected", this.identifier);<a name="line.582"></a>
+<span class="sourceLineNo">583</span>        break;<a name="line.583"></a>
+<span class="sourceLineNo">584</span><a name="line.584"></a>
+<span class="sourceLineNo">585</span>      // Abort the server if Disconnected or Expired<a name="line.585"></a>
+<span class="sourceLineNo">586</span>      case Disconnected:<a name="line.586"></a>
+<span class="sourceLineNo">587</span>        LOG.debug(prefix("Received Disconnected from ZooKeeper, ignoring"));<a name="line.587"></a>
+<span class="sourceLineNo">588</span>        break;<a name="line.588"></a>
+<span class="sourceLineNo">589</span><a name="line.589"></a>
+<span class="sourceLineNo">590</span>      case Closed:<a name="line.590"></a>
+<span class="sourceLineNo">591</span>        LOG.debug(prefix("ZooKeeper client closed, ignoring"));<a name="line.591"></a>
+<span class="sourceLineNo">592</span>        break;<a name="line.592"></a>
+<span class="sourceLineNo">593</span><a name="line.593"></a>
+<span class="sourceLineNo">594</span>      case Expired:<a name="line.594"></a>
+<span class="sourceLineNo">595</span>        String msg = prefix(this.identifier + " received expired from " +<a name="line.595"></a>
+<span class="sourceLineNo">596</span>          "ZooKeeper, aborting");<a name="line.596"></a>
+<span class="sourceLineNo">597</span>        // TODO: One thought is to add call to ZKListener so say,<a name="line.597"></a>
+<span class="sourceLineNo">598</span>        // ZKNodeTracker can zero out its data values.<a name="line.598"></a>
+<span class="sourceLineNo">599</span>        if (this.abortable != null) {<a name="line.599"></a>
+<span class="sourceLineNo">600</span>          this.abortable.abort(msg, new KeeperException.SessionExpiredException());<a name="line.600"></a>
+<span class="sourceLineNo">601</span>        }<a name="line.601"></a>
+<span class="sourceLineNo">602</span>        break;<a name="line.602"></a>
+<span class="sourceLineNo">603</span><a name="line.603"></a>
+<span class="sourceLineNo">604</span>      case ConnectedReadOnly:<a name="line.604"></a>
+<span class="sourceLineNo">605</span>      case SaslAuthenticated:<a name="line.605"></a>
+<span class="sourceLineNo">606</span>      case AuthFailed:<a name="line.606"></a>
+<span class="sourceLineNo">607</span>        break;<a name="line.607"></a>
+<span class="sourceLineNo">608</span><a name="line.608"></a>
+<span class="sourceLineNo">609</span>      default:<a name="line.609"></a>
+<span class="sourceLineNo">610</span>        throw new IllegalStateException("Received event is not valid: " + event.getState());<a name="line.610"></a>
+<span class="sourceLineNo">611</span>    }<a name="line.611"></a>
+<span class="sourceLineNo">612</span>  }<a name="line.612"></a>
+<span class="sourceLineNo">613</span><a name="line.613"></a>
+<span class="sourceLineNo">614</span>  /**<a name="line.614"></a>
+<span class="sourceLineNo">615</span>   * Forces a synchronization of this ZooKeeper client connection within a timeout. Enforcing a<a name="line.615"></a>
+<span class="sourceLineNo">616</span>   * timeout lets the callers fail-fast rather than wait forever for the sync to finish.<a name="line.616"></a>
+<span class="sourceLineNo">617</span>   * &lt;p&gt;<a name="line.617"></a>
+<span class="sourceLineNo">618</span>   * Executing this method before running other methods will ensure that the<a name="line.618"></a>
+<span class="sourceLineNo">619</span>   * subsequent operations are up-to-date and consistent as of the time that<a name="line.619"></a>
+<span class="sourceLineNo">620</span>   * the sync is complete.<a name="line.620"></a>
+<span class="sourceLineNo">621</span>   * &lt;p&gt;<a name="line.621"></a>
+<span class="sourceLineNo">622</span>   * This is used for compareAndSwap type operations where we need to read the<a name="line.622"></a>
+<span class="sourceLineNo">623</span>   * data of an existing node and delete or transition that node, utilizing the<a name="line.623"></a>
+<span class="sourceLineNo">624</span>   * previously read version and data.  We want to ensure that the version read<a name="line.624"></a>
+<span class="sourceLineNo">625</span>   * is up-to-date from when we begin the operation.<a name="line.625"></a>
+<span class="sourceLineNo">626</span>   * &lt;p&gt;<a name="line.626"></a>
+<span class="sourceLineNo">627</span>   */<a name="line.627"></a>
+<span class="sourceLineNo">628</span>  public void syncOrTimeout(String path) throws KeeperException {<a name="line.628"></a>
+<span class="sourceLineNo">629</span>    final CountDownLatch latch = new CountDownLatch(1);<a name="line.629"></a>
+<span class="sourceLineNo">630</span>    long startTime = EnvironmentEdgeManager.currentTime();<a name="line.630"></a>
+<span class="sourceLineNo">631</span>    this.recoverableZooKeeper.sync(path, (i, s, o) -&gt; latch.countDown(), null);<a name="line.631"></a>
+<span class="sourceLineNo">632</span>    try {<a name="line.632"></a>
+<span class="sourceLineNo">633</span>      if (!latch.await(zkSyncTimeout, TimeUnit.MILLISECONDS)) {<a name="line.633"></a>
+<span class="sourceLineNo">634</span>        LOG.warn("sync() operation to ZK timed out. Configured timeout: {}ms. This usually points "<a name="line.634"></a>
+<span class="sourceLineNo">635</span>            + "to a ZK side issue. Check ZK server logs and metrics.", zkSyncTimeout);<a name="line.635"></a>
+<span class="sourceLineNo">636</span>        throw new KeeperException.RequestTimeoutException();<a name="line.636"></a>
+<span class="sourceLineNo">637</span>      }<a name="line.637"></a>
+<span class="sourceLineNo">638</span>    } catch (InterruptedException e) {<a name="line.638"></a>
+<span class="sourceLineNo">639</span>      LOG.warn("Interrupted waiting for ZK sync() to finish.", e);<a name="line.639"></a>
+<span class="sourceLineNo">640</span>      Thread.currentThread().interrupt();<a name="line.640"></a>
+<span class="sourceLineNo">641</span>      return;<a name="line.641"></a>
+<span class="sourceLineNo">642</span>    }<a name="line.642"></a>
+<span class="sourceLineNo">643</span>    if (LOG.isDebugEnabled()) {<a name="line.643"></a>
+<span class="sourceLineNo">644</span>      // TODO: Switch to a metric once server side ZK watcher metrics are implemented. This is a<a name="line.644"></a>
+<span class="sourceLineNo">645</span>      // useful metric to have since the latency of sync() impacts the callers.<a name="line.645"></a>
+<span class="sourceLineNo">646</span>      LOG.debug("ZK sync() operation took {}ms", EnvironmentEdgeManager.currentTime() - startTime);<a name="line.646"></a>
+<span class="sourceLineNo">647</span>    }<a name="line.647"></a>
+<span class="sourceLineNo">648</span>  }<a name="line.648"></a>
+<span class="sourceLineNo">649</span><a name="line.649"></a>
+<span class="sourceLineNo">650</span>  /**<a name="line.650"></a>
+<span class="sourceLineNo">651</span>   * Handles KeeperExceptions in client calls.<a name="line.651"></a>
 <span class="sourceLineNo">652</span>   * &lt;p&gt;<a name="line.652"></a>
-<span class="sourceLineNo">653</span>   * TODO: Currently this method rethrows the exception to let the caller handle<a name="line.653"></a>
+<span class="sourceLineNo">653</span>   * This may be temporary but for now this gives one place to deal with these.<a name="line.653"></a>
 <span class="sourceLineNo">654</span>   * &lt;p&gt;<a name="line.654"></a>
-<span class="sourceLineNo">655</span>   * @param ke the exception to rethrow<a name="line.655"></a>
-<span class="sourceLineNo">656</span>   * @throws KeeperException if a ZooKeeper operation fails<a name="line.656"></a>
-<span class="sourceLineNo">657</span>   */<a name="line.657"></a>
-<span class="sourceLineNo">658</span>  public void keeperException(KeeperException ke) throws KeeperException {<a name="line.658"></a>
-<span class="sourceLineNo">659</span>    LOG.error(prefix("Received unexpected KeeperException, re-throwing exception"), ke);<a name="line.659"></a>
-<span class="sourceLineNo">660</span>    throw ke;<a name="line.660"></a>
-<span class="sourceLineNo">661</span>  }<a name="line.661"></a>
-<span class="sourceLineNo">662</span><a name="line.662"></a>
-<span class="sourceLineNo">663</span>  /**<a name="line.663"></a>
-<span class="sourceLineNo">664</span>   * Handles InterruptedExceptions in client calls.<a name="line.664"></a>
-<span class="sourceLineNo">665</span>   * @param ie the InterruptedException instance thrown<a name="line.665"></a>
-<span class="sourceLineNo">666</span>   * @throws KeeperException the exception to throw, transformed from the InterruptedException<a name="line.666"></a>
-<span class="sourceLineNo">667</span>   */<a name="line.667"></a>
-<span class="sourceLineNo">668</span>  public void interruptedException(InterruptedException ie) throws KeeperException {<a name="line.668"></a>
-<span class="sourceLineNo">669</span>    interruptedExceptionNoThrow(ie, true);<a name="line.669"></a>
-<span class="sourceLineNo">670</span>    // Throw a system error exception to let upper level handle it<a name="line.670"></a>
-<span class="sourceLineNo">671</span>    KeeperException keeperException = new KeeperException.SystemErrorException();<a name="line.671"></a>
-<span class="sourceLineNo">672</span>    keeperException.initCause(ie);<a name="line.672"></a>
-<span class="sourceLineNo">673</span>    throw keeperException;<a name="line.673"></a>
-<span class="sourceLineNo">674</span>  }<a name="line.674"></a>
-<span class="sourceLineNo">675</span><a name="line.675"></a>
-<span class="sourceLineNo">676</span>  /**<a name="line.676"></a>
-<span class="sourceLineNo">677</span>   * Log the InterruptedException and interrupt current thread<a name="line.677"></a>
-<span class="sourceLineNo">678</span>   * @param ie The IterruptedException to log<a name="line.678"></a>
-<span class="sourceLineNo">679</span>   * @param throwLater Whether we will throw the exception latter<a name="line.679"></a>
-<span class="sourceLineNo">680</span>   */<a name="line.680"></a>
-<span class="sourceLineNo">681</span>  public void interruptedExceptionNoThrow(InterruptedException ie, boolean throwLater) {<a name="line.681"></a>
-<span class="sourceLineNo">682</span>    LOG.debug(prefix("Received InterruptedException, will interrupt current thread"<a name="line.682"></a>
-<span class="sourceLineNo">683</span>        + (throwLater ? " and rethrow a SystemErrorException" : "")),<a name="line.683"></a>
-<span class="sourceLineNo">684</span>      ie);<a name="line.684"></a>
-<span class="sourceLineNo">685</span>    // At least preserve interrupt.<a name="line.685"></a>
-<span class="sourceLineNo">686</span>    Thread.currentThread().interrupt();<a name="line.686"></a>
-<span class="sourceLineNo">687</span>  }<a name="line.687"></a>
-<span class="sourceLineNo">688</span><a name="line.688"></a>
-<span class="sourceLineNo">689</span>  /**<a name="line.689"></a>
-<span class="sourceLineNo">690</span>   * Close the connection to ZooKeeper.<a name="line.690"></a>
-<span class="sourceLineNo">691</span>   *<a name="line.691"></a>
-<span class="sourceLineNo">692</span>   */<a name="line.692"></a>
-<span class="sourceLineNo">693</span>  @Override<a name="line.693"></a>
-<span class="sourceLineNo">694</span>  public void close() {<a name="line.694"></a>
-<span class="sourceLineNo">695</span>    zkEventProcessor.shutdownNow();<a name="line.695"></a>
-<span class="sourceLineNo">696</span>    try {<a name="line.696"></a>
-<span class="sourceLineNo">697</span>      recoverableZooKeeper.close();<a name="line.697"></a>
-<span class="sourceLineNo">698</span>    } catch (InterruptedException e) {<a name="line.698"></a>
-<span class="sourceLineNo">699</span>      Thread.currentThread().interrupt();<a name="line.699"></a>
-<span class="sourceLineNo">700</span>    }<a name="line.700"></a>
-<span class="sourceLineNo">701</span>  }<a name="line.701"></a>
-<span class="sourceLineNo">702</span><a name="line.702"></a>
-<span class="sourceLineNo">703</span>  public Configuration getConfiguration() {<a name="line.703"></a>
-<span class="sourceLineNo">704</span>    return conf;<a name="line.704"></a>
-<span class="sourceLineNo">705</span>  }<a name="line.705"></a>
-<span class="sourceLineNo">706</span><a name="line.706"></a>
-<span class="sourceLineNo">707</span>  @Override<a name="line.707"></a>
-<span class="sourceLineNo">708</span>  public void abort(String why, Throwable e) {<a name="line.708"></a>
-<span class="sourceLineNo">709</span>    if (this.abortable != null) {<a name="line.709"></a>
-<span class="sourceLineNo">710</span>      this.abortable.abort(why, e);<a name="line.710"></a>
-<span class="sourceLineNo">711</span>    } else {<a name="line.711"></a>
-<span class="sourceLineNo">712</span>      this.aborted = true;<a name="line.712"></a>
-<span class="sourceLineNo">713</span>    }<a name="line.713"></a>
-<span class="sourceLineNo">714</span>  }<a name="line.714"></a>
-<span class="sourceLineNo">715</span><a name="line.715"></a>
-<span class="sourceLineNo">716</span>  @Override<a name="line.716"></a>
-<span class="sourceLineNo">717</span>  public boolean isAborted() {<a name="line.717"></a>
-<span class="sourceLineNo">718</span>    return this.abortable == null? this.aborted: this.abortable.isAborted();<a name="line.718"></a>
-<span class="sourceLineNo">719</span>  }<a name="line.719"></a>
-<span class="sourceLineNo">720</span>}<a name="line.720"></a>
+<span class="sourceLineNo">655</span>   * TODO: Currently this method rethrows the exception to let the caller handle<a name="line.655"></a>
+<span class="sourceLineNo">656</span>   * &lt;p&gt;<a name="line.656"></a>
+<span class="sourceLineNo">657</span>   * @param ke the exception to rethrow<a name="line.657"></a>
+<span class="sourceLineNo">658</span>   * @throws KeeperException if a ZooKeeper operation fails<a name="line.658"></a>
+<span class="sourceLineNo">659</span>   */<a name="line.659"></a>
+<span class="sourceLineNo">660</span>  public void keeperException(KeeperException ke) throws KeeperException {<a name="line.660"></a>
+<span class="sourceLineNo">661</span>    LOG.error(prefix("Received unexpected KeeperException, re-throwing exception"), ke);<a name="line.661"></a>
+<span class="sourceLineNo">662</span>    throw ke;<a name="line.662"></a>
+<span class="sourceLineNo">663</span>  }<a name="line.663"></a>
+<span class="sourceLineNo">664</span><a name="line.664"></a>
+<span class="sourceLineNo">665</span>  /**<a name="line.665"></a>
+<span class="sourceLineNo">666</span>   * Handles InterruptedExceptions in client calls.<a name="line.666"></a>
+<span class="sourceLineNo">667</span>   * @param ie the InterruptedException instance thrown<a name="line.667"></a>
+<span class="sourceLineNo">668</span>   * @throws KeeperException the exception to throw, transformed from the InterruptedException<a name="line.668"></a>
+<span class="sourceLineNo">669</span>   */<a name="line.669"></a>
+<span class="sourceLineNo">670</span>  public void interruptedException(InterruptedException ie) throws KeeperException {<a name="line.670"></a>
+<span class="sourceLineNo">671</span>    interruptedExceptionNoThrow(ie, true);<a name="line.671"></a>
+<span class="sourceLineNo">672</span>    // Throw a system error exception to let upper level handle it<a name="line.672"></a>
+<span class="sourceLineNo">673</span>    KeeperException keeperException = new KeeperException.SystemErrorException();<a name="line.673"></a>
+<span class="sourceLineNo">674</span>    keeperException.initCause(ie);<a name="line.674"></a>
+<span class="sourceLineNo">675</span>    throw keeperException;<a name="line.675"></a>
+<span class="sourceLineNo">676</span>  }<a name="line.676"></a>
+<span class="sourceLineNo">677</span><a name="line.677"></a>
+<span class="sourceLineNo">678</span>  /**<a name="line.678"></a>
+<span class="sourceLineNo">679</span>   * Log the InterruptedException and interrupt current thread<a name="line.679"></a>
+<span class="sourceLineNo">680</span>   * @param ie The IterruptedException to log<a name="line.680"></a>
+<span class="sourceLineNo">681</span>   * @param throwLater Whether we will throw the exception latter<a name="line.681"></a>
+<span class="sourceLineNo">682</span>   */<a name="line.682"></a>
+<span class="sourceLineNo">683</span>  public void interruptedExceptionNoThrow(InterruptedException ie, boolean throwLater) {<a name="line.683"></a>
+<span class="sourceLineNo">684</span>    LOG.debug(prefix("Received InterruptedException, will interrupt current thread"<a name="line.684"></a>
+<span class="sourceLineNo">685</span>        + (throwLater ? " and rethrow a SystemErrorException" : "")),<a name="line.685"></a>
+<span class="sourceLineNo">686</span>      ie);<a name="line.686"></a>
+<span class="sourceLineNo">687</span>    // At least preserve interrupt.<a name="line.687"></a>
+<span class="sourceLineNo">688</span>    Thread.currentThread().interrupt();<a name="line.688"></a>
+<span class="sourceLineNo">689</span>  }<a name="line.689"></a>
+<span class="sourceLineNo">690</span><a name="line.690"></a>
+<span class="sourceLineNo">691</span>  /**<a name="line.691"></a>
+<span class="sourceLineNo">692</span>   * Close the connection to ZooKeeper.<a name="line.692"></a>
+<span class="sourceLineNo">693</span>   *<a name="line.693"></a>
+<span class="sourceLineNo">694</span>   */<a name="line.694"></a>
+<span class="sourceLineNo">695</span>  @Override<a name="line.695"></a>
+<span class="sourceLineNo">696</span>  public void close() {<a name="line.696"></a>
+<span class="sourceLineNo">697</span>    zkEventProcessor.shutdownNow();<a name="line.697"></a>
+<span class="sourceLineNo">698</span>    try {<a name="line.698"></a>
+<span class="sourceLineNo">699</span>      recoverableZooKeeper.close();<a name="line.699"></a>
+<span class="sourceLineNo">700</span>    } catch (InterruptedException e) {<a name="line.700"></a>
+<span class="sourceLineNo">701</span>      Thread.currentThread().interrupt();<a name="line.701"></a>
+<span class="sourceLineNo">702</span>    }<a name="line.702"></a>
+<span class="sourceLineNo">703</span>  }<a name="line.703"></a>
+<span class="sourceLineNo">704</span><a name="line.704"></a>
+<span class="sourceLineNo">705</span>  public Configuration getConfiguration() {<a name="line.705"></a>
+<span class="sourceLineNo">706</span>    return conf;<a name="line.706"></a>
+<span class="sourceLineNo">707</span>  }<a name="line.707"></a>
+<span class="sourceLineNo">708</span><a name="line.708"></a>
+<span class="sourceLineNo">709</span>  @Override<a name="line.709"></a>
+<span class="sourceLineNo">710</span>  public void abort(String why, Throwable e) {<a name="line.710"></a>
+<span class="sourceLineNo">711</span>    if (this.abortable != null) {<a name="line.711"></a>
+<span class="sourceLineNo">712</span>      this.abortable.abort(why, e);<a name="line.712"></a>
+<span class="sourceLineNo">713</span>    } else {<a name="line.713"></a>
+<span class="sourceLineNo">714</span>      this.aborted = true;<a name="line.714"></a>
+<span class="sourceLineNo">715</span>    }<a name="line.715"></a>
+<span class="sourceLineNo">716</span>  }<a name="line.716"></a>
+<span class="sourceLineNo">717</span><a name="line.717"></a>
+<span class="sourceLineNo">718</span>  @Override<a name="line.718"></a>
+<span class="sourceLineNo">719</span>  public boolean isAborted() {<a name="line.719"></a>
+<span class="sourceLineNo">720</span>    return this.abortable == null? this.aborted: this.abortable.isAborted();<a name="line.720"></a>
+<span class="sourceLineNo">721</span>  }<a name="line.721"></a>
+<span class="sourceLineNo">722</span>}<a name="line.722"></a>
 
 
 

@@ -52,378 +52,380 @@
 <span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.client.TableDescriptorBuilder;<a name="line.44"></a>
 <span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.AbstractHBaseTool;<a name="line.45"></a>
 <span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.util.StringUtils;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.util.ToolRunner;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.slf4j.Logger;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.slf4j.LoggerFactory;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.apache.hbase.thirdparty.com.google.common.collect.Lists;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>import org.apache.hbase.thirdparty.org.apache.commons.cli.CommandLine;<a name="line.54"></a>
-<span class="sourceLineNo">055</span><a name="line.55"></a>
-<span class="sourceLineNo">056</span>/**<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * A test tool that uses multiple threads to read and write multifamily rows into a table, verifying<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * that reads never see partially-complete writes<a name="line.58"></a>
-<span class="sourceLineNo">059</span> */<a name="line.59"></a>
-<span class="sourceLineNo">060</span>@InterfaceAudience.Private<a name="line.60"></a>
-<span class="sourceLineNo">061</span>public class AcidGuaranteesTestTool extends AbstractHBaseTool {<a name="line.61"></a>
-<span class="sourceLineNo">062</span><a name="line.62"></a>
-<span class="sourceLineNo">063</span>  private static final Logger LOG = LoggerFactory.getLogger(AcidGuaranteesTestTool.class);<a name="line.63"></a>
-<span class="sourceLineNo">064</span><a name="line.64"></a>
-<span class="sourceLineNo">065</span>  public static final TableName TABLE_NAME = TableName.valueOf("TestAcidGuarantees");<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  public static final byte[] FAMILY_A = Bytes.toBytes("A");<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  public static final byte[] FAMILY_B = Bytes.toBytes("B");<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  public static final byte[] FAMILY_C = Bytes.toBytes("C");<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  public static final byte[] QUALIFIER_NAME = Bytes.toBytes("data");<a name="line.69"></a>
-<span class="sourceLineNo">070</span><a name="line.70"></a>
-<span class="sourceLineNo">071</span>  public static final byte[][] FAMILIES = new byte[][] { FAMILY_A, FAMILY_B, FAMILY_C };<a name="line.71"></a>
-<span class="sourceLineNo">072</span><a name="line.72"></a>
-<span class="sourceLineNo">073</span>  public static int NUM_COLS_TO_CHECK = 50;<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private ExecutorService sharedPool;<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  private long millisToRun;<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  private int numWriters;<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  private int numGetters;<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  private int numScanners;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>  private int numUniqueRows;<a name="line.81"></a>
-<span class="sourceLineNo">082</span>  private boolean crazyFlush;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private boolean useMob;<a name="line.83"></a>
-<span class="sourceLineNo">084</span><a name="line.84"></a>
-<span class="sourceLineNo">085</span>  private ExecutorService createThreadPool() {<a name="line.85"></a>
-<span class="sourceLineNo">086</span>    int maxThreads = 256;<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    int coreThreads = 128;<a name="line.87"></a>
-<span class="sourceLineNo">088</span><a name="line.88"></a>
-<span class="sourceLineNo">089</span>    long keepAliveTime = 60;<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    BlockingQueue&lt;Runnable&gt; workQueue = new LinkedBlockingQueue&lt;Runnable&gt;(<a name="line.90"></a>
-<span class="sourceLineNo">091</span>        maxThreads * HConstants.DEFAULT_HBASE_CLIENT_MAX_TOTAL_TASKS);<a name="line.91"></a>
-<span class="sourceLineNo">092</span><a name="line.92"></a>
-<span class="sourceLineNo">093</span>    ThreadPoolExecutor tpe =<a name="line.93"></a>
-<span class="sourceLineNo">094</span>      new ThreadPoolExecutor(coreThreads, maxThreads, keepAliveTime, TimeUnit.SECONDS, workQueue,<a name="line.94"></a>
-<span class="sourceLineNo">095</span>        new ThreadFactoryBuilder().setNameFormat(toString() + "-shared-pool-%d").build());<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    tpe.allowCoreThreadTimeOut(true);<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    return tpe;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  @Override<a name="line.100"></a>
-<span class="sourceLineNo">101</span>  protected void addOptions() {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    addOptWithArg("millis", "time limit in milliseconds");<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    addOptWithArg("numWriters", "number of write threads");<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    addOptWithArg("numGetters", "number of get threads");<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    addOptWithArg("numScanners", "number of scan threads");<a name="line.105"></a>
-<span class="sourceLineNo">106</span>    addOptWithArg("numUniqueRows", "number of unique rows to test");<a name="line.106"></a>
-<span class="sourceLineNo">107</span>    addOptNoArg("crazyFlush",<a name="line.107"></a>
-<span class="sourceLineNo">108</span>      "if specified we will flush continuously otherwise will flush every minute");<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    addOptNoArg("useMob", "if specified we will enable mob on the first column family");<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  }<a name="line.110"></a>
-<span class="sourceLineNo">111</span><a name="line.111"></a>
-<span class="sourceLineNo">112</span>  @Override<a name="line.112"></a>
-<span class="sourceLineNo">113</span>  protected void processOptions(CommandLine cmd) {<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    millisToRun = getOptionAsLong(cmd, "millis", 5000);<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    numWriters = getOptionAsInt(cmd, "numWriters", 50);<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    numGetters = getOptionAsInt(cmd, "numGetters", 2);<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    numScanners = getOptionAsInt(cmd, "numScanners", 2);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    numUniqueRows = getOptionAsInt(cmd, "numUniqueRows", 3);<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    crazyFlush = cmd.hasOption("crazyFlush");<a name="line.119"></a>
-<span class="sourceLineNo">120</span>    useMob = cmd.hasOption("useMob");<a name="line.120"></a>
-<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
-<span class="sourceLineNo">122</span><a name="line.122"></a>
-<span class="sourceLineNo">123</span>  @Override<a name="line.123"></a>
-<span class="sourceLineNo">124</span>  protected int doWork() throws Exception {<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    sharedPool = createThreadPool();<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    try (Connection conn = ConnectionFactory.createConnection(getConf())) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      runTestAtomicity(conn.getAdmin());<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    } finally {<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      sharedPool.shutdown();<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    }<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    return 0;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  }<a name="line.132"></a>
-<span class="sourceLineNo">133</span><a name="line.133"></a>
-<span class="sourceLineNo">134</span>  /**<a name="line.134"></a>
-<span class="sourceLineNo">135</span>   * Thread that does random full-row writes into a table.<a name="line.135"></a>
-<span class="sourceLineNo">136</span>   */<a name="line.136"></a>
-<span class="sourceLineNo">137</span>  public static class AtomicityWriter extends RepeatingTestThread {<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    Random rand = new Random();<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    byte data[] = new byte[10];<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    byte[][] targetRows;<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    byte[][] targetFamilies;<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    Connection connection;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    Table table;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    AtomicLong numWritten = new AtomicLong();<a name="line.144"></a>
-<span class="sourceLineNo">145</span><a name="line.145"></a>
-<span class="sourceLineNo">146</span>    public AtomicityWriter(TestContext ctx, byte[][] targetRows, byte[][] targetFamilies,<a name="line.146"></a>
-<span class="sourceLineNo">147</span>        ExecutorService pool) throws IOException {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      super(ctx);<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      this.targetRows = targetRows;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>      this.targetFamilies = targetFamilies;<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      table = connection.getTable(TABLE_NAME);<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    }<a name="line.153"></a>
-<span class="sourceLineNo">154</span><a name="line.154"></a>
-<span class="sourceLineNo">155</span>    @Override<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    public void doAnAction() throws Exception {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      // Pick a random row to write into<a name="line.157"></a>
-<span class="sourceLineNo">158</span>      byte[] targetRow = targetRows[rand.nextInt(targetRows.length)];<a name="line.158"></a>
-<span class="sourceLineNo">159</span>      Put p = new Put(targetRow);<a name="line.159"></a>
-<span class="sourceLineNo">160</span>      rand.nextBytes(data);<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>      for (byte[] family : targetFamilies) {<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>          byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.164"></a>
-<span class="sourceLineNo">165</span>          p.addColumn(family, qualifier, data);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>        }<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      }<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      table.put(p);<a name="line.168"></a>
-<span class="sourceLineNo">169</span>      numWritten.getAndIncrement();<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    }<a name="line.170"></a>
-<span class="sourceLineNo">171</span><a name="line.171"></a>
-<span class="sourceLineNo">172</span>    @Override<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    public void workDone() throws IOException {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      try {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        table.close();<a name="line.175"></a>
-<span class="sourceLineNo">176</span>      } finally {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>        connection.close();<a name="line.177"></a>
-<span class="sourceLineNo">178</span>      }<a name="line.178"></a>
-<span class="sourceLineNo">179</span>    }<a name="line.179"></a>
-<span class="sourceLineNo">180</span>  }<a name="line.180"></a>
-<span class="sourceLineNo">181</span><a name="line.181"></a>
-<span class="sourceLineNo">182</span>  /**<a name="line.182"></a>
-<span class="sourceLineNo">183</span>   * Thread that does single-row reads in a table, looking for partially completed rows.<a name="line.183"></a>
-<span class="sourceLineNo">184</span>   */<a name="line.184"></a>
-<span class="sourceLineNo">185</span>  public static class AtomicGetReader extends RepeatingTestThread {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    byte[] targetRow;<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    byte[][] targetFamilies;<a name="line.187"></a>
-<span class="sourceLineNo">188</span>    Connection connection;<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    Table table;<a name="line.189"></a>
-<span class="sourceLineNo">190</span>    int numVerified = 0;<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    AtomicLong numRead = new AtomicLong();<a name="line.191"></a>
-<span class="sourceLineNo">192</span><a name="line.192"></a>
-<span class="sourceLineNo">193</span>    public AtomicGetReader(TestContext ctx, byte[] targetRow, byte[][] targetFamilies,<a name="line.193"></a>
-<span class="sourceLineNo">194</span>        ExecutorService pool) throws IOException {<a name="line.194"></a>
-<span class="sourceLineNo">195</span>      super(ctx);<a name="line.195"></a>
-<span class="sourceLineNo">196</span>      this.targetRow = targetRow;<a name="line.196"></a>
-<span class="sourceLineNo">197</span>      this.targetFamilies = targetFamilies;<a name="line.197"></a>
-<span class="sourceLineNo">198</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>      table = connection.getTable(TABLE_NAME);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>    @Override<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    public void doAnAction() throws Exception {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      Get g = new Get(targetRow);<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      Result res = table.get(g);<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      byte[] gotValue = null;<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      if (res.getRow() == null) {<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        // Trying to verify but we didn't find the row - the writing<a name="line.208"></a>
-<span class="sourceLineNo">209</span>        // thread probably just hasn't started writing yet, so we can<a name="line.209"></a>
-<span class="sourceLineNo">210</span>        // ignore this action<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        return;<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      }<a name="line.212"></a>
-<span class="sourceLineNo">213</span><a name="line.213"></a>
-<span class="sourceLineNo">214</span>      for (byte[] family : targetFamilies) {<a name="line.214"></a>
-<span class="sourceLineNo">215</span>        for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>          byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.216"></a>
-<span class="sourceLineNo">217</span>          byte thisValue[] = res.getValue(family, qualifier);<a name="line.217"></a>
-<span class="sourceLineNo">218</span>          if (gotValue != null &amp;&amp; !Bytes.equals(gotValue, thisValue)) {<a name="line.218"></a>
-<span class="sourceLineNo">219</span>            gotFailure(gotValue, res);<a name="line.219"></a>
-<span class="sourceLineNo">220</span>          }<a name="line.220"></a>
-<span class="sourceLineNo">221</span>          numVerified++;<a name="line.221"></a>
-<span class="sourceLineNo">222</span>          gotValue = thisValue;<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        }<a name="line.223"></a>
-<span class="sourceLineNo">224</span>      }<a name="line.224"></a>
-<span class="sourceLineNo">225</span>      numRead.getAndIncrement();<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    }<a name="line.226"></a>
-<span class="sourceLineNo">227</span><a name="line.227"></a>
-<span class="sourceLineNo">228</span>    @Override<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    public void workDone() throws IOException {<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      try {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>        table.close();<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      } finally {<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        connection.close();<a name="line.233"></a>
-<span class="sourceLineNo">234</span>      }<a name="line.234"></a>
-<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
-<span class="sourceLineNo">236</span><a name="line.236"></a>
-<span class="sourceLineNo">237</span>    private void gotFailure(byte[] expected, Result res) {<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      StringBuilder msg = new StringBuilder();<a name="line.238"></a>
-<span class="sourceLineNo">239</span>      msg.append("Failed after ").append(numVerified).append("!");<a name="line.239"></a>
-<span class="sourceLineNo">240</span>      msg.append("Expected=").append(Bytes.toStringBinary(expected));<a name="line.240"></a>
-<span class="sourceLineNo">241</span>      msg.append("Got:\n");<a name="line.241"></a>
-<span class="sourceLineNo">242</span>      for (Cell kv : res.listCells()) {<a name="line.242"></a>
-<span class="sourceLineNo">243</span>        msg.append(kv.toString());<a name="line.243"></a>
-<span class="sourceLineNo">244</span>        msg.append(" val= ");<a name="line.244"></a>
-<span class="sourceLineNo">245</span>        msg.append(Bytes.toStringBinary(CellUtil.cloneValue(kv)));<a name="line.245"></a>
-<span class="sourceLineNo">246</span>        msg.append("\n");<a name="line.246"></a>
-<span class="sourceLineNo">247</span>      }<a name="line.247"></a>
-<span class="sourceLineNo">248</span>      throw new RuntimeException(msg.toString());<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    }<a name="line.249"></a>
-<span class="sourceLineNo">250</span>  }<a name="line.250"></a>
-<span class="sourceLineNo">251</span><a name="line.251"></a>
-<span class="sourceLineNo">252</span>  /**<a name="line.252"></a>
-<span class="sourceLineNo">253</span>   * Thread that does full scans of the table looking for any partially completed rows.<a name="line.253"></a>
-<span class="sourceLineNo">254</span>   */<a name="line.254"></a>
-<span class="sourceLineNo">255</span>  public static class AtomicScanReader extends RepeatingTestThread {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    byte[][] targetFamilies;<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    Table table;<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    Connection connection;<a name="line.258"></a>
-<span class="sourceLineNo">259</span>    AtomicLong numScans = new AtomicLong();<a name="line.259"></a>
-<span class="sourceLineNo">260</span>    AtomicLong numRowsScanned = new AtomicLong();<a name="line.260"></a>
-<span class="sourceLineNo">261</span><a name="line.261"></a>
-<span class="sourceLineNo">262</span>    public AtomicScanReader(TestContext ctx, byte[][] targetFamilies, ExecutorService pool)<a name="line.262"></a>
-<span class="sourceLineNo">263</span>        throws IOException {<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      super(ctx);<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      this.targetFamilies = targetFamilies;<a name="line.265"></a>
-<span class="sourceLineNo">266</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      table = connection.getTable(TABLE_NAME);<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    }<a name="line.268"></a>
-<span class="sourceLineNo">269</span><a name="line.269"></a>
-<span class="sourceLineNo">270</span>    @Override<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    public void doAnAction() throws Exception {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      Scan s = new Scan();<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      for (byte[] family : targetFamilies) {<a name="line.273"></a>
-<span class="sourceLineNo">274</span>        s.addFamily(family);<a name="line.274"></a>
-<span class="sourceLineNo">275</span>      }<a name="line.275"></a>
-<span class="sourceLineNo">276</span>      ResultScanner scanner = table.getScanner(s);<a name="line.276"></a>
-<span class="sourceLineNo">277</span><a name="line.277"></a>
-<span class="sourceLineNo">278</span>      for (Result res : scanner) {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>        byte[] gotValue = null;<a name="line.279"></a>
-<span class="sourceLineNo">280</span><a name="line.280"></a>
-<span class="sourceLineNo">281</span>        for (byte[] family : targetFamilies) {<a name="line.281"></a>
-<span class="sourceLineNo">282</span>          for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>            byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.283"></a>
-<span class="sourceLineNo">284</span>            byte thisValue[] = res.getValue(family, qualifier);<a name="line.284"></a>
-<span class="sourceLineNo">285</span>            if (gotValue != null &amp;&amp; !Bytes.equals(gotValue, thisValue)) {<a name="line.285"></a>
-<span class="sourceLineNo">286</span>              gotFailure(gotValue, res);<a name="line.286"></a>
-<span class="sourceLineNo">287</span>            }<a name="line.287"></a>
-<span class="sourceLineNo">288</span>            gotValue = thisValue;<a name="line.288"></a>
-<span class="sourceLineNo">289</span>          }<a name="line.289"></a>
-<span class="sourceLineNo">290</span>        }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>        numRowsScanned.getAndIncrement();<a name="line.291"></a>
-<span class="sourceLineNo">292</span>      }<a name="line.292"></a>
-<span class="sourceLineNo">293</span>      numScans.getAndIncrement();<a name="line.293"></a>
-<span class="sourceLineNo">294</span>    }<a name="line.294"></a>
-<span class="sourceLineNo">295</span><a name="line.295"></a>
-<span class="sourceLineNo">296</span>    @Override<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    public void workDone() throws IOException {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>      try {<a name="line.298"></a>
-<span class="sourceLineNo">299</span>        table.close();<a name="line.299"></a>
-<span class="sourceLineNo">300</span>      } finally {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>        connection.close();<a name="line.301"></a>
-<span class="sourceLineNo">302</span>      }<a name="line.302"></a>
-<span class="sourceLineNo">303</span>    }<a name="line.303"></a>
-<span class="sourceLineNo">304</span><a name="line.304"></a>
-<span class="sourceLineNo">305</span>    private void gotFailure(byte[] expected, Result res) {<a name="line.305"></a>
-<span class="sourceLineNo">306</span>      StringBuilder msg = new StringBuilder();<a name="line.306"></a>
-<span class="sourceLineNo">307</span>      msg.append("Failed after ").append(numRowsScanned).append("!");<a name="line.307"></a>
-<span class="sourceLineNo">308</span>      msg.append("Expected=").append(Bytes.toStringBinary(expected));<a name="line.308"></a>
-<span class="sourceLineNo">309</span>      msg.append("Got:\n");<a name="line.309"></a>
-<span class="sourceLineNo">310</span>      for (Cell kv : res.listCells()) {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>        msg.append(kv.toString());<a name="line.311"></a>
-<span class="sourceLineNo">312</span>        msg.append(" val= ");<a name="line.312"></a>
-<span class="sourceLineNo">313</span>        msg.append(Bytes.toStringBinary(CellUtil.cloneValue(kv)));<a name="line.313"></a>
-<span class="sourceLineNo">314</span>        msg.append("\n");<a name="line.314"></a>
-<span class="sourceLineNo">315</span>      }<a name="line.315"></a>
-<span class="sourceLineNo">316</span>      throw new RuntimeException(msg.toString());<a name="line.316"></a>
-<span class="sourceLineNo">317</span>    }<a name="line.317"></a>
-<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
-<span class="sourceLineNo">319</span><a name="line.319"></a>
-<span class="sourceLineNo">320</span>  private void createTableIfMissing(Admin admin, boolean useMob) throws IOException {<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    if (!admin.tableExists(TABLE_NAME)) {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>      TableDescriptorBuilder builder = TableDescriptorBuilder.newBuilder(TABLE_NAME);<a name="line.322"></a>
-<span class="sourceLineNo">323</span>      Stream.of(FAMILIES).map(ColumnFamilyDescriptorBuilder::of)<a name="line.323"></a>
-<span class="sourceLineNo">324</span>          .forEachOrdered(builder::setColumnFamily);<a name="line.324"></a>
-<span class="sourceLineNo">325</span>      admin.createTable(builder.build());<a name="line.325"></a>
-<span class="sourceLineNo">326</span>    }<a name="line.326"></a>
-<span class="sourceLineNo">327</span>    ColumnFamilyDescriptor cfd = admin.getDescriptor(TABLE_NAME).getColumnFamilies()[0];<a name="line.327"></a>
-<span class="sourceLineNo">328</span>    if (cfd.isMobEnabled() != useMob) {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>      admin.modifyColumnFamily(TABLE_NAME, ColumnFamilyDescriptorBuilder.newBuilder(cfd)<a name="line.329"></a>
-<span class="sourceLineNo">330</span>          .setMobEnabled(useMob).setMobThreshold(4).build());<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    }<a name="line.331"></a>
-<span class="sourceLineNo">332</span>  }<a name="line.332"></a>
-<span class="sourceLineNo">333</span><a name="line.333"></a>
-<span class="sourceLineNo">334</span>  private void runTestAtomicity(Admin admin) throws Exception {<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    createTableIfMissing(admin, useMob);<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    TestContext ctx = new TestContext(conf);<a name="line.336"></a>
-<span class="sourceLineNo">337</span><a name="line.337"></a>
-<span class="sourceLineNo">338</span>    byte rows[][] = new byte[numUniqueRows][];<a name="line.338"></a>
-<span class="sourceLineNo">339</span>    for (int i = 0; i &lt; numUniqueRows; i++) {<a name="line.339"></a>
-<span class="sourceLineNo">340</span>      rows[i] = Bytes.toBytes("test_row_" + i);<a name="line.340"></a>
-<span class="sourceLineNo">341</span>    }<a name="line.341"></a>
-<span class="sourceLineNo">342</span><a name="line.342"></a>
-<span class="sourceLineNo">343</span>    List&lt;AtomicityWriter&gt; writers = Lists.newArrayList();<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    for (int i = 0; i &lt; numWriters; i++) {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      AtomicityWriter writer = new AtomicityWriter(ctx, rows, FAMILIES, sharedPool);<a name="line.345"></a>
-<span class="sourceLineNo">346</span>      writers.add(writer);<a name="line.346"></a>
-<span class="sourceLineNo">347</span>      ctx.addThread(writer);<a name="line.347"></a>
-<span class="sourceLineNo">348</span>    }<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    // Add a flusher<a name="line.349"></a>
-<span class="sourceLineNo">350</span>    ctx.addThread(new RepeatingTestThread(ctx) {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>      @Override<a name="line.351"></a>
-<span class="sourceLineNo">352</span>      public void doAnAction() throws Exception {<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        try {<a name="line.353"></a>
-<span class="sourceLineNo">354</span>          admin.flush(TABLE_NAME);<a name="line.354"></a>
-<span class="sourceLineNo">355</span>        } catch (IOException ioe) {<a name="line.355"></a>
-<span class="sourceLineNo">356</span>          LOG.warn("Ignoring exception while flushing: " + StringUtils.stringifyException(ioe));<a name="line.356"></a>
-<span class="sourceLineNo">357</span>        }<a name="line.357"></a>
-<span class="sourceLineNo">358</span>        // Flushing has been a source of ACID violations previously (see HBASE-2856), so ideally,<a name="line.358"></a>
-<span class="sourceLineNo">359</span>        // we would flush as often as possible. On a running cluster, this isn't practical:<a name="line.359"></a>
-<span class="sourceLineNo">360</span>        // (1) we will cause a lot of load due to all the flushing and compacting<a name="line.360"></a>
-<span class="sourceLineNo">361</span>        // (2) we cannot change the flushing/compacting related Configuration options to try to<a name="line.361"></a>
-<span class="sourceLineNo">362</span>        // alleviate this<a name="line.362"></a>
-<span class="sourceLineNo">363</span>        // (3) it is an unrealistic workload, since no one would actually flush that often.<a name="line.363"></a>
-<span class="sourceLineNo">364</span>        // Therefore, let's flush every minute to have more flushes than usual, but not overload<a name="line.364"></a>
-<span class="sourceLineNo">365</span>        // the running cluster.<a name="line.365"></a>
-<span class="sourceLineNo">366</span>        if (!crazyFlush) {<a name="line.366"></a>
-<span class="sourceLineNo">367</span>          Thread.sleep(60000);<a name="line.367"></a>
-<span class="sourceLineNo">368</span>        }<a name="line.368"></a>
-<span class="sourceLineNo">369</span>      }<a name="line.369"></a>
-<span class="sourceLineNo">370</span>    });<a name="line.370"></a>
-<span class="sourceLineNo">371</span><a name="line.371"></a>
-<span class="sourceLineNo">372</span>    List&lt;AtomicGetReader&gt; getters = Lists.newArrayList();<a name="line.372"></a>
-<span class="sourceLineNo">373</span>    for (int i = 0; i &lt; numGetters; i++) {<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      AtomicGetReader getter =<a name="line.374"></a>
-<span class="sourceLineNo">375</span>          new AtomicGetReader(ctx, rows[i % numUniqueRows], FAMILIES, sharedPool);<a name="line.375"></a>
-<span class="sourceLineNo">376</span>      getters.add(getter);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>      ctx.addThread(getter);<a name="line.377"></a>
-<span class="sourceLineNo">378</span>    }<a name="line.378"></a>
-<span class="sourceLineNo">379</span><a name="line.379"></a>
-<span class="sourceLineNo">380</span>    List&lt;AtomicScanReader&gt; scanners = Lists.newArrayList();<a name="line.380"></a>
-<span class="sourceLineNo">381</span>    for (int i = 0; i &lt; numScanners; i++) {<a name="line.381"></a>
-<span class="sourceLineNo">382</span>      AtomicScanReader scanner = new AtomicScanReader(ctx, FAMILIES, sharedPool);<a name="line.382"></a>
-<span class="sourceLineNo">383</span>      scanners.add(scanner);<a name="line.383"></a>
-<span class="sourceLineNo">384</span>      ctx.addThread(scanner);<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    }<a name="line.385"></a>
-<span class="sourceLineNo">386</span><a name="line.386"></a>
-<span class="sourceLineNo">387</span>    ctx.startThreads();<a name="line.387"></a>
-<span class="sourceLineNo">388</span>    ctx.waitFor(millisToRun);<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    ctx.stop();<a name="line.389"></a>
-<span class="sourceLineNo">390</span><a name="line.390"></a>
-<span class="sourceLineNo">391</span>    LOG.info("Finished test. Writers:");<a name="line.391"></a>
-<span class="sourceLineNo">392</span>    for (AtomicityWriter writer : writers) {<a name="line.392"></a>
-<span class="sourceLineNo">393</span>      LOG.info("  wrote " + writer.numWritten.get());<a name="line.393"></a>
-<span class="sourceLineNo">394</span>    }<a name="line.394"></a>
-<span class="sourceLineNo">395</span>    LOG.info("Readers:");<a name="line.395"></a>
-<span class="sourceLineNo">396</span>    for (AtomicGetReader reader : getters) {<a name="line.396"></a>
-<span class="sourceLineNo">397</span>      LOG.info("  read " + reader.numRead.get());<a name="line.397"></a>
-<span class="sourceLineNo">398</span>    }<a name="line.398"></a>
-<span class="sourceLineNo">399</span>    LOG.info("Scanners:");<a name="line.399"></a>
-<span class="sourceLineNo">400</span>    for (AtomicScanReader scanner : scanners) {<a name="line.400"></a>
-<span class="sourceLineNo">401</span>      LOG.info("  scanned " + scanner.numScans.get());<a name="line.401"></a>
-<span class="sourceLineNo">402</span>      LOG.info("  verified " + scanner.numRowsScanned.get() + " rows");<a name="line.402"></a>
-<span class="sourceLineNo">403</span>    }<a name="line.403"></a>
-<span class="sourceLineNo">404</span>  }<a name="line.404"></a>
-<span class="sourceLineNo">405</span><a name="line.405"></a>
-<span class="sourceLineNo">406</span>  public static void main(String[] args) {<a name="line.406"></a>
-<span class="sourceLineNo">407</span>    Configuration c = HBaseConfiguration.create();<a name="line.407"></a>
-<span class="sourceLineNo">408</span>    int status;<a name="line.408"></a>
-<span class="sourceLineNo">409</span>    try {<a name="line.409"></a>
-<span class="sourceLineNo">410</span>      AcidGuaranteesTestTool test = new AcidGuaranteesTestTool();<a name="line.410"></a>
-<span class="sourceLineNo">411</span>      status = ToolRunner.run(c, test, args);<a name="line.411"></a>
-<span class="sourceLineNo">412</span>    } catch (Exception e) {<a name="line.412"></a>
-<span class="sourceLineNo">413</span>      LOG.error("Exiting due to error", e);<a name="line.413"></a>
-<span class="sourceLineNo">414</span>      status = -1;<a name="line.414"></a>
-<span class="sourceLineNo">415</span>    }<a name="line.415"></a>
-<span class="sourceLineNo">416</span>    System.exit(status);<a name="line.416"></a>
-<span class="sourceLineNo">417</span>  }<a name="line.417"></a>
-<span class="sourceLineNo">418</span>}<a name="line.418"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.util.StringUtils;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.util.ToolRunner;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.slf4j.Logger;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.slf4j.LoggerFactory;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.apache.hbase.thirdparty.com.google.common.collect.Lists;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>import org.apache.hbase.thirdparty.org.apache.commons.cli.CommandLine;<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>/**<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * A test tool that uses multiple threads to read and write multifamily rows into a table, verifying<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * that reads never see partially-complete writes<a name="line.59"></a>
+<span class="sourceLineNo">060</span> */<a name="line.60"></a>
+<span class="sourceLineNo">061</span>@InterfaceAudience.Private<a name="line.61"></a>
+<span class="sourceLineNo">062</span>public class AcidGuaranteesTestTool extends AbstractHBaseTool {<a name="line.62"></a>
+<span class="sourceLineNo">063</span><a name="line.63"></a>
+<span class="sourceLineNo">064</span>  private static final Logger LOG = LoggerFactory.getLogger(AcidGuaranteesTestTool.class);<a name="line.64"></a>
+<span class="sourceLineNo">065</span><a name="line.65"></a>
+<span class="sourceLineNo">066</span>  public static final TableName TABLE_NAME = TableName.valueOf("TestAcidGuarantees");<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  public static final byte[] FAMILY_A = Bytes.toBytes("A");<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  public static final byte[] FAMILY_B = Bytes.toBytes("B");<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  public static final byte[] FAMILY_C = Bytes.toBytes("C");<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  public static final byte[] QUALIFIER_NAME = Bytes.toBytes("data");<a name="line.70"></a>
+<span class="sourceLineNo">071</span><a name="line.71"></a>
+<span class="sourceLineNo">072</span>  public static final byte[][] FAMILIES = new byte[][] { FAMILY_A, FAMILY_B, FAMILY_C };<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  public static int NUM_COLS_TO_CHECK = 50;<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private ExecutorService sharedPool;<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private long millisToRun;<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  private int numWriters;<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  private int numGetters;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  private int numScanners;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  private int numUniqueRows;<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private boolean crazyFlush;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private boolean useMob;<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private ExecutorService createThreadPool() {<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    int maxThreads = 256;<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    int coreThreads = 128;<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>    long keepAliveTime = 60;<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    BlockingQueue&lt;Runnable&gt; workQueue = new LinkedBlockingQueue&lt;Runnable&gt;(<a name="line.91"></a>
+<span class="sourceLineNo">092</span>        maxThreads * HConstants.DEFAULT_HBASE_CLIENT_MAX_TOTAL_TASKS);<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>    ThreadPoolExecutor tpe =<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      new ThreadPoolExecutor(coreThreads, maxThreads, keepAliveTime, TimeUnit.SECONDS, workQueue,<a name="line.95"></a>
+<span class="sourceLineNo">096</span>        new ThreadFactoryBuilder().setNameFormat(toString() + "-shared-pool-%d")<a name="line.96"></a>
+<span class="sourceLineNo">097</span>          .setUncaughtExceptionHandler(Threads.LOGGING_EXCEPTION_HANDLER).build());<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    tpe.allowCoreThreadTimeOut(true);<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    return tpe;<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  }<a name="line.100"></a>
+<span class="sourceLineNo">101</span><a name="line.101"></a>
+<span class="sourceLineNo">102</span>  @Override<a name="line.102"></a>
+<span class="sourceLineNo">103</span>  protected void addOptions() {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    addOptWithArg("millis", "time limit in milliseconds");<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    addOptWithArg("numWriters", "number of write threads");<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    addOptWithArg("numGetters", "number of get threads");<a name="line.106"></a>
+<span class="sourceLineNo">107</span>    addOptWithArg("numScanners", "number of scan threads");<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    addOptWithArg("numUniqueRows", "number of unique rows to test");<a name="line.108"></a>
+<span class="sourceLineNo">109</span>    addOptNoArg("crazyFlush",<a name="line.109"></a>
+<span class="sourceLineNo">110</span>      "if specified we will flush continuously otherwise will flush every minute");<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    addOptNoArg("useMob", "if specified we will enable mob on the first column family");<a name="line.111"></a>
+<span class="sourceLineNo">112</span>  }<a name="line.112"></a>
+<span class="sourceLineNo">113</span><a name="line.113"></a>
+<span class="sourceLineNo">114</span>  @Override<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  protected void processOptions(CommandLine cmd) {<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    millisToRun = getOptionAsLong(cmd, "millis", 5000);<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    numWriters = getOptionAsInt(cmd, "numWriters", 50);<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    numGetters = getOptionAsInt(cmd, "numGetters", 2);<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    numScanners = getOptionAsInt(cmd, "numScanners", 2);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    numUniqueRows = getOptionAsInt(cmd, "numUniqueRows", 3);<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    crazyFlush = cmd.hasOption("crazyFlush");<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    useMob = cmd.hasOption("useMob");<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>  @Override<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  protected int doWork() throws Exception {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    sharedPool = createThreadPool();<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    try (Connection conn = ConnectionFactory.createConnection(getConf())) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      runTestAtomicity(conn.getAdmin());<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    } finally {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      sharedPool.shutdown();<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    return 0;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
+<span class="sourceLineNo">137</span>   * Thread that does random full-row writes into a table.<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   */<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  public static class AtomicityWriter extends RepeatingTestThread {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    Random rand = new Random();<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    byte data[] = new byte[10];<a name="line.141"></a>
+<span class="sourceLineNo">142</span>    byte[][] targetRows;<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    byte[][] targetFamilies;<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    Connection connection;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    Table table;<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    AtomicLong numWritten = new AtomicLong();<a name="line.146"></a>
+<span class="sourceLineNo">147</span><a name="line.147"></a>
+<span class="sourceLineNo">148</span>    public AtomicityWriter(TestContext ctx, byte[][] targetRows, byte[][] targetFamilies,<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        ExecutorService pool) throws IOException {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>      super(ctx);<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      this.targetRows = targetRows;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>      this.targetFamilies = targetFamilies;<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      table = connection.getTable(TABLE_NAME);<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    }<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>    @Override<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    public void doAnAction() throws Exception {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      // Pick a random row to write into<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      byte[] targetRow = targetRows[rand.nextInt(targetRows.length)];<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      Put p = new Put(targetRow);<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      rand.nextBytes(data);<a name="line.162"></a>
+<span class="sourceLineNo">163</span><a name="line.163"></a>
+<span class="sourceLineNo">164</span>      for (byte[] family : targetFamilies) {<a name="line.164"></a>
+<span class="sourceLineNo">165</span>        for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>          byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>          p.addColumn(family, qualifier, data);<a name="line.167"></a>
+<span class="sourceLineNo">168</span>        }<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      }<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      table.put(p);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      numWritten.getAndIncrement();<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
+<span class="sourceLineNo">173</span><a name="line.173"></a>
+<span class="sourceLineNo">174</span>    @Override<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    public void workDone() throws IOException {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      try {<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        table.close();<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      } finally {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        connection.close();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>      }<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    }<a name="line.181"></a>
+<span class="sourceLineNo">182</span>  }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>  /**<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   * Thread that does single-row reads in a table, looking for partially completed rows.<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   */<a name="line.186"></a>
+<span class="sourceLineNo">187</span>  public static class AtomicGetReader extends RepeatingTestThread {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    byte[] targetRow;<a name="line.188"></a>
+<span class="sourceLineNo">189</span>    byte[][] targetFamilies;<a name="line.189"></a>
+<span class="sourceLineNo">190</span>    Connection connection;<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    Table table;<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    int numVerified = 0;<a name="line.192"></a>
+<span class="sourceLineNo">193</span>    AtomicLong numRead = new AtomicLong();<a name="line.193"></a>
+<span class="sourceLineNo">194</span><a name="line.194"></a>
+<span class="sourceLineNo">195</span>    public AtomicGetReader(TestContext ctx, byte[] targetRow, byte[][] targetFamilies,<a name="line.195"></a>
+<span class="sourceLineNo">196</span>        ExecutorService pool) throws IOException {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>      super(ctx);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      this.targetRow = targetRow;<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      this.targetFamilies = targetFamilies;<a name="line.199"></a>
+<span class="sourceLineNo">200</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      table = connection.getTable(TABLE_NAME);<a name="line.201"></a>
+<span class="sourceLineNo">202</span>    }<a name="line.202"></a>
+<span class="sourceLineNo">203</span><a name="line.203"></a>
+<span class="sourceLineNo">204</span>    @Override<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    public void doAnAction() throws Exception {<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      Get g = new Get(targetRow);<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      Result res = table.get(g);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      byte[] gotValue = null;<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      if (res.getRow() == null) {<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        // Trying to verify but we didn't find the row - the writing<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        // thread probably just hasn't started writing yet, so we can<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        // ignore this action<a name="line.212"></a>
+<span class="sourceLineNo">213</span>        return;<a name="line.213"></a>
+<span class="sourceLineNo">214</span>      }<a name="line.214"></a>
+<span class="sourceLineNo">215</span><a name="line.215"></a>
+<span class="sourceLineNo">216</span>      for (byte[] family : targetFamilies) {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.217"></a>
+<span class="sourceLineNo">218</span>          byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.218"></a>
+<span class="sourceLineNo">219</span>          byte thisValue[] = res.getValue(family, qualifier);<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          if (gotValue != null &amp;&amp; !Bytes.equals(gotValue, thisValue)) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>            gotFailure(gotValue, res);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>          }<a name="line.222"></a>
+<span class="sourceLineNo">223</span>          numVerified++;<a name="line.223"></a>
+<span class="sourceLineNo">224</span>          gotValue = thisValue;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>        }<a name="line.225"></a>
+<span class="sourceLineNo">226</span>      }<a name="line.226"></a>
+<span class="sourceLineNo">227</span>      numRead.getAndIncrement();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    }<a name="line.228"></a>
+<span class="sourceLineNo">229</span><a name="line.229"></a>
+<span class="sourceLineNo">230</span>    @Override<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    public void workDone() throws IOException {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      try {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>        table.close();<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      } finally {<a name="line.234"></a>
+<span class="sourceLineNo">235</span>        connection.close();<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      }<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    }<a name="line.237"></a>
+<span class="sourceLineNo">238</span><a name="line.238"></a>
+<span class="sourceLineNo">239</span>    private void gotFailure(byte[] expected, Result res) {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      StringBuilder msg = new StringBuilder();<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      msg.append("Failed after ").append(numVerified).append("!");<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      msg.append("Expected=").append(Bytes.toStringBinary(expected));<a name="line.242"></a>
+<span class="sourceLineNo">243</span>      msg.append("Got:\n");<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      for (Cell kv : res.listCells()) {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>        msg.append(kv.toString());<a name="line.245"></a>
+<span class="sourceLineNo">246</span>        msg.append(" val= ");<a name="line.246"></a>
+<span class="sourceLineNo">247</span>        msg.append(Bytes.toStringBinary(CellUtil.cloneValue(kv)));<a name="line.247"></a>
+<span class="sourceLineNo">248</span>        msg.append("\n");<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      }<a name="line.249"></a>
+<span class="sourceLineNo">250</span>      throw new RuntimeException(msg.toString());<a name="line.250"></a>
+<span class="sourceLineNo">251</span>    }<a name="line.251"></a>
+<span class="sourceLineNo">252</span>  }<a name="line.252"></a>
+<span class="sourceLineNo">253</span><a name="line.253"></a>
+<span class="sourceLineNo">254</span>  /**<a name="line.254"></a>
+<span class="sourceLineNo">255</span>   * Thread that does full scans of the table looking for any partially completed rows.<a name="line.255"></a>
+<span class="sourceLineNo">256</span>   */<a name="line.256"></a>
+<span class="sourceLineNo">257</span>  public static class AtomicScanReader extends RepeatingTestThread {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    byte[][] targetFamilies;<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    Table table;<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    Connection connection;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    AtomicLong numScans = new AtomicLong();<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    AtomicLong numRowsScanned = new AtomicLong();<a name="line.262"></a>
+<span class="sourceLineNo">263</span><a name="line.263"></a>
+<span class="sourceLineNo">264</span>    public AtomicScanReader(TestContext ctx, byte[][] targetFamilies, ExecutorService pool)<a name="line.264"></a>
+<span class="sourceLineNo">265</span>        throws IOException {<a name="line.265"></a>
+<span class="sourceLineNo">266</span>      super(ctx);<a name="line.266"></a>
+<span class="sourceLineNo">267</span>      this.targetFamilies = targetFamilies;<a name="line.267"></a>
+<span class="sourceLineNo">268</span>      connection = ConnectionFactory.createConnection(ctx.getConf(), pool);<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      table = connection.getTable(TABLE_NAME);<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    }<a name="line.270"></a>
+<span class="sourceLineNo">271</span><a name="line.271"></a>
+<span class="sourceLineNo">272</span>    @Override<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    public void doAnAction() throws Exception {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      Scan s = new Scan();<a name="line.274"></a>
+<span class="sourceLineNo">275</span>      for (byte[] family : targetFamilies) {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>        s.addFamily(family);<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      }<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      ResultScanner scanner = table.getScanner(s);<a name="line.278"></a>
+<span class="sourceLineNo">279</span><a name="line.279"></a>
+<span class="sourceLineNo">280</span>      for (Result res : scanner) {<a name="line.280"></a>
+<span class="sourceLineNo">281</span>        byte[] gotValue = null;<a name="line.281"></a>
+<span class="sourceLineNo">282</span><a name="line.282"></a>
+<span class="sourceLineNo">283</span>        for (byte[] family : targetFamilies) {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>          for (int i = 0; i &lt; NUM_COLS_TO_CHECK; i++) {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>            byte qualifier[] = Bytes.toBytes("col" + i);<a name="line.285"></a>
+<span class="sourceLineNo">286</span>            byte thisValue[] = res.getValue(family, qualifier);<a name="line.286"></a>
+<span class="sourceLineNo">287</span>            if (gotValue != null &amp;&amp; !Bytes.equals(gotValue, thisValue)) {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>              gotFailure(gotValue, res);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>            }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>            gotValue = thisValue;<a name="line.290"></a>
+<span class="sourceLineNo">291</span>          }<a name="line.291"></a>
+<span class="sourceLineNo">292</span>        }<a name="line.292"></a>
+<span class="sourceLineNo">293</span>        numRowsScanned.getAndIncrement();<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>      numScans.getAndIncrement();<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    }<a name="line.296"></a>
+<span class="sourceLineNo">297</span><a name="line.297"></a>
+<span class="sourceLineNo">298</span>    @Override<a name="line.298"></a>
+<span class="sourceLineNo">299</span>    public void workDone() throws IOException {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>      try {<a name="line.300"></a>
+<span class="sourceLineNo">301</span>        table.close();<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      } finally {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>        connection.close();<a name="line.303"></a>
+<span class="sourceLineNo">304</span>      }<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    }<a name="line.305"></a>
+<span class="sourceLineNo">306</span><a name="line.306"></a>
+<span class="sourceLineNo">307</span>    private void gotFailure(byte[] expected, Result res) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      StringBuilder msg = new StringBuilder();<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      msg.append("Failed after ").append(numRowsScanned).append("!");<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      msg.append("Expected=").append(Bytes.toStringBinary(expected));<a name="line.310"></a>
+<span class="sourceLineNo">311</span>      msg.append("Got:\n");<a name="line.311"></a>
+<span class="sourceLineNo">312</span>      for (Cell kv : res.listCells()) {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>        msg.append(kv.toString());<a name="line.313"></a>
+<span class="sourceLineNo">314</span>        msg.append(" val= ");<a name="line.314"></a>
+<span class="sourceLineNo">315</span>        msg.append(Bytes.toStringBinary(CellUtil.cloneValue(kv)));<a name="line.315"></a>
+<span class="sourceLineNo">316</span>        msg.append("\n");<a name="line.316"></a>
+<span class="sourceLineNo">317</span>      }<a name="line.317"></a>
+<span class="sourceLineNo">318</span>      throw new RuntimeException(msg.toString());<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    }<a name="line.319"></a>
+<span class="sourceLineNo">320</span>  }<a name="line.320"></a>
+<span class="sourceLineNo">321</span><a name="line.321"></a>
+<span class="sourceLineNo">322</span>  private void createTableIfMissing(Admin admin, boolean useMob) throws IOException {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    if (!admin.tableExists(TABLE_NAME)) {<a name="line.323"></a>
+<span class="sourceLineNo">324</span>      TableDescriptorBuilder builder = TableDescriptorBuilder.newBuilder(TABLE_NAME);<a name="line.324"></a>
+<span class="sourceLineNo">325</span>      Stream.of(FAMILIES).map(ColumnFamilyDescriptorBuilder::of)<a name="line.325"></a>
+<span class="sourceLineNo">326</span>          .forEachOrdered(builder::setColumnFamily);<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      admin.createTable(builder.build());<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    }<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    ColumnFamilyDescriptor cfd = admin.getDescriptor(TABLE_NAME).getColumnFamilies()[0];<a name="line.329"></a>
+<span class="sourceLineNo">330</span>    if (cfd.isMobEnabled() != useMob) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>      admin.modifyColumnFamily(TABLE_NAME, ColumnFamilyDescriptorBuilder.newBuilder(cfd)<a name="line.331"></a>
+<span class="sourceLineNo">332</span>          .setMobEnabled(useMob).setMobThreshold(4).build());<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    }<a name="line.333"></a>
+<span class="sourceLineNo">334</span>  }<a name="line.334"></a>
+<span class="sourceLineNo">335</span><a name="line.335"></a>
+<span class="sourceLineNo">336</span>  private void runTestAtomicity(Admin admin) throws Exception {<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    createTableIfMissing(admin, useMob);<a name="line.337"></a>
+<span class="sourceLineNo">338</span>    TestContext ctx = new TestContext(conf);<a name="line.338"></a>
+<span class="sourceLineNo">339</span><a name="line.339"></a>
+<span class="sourceLineNo">340</span>    byte rows[][] = new byte[numUniqueRows][];<a name="line.340"></a>
+<span class="sourceLineNo">341</span>    for (int i = 0; i &lt; numUniqueRows; i++) {<a name="line.341"></a>
+<span class="sourceLineNo">342</span>      rows[i] = Bytes.toBytes("test_row_" + i);<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    }<a name="line.343"></a>
+<span class="sourceLineNo">344</span><a name="line.344"></a>
+<span class="sourceLineNo">345</span>    List&lt;AtomicityWriter&gt; writers = Lists.newArrayList();<a name="line.345"></a>
+<span class="sourceLineNo">346</span>    for (int i = 0; i &lt; numWriters; i++) {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      AtomicityWriter writer = new AtomicityWriter(ctx, rows, FAMILIES, sharedPool);<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      writers.add(writer);<a name="line.348"></a>
+<span class="sourceLineNo">349</span>      ctx.addThread(writer);<a name="line.349"></a>
+<span class="sourceLineNo">350</span>    }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    // Add a flusher<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    ctx.addThread(new RepeatingTestThread(ctx) {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>      @Override<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      public void doAnAction() throws Exception {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>        try {<a name="line.355"></a>
+<span class="sourceLineNo">356</span>          admin.flush(TABLE_NAME);<a name="line.356"></a>
+<span class="sourceLineNo">357</span>        } catch (IOException ioe) {<a name="line.357"></a>
+<span class="sourceLineNo">358</span>          LOG.warn("Ignoring exception while flushing: " + StringUtils.stringifyException(ioe));<a name="line.358"></a>
+<span class="sourceLineNo">359</span>        }<a name="line.359"></a>
+<span class="sourceLineNo">360</span>        // Flushing has been a source of ACID violations previously (see HBASE-2856), so ideally,<a name="line.360"></a>
+<span class="sourceLineNo">361</span>        // we would flush as often as possible. On a running cluster, this isn't practical:<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        // (1) we will cause a lot of load due to all the flushing and compacting<a name="line.362"></a>
+<span class="sourceLineNo">363</span>        // (2) we cannot change the flushing/compacting related Configuration options to try to<a name="line.363"></a>
+<span class="sourceLineNo">364</span>        // alleviate this<a name="line.364"></a>
+<span class="sourceLineNo">365</span>        // (3) it is an unrealistic workload, since no one would actually flush that often.<a name="line.365"></a>
+<span class="sourceLineNo">366</span>        // Therefore, let's flush every minute to have more flushes than usual, but not overload<a name="line.366"></a>
+<span class="sourceLineNo">367</span>        // the running cluster.<a name="line.367"></a>
+<span class="sourceLineNo">368</span>        if (!crazyFlush) {<a name="line.368"></a>
+<span class="sourceLineNo">369</span>          Thread.sleep(60000);<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        }<a name="line.370"></a>
+<span class="sourceLineNo">371</span>      }<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    });<a name="line.372"></a>
+<span class="sourceLineNo">373</span><a name="line.373"></a>
+<span class="sourceLineNo">374</span>    List&lt;AtomicGetReader&gt; getters = Lists.newArrayList();<a name="line.374"></a>
+<span class="sourceLineNo">375</span>    for (int i = 0; i &lt; numGetters; i++) {<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      AtomicGetReader getter =<a name="line.376"></a>
+<span class="sourceLineNo">377</span>          new AtomicGetReader(ctx, rows[i % numUniqueRows], FAMILIES, sharedPool);<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      getters.add(getter);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>      ctx.addThread(getter);<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    }<a name="line.380"></a>
+<span class="sourceLineNo">381</span><a name="line.381"></a>
+<span class="sourceLineNo">382</span>    List&lt;AtomicScanReader&gt; scanners = Lists.newArrayList();<a name="line.382"></a>
+<span class="sourceLineNo">383</span>    for (int i = 0; i &lt; numScanners; i++) {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>      AtomicScanReader scanner = new AtomicScanReader(ctx, FAMILIES, sharedPool);<a name="line.384"></a>
+<span class="sourceLineNo">385</span>      scanners.add(scanner);<a name="line.385"></a>
+<span class="sourceLineNo">386</span>      ctx.addThread(scanner);<a name="line.386"></a>
+<span class="sourceLineNo">387</span>    }<a name="line.387"></a>
+<span class="sourceLineNo">388</span><a name="line.388"></a>
+<span class="sourceLineNo">389</span>    ctx.startThreads();<a name="line.389"></a>
+<span class="sourceLineNo">390</span>    ctx.waitFor(millisToRun);<a name="line.390"></a>
+<span class="sourceLineNo">391</span>    ctx.stop();<a name="line.391"></a>
+<span class="sourceLineNo">392</span><a name="line.392"></a>
+<span class="sourceLineNo">393</span>    LOG.info("Finished test. Writers:");<a name="line.393"></a>
+<span class="sourceLineNo">394</span>    for (AtomicityWriter writer : writers) {<a name="line.394"></a>
+<span class="sourceLineNo">395</span>      LOG.info("  wrote " + writer.numWritten.get());<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    }<a name="line.396"></a>
+<span class="sourceLineNo">397</span>    LOG.info("Readers:");<a name="line.397"></a>
+<span class="sourceLineNo">398</span>    for (AtomicGetReader reader : getters) {<a name="line.398"></a>
+<span class="sourceLineNo">399</span>      LOG.info("  read " + reader.numRead.get());<a name="line.399"></a>
+<span class="sourceLineNo">400</span>    }<a name="line.400"></a>
+<span class="sourceLineNo">401</span>    LOG.info("Scanners:");<a name="line.401"></a>
+<span class="sourceLineNo">402</span>    for (AtomicScanReader scanner : scanners) {<a name="line.402"></a>
+<span class="sourceLineNo">403</span>      LOG.info("  scanned " + scanner.numScans.get());<a name="line.403"></a>
+<span class="sourceLineNo">404</span>      LOG.info("  verified " + scanner.numRowsScanned.get() + " rows");<a name="line.404"></a>
+<span class="sourceLineNo">405</span>    }<a name="line.405"></a>
+<span class="sourceLineNo">406</span>  }<a name="line.406"></a>
+<span class="sourceLineNo">407</span><a name="line.407"></a>
+<span class="sourceLineNo">408</span>  public static void main(String[] args) {<a name="line.408"></a>
+<span class="sourceLineNo">409</span>    Configuration c = HBaseConfiguration.create();<a name="line.409"></a>
+<span class="sourceLineNo">410</span>    int status;<a name="line.410"></a>
+<span class="sourceLineNo">411</span>    try {<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      AcidGuaranteesTestTool test = new AcidGuaranteesTestTool();<a name="line.412"></a>
+<span class="sourceLineNo">413</span>      status = ToolRunner.run(c, test, args);<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    } catch (Exception e) {<a name="line.414"></a>
+<span class="sourceLineNo">415</span>      LOG.error("Exiting due to error", e);<a name="line.415"></a>
+<span class="sourceLineNo">416</span>      status = -1;<a name="line.416"></a>
+<span class="sourceLineNo">417</span>    }<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    System.exit(status);<a name="line.418"></a>
+<span class="sourceLineNo">419</span>  }<a name="line.419"></a>
+<span class="sourceLineNo">420</span>}<a name="line.420"></a>
 
 
 
