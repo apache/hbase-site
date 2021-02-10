@@ -1,0 +1,410 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/**<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.ipc;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.IOException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.io.InputStream;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.net.InetAddress;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.net.Socket;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import java.nio.ByteBuffer;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import java.nio.channels.ReadableByteChannel;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import java.nio.channels.SocketChannel;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import java.util.concurrent.ConcurrentLinkedDeque;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import java.util.concurrent.atomic.LongAdder;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import java.util.concurrent.locks.Lock;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import java.util.concurrent.locks.ReentrantLock;<a name="line.30"></a>
+<span class="sourceLineNo">031</span><a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.CellScanner;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.DoNotRetryIOException;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.client.VersionInfoUtil;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.exceptions.RequestTooBigException;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.ipc.RpcServer.CallCleanup;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.nio.ByteBuff;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hbase.thirdparty.com.google.protobuf.BlockingService;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hbase.thirdparty.com.google.protobuf.CodedInputStream;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors.MethodDescriptor;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hbase.thirdparty.com.google.protobuf.Message;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.RPCProtos.RequestHeader;<a name="line.44"></a>
+<span class="sourceLineNo">045</span><a name="line.45"></a>
+<span class="sourceLineNo">046</span>/** Reads calls from a connection and queues them for handling. */<a name="line.46"></a>
+<span class="sourceLineNo">047</span>@edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "VO_VOLATILE_INCREMENT",<a name="line.47"></a>
+<span class="sourceLineNo">048</span>    justification = "False positive according to http://sourceforge.net/p/findbugs/bugs/1032/")<a name="line.48"></a>
+<span class="sourceLineNo">049</span>@InterfaceAudience.Private<a name="line.49"></a>
+<span class="sourceLineNo">050</span>class SimpleServerRpcConnection extends ServerRpcConnection {<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>  final SocketChannel channel;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  private ByteBuff data;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>  private ByteBuffer dataLengthBuffer;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  private ByteBuffer preambleBuffer;<a name="line.55"></a>
+<span class="sourceLineNo">056</span>  private final LongAdder rpcCount = new LongAdder(); // number of outstanding rpcs<a name="line.56"></a>
+<span class="sourceLineNo">057</span>  private long lastContact;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private final Socket socket;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  final SimpleRpcServerResponder responder;<a name="line.59"></a>
+<span class="sourceLineNo">060</span><a name="line.60"></a>
+<span class="sourceLineNo">061</span>  // If initial preamble with version and magic has been read or not.<a name="line.61"></a>
+<span class="sourceLineNo">062</span>  private boolean connectionPreambleRead = false;<a name="line.62"></a>
+<span class="sourceLineNo">063</span><a name="line.63"></a>
+<span class="sourceLineNo">064</span>  final ConcurrentLinkedDeque&lt;RpcResponse&gt; responseQueue = new ConcurrentLinkedDeque&lt;&gt;();<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  final Lock responseWriteLock = new ReentrantLock();<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  long lastSentTime = -1L;<a name="line.66"></a>
+<span class="sourceLineNo">067</span><a name="line.67"></a>
+<span class="sourceLineNo">068</span>  public SimpleServerRpcConnection(SimpleRpcServer rpcServer, SocketChannel channel,<a name="line.68"></a>
+<span class="sourceLineNo">069</span>      long lastContact) {<a name="line.69"></a>
+<span class="sourceLineNo">070</span>    super(rpcServer);<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    this.channel = channel;<a name="line.71"></a>
+<span class="sourceLineNo">072</span>    this.lastContact = lastContact;<a name="line.72"></a>
+<span class="sourceLineNo">073</span>    this.data = null;<a name="line.73"></a>
+<span class="sourceLineNo">074</span>    this.dataLengthBuffer = ByteBuffer.allocate(4);<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    this.socket = channel.socket();<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    this.addr = socket.getInetAddress();<a name="line.76"></a>
+<span class="sourceLineNo">077</span>    if (addr == null) {<a name="line.77"></a>
+<span class="sourceLineNo">078</span>      this.hostAddress = "*Unknown*";<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    } else {<a name="line.79"></a>
+<span class="sourceLineNo">080</span>      this.hostAddress = addr.getHostAddress();<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    }<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    this.remotePort = socket.getPort();<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    if (rpcServer.socketSendBufferSize != 0) {<a name="line.83"></a>
+<span class="sourceLineNo">084</span>      try {<a name="line.84"></a>
+<span class="sourceLineNo">085</span>        socket.setSendBufferSize(rpcServer.socketSendBufferSize);<a name="line.85"></a>
+<span class="sourceLineNo">086</span>      } catch (IOException e) {<a name="line.86"></a>
+<span class="sourceLineNo">087</span>        SimpleRpcServer.LOG.warn(<a name="line.87"></a>
+<span class="sourceLineNo">088</span>          "Connection: unable to set socket send buffer size to " + rpcServer.socketSendBufferSize);<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      }<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    }<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this.responder = rpcServer.responder;<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  }<a name="line.92"></a>
+<span class="sourceLineNo">093</span><a name="line.93"></a>
+<span class="sourceLineNo">094</span>  public void setLastContact(long lastContact) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    this.lastContact = lastContact;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  }<a name="line.96"></a>
+<span class="sourceLineNo">097</span><a name="line.97"></a>
+<span class="sourceLineNo">098</span>  public long getLastContact() {<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    return lastContact;<a name="line.99"></a>
+<span class="sourceLineNo">100</span>  }<a name="line.100"></a>
+<span class="sourceLineNo">101</span><a name="line.101"></a>
+<span class="sourceLineNo">102</span>  /* Return true if the connection has no outstanding rpc */<a name="line.102"></a>
+<span class="sourceLineNo">103</span>  boolean isIdle() {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    return rpcCount.sum() == 0;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  }<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  /* Decrement the outstanding RPC count */<a name="line.107"></a>
+<span class="sourceLineNo">108</span>  protected void decRpcCount() {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>    rpcCount.decrement();<a name="line.109"></a>
+<span class="sourceLineNo">110</span>  }<a name="line.110"></a>
+<span class="sourceLineNo">111</span><a name="line.111"></a>
+<span class="sourceLineNo">112</span>  /* Increment the outstanding RPC count */<a name="line.112"></a>
+<span class="sourceLineNo">113</span>  protected void incRpcCount() {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    rpcCount.increment();<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  }<a name="line.115"></a>
+<span class="sourceLineNo">116</span><a name="line.116"></a>
+<span class="sourceLineNo">117</span>  private int readPreamble() throws IOException {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    if (preambleBuffer == null) {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      preambleBuffer = ByteBuffer.allocate(6);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    }<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    int count = this.rpcServer.channelRead(channel, preambleBuffer);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    if (count &lt; 0 || preambleBuffer.remaining() &gt; 0) {<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      return count;<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    }<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    preambleBuffer.flip();<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    if (!processPreamble(preambleBuffer)) {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      return -1;<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    }<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    preambleBuffer = null; // do not need it anymore<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    connectionPreambleRead = true;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    return count;<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  }<a name="line.132"></a>
+<span class="sourceLineNo">133</span><a name="line.133"></a>
+<span class="sourceLineNo">134</span>  private int read4Bytes() throws IOException {<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    if (this.dataLengthBuffer.remaining() &gt; 0) {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      return this.rpcServer.channelRead(channel, this.dataLengthBuffer);<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    } else {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      return 0;<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    }<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  }<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>  /**<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   * Read off the wire. If there is not enough data to read, update the connection state with what<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   * we have and returns.<a name="line.144"></a>
+<span class="sourceLineNo">145</span>   * @return Returns -1 if failure (and caller will close connection), else zero or more.<a name="line.145"></a>
+<span class="sourceLineNo">146</span>   * @throws IOException<a name="line.146"></a>
+<span class="sourceLineNo">147</span>   * @throws InterruptedException<a name="line.147"></a>
+<span class="sourceLineNo">148</span>   */<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  public int readAndProcess() throws IOException, InterruptedException {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    // If we have not read the connection setup preamble, look to see if that is on the wire.<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    if (!connectionPreambleRead) {<a name="line.151"></a>
+<span class="sourceLineNo">152</span>      int count = readPreamble();<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      if (!connectionPreambleRead) {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>        return count;<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      }<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
+<span class="sourceLineNo">157</span><a name="line.157"></a>
+<span class="sourceLineNo">158</span>    // Try and read in an int. it will be length of the data to read (or -1 if a ping). We catch the<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    // integer length into the 4-byte this.dataLengthBuffer.<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    int count = read4Bytes();<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    if (count &lt; 0 || dataLengthBuffer.remaining() &gt; 0) {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      return count;<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    }<a name="line.163"></a>
+<span class="sourceLineNo">164</span><a name="line.164"></a>
+<span class="sourceLineNo">165</span>    // We have read a length and we have read the preamble. It is either the connection header<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    // or it is a request.<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    if (data == null) {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>      dataLengthBuffer.flip();<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      int dataLength = dataLengthBuffer.getInt();<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      if (dataLength == RpcClient.PING_CALL_ID) {<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        if (!useWrap) { // covers the !useSasl too<a name="line.171"></a>
+<span class="sourceLineNo">172</span>          dataLengthBuffer.clear();<a name="line.172"></a>
+<span class="sourceLineNo">173</span>          return 0; // ping message<a name="line.173"></a>
+<span class="sourceLineNo">174</span>        }<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      }<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      if (dataLength &lt; 0) { // A data length of zero is legal.<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        throw new DoNotRetryIOException(<a name="line.177"></a>
+<span class="sourceLineNo">178</span>            "Unexpected data length " + dataLength + "!! from " + getHostAddress());<a name="line.178"></a>
+<span class="sourceLineNo">179</span>      }<a name="line.179"></a>
+<span class="sourceLineNo">180</span><a name="line.180"></a>
+<span class="sourceLineNo">181</span>      if (dataLength &gt; this.rpcServer.maxRequestSize) {<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        String msg = "RPC data length of " + dataLength + " received from " + getHostAddress() +<a name="line.182"></a>
+<span class="sourceLineNo">183</span>            " is greater than max allowed " + this.rpcServer.maxRequestSize + ". Set \"" +<a name="line.183"></a>
+<span class="sourceLineNo">184</span>            SimpleRpcServer.MAX_REQUEST_SIZE +<a name="line.184"></a>
+<span class="sourceLineNo">185</span>            "\" on server to override this limit (not recommended)";<a name="line.185"></a>
+<span class="sourceLineNo">186</span>        SimpleRpcServer.LOG.warn(msg);<a name="line.186"></a>
+<span class="sourceLineNo">187</span><a name="line.187"></a>
+<span class="sourceLineNo">188</span>        if (connectionHeaderRead &amp;&amp; connectionPreambleRead) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>          incRpcCount();<a name="line.189"></a>
+<span class="sourceLineNo">190</span>          // Construct InputStream for the non-blocking SocketChannel<a name="line.190"></a>
+<span class="sourceLineNo">191</span>          // We need the InputStream because we want to read only the request header<a name="line.191"></a>
+<span class="sourceLineNo">192</span>          // instead of the whole rpc.<a name="line.192"></a>
+<span class="sourceLineNo">193</span>          ByteBuffer buf = ByteBuffer.allocate(1);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>          InputStream is = new InputStream() {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>            @Override<a name="line.195"></a>
+<span class="sourceLineNo">196</span>            public int read() throws IOException {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>              SimpleServerRpcConnection.this.rpcServer.channelRead(channel, buf);<a name="line.197"></a>
+<span class="sourceLineNo">198</span>              buf.flip();<a name="line.198"></a>
+<span class="sourceLineNo">199</span>              int x = buf.get();<a name="line.199"></a>
+<span class="sourceLineNo">200</span>              buf.flip();<a name="line.200"></a>
+<span class="sourceLineNo">201</span>              return x;<a name="line.201"></a>
+<span class="sourceLineNo">202</span>            }<a name="line.202"></a>
+<span class="sourceLineNo">203</span>          };<a name="line.203"></a>
+<span class="sourceLineNo">204</span>          CodedInputStream cis = CodedInputStream.newInstance(is);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>          int headerSize = cis.readRawVarint32();<a name="line.205"></a>
+<span class="sourceLineNo">206</span>          Message.Builder builder = RequestHeader.newBuilder();<a name="line.206"></a>
+<span class="sourceLineNo">207</span>          ProtobufUtil.mergeFrom(builder, cis, headerSize);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>          RequestHeader header = (RequestHeader) builder.build();<a name="line.208"></a>
+<span class="sourceLineNo">209</span><a name="line.209"></a>
+<span class="sourceLineNo">210</span>          // Notify the client about the offending request<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          SimpleServerCall reqTooBig = new SimpleServerCall(header.getCallId(), this.service, null,<a name="line.211"></a>
+<span class="sourceLineNo">212</span>              null, null, null, this, 0, this.addr, System.currentTimeMillis(), 0,<a name="line.212"></a>
+<span class="sourceLineNo">213</span>              this.rpcServer.bbAllocator, this.rpcServer.cellBlockBuilder, null, responder);<a name="line.213"></a>
+<span class="sourceLineNo">214</span>          this.rpcServer.metrics.exception(SimpleRpcServer.REQUEST_TOO_BIG_EXCEPTION);<a name="line.214"></a>
+<span class="sourceLineNo">215</span>          // Make sure the client recognizes the underlying exception<a name="line.215"></a>
+<span class="sourceLineNo">216</span>          // Otherwise, throw a DoNotRetryIOException.<a name="line.216"></a>
+<span class="sourceLineNo">217</span>          if (VersionInfoUtil.hasMinimumVersion(connectionHeader.getVersionInfo(),<a name="line.217"></a>
+<span class="sourceLineNo">218</span>            RequestTooBigException.MAJOR_VERSION, RequestTooBigException.MINOR_VERSION)) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>            reqTooBig.setResponse(null, null, SimpleRpcServer.REQUEST_TOO_BIG_EXCEPTION, msg);<a name="line.219"></a>
+<span class="sourceLineNo">220</span>          } else {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>            reqTooBig.setResponse(null, null, new DoNotRetryIOException(), msg);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>          }<a name="line.222"></a>
+<span class="sourceLineNo">223</span>          // In most cases we will write out the response directly. If not, it is still OK to just<a name="line.223"></a>
+<span class="sourceLineNo">224</span>          // close the connection without writing out the reqTooBig response. Do not try to write<a name="line.224"></a>
+<span class="sourceLineNo">225</span>          // out directly here, and it will cause deserialization error if the connection is slow<a name="line.225"></a>
+<span class="sourceLineNo">226</span>          // and we have a half writing response in the queue.<a name="line.226"></a>
+<span class="sourceLineNo">227</span>          reqTooBig.sendResponseIfReady();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>        }<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        // Close the connection<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        return -1;<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      }<a name="line.231"></a>
+<span class="sourceLineNo">232</span><a name="line.232"></a>
+<span class="sourceLineNo">233</span>      // Initialize this.data with a ByteBuff.<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      // This call will allocate a ByteBuff to read request into and assign to this.data<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      // Also when we use some buffer(s) from pool, it will create a CallCleanup instance also and<a name="line.235"></a>
+<span class="sourceLineNo">236</span>      // assign to this.callCleanup<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      initByteBuffToReadInto(dataLength);<a name="line.237"></a>
+<span class="sourceLineNo">238</span><a name="line.238"></a>
+<span class="sourceLineNo">239</span>      // Increment the rpc count. This counter will be decreased when we write<a name="line.239"></a>
+<span class="sourceLineNo">240</span>      // the response. If we want the connection to be detected as idle properly, we<a name="line.240"></a>
+<span class="sourceLineNo">241</span>      // need to keep the inc / dec correct.<a name="line.241"></a>
+<span class="sourceLineNo">242</span>      incRpcCount();<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    }<a name="line.243"></a>
+<span class="sourceLineNo">244</span><a name="line.244"></a>
+<span class="sourceLineNo">245</span>    count = channelDataRead(channel, data);<a name="line.245"></a>
+<span class="sourceLineNo">246</span><a name="line.246"></a>
+<span class="sourceLineNo">247</span>    if (count &gt;= 0 &amp;&amp; data.remaining() == 0) { // count==0 if dataLength == 0<a name="line.247"></a>
+<span class="sourceLineNo">248</span>      process();<a name="line.248"></a>
+<span class="sourceLineNo">249</span>    }<a name="line.249"></a>
+<span class="sourceLineNo">250</span><a name="line.250"></a>
+<span class="sourceLineNo">251</span>    return count;<a name="line.251"></a>
+<span class="sourceLineNo">252</span>  }<a name="line.252"></a>
+<span class="sourceLineNo">253</span><a name="line.253"></a>
+<span class="sourceLineNo">254</span>  // It creates the ByteBuff and CallCleanup and assign to Connection instance.<a name="line.254"></a>
+<span class="sourceLineNo">255</span>  private void initByteBuffToReadInto(int length) {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    this.data = rpcServer.bbAllocator.allocate(length);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    this.callCleanup = data::release;<a name="line.257"></a>
+<span class="sourceLineNo">258</span>  }<a name="line.258"></a>
+<span class="sourceLineNo">259</span><a name="line.259"></a>
+<span class="sourceLineNo">260</span>  protected int channelDataRead(ReadableByteChannel channel, ByteBuff buf) throws IOException {<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    int count = buf.read(channel);<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    if (count &gt; 0) {<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      this.rpcServer.metrics.receivedBytes(count);<a name="line.263"></a>
+<span class="sourceLineNo">264</span>    }<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    return count;<a name="line.265"></a>
+<span class="sourceLineNo">266</span>  }<a name="line.266"></a>
+<span class="sourceLineNo">267</span><a name="line.267"></a>
+<span class="sourceLineNo">268</span>  /**<a name="line.268"></a>
+<span class="sourceLineNo">269</span>   * Process the data buffer and clean the connection state for the next call.<a name="line.269"></a>
+<span class="sourceLineNo">270</span>   */<a name="line.270"></a>
+<span class="sourceLineNo">271</span>  private void process() throws IOException, InterruptedException {<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    data.rewind();<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    try {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      if (skipInitialSaslHandshake) {<a name="line.274"></a>
+<span class="sourceLineNo">275</span>        skipInitialSaslHandshake = false;<a name="line.275"></a>
+<span class="sourceLineNo">276</span>        return;<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      }<a name="line.277"></a>
+<span class="sourceLineNo">278</span><a name="line.278"></a>
+<span class="sourceLineNo">279</span>      if (useSasl) {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>        saslReadAndProcess(data);<a name="line.280"></a>
+<span class="sourceLineNo">281</span>      } else {<a name="line.281"></a>
+<span class="sourceLineNo">282</span>        processOneRpc(data);<a name="line.282"></a>
+<span class="sourceLineNo">283</span>      }<a name="line.283"></a>
+<span class="sourceLineNo">284</span><a name="line.284"></a>
+<span class="sourceLineNo">285</span>    } finally {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>      dataLengthBuffer.clear(); // Clean for the next call<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      data = null; // For the GC<a name="line.287"></a>
+<span class="sourceLineNo">288</span>      this.callCleanup = null;<a name="line.288"></a>
+<span class="sourceLineNo">289</span>    }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>  }<a name="line.290"></a>
+<span class="sourceLineNo">291</span><a name="line.291"></a>
+<span class="sourceLineNo">292</span>  @Override<a name="line.292"></a>
+<span class="sourceLineNo">293</span>  public synchronized void close() {<a name="line.293"></a>
+<span class="sourceLineNo">294</span>    disposeSasl();<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    data = null;<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    callCleanup = null;<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    if (!channel.isOpen()) return;<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    try {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>      socket.shutdownOutput();<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    } catch (Exception ignored) {<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      if (SimpleRpcServer.LOG.isTraceEnabled()) {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>        SimpleRpcServer.LOG.trace("Ignored exception", ignored);<a name="line.302"></a>
+<span class="sourceLineNo">303</span>      }<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    }<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    if (channel.isOpen()) {<a name="line.305"></a>
+<span class="sourceLineNo">306</span>      try {<a name="line.306"></a>
+<span class="sourceLineNo">307</span>        channel.close();<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      } catch (Exception ignored) {<a name="line.308"></a>
+<span class="sourceLineNo">309</span>      }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    }<a name="line.310"></a>
+<span class="sourceLineNo">311</span>    try {<a name="line.311"></a>
+<span class="sourceLineNo">312</span>      socket.close();<a name="line.312"></a>
+<span class="sourceLineNo">313</span>    } catch (Exception ignored) {<a name="line.313"></a>
+<span class="sourceLineNo">314</span>      if (SimpleRpcServer.LOG.isTraceEnabled()) {<a name="line.314"></a>
+<span class="sourceLineNo">315</span>        SimpleRpcServer.LOG.trace("Ignored exception", ignored);<a name="line.315"></a>
+<span class="sourceLineNo">316</span>      }<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    }<a name="line.317"></a>
+<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
+<span class="sourceLineNo">319</span><a name="line.319"></a>
+<span class="sourceLineNo">320</span>  @Override<a name="line.320"></a>
+<span class="sourceLineNo">321</span>  public boolean isConnectionOpen() {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    return channel.isOpen();<a name="line.322"></a>
+<span class="sourceLineNo">323</span>  }<a name="line.323"></a>
+<span class="sourceLineNo">324</span><a name="line.324"></a>
+<span class="sourceLineNo">325</span>  @Override<a name="line.325"></a>
+<span class="sourceLineNo">326</span>  public SimpleServerCall createCall(int id, BlockingService service, MethodDescriptor md,<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      RequestHeader header, Message param, CellScanner cellScanner, long size,<a name="line.327"></a>
+<span class="sourceLineNo">328</span>      InetAddress remoteAddress, int timeout, CallCleanup reqCleanup) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    return new SimpleServerCall(id, service, md, header, param, cellScanner, this, size,<a name="line.329"></a>
+<span class="sourceLineNo">330</span>        remoteAddress, System.currentTimeMillis(), timeout, this.rpcServer.bbAllocator,<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        this.rpcServer.cellBlockBuilder, reqCleanup, this.responder);<a name="line.331"></a>
+<span class="sourceLineNo">332</span>  }<a name="line.332"></a>
+<span class="sourceLineNo">333</span><a name="line.333"></a>
+<span class="sourceLineNo">334</span>  @Override<a name="line.334"></a>
+<span class="sourceLineNo">335</span>  protected void doRespond(RpcResponse resp) throws IOException {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    responder.doRespond(this, resp);<a name="line.336"></a>
+<span class="sourceLineNo">337</span>  }<a name="line.337"></a>
+<span class="sourceLineNo">338</span>}<a name="line.338"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
