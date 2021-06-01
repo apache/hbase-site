@@ -37,354 +37,355 @@
 <span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.CellUtil;<a name="line.29"></a>
 <span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.HConstants;<a name="line.30"></a>
 <span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.replication.ReplicationEndpoint;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.wal.WAL.Entry;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.wal.WALEdit;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.slf4j.Logger;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.slf4j.LoggerFactory;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.BulkLoadDescriptor;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.StoreDescriptor;<a name="line.39"></a>
-<span class="sourceLineNo">040</span><a name="line.40"></a>
-<span class="sourceLineNo">041</span>/**<a name="line.41"></a>
-<span class="sourceLineNo">042</span> * This thread reads entries from a queue and ships them. Entries are placed onto the queue by<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * ReplicationSourceWALReaderThread<a name="line.43"></a>
-<span class="sourceLineNo">044</span> */<a name="line.44"></a>
-<span class="sourceLineNo">045</span>@InterfaceAudience.Private<a name="line.45"></a>
-<span class="sourceLineNo">046</span>public class ReplicationSourceShipper extends Thread {<a name="line.46"></a>
-<span class="sourceLineNo">047</span>  private static final Logger LOG = LoggerFactory.getLogger(ReplicationSourceShipper.class);<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>  // Hold the state of a replication worker thread<a name="line.49"></a>
-<span class="sourceLineNo">050</span>  public enum WorkerState {<a name="line.50"></a>
-<span class="sourceLineNo">051</span>    RUNNING,<a name="line.51"></a>
-<span class="sourceLineNo">052</span>    STOPPED,<a name="line.52"></a>
-<span class="sourceLineNo">053</span>    FINISHED,  // The worker is done processing a queue<a name="line.53"></a>
-<span class="sourceLineNo">054</span>  }<a name="line.54"></a>
-<span class="sourceLineNo">055</span><a name="line.55"></a>
-<span class="sourceLineNo">056</span>  private final Configuration conf;<a name="line.56"></a>
-<span class="sourceLineNo">057</span>  protected final String walGroupId;<a name="line.57"></a>
-<span class="sourceLineNo">058</span>  protected final ReplicationSourceLogQueue logQueue;<a name="line.58"></a>
-<span class="sourceLineNo">059</span>  private final ReplicationSource source;<a name="line.59"></a>
-<span class="sourceLineNo">060</span><a name="line.60"></a>
-<span class="sourceLineNo">061</span>  // Last position in the log that we sent to ZooKeeper<a name="line.61"></a>
-<span class="sourceLineNo">062</span>  // It will be accessed by the stats thread so make it volatile<a name="line.62"></a>
-<span class="sourceLineNo">063</span>  private volatile long currentPosition = -1;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>  // Path of the current log<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  private Path currentPath;<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  // Current state of the worker thread<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  private volatile WorkerState state;<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  protected ReplicationSourceWALReader entryReader;<a name="line.68"></a>
-<span class="sourceLineNo">069</span><a name="line.69"></a>
-<span class="sourceLineNo">070</span>  // How long should we sleep for each retry<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  protected final long sleepForRetries;<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  // Maximum number of retries before taking bold actions<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  protected final int maxRetriesMultiplier;<a name="line.73"></a>
-<span class="sourceLineNo">074</span>  private final int DEFAULT_TIMEOUT = 20000;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private final int getEntriesTimeout;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>  private final int shipEditsTimeout;<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>  public ReplicationSourceShipper(Configuration conf, String walGroupId,<a name="line.78"></a>
-<span class="sourceLineNo">079</span>      ReplicationSourceLogQueue logQueue, ReplicationSource source) {<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    this.conf = conf;<a name="line.80"></a>
-<span class="sourceLineNo">081</span>    this.walGroupId = walGroupId;<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    this.logQueue = logQueue;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>    this.source = source;<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    this.sleepForRetries =<a name="line.84"></a>
-<span class="sourceLineNo">085</span>        this.conf.getLong("replication.source.sleepforretries", 1000);    // 1 second<a name="line.85"></a>
-<span class="sourceLineNo">086</span>    this.maxRetriesMultiplier =<a name="line.86"></a>
-<span class="sourceLineNo">087</span>        this.conf.getInt("replication.source.maxretriesmultiplier", 300); // 5 minutes @ 1 sec per<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    this.getEntriesTimeout =<a name="line.88"></a>
-<span class="sourceLineNo">089</span>        this.conf.getInt("replication.source.getEntries.timeout", DEFAULT_TIMEOUT); // 20 seconds<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    this.shipEditsTimeout = this.conf.getInt(HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT,<a name="line.90"></a>
-<span class="sourceLineNo">091</span>        HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT_DFAULT);<a name="line.91"></a>
-<span class="sourceLineNo">092</span>  }<a name="line.92"></a>
-<span class="sourceLineNo">093</span><a name="line.93"></a>
-<span class="sourceLineNo">094</span>  @Override<a name="line.94"></a>
-<span class="sourceLineNo">095</span>  public final void run() {<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    setWorkerState(WorkerState.RUNNING);<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    LOG.info("Running ReplicationSourceShipper Thread for wal group: {}", this.walGroupId);<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    // Loop until we close down<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    while (isActive()) {<a name="line.99"></a>
-<span class="sourceLineNo">100</span>      // Sleep until replication is enabled again<a name="line.100"></a>
-<span class="sourceLineNo">101</span>      if (!source.isPeerEnabled()) {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>        // The peer enabled check is in memory, not expensive, so do not need to increase the<a name="line.102"></a>
-<span class="sourceLineNo">103</span>        // sleep interval as it may cause a long lag when we enable the peer.<a name="line.103"></a>
-<span class="sourceLineNo">104</span>        sleepForRetries("Replication is disabled", sleepForRetries, 1, maxRetriesMultiplier);<a name="line.104"></a>
-<span class="sourceLineNo">105</span>        continue;<a name="line.105"></a>
-<span class="sourceLineNo">106</span>      }<a name="line.106"></a>
-<span class="sourceLineNo">107</span>      try {<a name="line.107"></a>
-<span class="sourceLineNo">108</span>        WALEntryBatch entryBatch = entryReader.poll(getEntriesTimeout);<a name="line.108"></a>
-<span class="sourceLineNo">109</span>        LOG.debug("Shipper from source {} got entry batch from reader: {}",<a name="line.109"></a>
-<span class="sourceLineNo">110</span>            source.getQueueId(), entryBatch);<a name="line.110"></a>
-<span class="sourceLineNo">111</span>        if (entryBatch == null) {<a name="line.111"></a>
-<span class="sourceLineNo">112</span>          continue;<a name="line.112"></a>
-<span class="sourceLineNo">113</span>        }<a name="line.113"></a>
-<span class="sourceLineNo">114</span>        // the NO_MORE_DATA instance has no path so do not call shipEdits<a name="line.114"></a>
-<span class="sourceLineNo">115</span>        if (entryBatch == WALEntryBatch.NO_MORE_DATA) {<a name="line.115"></a>
-<span class="sourceLineNo">116</span>          noMoreData();<a name="line.116"></a>
-<span class="sourceLineNo">117</span>        } else {<a name="line.117"></a>
-<span class="sourceLineNo">118</span>          shipEdits(entryBatch);<a name="line.118"></a>
-<span class="sourceLineNo">119</span>        }<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      } catch (InterruptedException | ReplicationRuntimeException e) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>        // It is interrupted and needs to quit.<a name="line.121"></a>
-<span class="sourceLineNo">122</span>        LOG.warn("Interrupted while waiting for next replication entry batch", e);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>        Thread.currentThread().interrupt();<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      }<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    }<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    // If the worker exits run loop without finishing its task, mark it as stopped.<a name="line.126"></a>
-<span class="sourceLineNo">127</span>    if (!isFinished()) {<a name="line.127"></a>
-<span class="sourceLineNo">128</span>      setWorkerState(WorkerState.STOPPED);<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    } else {<a name="line.129"></a>
-<span class="sourceLineNo">130</span>      source.removeWorker(this);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>      postFinish();<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    }<a name="line.132"></a>
-<span class="sourceLineNo">133</span>  }<a name="line.133"></a>
-<span class="sourceLineNo">134</span><a name="line.134"></a>
-<span class="sourceLineNo">135</span>  private void noMoreData() {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    if (source.isRecovered()) {<a name="line.136"></a>
-<span class="sourceLineNo">137</span>      LOG.debug("Finished recovering queue for group {} of peer {}", walGroupId,<a name="line.137"></a>
-<span class="sourceLineNo">138</span>        source.getQueueId());<a name="line.138"></a>
-<span class="sourceLineNo">139</span>      source.getSourceMetrics().incrCompletedRecoveryQueue();<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    } else {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      LOG.debug("Finished queue for group {} of peer {}", walGroupId, source.getQueueId());<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    }<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    setWorkerState(WorkerState.FINISHED);<a name="line.143"></a>
-<span class="sourceLineNo">144</span>  }<a name="line.144"></a>
-<span class="sourceLineNo">145</span><a name="line.145"></a>
-<span class="sourceLineNo">146</span>  // To be implemented by recovered shipper<a name="line.146"></a>
-<span class="sourceLineNo">147</span>  protected void postFinish() {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>  }<a name="line.148"></a>
-<span class="sourceLineNo">149</span><a name="line.149"></a>
-<span class="sourceLineNo">150</span>  /**<a name="line.150"></a>
-<span class="sourceLineNo">151</span>   * get batchEntry size excludes bulk load file sizes.<a name="line.151"></a>
-<span class="sourceLineNo">152</span>   * Uses ReplicationSourceWALReader's static method.<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   */<a name="line.153"></a>
-<span class="sourceLineNo">154</span>  private int getBatchEntrySizeExcludeBulkLoad(WALEntryBatch entryBatch) {<a name="line.154"></a>
-<span class="sourceLineNo">155</span>    int totalSize = 0;<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    for(Entry entry : entryBatch.getWalEntries()) {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      totalSize += ReplicationSourceWALReader.getEntrySizeExcludeBulkLoad(entry);<a name="line.157"></a>
-<span class="sourceLineNo">158</span>    }<a name="line.158"></a>
-<span class="sourceLineNo">159</span>    return  totalSize;<a name="line.159"></a>
-<span class="sourceLineNo">160</span>  }<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>  /**<a name="line.162"></a>
-<span class="sourceLineNo">163</span>   * Do the shipping logic<a name="line.163"></a>
-<span class="sourceLineNo">164</span>   */<a name="line.164"></a>
-<span class="sourceLineNo">165</span>  private void shipEdits(WALEntryBatch entryBatch) {<a name="line.165"></a>
-<span class="sourceLineNo">166</span>    List&lt;Entry&gt; entries = entryBatch.getWalEntries();<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    int sleepMultiplier = 0;<a name="line.167"></a>
-<span class="sourceLineNo">168</span>    if (entries.isEmpty()) {<a name="line.168"></a>
-<span class="sourceLineNo">169</span>      updateLogPosition(entryBatch);<a name="line.169"></a>
-<span class="sourceLineNo">170</span>      return;<a name="line.170"></a>
-<span class="sourceLineNo">171</span>    }<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    int currentSize = (int) entryBatch.getHeapSize();<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    int sizeExcludeBulkLoad = getBatchEntrySizeExcludeBulkLoad(entryBatch);<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    source.getSourceMetrics().setTimeStampNextToReplicate(entries.get(entries.size() - 1)<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        .getKey().getWriteTime());<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    while (isActive()) {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>      try {<a name="line.177"></a>
-<span class="sourceLineNo">178</span>        try {<a name="line.178"></a>
-<span class="sourceLineNo">179</span>          source.tryThrottle(currentSize);<a name="line.179"></a>
-<span class="sourceLineNo">180</span>        } catch (InterruptedException e) {<a name="line.180"></a>
-<span class="sourceLineNo">181</span>          LOG.debug("Interrupted while sleeping for throttling control");<a name="line.181"></a>
-<span class="sourceLineNo">182</span>          Thread.currentThread().interrupt();<a name="line.182"></a>
-<span class="sourceLineNo">183</span>          // current thread might be interrupted to terminate<a name="line.183"></a>
-<span class="sourceLineNo">184</span>          // directly go back to while() for confirm this<a name="line.184"></a>
-<span class="sourceLineNo">185</span>          continue;<a name="line.185"></a>
-<span class="sourceLineNo">186</span>        }<a name="line.186"></a>
-<span class="sourceLineNo">187</span>        // create replicateContext here, so the entries can be GC'd upon return from this call<a name="line.187"></a>
-<span class="sourceLineNo">188</span>        // stack<a name="line.188"></a>
-<span class="sourceLineNo">189</span>        ReplicationEndpoint.ReplicateContext replicateContext =<a name="line.189"></a>
-<span class="sourceLineNo">190</span>            new ReplicationEndpoint.ReplicateContext();<a name="line.190"></a>
-<span class="sourceLineNo">191</span>        replicateContext.setEntries(entries).setSize(currentSize);<a name="line.191"></a>
-<span class="sourceLineNo">192</span>        replicateContext.setWalGroupId(walGroupId);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>        replicateContext.setTimeout(getAdaptiveTimeout(this.shipEditsTimeout, sleepMultiplier));<a name="line.193"></a>
-<span class="sourceLineNo">194</span><a name="line.194"></a>
-<span class="sourceLineNo">195</span>        long startTimeNs = System.nanoTime();<a name="line.195"></a>
-<span class="sourceLineNo">196</span>        // send the edits to the endpoint. Will block until the edits are shipped and acknowledged<a name="line.196"></a>
-<span class="sourceLineNo">197</span>        boolean replicated = source.getReplicationEndpoint().replicate(replicateContext);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>        long endTimeNs = System.nanoTime();<a name="line.198"></a>
-<span class="sourceLineNo">199</span><a name="line.199"></a>
-<span class="sourceLineNo">200</span>        if (!replicated) {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>          continue;<a name="line.201"></a>
-<span class="sourceLineNo">202</span>        } else {<a name="line.202"></a>
-<span class="sourceLineNo">203</span>          sleepMultiplier = Math.max(sleepMultiplier - 1, 0);<a name="line.203"></a>
-<span class="sourceLineNo">204</span>        }<a name="line.204"></a>
-<span class="sourceLineNo">205</span>        // Clean up hfile references<a name="line.205"></a>
-<span class="sourceLineNo">206</span>        for (Entry entry : entries) {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>          cleanUpHFileRefs(entry.getEdit());<a name="line.207"></a>
-<span class="sourceLineNo">208</span>          LOG.trace("shipped entry {}: ", entry);<a name="line.208"></a>
-<span class="sourceLineNo">209</span>        }<a name="line.209"></a>
-<span class="sourceLineNo">210</span>        // Log and clean up WAL logs<a name="line.210"></a>
-<span class="sourceLineNo">211</span>        updateLogPosition(entryBatch);<a name="line.211"></a>
-<span class="sourceLineNo">212</span><a name="line.212"></a>
-<span class="sourceLineNo">213</span>        //offsets totalBufferUsed by deducting shipped batchSize (excludes bulk load size)<a name="line.213"></a>
-<span class="sourceLineNo">214</span>        //this sizeExcludeBulkLoad has to use same calculation that when calling<a name="line.214"></a>
-<span class="sourceLineNo">215</span>        //acquireBufferQuota() in ReplicationSourceWALReader because they maintain<a name="line.215"></a>
-<span class="sourceLineNo">216</span>        //same variable: totalBufferUsed<a name="line.216"></a>
-<span class="sourceLineNo">217</span>        source.postShipEdits(entries, sizeExcludeBulkLoad);<a name="line.217"></a>
-<span class="sourceLineNo">218</span>        // FIXME check relationship between wal group and overall<a name="line.218"></a>
-<span class="sourceLineNo">219</span>        source.getSourceMetrics().shipBatch(entryBatch.getNbOperations(), currentSize,<a name="line.219"></a>
-<span class="sourceLineNo">220</span>          entryBatch.getNbHFiles());<a name="line.220"></a>
-<span class="sourceLineNo">221</span>        source.getSourceMetrics().setAgeOfLastShippedOp(<a name="line.221"></a>
-<span class="sourceLineNo">222</span>          entries.get(entries.size() - 1).getKey().getWriteTime(), walGroupId);<a name="line.222"></a>
-<span class="sourceLineNo">223</span>        source.getSourceMetrics().updateTableLevelMetrics(entryBatch.getWalEntriesWithSize());<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>        if (LOG.isTraceEnabled()) {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>          LOG.debug("Replicated {} entries or {} operations in {} ms",<a name="line.226"></a>
-<span class="sourceLineNo">227</span>              entries.size(), entryBatch.getNbOperations(), (endTimeNs - startTimeNs) / 1000000);<a name="line.227"></a>
-<span class="sourceLineNo">228</span>        }<a name="line.228"></a>
-<span class="sourceLineNo">229</span>        break;<a name="line.229"></a>
-<span class="sourceLineNo">230</span>      } catch (Exception ex) {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>        LOG.warn("{} threw unknown exception:",<a name="line.231"></a>
-<span class="sourceLineNo">232</span>          source.getReplicationEndpoint().getClass().getName(), ex);<a name="line.232"></a>
-<span class="sourceLineNo">233</span>        if (sleepForRetries("ReplicationEndpoint threw exception", sleepForRetries, sleepMultiplier,<a name="line.233"></a>
-<span class="sourceLineNo">234</span>          maxRetriesMultiplier)) {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>          sleepMultiplier++;<a name="line.235"></a>
-<span class="sourceLineNo">236</span>        }<a name="line.236"></a>
-<span class="sourceLineNo">237</span>      }<a name="line.237"></a>
-<span class="sourceLineNo">238</span>    }<a name="line.238"></a>
-<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
-<span class="sourceLineNo">240</span><a name="line.240"></a>
-<span class="sourceLineNo">241</span>  private void cleanUpHFileRefs(WALEdit edit) throws IOException {<a name="line.241"></a>
-<span class="sourceLineNo">242</span>    String peerId = source.getPeerId();<a name="line.242"></a>
-<span class="sourceLineNo">243</span>    if (peerId.contains("-")) {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>      // peerClusterZnode will be in the form peerId + "-" + rsZNode.<a name="line.244"></a>
-<span class="sourceLineNo">245</span>      // A peerId will not have "-" in its name, see HBASE-11394<a name="line.245"></a>
-<span class="sourceLineNo">246</span>      peerId = peerId.split("-")[0];<a name="line.246"></a>
-<span class="sourceLineNo">247</span>    }<a name="line.247"></a>
-<span class="sourceLineNo">248</span>    List&lt;Cell&gt; cells = edit.getCells();<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    int totalCells = cells.size();<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    for (int i = 0; i &lt; totalCells; i++) {<a name="line.250"></a>
-<span class="sourceLineNo">251</span>      Cell cell = cells.get(i);<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      if (CellUtil.matchingQualifier(cell, WALEdit.BULK_LOAD)) {<a name="line.252"></a>
-<span class="sourceLineNo">253</span>        BulkLoadDescriptor bld = WALEdit.getBulkLoadDescriptor(cell);<a name="line.253"></a>
-<span class="sourceLineNo">254</span>        List&lt;StoreDescriptor&gt; stores = bld.getStoresList();<a name="line.254"></a>
-<span class="sourceLineNo">255</span>        int totalStores = stores.size();<a name="line.255"></a>
-<span class="sourceLineNo">256</span>        for (int j = 0; j &lt; totalStores; j++) {<a name="line.256"></a>
-<span class="sourceLineNo">257</span>          List&lt;String&gt; storeFileList = stores.get(j).getStoreFileList();<a name="line.257"></a>
-<span class="sourceLineNo">258</span>          source.getSourceManager().cleanUpHFileRefs(peerId, storeFileList);<a name="line.258"></a>
-<span class="sourceLineNo">259</span>          source.getSourceMetrics().decrSizeOfHFileRefsQueue(storeFileList.size());<a name="line.259"></a>
-<span class="sourceLineNo">260</span>        }<a name="line.260"></a>
-<span class="sourceLineNo">261</span>      }<a name="line.261"></a>
-<span class="sourceLineNo">262</span>    }<a name="line.262"></a>
-<span class="sourceLineNo">263</span>  }<a name="line.263"></a>
-<span class="sourceLineNo">264</span><a name="line.264"></a>
-<span class="sourceLineNo">265</span>  private boolean updateLogPosition(WALEntryBatch batch) {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>    boolean updated = false;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>    // if end of file is true, then the logPositionAndCleanOldLogs method will remove the file<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    // record on zk, so let's call it. The last wal position maybe zero if end of file is true and<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    // there is no entry in the batch. It is OK because that the queue storage will ignore the zero<a name="line.269"></a>
-<span class="sourceLineNo">270</span>    // position and the file will be removed soon in cleanOldLogs.<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    if (batch.isEndOfFile() || !batch.getLastWalPath().equals(currentPath) ||<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      batch.getLastWalPosition() != currentPosition) {<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      source.logPositionAndCleanOldLogs(batch);<a name="line.273"></a>
-<span class="sourceLineNo">274</span>      updated = true;<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    }<a name="line.275"></a>
-<span class="sourceLineNo">276</span>    // if end of file is true, then we can just skip to the next file in queue.<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    // the only exception is for recovered queue, if we reach the end of the queue, then there will<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    // no more files so here the currentPath may be null.<a name="line.278"></a>
-<span class="sourceLineNo">279</span>    if (batch.isEndOfFile()) {<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      currentPath = entryReader.getCurrentPath();<a name="line.280"></a>
-<span class="sourceLineNo">281</span>      currentPosition = 0L;<a name="line.281"></a>
-<span class="sourceLineNo">282</span>    } else {<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      currentPath = batch.getLastWalPath();<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      currentPosition = batch.getLastWalPosition();<a name="line.284"></a>
-<span class="sourceLineNo">285</span>    }<a name="line.285"></a>
-<span class="sourceLineNo">286</span>    return updated;<a name="line.286"></a>
-<span class="sourceLineNo">287</span>  }<a name="line.287"></a>
-<span class="sourceLineNo">288</span><a name="line.288"></a>
-<span class="sourceLineNo">289</span>  public void startup(UncaughtExceptionHandler handler) {<a name="line.289"></a>
-<span class="sourceLineNo">290</span>    String name = Thread.currentThread().getName();<a name="line.290"></a>
-<span class="sourceLineNo">291</span>    Threads.setDaemonThreadRunning(this,<a name="line.291"></a>
-<span class="sourceLineNo">292</span>      name + ".replicationSource.shipper" + walGroupId + "," + source.getQueueId(),<a name="line.292"></a>
-<span class="sourceLineNo">293</span>      handler::uncaughtException);<a name="line.293"></a>
-<span class="sourceLineNo">294</span>  }<a name="line.294"></a>
-<span class="sourceLineNo">295</span><a name="line.295"></a>
-<span class="sourceLineNo">296</span>  Path getCurrentPath() {<a name="line.296"></a>
-<span class="sourceLineNo">297</span>    return entryReader.getCurrentPath();<a name="line.297"></a>
-<span class="sourceLineNo">298</span>  }<a name="line.298"></a>
-<span class="sourceLineNo">299</span><a name="line.299"></a>
-<span class="sourceLineNo">300</span>  long getCurrentPosition() {<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    return currentPosition;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>  }<a name="line.302"></a>
-<span class="sourceLineNo">303</span><a name="line.303"></a>
-<span class="sourceLineNo">304</span>  void setWALReader(ReplicationSourceWALReader entryReader) {<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    this.entryReader = entryReader;<a name="line.305"></a>
-<span class="sourceLineNo">306</span>  }<a name="line.306"></a>
-<span class="sourceLineNo">307</span><a name="line.307"></a>
-<span class="sourceLineNo">308</span>  long getStartPosition() {<a name="line.308"></a>
-<span class="sourceLineNo">309</span>    return 0;<a name="line.309"></a>
-<span class="sourceLineNo">310</span>  }<a name="line.310"></a>
-<span class="sourceLineNo">311</span><a name="line.311"></a>
-<span class="sourceLineNo">312</span>  protected boolean isActive() {<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    return source.isSourceActive() &amp;&amp; state == WorkerState.RUNNING &amp;&amp; !isInterrupted();<a name="line.313"></a>
-<span class="sourceLineNo">314</span>  }<a name="line.314"></a>
-<span class="sourceLineNo">315</span><a name="line.315"></a>
-<span class="sourceLineNo">316</span>  protected final void setWorkerState(WorkerState state) {<a name="line.316"></a>
-<span class="sourceLineNo">317</span>    this.state = state;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
-<span class="sourceLineNo">319</span><a name="line.319"></a>
-<span class="sourceLineNo">320</span>  void stopWorker() {<a name="line.320"></a>
-<span class="sourceLineNo">321</span>    setWorkerState(WorkerState.STOPPED);<a name="line.321"></a>
-<span class="sourceLineNo">322</span>  }<a name="line.322"></a>
-<span class="sourceLineNo">323</span><a name="line.323"></a>
-<span class="sourceLineNo">324</span>  public boolean isFinished() {<a name="line.324"></a>
-<span class="sourceLineNo">325</span>    return state == WorkerState.FINISHED;<a name="line.325"></a>
-<span class="sourceLineNo">326</span>  }<a name="line.326"></a>
-<span class="sourceLineNo">327</span><a name="line.327"></a>
-<span class="sourceLineNo">328</span>  /**<a name="line.328"></a>
-<span class="sourceLineNo">329</span>   * Attempts to properly update &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;,<a name="line.329"></a>
-<span class="sourceLineNo">330</span>   * in case there were unprocessed entries batched by the reader to the shipper,<a name="line.330"></a>
-<span class="sourceLineNo">331</span>   * but the shipper didn't manage to ship those because the replication source is being terminated.<a name="line.331"></a>
-<span class="sourceLineNo">332</span>   * In that case, it iterates through the batched entries and decrease the pending<a name="line.332"></a>
-<span class="sourceLineNo">333</span>   * entries size from &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;<a name="line.333"></a>
-<span class="sourceLineNo">334</span>   * &lt;p/&gt;<a name="line.334"></a>
-<span class="sourceLineNo">335</span>   * &lt;b&gt;NOTES&lt;/b&gt;<a name="line.335"></a>
-<span class="sourceLineNo">336</span>   * 1) This method should only be called upon replication source termination.<a name="line.336"></a>
-<span class="sourceLineNo">337</span>   * It blocks waiting for both shipper and reader threads termination,<a name="line.337"></a>
-<span class="sourceLineNo">338</span>   * to make sure no race conditions<a name="line.338"></a>
-<span class="sourceLineNo">339</span>   * when updating &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;.<a name="line.339"></a>
-<span class="sourceLineNo">340</span>   *<a name="line.340"></a>
-<span class="sourceLineNo">341</span>   * 2) It &lt;b&gt;does not&lt;/b&gt; attempt to terminate reader and shipper threads. Those &lt;b&gt;must&lt;/b&gt;<a name="line.341"></a>
-<span class="sourceLineNo">342</span>   * have been triggered interruption/termination prior to calling this method.<a name="line.342"></a>
-<span class="sourceLineNo">343</span>   */<a name="line.343"></a>
-<span class="sourceLineNo">344</span>  void clearWALEntryBatch() {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>    long timeout = System.currentTimeMillis() + this.shipEditsTimeout;<a name="line.345"></a>
-<span class="sourceLineNo">346</span>    while(this.isAlive() || this.entryReader.isAlive()){<a name="line.346"></a>
-<span class="sourceLineNo">347</span>      try {<a name="line.347"></a>
-<span class="sourceLineNo">348</span>        if (System.currentTimeMillis() &gt;= timeout) {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>          LOG.warn("Shipper clearWALEntryBatch method timed out whilst waiting reader/shipper "<a name="line.349"></a>
-<span class="sourceLineNo">350</span>            + "thread to stop. Not cleaning buffer usage. Shipper alive: {}; Reader alive: {}",<a name="line.350"></a>
-<span class="sourceLineNo">351</span>            this.source.getPeerId(), this.isAlive(), this.entryReader.isAlive());<a name="line.351"></a>
-<span class="sourceLineNo">352</span>          return;<a name="line.352"></a>
-<span class="sourceLineNo">353</span>        } else {<a name="line.353"></a>
-<span class="sourceLineNo">354</span>          // Wait both shipper and reader threads to stop<a name="line.354"></a>
-<span class="sourceLineNo">355</span>          Thread.sleep(this.sleepForRetries);<a name="line.355"></a>
-<span class="sourceLineNo">356</span>        }<a name="line.356"></a>
-<span class="sourceLineNo">357</span>      } catch (InterruptedException e) {<a name="line.357"></a>
-<span class="sourceLineNo">358</span>        LOG.warn("{} Interrupted while waiting {} to stop on clearWALEntryBatch. "<a name="line.358"></a>
-<span class="sourceLineNo">359</span>            + "Not cleaning buffer usage: {}", this.source.getPeerId(), this.getName(), e);<a name="line.359"></a>
-<span class="sourceLineNo">360</span>        return;<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      }<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    }<a name="line.362"></a>
-<span class="sourceLineNo">363</span>    LongAccumulator totalToDecrement = new LongAccumulator((a,b) -&gt; a + b, 0);<a name="line.363"></a>
-<span class="sourceLineNo">364</span>    entryReader.entryBatchQueue.forEach(w -&gt; {<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      entryReader.entryBatchQueue.remove(w);<a name="line.365"></a>
-<span class="sourceLineNo">366</span>      w.getWalEntries().forEach(e -&gt; {<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        long entrySizeExcludeBulkLoad = ReplicationSourceWALReader.getEntrySizeExcludeBulkLoad(e);<a name="line.367"></a>
-<span class="sourceLineNo">368</span>        totalToDecrement.accumulate(entrySizeExcludeBulkLoad);<a name="line.368"></a>
-<span class="sourceLineNo">369</span>      });<a name="line.369"></a>
-<span class="sourceLineNo">370</span>    });<a name="line.370"></a>
-<span class="sourceLineNo">371</span>    if( LOG.isTraceEnabled()) {<a name="line.371"></a>
-<span class="sourceLineNo">372</span>      LOG.trace("Decrementing totalBufferUsed by {}B while stopping Replication WAL Readers.",<a name="line.372"></a>
-<span class="sourceLineNo">373</span>        totalToDecrement.longValue());<a name="line.373"></a>
-<span class="sourceLineNo">374</span>    }<a name="line.374"></a>
-<span class="sourceLineNo">375</span>    long newBufferUsed = source.getSourceManager().getTotalBufferUsed()<a name="line.375"></a>
-<span class="sourceLineNo">376</span>      .addAndGet(-totalToDecrement.longValue());<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    source.getSourceManager().getGlobalMetrics().setWALReaderEditsBufferBytes(newBufferUsed);<a name="line.377"></a>
-<span class="sourceLineNo">378</span>  }<a name="line.378"></a>
-<span class="sourceLineNo">379</span>}<a name="line.379"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.util.Threads;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.wal.WAL.Entry;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.wal.WALEdit;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.slf4j.Logger;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.slf4j.LoggerFactory;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.BulkLoadDescriptor;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.StoreDescriptor;<a name="line.40"></a>
+<span class="sourceLineNo">041</span><a name="line.41"></a>
+<span class="sourceLineNo">042</span>/**<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * This thread reads entries from a queue and ships them. Entries are placed onto the queue by<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * ReplicationSourceWALReaderThread<a name="line.44"></a>
+<span class="sourceLineNo">045</span> */<a name="line.45"></a>
+<span class="sourceLineNo">046</span>@InterfaceAudience.Private<a name="line.46"></a>
+<span class="sourceLineNo">047</span>public class ReplicationSourceShipper extends Thread {<a name="line.47"></a>
+<span class="sourceLineNo">048</span>  private static final Logger LOG = LoggerFactory.getLogger(ReplicationSourceShipper.class);<a name="line.48"></a>
+<span class="sourceLineNo">049</span><a name="line.49"></a>
+<span class="sourceLineNo">050</span>  // Hold the state of a replication worker thread<a name="line.50"></a>
+<span class="sourceLineNo">051</span>  public enum WorkerState {<a name="line.51"></a>
+<span class="sourceLineNo">052</span>    RUNNING,<a name="line.52"></a>
+<span class="sourceLineNo">053</span>    STOPPED,<a name="line.53"></a>
+<span class="sourceLineNo">054</span>    FINISHED,  // The worker is done processing a queue<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  }<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>  private final Configuration conf;<a name="line.57"></a>
+<span class="sourceLineNo">058</span>  protected final String walGroupId;<a name="line.58"></a>
+<span class="sourceLineNo">059</span>  protected final ReplicationSourceLogQueue logQueue;<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private final ReplicationSource source;<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  // Last position in the log that we sent to ZooKeeper<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  // It will be accessed by the stats thread so make it volatile<a name="line.63"></a>
+<span class="sourceLineNo">064</span>  private volatile long currentPosition = -1;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  // Path of the current log<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  private Path currentPath;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  // Current state of the worker thread<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  private volatile WorkerState state;<a name="line.68"></a>
+<span class="sourceLineNo">069</span>  protected ReplicationSourceWALReader entryReader;<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  // How long should we sleep for each retry<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  protected final long sleepForRetries;<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  // Maximum number of retries before taking bold actions<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  protected final int maxRetriesMultiplier;<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private final int DEFAULT_TIMEOUT = 20000;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private final int getEntriesTimeout;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  private final int shipEditsTimeout;<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>  public ReplicationSourceShipper(Configuration conf, String walGroupId,<a name="line.79"></a>
+<span class="sourceLineNo">080</span>      ReplicationSourceLogQueue logQueue, ReplicationSource source) {<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    this.conf = conf;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    this.walGroupId = walGroupId;<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    this.logQueue = logQueue;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    this.source = source;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    this.sleepForRetries =<a name="line.85"></a>
+<span class="sourceLineNo">086</span>        this.conf.getLong("replication.source.sleepforretries", 1000);    // 1 second<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    this.maxRetriesMultiplier =<a name="line.87"></a>
+<span class="sourceLineNo">088</span>        this.conf.getInt("replication.source.maxretriesmultiplier", 300); // 5 minutes @ 1 sec per<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    this.getEntriesTimeout =<a name="line.89"></a>
+<span class="sourceLineNo">090</span>        this.conf.getInt("replication.source.getEntries.timeout", DEFAULT_TIMEOUT); // 20 seconds<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this.shipEditsTimeout = this.conf.getInt(HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT,<a name="line.91"></a>
+<span class="sourceLineNo">092</span>        HConstants.REPLICATION_SOURCE_SHIPEDITS_TIMEOUT_DFAULT);<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  }<a name="line.93"></a>
+<span class="sourceLineNo">094</span><a name="line.94"></a>
+<span class="sourceLineNo">095</span>  @Override<a name="line.95"></a>
+<span class="sourceLineNo">096</span>  public final void run() {<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    setWorkerState(WorkerState.RUNNING);<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    LOG.info("Running ReplicationSourceShipper Thread for wal group: {}", this.walGroupId);<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    // Loop until we close down<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    while (isActive()) {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      // Sleep until replication is enabled again<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      if (!source.isPeerEnabled()) {<a name="line.102"></a>
+<span class="sourceLineNo">103</span>        // The peer enabled check is in memory, not expensive, so do not need to increase the<a name="line.103"></a>
+<span class="sourceLineNo">104</span>        // sleep interval as it may cause a long lag when we enable the peer.<a name="line.104"></a>
+<span class="sourceLineNo">105</span>        sleepForRetries("Replication is disabled", sleepForRetries, 1, maxRetriesMultiplier);<a name="line.105"></a>
+<span class="sourceLineNo">106</span>        continue;<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      }<a name="line.107"></a>
+<span class="sourceLineNo">108</span>      try {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>        WALEntryBatch entryBatch = entryReader.poll(getEntriesTimeout);<a name="line.109"></a>
+<span class="sourceLineNo">110</span>        LOG.debug("Shipper from source {} got entry batch from reader: {}",<a name="line.110"></a>
+<span class="sourceLineNo">111</span>            source.getQueueId(), entryBatch);<a name="line.111"></a>
+<span class="sourceLineNo">112</span>        if (entryBatch == null) {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>          continue;<a name="line.113"></a>
+<span class="sourceLineNo">114</span>        }<a name="line.114"></a>
+<span class="sourceLineNo">115</span>        // the NO_MORE_DATA instance has no path so do not call shipEdits<a name="line.115"></a>
+<span class="sourceLineNo">116</span>        if (entryBatch == WALEntryBatch.NO_MORE_DATA) {<a name="line.116"></a>
+<span class="sourceLineNo">117</span>          noMoreData();<a name="line.117"></a>
+<span class="sourceLineNo">118</span>        } else {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>          shipEdits(entryBatch);<a name="line.119"></a>
+<span class="sourceLineNo">120</span>        }<a name="line.120"></a>
+<span class="sourceLineNo">121</span>      } catch (InterruptedException | ReplicationRuntimeException e) {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>        // It is interrupted and needs to quit.<a name="line.122"></a>
+<span class="sourceLineNo">123</span>        LOG.warn("Interrupted while waiting for next replication entry batch", e);<a name="line.123"></a>
+<span class="sourceLineNo">124</span>        Thread.currentThread().interrupt();<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      }<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    }<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    // If the worker exits run loop without finishing its task, mark it as stopped.<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    if (!isFinished()) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      setWorkerState(WorkerState.STOPPED);<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    } else {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>      source.removeWorker(this);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      postFinish();<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
+<span class="sourceLineNo">134</span>  }<a name="line.134"></a>
+<span class="sourceLineNo">135</span><a name="line.135"></a>
+<span class="sourceLineNo">136</span>  private void noMoreData() {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    if (source.isRecovered()) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      LOG.debug("Finished recovering queue for group {} of peer {}", walGroupId,<a name="line.138"></a>
+<span class="sourceLineNo">139</span>        source.getQueueId());<a name="line.139"></a>
+<span class="sourceLineNo">140</span>      source.getSourceMetrics().incrCompletedRecoveryQueue();<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    } else {<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      LOG.debug("Finished queue for group {} of peer {}", walGroupId, source.getQueueId());<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    }<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    setWorkerState(WorkerState.FINISHED);<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  }<a name="line.145"></a>
+<span class="sourceLineNo">146</span><a name="line.146"></a>
+<span class="sourceLineNo">147</span>  // To be implemented by recovered shipper<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  protected void postFinish() {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>  }<a name="line.149"></a>
+<span class="sourceLineNo">150</span><a name="line.150"></a>
+<span class="sourceLineNo">151</span>  /**<a name="line.151"></a>
+<span class="sourceLineNo">152</span>   * get batchEntry size excludes bulk load file sizes.<a name="line.152"></a>
+<span class="sourceLineNo">153</span>   * Uses ReplicationSourceWALReader's static method.<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   */<a name="line.154"></a>
+<span class="sourceLineNo">155</span>  private int getBatchEntrySizeExcludeBulkLoad(WALEntryBatch entryBatch) {<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    int totalSize = 0;<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    for(Entry entry : entryBatch.getWalEntries()) {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      totalSize += ReplicationSourceWALReader.getEntrySizeExcludeBulkLoad(entry);<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    }<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    return  totalSize;<a name="line.160"></a>
+<span class="sourceLineNo">161</span>  }<a name="line.161"></a>
+<span class="sourceLineNo">162</span><a name="line.162"></a>
+<span class="sourceLineNo">163</span>  /**<a name="line.163"></a>
+<span class="sourceLineNo">164</span>   * Do the shipping logic<a name="line.164"></a>
+<span class="sourceLineNo">165</span>   */<a name="line.165"></a>
+<span class="sourceLineNo">166</span>  private void shipEdits(WALEntryBatch entryBatch) {<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    List&lt;Entry&gt; entries = entryBatch.getWalEntries();<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    int sleepMultiplier = 0;<a name="line.168"></a>
+<span class="sourceLineNo">169</span>    if (entries.isEmpty()) {<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      updateLogPosition(entryBatch);<a name="line.170"></a>
+<span class="sourceLineNo">171</span>      return;<a name="line.171"></a>
+<span class="sourceLineNo">172</span>    }<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    int currentSize = (int) entryBatch.getHeapSize();<a name="line.173"></a>
+<span class="sourceLineNo">174</span>    int sizeExcludeBulkLoad = getBatchEntrySizeExcludeBulkLoad(entryBatch);<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    source.getSourceMetrics().setTimeStampNextToReplicate(entries.get(entries.size() - 1)<a name="line.175"></a>
+<span class="sourceLineNo">176</span>        .getKey().getWriteTime());<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    while (isActive()) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      try {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        try {<a name="line.179"></a>
+<span class="sourceLineNo">180</span>          source.tryThrottle(currentSize);<a name="line.180"></a>
+<span class="sourceLineNo">181</span>        } catch (InterruptedException e) {<a name="line.181"></a>
+<span class="sourceLineNo">182</span>          LOG.debug("Interrupted while sleeping for throttling control");<a name="line.182"></a>
+<span class="sourceLineNo">183</span>          Thread.currentThread().interrupt();<a name="line.183"></a>
+<span class="sourceLineNo">184</span>          // current thread might be interrupted to terminate<a name="line.184"></a>
+<span class="sourceLineNo">185</span>          // directly go back to while() for confirm this<a name="line.185"></a>
+<span class="sourceLineNo">186</span>          continue;<a name="line.186"></a>
+<span class="sourceLineNo">187</span>        }<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        // create replicateContext here, so the entries can be GC'd upon return from this call<a name="line.188"></a>
+<span class="sourceLineNo">189</span>        // stack<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        ReplicationEndpoint.ReplicateContext replicateContext =<a name="line.190"></a>
+<span class="sourceLineNo">191</span>            new ReplicationEndpoint.ReplicateContext();<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        replicateContext.setEntries(entries).setSize(currentSize);<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        replicateContext.setWalGroupId(walGroupId);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        replicateContext.setTimeout(getAdaptiveTimeout(this.shipEditsTimeout, sleepMultiplier));<a name="line.194"></a>
+<span class="sourceLineNo">195</span><a name="line.195"></a>
+<span class="sourceLineNo">196</span>        long startTimeNs = System.nanoTime();<a name="line.196"></a>
+<span class="sourceLineNo">197</span>        // send the edits to the endpoint. Will block until the edits are shipped and acknowledged<a name="line.197"></a>
+<span class="sourceLineNo">198</span>        boolean replicated = source.getReplicationEndpoint().replicate(replicateContext);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>        long endTimeNs = System.nanoTime();<a name="line.199"></a>
+<span class="sourceLineNo">200</span><a name="line.200"></a>
+<span class="sourceLineNo">201</span>        if (!replicated) {<a name="line.201"></a>
+<span class="sourceLineNo">202</span>          continue;<a name="line.202"></a>
+<span class="sourceLineNo">203</span>        } else {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>          sleepMultiplier = Math.max(sleepMultiplier - 1, 0);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>        }<a name="line.205"></a>
+<span class="sourceLineNo">206</span>        // Clean up hfile references<a name="line.206"></a>
+<span class="sourceLineNo">207</span>        for (Entry entry : entries) {<a name="line.207"></a>
+<span class="sourceLineNo">208</span>          cleanUpHFileRefs(entry.getEdit());<a name="line.208"></a>
+<span class="sourceLineNo">209</span>          LOG.trace("shipped entry {}: ", entry);<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        }<a name="line.210"></a>
+<span class="sourceLineNo">211</span>        // Log and clean up WAL logs<a name="line.211"></a>
+<span class="sourceLineNo">212</span>        updateLogPosition(entryBatch);<a name="line.212"></a>
+<span class="sourceLineNo">213</span><a name="line.213"></a>
+<span class="sourceLineNo">214</span>        //offsets totalBufferUsed by deducting shipped batchSize (excludes bulk load size)<a name="line.214"></a>
+<span class="sourceLineNo">215</span>        //this sizeExcludeBulkLoad has to use same calculation that when calling<a name="line.215"></a>
+<span class="sourceLineNo">216</span>        //acquireBufferQuota() in ReplicationSourceWALReader because they maintain<a name="line.216"></a>
+<span class="sourceLineNo">217</span>        //same variable: totalBufferUsed<a name="line.217"></a>
+<span class="sourceLineNo">218</span>        source.postShipEdits(entries, sizeExcludeBulkLoad);<a name="line.218"></a>
+<span class="sourceLineNo">219</span>        // FIXME check relationship between wal group and overall<a name="line.219"></a>
+<span class="sourceLineNo">220</span>        source.getSourceMetrics().shipBatch(entryBatch.getNbOperations(), currentSize,<a name="line.220"></a>
+<span class="sourceLineNo">221</span>          entryBatch.getNbHFiles());<a name="line.221"></a>
+<span class="sourceLineNo">222</span>        source.getSourceMetrics().setAgeOfLastShippedOp(<a name="line.222"></a>
+<span class="sourceLineNo">223</span>          entries.get(entries.size() - 1).getKey().getWriteTime(), walGroupId);<a name="line.223"></a>
+<span class="sourceLineNo">224</span>        source.getSourceMetrics().updateTableLevelMetrics(entryBatch.getWalEntriesWithSize());<a name="line.224"></a>
+<span class="sourceLineNo">225</span><a name="line.225"></a>
+<span class="sourceLineNo">226</span>        if (LOG.isTraceEnabled()) {<a name="line.226"></a>
+<span class="sourceLineNo">227</span>          LOG.debug("Replicated {} entries or {} operations in {} ms",<a name="line.227"></a>
+<span class="sourceLineNo">228</span>              entries.size(), entryBatch.getNbOperations(), (endTimeNs - startTimeNs) / 1000000);<a name="line.228"></a>
+<span class="sourceLineNo">229</span>        }<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        break;<a name="line.230"></a>
+<span class="sourceLineNo">231</span>      } catch (Exception ex) {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>        LOG.warn("{} threw unknown exception:",<a name="line.232"></a>
+<span class="sourceLineNo">233</span>          source.getReplicationEndpoint().getClass().getName(), ex);<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        if (sleepForRetries("ReplicationEndpoint threw exception", sleepForRetries, sleepMultiplier,<a name="line.234"></a>
+<span class="sourceLineNo">235</span>          maxRetriesMultiplier)) {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>          sleepMultiplier++;<a name="line.236"></a>
+<span class="sourceLineNo">237</span>        }<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      }<a name="line.238"></a>
+<span class="sourceLineNo">239</span>    }<a name="line.239"></a>
+<span class="sourceLineNo">240</span>  }<a name="line.240"></a>
+<span class="sourceLineNo">241</span><a name="line.241"></a>
+<span class="sourceLineNo">242</span>  private void cleanUpHFileRefs(WALEdit edit) throws IOException {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    String peerId = source.getPeerId();<a name="line.243"></a>
+<span class="sourceLineNo">244</span>    if (peerId.contains("-")) {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>      // peerClusterZnode will be in the form peerId + "-" + rsZNode.<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      // A peerId will not have "-" in its name, see HBASE-11394<a name="line.246"></a>
+<span class="sourceLineNo">247</span>      peerId = peerId.split("-")[0];<a name="line.247"></a>
+<span class="sourceLineNo">248</span>    }<a name="line.248"></a>
+<span class="sourceLineNo">249</span>    List&lt;Cell&gt; cells = edit.getCells();<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    int totalCells = cells.size();<a name="line.250"></a>
+<span class="sourceLineNo">251</span>    for (int i = 0; i &lt; totalCells; i++) {<a name="line.251"></a>
+<span class="sourceLineNo">252</span>      Cell cell = cells.get(i);<a name="line.252"></a>
+<span class="sourceLineNo">253</span>      if (CellUtil.matchingQualifier(cell, WALEdit.BULK_LOAD)) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>        BulkLoadDescriptor bld = WALEdit.getBulkLoadDescriptor(cell);<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        List&lt;StoreDescriptor&gt; stores = bld.getStoresList();<a name="line.255"></a>
+<span class="sourceLineNo">256</span>        int totalStores = stores.size();<a name="line.256"></a>
+<span class="sourceLineNo">257</span>        for (int j = 0; j &lt; totalStores; j++) {<a name="line.257"></a>
+<span class="sourceLineNo">258</span>          List&lt;String&gt; storeFileList = stores.get(j).getStoreFileList();<a name="line.258"></a>
+<span class="sourceLineNo">259</span>          source.getSourceManager().cleanUpHFileRefs(peerId, storeFileList);<a name="line.259"></a>
+<span class="sourceLineNo">260</span>          source.getSourceMetrics().decrSizeOfHFileRefsQueue(storeFileList.size());<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        }<a name="line.261"></a>
+<span class="sourceLineNo">262</span>      }<a name="line.262"></a>
+<span class="sourceLineNo">263</span>    }<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  }<a name="line.264"></a>
+<span class="sourceLineNo">265</span><a name="line.265"></a>
+<span class="sourceLineNo">266</span>  private boolean updateLogPosition(WALEntryBatch batch) {<a name="line.266"></a>
+<span class="sourceLineNo">267</span>    boolean updated = false;<a name="line.267"></a>
+<span class="sourceLineNo">268</span>    // if end of file is true, then the logPositionAndCleanOldLogs method will remove the file<a name="line.268"></a>
+<span class="sourceLineNo">269</span>    // record on zk, so let's call it. The last wal position maybe zero if end of file is true and<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    // there is no entry in the batch. It is OK because that the queue storage will ignore the zero<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    // position and the file will be removed soon in cleanOldLogs.<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    if (batch.isEndOfFile() || !batch.getLastWalPath().equals(currentPath) ||<a name="line.272"></a>
+<span class="sourceLineNo">273</span>      batch.getLastWalPosition() != currentPosition) {<a name="line.273"></a>
+<span class="sourceLineNo">274</span>      source.logPositionAndCleanOldLogs(batch);<a name="line.274"></a>
+<span class="sourceLineNo">275</span>      updated = true;<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    }<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    // if end of file is true, then we can just skip to the next file in queue.<a name="line.277"></a>
+<span class="sourceLineNo">278</span>    // the only exception is for recovered queue, if we reach the end of the queue, then there will<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    // no more files so here the currentPath may be null.<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    if (batch.isEndOfFile()) {<a name="line.280"></a>
+<span class="sourceLineNo">281</span>      currentPath = entryReader.getCurrentPath();<a name="line.281"></a>
+<span class="sourceLineNo">282</span>      currentPosition = 0L;<a name="line.282"></a>
+<span class="sourceLineNo">283</span>    } else {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>      currentPath = batch.getLastWalPath();<a name="line.284"></a>
+<span class="sourceLineNo">285</span>      currentPosition = batch.getLastWalPosition();<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    }<a name="line.286"></a>
+<span class="sourceLineNo">287</span>    return updated;<a name="line.287"></a>
+<span class="sourceLineNo">288</span>  }<a name="line.288"></a>
+<span class="sourceLineNo">289</span><a name="line.289"></a>
+<span class="sourceLineNo">290</span>  public void startup(UncaughtExceptionHandler handler) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>    String name = Thread.currentThread().getName();<a name="line.291"></a>
+<span class="sourceLineNo">292</span>    Threads.setDaemonThreadRunning(this,<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      name + ".replicationSource.shipper" + walGroupId + "," + source.getQueueId(),<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      handler::uncaughtException);<a name="line.294"></a>
+<span class="sourceLineNo">295</span>  }<a name="line.295"></a>
+<span class="sourceLineNo">296</span><a name="line.296"></a>
+<span class="sourceLineNo">297</span>  Path getCurrentPath() {<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    return entryReader.getCurrentPath();<a name="line.298"></a>
+<span class="sourceLineNo">299</span>  }<a name="line.299"></a>
+<span class="sourceLineNo">300</span><a name="line.300"></a>
+<span class="sourceLineNo">301</span>  long getCurrentPosition() {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>    return currentPosition;<a name="line.302"></a>
+<span class="sourceLineNo">303</span>  }<a name="line.303"></a>
+<span class="sourceLineNo">304</span><a name="line.304"></a>
+<span class="sourceLineNo">305</span>  void setWALReader(ReplicationSourceWALReader entryReader) {<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    this.entryReader = entryReader;<a name="line.306"></a>
+<span class="sourceLineNo">307</span>  }<a name="line.307"></a>
+<span class="sourceLineNo">308</span><a name="line.308"></a>
+<span class="sourceLineNo">309</span>  long getStartPosition() {<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    return 0;<a name="line.310"></a>
+<span class="sourceLineNo">311</span>  }<a name="line.311"></a>
+<span class="sourceLineNo">312</span><a name="line.312"></a>
+<span class="sourceLineNo">313</span>  protected boolean isActive() {<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    return source.isSourceActive() &amp;&amp; state == WorkerState.RUNNING &amp;&amp; !isInterrupted();<a name="line.314"></a>
+<span class="sourceLineNo">315</span>  }<a name="line.315"></a>
+<span class="sourceLineNo">316</span><a name="line.316"></a>
+<span class="sourceLineNo">317</span>  protected final void setWorkerState(WorkerState state) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>    this.state = state;<a name="line.318"></a>
+<span class="sourceLineNo">319</span>  }<a name="line.319"></a>
+<span class="sourceLineNo">320</span><a name="line.320"></a>
+<span class="sourceLineNo">321</span>  void stopWorker() {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>    setWorkerState(WorkerState.STOPPED);<a name="line.322"></a>
+<span class="sourceLineNo">323</span>  }<a name="line.323"></a>
+<span class="sourceLineNo">324</span><a name="line.324"></a>
+<span class="sourceLineNo">325</span>  public boolean isFinished() {<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    return state == WorkerState.FINISHED;<a name="line.326"></a>
+<span class="sourceLineNo">327</span>  }<a name="line.327"></a>
+<span class="sourceLineNo">328</span><a name="line.328"></a>
+<span class="sourceLineNo">329</span>  /**<a name="line.329"></a>
+<span class="sourceLineNo">330</span>   * Attempts to properly update &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;,<a name="line.330"></a>
+<span class="sourceLineNo">331</span>   * in case there were unprocessed entries batched by the reader to the shipper,<a name="line.331"></a>
+<span class="sourceLineNo">332</span>   * but the shipper didn't manage to ship those because the replication source is being terminated.<a name="line.332"></a>
+<span class="sourceLineNo">333</span>   * In that case, it iterates through the batched entries and decrease the pending<a name="line.333"></a>
+<span class="sourceLineNo">334</span>   * entries size from &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;<a name="line.334"></a>
+<span class="sourceLineNo">335</span>   * &lt;p/&gt;<a name="line.335"></a>
+<span class="sourceLineNo">336</span>   * &lt;b&gt;NOTES&lt;/b&gt;<a name="line.336"></a>
+<span class="sourceLineNo">337</span>   * 1) This method should only be called upon replication source termination.<a name="line.337"></a>
+<span class="sourceLineNo">338</span>   * It blocks waiting for both shipper and reader threads termination,<a name="line.338"></a>
+<span class="sourceLineNo">339</span>   * to make sure no race conditions<a name="line.339"></a>
+<span class="sourceLineNo">340</span>   * when updating &lt;code&gt;ReplicationSourceManager.totalBufferUser&lt;/code&gt;.<a name="line.340"></a>
+<span class="sourceLineNo">341</span>   *<a name="line.341"></a>
+<span class="sourceLineNo">342</span>   * 2) It &lt;b&gt;does not&lt;/b&gt; attempt to terminate reader and shipper threads. Those &lt;b&gt;must&lt;/b&gt;<a name="line.342"></a>
+<span class="sourceLineNo">343</span>   * have been triggered interruption/termination prior to calling this method.<a name="line.343"></a>
+<span class="sourceLineNo">344</span>   */<a name="line.344"></a>
+<span class="sourceLineNo">345</span>  void clearWALEntryBatch() {<a name="line.345"></a>
+<span class="sourceLineNo">346</span>    long timeout = EnvironmentEdgeManager.currentTime() + this.shipEditsTimeout;<a name="line.346"></a>
+<span class="sourceLineNo">347</span>    while(this.isAlive() || this.entryReader.isAlive()){<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      try {<a name="line.348"></a>
+<span class="sourceLineNo">349</span>        if (EnvironmentEdgeManager.currentTime() &gt;= timeout) {<a name="line.349"></a>
+<span class="sourceLineNo">350</span>          LOG.warn("Shipper clearWALEntryBatch method timed out whilst waiting reader/shipper "<a name="line.350"></a>
+<span class="sourceLineNo">351</span>            + "thread to stop. Not cleaning buffer usage. Shipper alive: {}; Reader alive: {}",<a name="line.351"></a>
+<span class="sourceLineNo">352</span>            this.source.getPeerId(), this.isAlive(), this.entryReader.isAlive());<a name="line.352"></a>
+<span class="sourceLineNo">353</span>          return;<a name="line.353"></a>
+<span class="sourceLineNo">354</span>        } else {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>          // Wait both shipper and reader threads to stop<a name="line.355"></a>
+<span class="sourceLineNo">356</span>          Thread.sleep(this.sleepForRetries);<a name="line.356"></a>
+<span class="sourceLineNo">357</span>        }<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      } catch (InterruptedException e) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>        LOG.warn("{} Interrupted while waiting {} to stop on clearWALEntryBatch. "<a name="line.359"></a>
+<span class="sourceLineNo">360</span>            + "Not cleaning buffer usage: {}", this.source.getPeerId(), this.getName(), e);<a name="line.360"></a>
+<span class="sourceLineNo">361</span>        return;<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      }<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    }<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    LongAccumulator totalToDecrement = new LongAccumulator((a,b) -&gt; a + b, 0);<a name="line.364"></a>
+<span class="sourceLineNo">365</span>    entryReader.entryBatchQueue.forEach(w -&gt; {<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      entryReader.entryBatchQueue.remove(w);<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      w.getWalEntries().forEach(e -&gt; {<a name="line.367"></a>
+<span class="sourceLineNo">368</span>        long entrySizeExcludeBulkLoad = ReplicationSourceWALReader.getEntrySizeExcludeBulkLoad(e);<a name="line.368"></a>
+<span class="sourceLineNo">369</span>        totalToDecrement.accumulate(entrySizeExcludeBulkLoad);<a name="line.369"></a>
+<span class="sourceLineNo">370</span>      });<a name="line.370"></a>
+<span class="sourceLineNo">371</span>    });<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    if( LOG.isTraceEnabled()) {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      LOG.trace("Decrementing totalBufferUsed by {}B while stopping Replication WAL Readers.",<a name="line.373"></a>
+<span class="sourceLineNo">374</span>        totalToDecrement.longValue());<a name="line.374"></a>
+<span class="sourceLineNo">375</span>    }<a name="line.375"></a>
+<span class="sourceLineNo">376</span>    long newBufferUsed = source.getSourceManager().getTotalBufferUsed()<a name="line.376"></a>
+<span class="sourceLineNo">377</span>      .addAndGet(-totalToDecrement.longValue());<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    source.getSourceManager().getGlobalMetrics().setWALReaderEditsBufferBytes(newBufferUsed);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>  }<a name="line.379"></a>
+<span class="sourceLineNo">380</span>}<a name="line.380"></a>
 
 
 
