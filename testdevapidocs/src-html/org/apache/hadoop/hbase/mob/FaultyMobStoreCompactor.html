@@ -40,356 +40,358 @@
 <span class="sourceLineNo">032</span>import org.apache.hadoop.fs.FileSystem;<a name="line.32"></a>
 <span class="sourceLineNo">033</span>import org.apache.hadoop.fs.Path;<a name="line.33"></a>
 <span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.Cell;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.PrivateCellUtil;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.TableName;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.io.hfile.CorruptHFileException;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.regionserver.CellSink;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.HStore;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.InternalScanner;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.regionserver.KeyValueScanner;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.regionserver.ScannerContext;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.ShipperListener;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.StoreFileWriter;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.regionserver.compactions.CloseChecker;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.regionserver.throttle.ThroughputControlUtil;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.51"></a>
-<span class="sourceLineNo">052</span>import org.slf4j.Logger;<a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.slf4j.LoggerFactory;<a name="line.53"></a>
-<span class="sourceLineNo">054</span>/**<a name="line.54"></a>
-<span class="sourceLineNo">055</span> * This class is used for testing only. The main purpose is to emulate<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * random failures during MOB compaction process.<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * Example of usage:<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * &lt;pre&gt;{@code<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * public class SomeTest {<a name="line.59"></a>
-<span class="sourceLineNo">060</span> *<a name="line.60"></a>
-<span class="sourceLineNo">061</span> *   public void initConfiguration(Configuration conf){<a name="line.61"></a>
-<span class="sourceLineNo">062</span> *     conf.set(MobStoreEngine.DEFAULT_MOB_COMPACTOR_CLASS_KEY,<a name="line.62"></a>
-<span class="sourceLineNo">063</span>         FaultyMobStoreCompactor.class.getName());<a name="line.63"></a>
-<span class="sourceLineNo">064</span>       conf.setDouble("hbase.mob.compaction.fault.probability", 0.1);<a name="line.64"></a>
-<span class="sourceLineNo">065</span> *   }<a name="line.65"></a>
-<span class="sourceLineNo">066</span> * }<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * }&lt;/pre&gt;<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * @see org.apache.hadoop.hbase.mob.MobStressToolRunner on how to use and configure<a name="line.68"></a>
-<span class="sourceLineNo">069</span> *   this class.<a name="line.69"></a>
-<span class="sourceLineNo">070</span> *<a name="line.70"></a>
-<span class="sourceLineNo">071</span> */<a name="line.71"></a>
-<span class="sourceLineNo">072</span>@InterfaceAudience.Private<a name="line.72"></a>
-<span class="sourceLineNo">073</span>public class FaultyMobStoreCompactor extends DefaultMobStoreCompactor {<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  private static final Logger LOG = LoggerFactory.getLogger(FaultyMobStoreCompactor.class);<a name="line.75"></a>
-<span class="sourceLineNo">076</span><a name="line.76"></a>
-<span class="sourceLineNo">077</span>  public static AtomicLong mobCounter = new AtomicLong();<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  public static AtomicLong totalFailures = new AtomicLong();<a name="line.78"></a>
-<span class="sourceLineNo">079</span>  public static AtomicLong totalCompactions = new AtomicLong();<a name="line.79"></a>
-<span class="sourceLineNo">080</span>  public static AtomicLong totalMajorCompactions = new AtomicLong();<a name="line.80"></a>
-<span class="sourceLineNo">081</span><a name="line.81"></a>
-<span class="sourceLineNo">082</span>  static double failureProb = 0.1d;<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  static Random rnd = new Random();<a name="line.83"></a>
-<span class="sourceLineNo">084</span><a name="line.84"></a>
-<span class="sourceLineNo">085</span>  public FaultyMobStoreCompactor(Configuration conf, HStore store) {<a name="line.85"></a>
-<span class="sourceLineNo">086</span>    super(conf, store);<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    failureProb = conf.getDouble("hbase.mob.compaction.fault.probability", 0.1);<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  }<a name="line.88"></a>
-<span class="sourceLineNo">089</span><a name="line.89"></a>
-<span class="sourceLineNo">090</span>  @Override<a name="line.90"></a>
-<span class="sourceLineNo">091</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.91"></a>
-<span class="sourceLineNo">092</span>      long smallestReadPoint, boolean cleanSeqId, ThroughputController throughputController,<a name="line.92"></a>
-<span class="sourceLineNo">093</span>      boolean major, int numofFilesToCompact) throws IOException {<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>    totalCompactions.incrementAndGet();<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    if (major) {<a name="line.96"></a>
-<span class="sourceLineNo">097</span>      totalMajorCompactions.incrementAndGet();<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    }<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    long bytesWrittenProgressForLog = 0;<a name="line.99"></a>
-<span class="sourceLineNo">100</span>    long bytesWrittenProgressForShippedCall = 0;<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    // Clear old mob references<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    mobRefSet.get().clear();<a name="line.102"></a>
-<span class="sourceLineNo">103</span>    boolean isUserRequest = userRequest.get();<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    boolean compactMOBs = major &amp;&amp; isUserRequest;<a name="line.104"></a>
-<span class="sourceLineNo">105</span>    boolean discardMobMiss = conf.getBoolean(MobConstants.MOB_UNSAFE_DISCARD_MISS_KEY,<a name="line.105"></a>
-<span class="sourceLineNo">106</span>      MobConstants.DEFAULT_MOB_DISCARD_MISS);<a name="line.106"></a>
-<span class="sourceLineNo">107</span><a name="line.107"></a>
-<span class="sourceLineNo">108</span>    boolean mustFail = false;<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    if (compactMOBs) {<a name="line.109"></a>
-<span class="sourceLineNo">110</span>      mobCounter.incrementAndGet();<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      double dv = rnd.nextDouble();<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      if (dv &lt; failureProb) {<a name="line.112"></a>
-<span class="sourceLineNo">113</span>        mustFail = true;<a name="line.113"></a>
-<span class="sourceLineNo">114</span>        totalFailures.incrementAndGet();<a name="line.114"></a>
-<span class="sourceLineNo">115</span>      }<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    }<a name="line.116"></a>
-<span class="sourceLineNo">117</span><a name="line.117"></a>
-<span class="sourceLineNo">118</span>    FileSystem fs = store.getFileSystem();<a name="line.118"></a>
-<span class="sourceLineNo">119</span><a name="line.119"></a>
-<span class="sourceLineNo">120</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.120"></a>
-<span class="sourceLineNo">121</span>    // we have to use a do/while loop.<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    List&lt;Cell&gt; cells = new ArrayList&lt;&gt;();<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    long currentTime = EnvironmentEdgeManager.currentTime();<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    long lastMillis = 0;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    if (LOG.isDebugEnabled()) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      lastMillis = currentTime;<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    }<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    CloseChecker closeChecker = new CloseChecker(conf, currentTime);<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    String compactionName = ThroughputControlUtil.getNameForThrottling(store, "compaction");<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    long now = 0;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    boolean hasMore;<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    Path path = MobUtils.getMobFamilyPath(conf, store.getTableName(), store.getColumnFamilyName());<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    byte[] fileName = null;<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    StoreFileWriter mobFileWriter = null;<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    long mobCells = 0;<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    long cellsCountCompactedToMob = 0, cellsCountCompactedFromMob = 0;<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    long cellsSizeCompactedToMob = 0, cellsSizeCompactedFromMob = 0;<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    boolean finished = false;<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>    ScannerContext scannerContext =<a name="line.141"></a>
-<span class="sourceLineNo">142</span>        ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    throughputController.start(compactionName);<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    KeyValueScanner kvs = (scanner instanceof KeyValueScanner) ? (KeyValueScanner) scanner : null;<a name="line.144"></a>
-<span class="sourceLineNo">145</span>    long shippedCallSizeLimit =<a name="line.145"></a>
-<span class="sourceLineNo">146</span>        (long) numofFilesToCompact * this.store.getColumnFamilyDescriptor().getBlocksize();<a name="line.146"></a>
-<span class="sourceLineNo">147</span><a name="line.147"></a>
-<span class="sourceLineNo">148</span>    Cell mobCell = null;<a name="line.148"></a>
-<span class="sourceLineNo">149</span><a name="line.149"></a>
-<span class="sourceLineNo">150</span>    long counter = 0;<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    long countFailAt = -1;<a name="line.151"></a>
-<span class="sourceLineNo">152</span>    if (mustFail) {<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      countFailAt = rnd.nextInt(100); // randomly fail fast<a name="line.153"></a>
-<span class="sourceLineNo">154</span>    }<a name="line.154"></a>
-<span class="sourceLineNo">155</span><a name="line.155"></a>
-<span class="sourceLineNo">156</span>    try {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      try {<a name="line.157"></a>
-<span class="sourceLineNo">158</span>        mobFileWriter = mobStore.createWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.158"></a>
-<span class="sourceLineNo">159</span>          major ? majorCompactionCompression : minorCompactionCompression,<a name="line.159"></a>
-<span class="sourceLineNo">160</span>          store.getRegionInfo().getStartKey(), true);<a name="line.160"></a>
-<span class="sourceLineNo">161</span>        fileName = Bytes.toBytes(mobFileWriter.getPath().getName());<a name="line.161"></a>
-<span class="sourceLineNo">162</span>      } catch (IOException e) {<a name="line.162"></a>
-<span class="sourceLineNo">163</span>        // Bailing out<a name="line.163"></a>
-<span class="sourceLineNo">164</span>        LOG.error("Failed to create mob writer, ", e);<a name="line.164"></a>
-<span class="sourceLineNo">165</span>        throw e;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>      }<a name="line.166"></a>
-<span class="sourceLineNo">167</span>      if (compactMOBs) {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>        // Add the only reference we get for compact MOB case<a name="line.168"></a>
-<span class="sourceLineNo">169</span>        // because new store file will have only one MOB reference<a name="line.169"></a>
-<span class="sourceLineNo">170</span>        // in this case - of newly compacted MOB file<a name="line.170"></a>
-<span class="sourceLineNo">171</span>        mobRefSet.get().put(store.getTableName(), mobFileWriter.getPath().getName());<a name="line.171"></a>
-<span class="sourceLineNo">172</span>      }<a name="line.172"></a>
-<span class="sourceLineNo">173</span>      do {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>        hasMore = scanner.next(cells, scannerContext);<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        currentTime = EnvironmentEdgeManager.currentTime();<a name="line.175"></a>
-<span class="sourceLineNo">176</span>        if (LOG.isDebugEnabled()) {<a name="line.176"></a>
-<span class="sourceLineNo">177</span>          now = currentTime;<a name="line.177"></a>
-<span class="sourceLineNo">178</span>        }<a name="line.178"></a>
-<span class="sourceLineNo">179</span>        if (closeChecker.isTimeLimit(store, currentTime)) {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>          progress.cancel();<a name="line.180"></a>
-<span class="sourceLineNo">181</span>          return false;<a name="line.181"></a>
-<span class="sourceLineNo">182</span>        }<a name="line.182"></a>
-<span class="sourceLineNo">183</span>        for (Cell c : cells) {<a name="line.183"></a>
-<span class="sourceLineNo">184</span>          counter++;<a name="line.184"></a>
-<span class="sourceLineNo">185</span>          if (compactMOBs) {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>            if (MobUtils.isMobReferenceCell(c)) {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>              if (counter == countFailAt) {<a name="line.187"></a>
-<span class="sourceLineNo">188</span>                LOG.warn("INJECTED FAULT mobCounter={}", mobCounter.get());<a name="line.188"></a>
-<span class="sourceLineNo">189</span>                throw new CorruptHFileException("injected fault");<a name="line.189"></a>
-<span class="sourceLineNo">190</span>              }<a name="line.190"></a>
-<span class="sourceLineNo">191</span>              String fName = MobUtils.getMobFileName(c);<a name="line.191"></a>
-<span class="sourceLineNo">192</span>              // Added to support migration<a name="line.192"></a>
-<span class="sourceLineNo">193</span>              try {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>                mobCell = mobStore.resolve(c, true, false).getCell();<a name="line.194"></a>
-<span class="sourceLineNo">195</span>              } catch (FileNotFoundException fnfe) {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>                if (discardMobMiss) {<a name="line.196"></a>
-<span class="sourceLineNo">197</span>                  LOG.error("Missing MOB cell: file={} not found", fName);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>                  continue;<a name="line.198"></a>
-<span class="sourceLineNo">199</span>                } else {<a name="line.199"></a>
-<span class="sourceLineNo">200</span>                  throw fnfe;<a name="line.200"></a>
-<span class="sourceLineNo">201</span>                }<a name="line.201"></a>
-<span class="sourceLineNo">202</span>              }<a name="line.202"></a>
-<span class="sourceLineNo">203</span><a name="line.203"></a>
-<span class="sourceLineNo">204</span>              if (discardMobMiss &amp;&amp; mobCell.getValueLength() == 0) {<a name="line.204"></a>
-<span class="sourceLineNo">205</span>                LOG.error("Missing MOB cell value: file={} cell={}", fName, mobCell);<a name="line.205"></a>
-<span class="sourceLineNo">206</span>                continue;<a name="line.206"></a>
-<span class="sourceLineNo">207</span>              }<a name="line.207"></a>
-<span class="sourceLineNo">208</span><a name="line.208"></a>
-<span class="sourceLineNo">209</span>              if (mobCell.getValueLength() &gt; mobSizeThreshold) {<a name="line.209"></a>
-<span class="sourceLineNo">210</span>                // put the mob data back to the store file<a name="line.210"></a>
-<span class="sourceLineNo">211</span>                PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.211"></a>
-<span class="sourceLineNo">212</span>                mobFileWriter.append(mobCell);<a name="line.212"></a>
-<span class="sourceLineNo">213</span>                writer.append(<a name="line.213"></a>
-<span class="sourceLineNo">214</span>                  MobUtils.createMobRefCell(mobCell, fileName, this.mobStore.getRefCellTags()));<a name="line.214"></a>
-<span class="sourceLineNo">215</span>                mobCells++;<a name="line.215"></a>
-<span class="sourceLineNo">216</span>              } else {<a name="line.216"></a>
-<span class="sourceLineNo">217</span>                // If MOB value is less than threshold, append it directly to a store file<a name="line.217"></a>
-<span class="sourceLineNo">218</span>                PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.218"></a>
-<span class="sourceLineNo">219</span>                writer.append(mobCell);<a name="line.219"></a>
-<span class="sourceLineNo">220</span>                cellsCountCompactedFromMob++;<a name="line.220"></a>
-<span class="sourceLineNo">221</span>                cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.221"></a>
-<span class="sourceLineNo">222</span>              }<a name="line.222"></a>
-<span class="sourceLineNo">223</span>            } else {<a name="line.223"></a>
-<span class="sourceLineNo">224</span>              // Not a MOB reference cell<a name="line.224"></a>
-<span class="sourceLineNo">225</span>              int size = c.getValueLength();<a name="line.225"></a>
-<span class="sourceLineNo">226</span>              if (size &gt; mobSizeThreshold) {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>                mobFileWriter.append(c);<a name="line.227"></a>
-<span class="sourceLineNo">228</span>                writer<a name="line.228"></a>
-<span class="sourceLineNo">229</span>                    .append(MobUtils.createMobRefCell(c, fileName, this.mobStore.getRefCellTags()));<a name="line.229"></a>
-<span class="sourceLineNo">230</span>                mobCells++;<a name="line.230"></a>
-<span class="sourceLineNo">231</span>                cellsCountCompactedToMob++;<a name="line.231"></a>
-<span class="sourceLineNo">232</span>                cellsSizeCompactedToMob += c.getValueLength();<a name="line.232"></a>
-<span class="sourceLineNo">233</span>              } else {<a name="line.233"></a>
-<span class="sourceLineNo">234</span>                writer.append(c);<a name="line.234"></a>
-<span class="sourceLineNo">235</span>              }<a name="line.235"></a>
-<span class="sourceLineNo">236</span>            }<a name="line.236"></a>
-<span class="sourceLineNo">237</span>          } else if (c.getTypeByte() != KeyValue.Type.Put.getCode()) {<a name="line.237"></a>
-<span class="sourceLineNo">238</span>            // Not a major compaction or major with MOB disabled<a name="line.238"></a>
-<span class="sourceLineNo">239</span>            // If the kv type is not put, directly write the cell<a name="line.239"></a>
-<span class="sourceLineNo">240</span>            // to the store file.<a name="line.240"></a>
-<span class="sourceLineNo">241</span>            writer.append(c);<a name="line.241"></a>
-<span class="sourceLineNo">242</span>          } else if (MobUtils.isMobReferenceCell(c)) {<a name="line.242"></a>
-<span class="sourceLineNo">243</span>            // Not a major MOB compaction, Put MOB reference<a name="line.243"></a>
-<span class="sourceLineNo">244</span>            if (MobUtils.hasValidMobRefCellValue(c)) {<a name="line.244"></a>
-<span class="sourceLineNo">245</span>              int size = MobUtils.getMobValueLength(c);<a name="line.245"></a>
-<span class="sourceLineNo">246</span>              if (size &gt; mobSizeThreshold) {<a name="line.246"></a>
-<span class="sourceLineNo">247</span>                // If the value size is larger than the threshold, it's regarded as a mob. Since<a name="line.247"></a>
-<span class="sourceLineNo">248</span>                // its value is already in the mob file, directly write this cell to the store file<a name="line.248"></a>
-<span class="sourceLineNo">249</span>                Optional&lt;TableName&gt; refTable = MobUtils.getTableName(c);<a name="line.249"></a>
-<span class="sourceLineNo">250</span>                if (refTable.isPresent()) {<a name="line.250"></a>
-<span class="sourceLineNo">251</span>                  mobRefSet.get().put(refTable.get(), MobUtils.getMobFileName(c));<a name="line.251"></a>
-<span class="sourceLineNo">252</span>                  writer.append(c);<a name="line.252"></a>
-<span class="sourceLineNo">253</span>                } else {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>                  throw new IOException(String.format("MOB cell did not contain a tablename " +<a name="line.254"></a>
-<span class="sourceLineNo">255</span>                      "tag. should not be possible. see ref guide on mob troubleshooting. " +<a name="line.255"></a>
-<span class="sourceLineNo">256</span>                      "store=%s cell=%s", getStoreInfo(), c));<a name="line.256"></a>
-<span class="sourceLineNo">257</span>                }<a name="line.257"></a>
-<span class="sourceLineNo">258</span>              } else {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>                // If the value is not larger than the threshold, it's not regarded a mob. Retrieve<a name="line.259"></a>
-<span class="sourceLineNo">260</span>                // the mob cell from the mob file, and write it back to the store file.<a name="line.260"></a>
-<span class="sourceLineNo">261</span>                mobCell = mobStore.resolve(c, true, false).getCell();<a name="line.261"></a>
-<span class="sourceLineNo">262</span>                if (mobCell.getValueLength() != 0) {<a name="line.262"></a>
-<span class="sourceLineNo">263</span>                  // put the mob data back to the store file<a name="line.263"></a>
-<span class="sourceLineNo">264</span>                  PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.264"></a>
-<span class="sourceLineNo">265</span>                  writer.append(mobCell);<a name="line.265"></a>
-<span class="sourceLineNo">266</span>                  cellsCountCompactedFromMob++;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>                  cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.267"></a>
-<span class="sourceLineNo">268</span>                } else {<a name="line.268"></a>
-<span class="sourceLineNo">269</span>                  // If the value of a file is empty, there might be issues when retrieving,<a name="line.269"></a>
-<span class="sourceLineNo">270</span>                  // directly write the cell to the store file, and leave it to be handled by the<a name="line.270"></a>
-<span class="sourceLineNo">271</span>                  // next compaction.<a name="line.271"></a>
-<span class="sourceLineNo">272</span>                  LOG.error("Empty value for: " + c);<a name="line.272"></a>
-<span class="sourceLineNo">273</span>                  Optional&lt;TableName&gt; refTable = MobUtils.getTableName(c);<a name="line.273"></a>
-<span class="sourceLineNo">274</span>                  if (refTable.isPresent()) {<a name="line.274"></a>
-<span class="sourceLineNo">275</span>                    mobRefSet.get().put(refTable.get(), MobUtils.getMobFileName(c));<a name="line.275"></a>
-<span class="sourceLineNo">276</span>                    writer.append(c);<a name="line.276"></a>
-<span class="sourceLineNo">277</span>                  } else {<a name="line.277"></a>
-<span class="sourceLineNo">278</span>                    throw new IOException(String.format("MOB cell did not contain a tablename " +<a name="line.278"></a>
-<span class="sourceLineNo">279</span>                        "tag. should not be possible. see ref guide on mob troubleshooting. " +<a name="line.279"></a>
-<span class="sourceLineNo">280</span>                        "store=%s cell=%s", getStoreInfo(), c));<a name="line.280"></a>
-<span class="sourceLineNo">281</span>                  }<a name="line.281"></a>
-<span class="sourceLineNo">282</span>                }<a name="line.282"></a>
-<span class="sourceLineNo">283</span>              }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>            } else {<a name="line.284"></a>
-<span class="sourceLineNo">285</span>              LOG.error("Corrupted MOB reference: {}", c);<a name="line.285"></a>
-<span class="sourceLineNo">286</span>              writer.append(c);<a name="line.286"></a>
-<span class="sourceLineNo">287</span>            }<a name="line.287"></a>
-<span class="sourceLineNo">288</span>          } else if (c.getValueLength() &lt;= mobSizeThreshold) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>            // If the value size of a cell is not larger than the threshold, directly write it to<a name="line.289"></a>
-<span class="sourceLineNo">290</span>            // the store file.<a name="line.290"></a>
-<span class="sourceLineNo">291</span>            writer.append(c);<a name="line.291"></a>
-<span class="sourceLineNo">292</span>          } else {<a name="line.292"></a>
-<span class="sourceLineNo">293</span>            // If the value size of a cell is larger than the threshold, it's regarded as a mob,<a name="line.293"></a>
-<span class="sourceLineNo">294</span>            // write this cell to a mob file, and write the path to the store file.<a name="line.294"></a>
-<span class="sourceLineNo">295</span>            mobCells++;<a name="line.295"></a>
-<span class="sourceLineNo">296</span>            // append the original keyValue in the mob file.<a name="line.296"></a>
-<span class="sourceLineNo">297</span>            mobFileWriter.append(c);<a name="line.297"></a>
-<span class="sourceLineNo">298</span>            Cell reference = MobUtils.createMobRefCell(c, fileName, this.mobStore.getRefCellTags());<a name="line.298"></a>
-<span class="sourceLineNo">299</span>            // write the cell whose value is the path of a mob file to the store file.<a name="line.299"></a>
-<span class="sourceLineNo">300</span>            writer.append(reference);<a name="line.300"></a>
-<span class="sourceLineNo">301</span>            cellsCountCompactedToMob++;<a name="line.301"></a>
-<span class="sourceLineNo">302</span>            cellsSizeCompactedToMob += c.getValueLength();<a name="line.302"></a>
-<span class="sourceLineNo">303</span>            // Add ref we get for compact MOB case<a name="line.303"></a>
-<span class="sourceLineNo">304</span>            mobRefSet.get().put(store.getTableName(), mobFileWriter.getPath().getName());<a name="line.304"></a>
-<span class="sourceLineNo">305</span>          }<a name="line.305"></a>
-<span class="sourceLineNo">306</span><a name="line.306"></a>
-<span class="sourceLineNo">307</span>          int len = c.getSerializedSize();<a name="line.307"></a>
-<span class="sourceLineNo">308</span>          ++progress.currentCompactedKVs;<a name="line.308"></a>
-<span class="sourceLineNo">309</span>          progress.totalCompactedSize += len;<a name="line.309"></a>
-<span class="sourceLineNo">310</span>          bytesWrittenProgressForShippedCall += len;<a name="line.310"></a>
-<span class="sourceLineNo">311</span>          if (LOG.isDebugEnabled()) {<a name="line.311"></a>
-<span class="sourceLineNo">312</span>            bytesWrittenProgressForLog += len;<a name="line.312"></a>
-<span class="sourceLineNo">313</span>          }<a name="line.313"></a>
-<span class="sourceLineNo">314</span>          throughputController.control(compactionName, len);<a name="line.314"></a>
-<span class="sourceLineNo">315</span>          if (closeChecker.isSizeLimit(store, len)) {<a name="line.315"></a>
-<span class="sourceLineNo">316</span>            progress.cancel();<a name="line.316"></a>
-<span class="sourceLineNo">317</span>            return false;<a name="line.317"></a>
-<span class="sourceLineNo">318</span>          }<a name="line.318"></a>
-<span class="sourceLineNo">319</span>          if (kvs != null &amp;&amp; bytesWrittenProgressForShippedCall &gt; shippedCallSizeLimit) {<a name="line.319"></a>
-<span class="sourceLineNo">320</span>            ((ShipperListener) writer).beforeShipped();<a name="line.320"></a>
-<span class="sourceLineNo">321</span>            kvs.shipped();<a name="line.321"></a>
-<span class="sourceLineNo">322</span>            bytesWrittenProgressForShippedCall = 0;<a name="line.322"></a>
-<span class="sourceLineNo">323</span>          }<a name="line.323"></a>
-<span class="sourceLineNo">324</span>        }<a name="line.324"></a>
-<span class="sourceLineNo">325</span>        // Log the progress of long running compactions every minute if<a name="line.325"></a>
-<span class="sourceLineNo">326</span>        // logging at DEBUG level<a name="line.326"></a>
-<span class="sourceLineNo">327</span>        if (LOG.isDebugEnabled()) {<a name="line.327"></a>
-<span class="sourceLineNo">328</span>          if ((now - lastMillis) &gt;= COMPACTION_PROGRESS_LOG_INTERVAL) {<a name="line.328"></a>
-<span class="sourceLineNo">329</span>            String rate = String.format("%.2f",<a name="line.329"></a>
-<span class="sourceLineNo">330</span>              (bytesWrittenProgressForLog / 1024.0) / ((now - lastMillis) / 1000.0));<a name="line.330"></a>
-<span class="sourceLineNo">331</span>            LOG.debug("Compaction progress: {} {}, rate={} KB/sec, throughputController is {}",<a name="line.331"></a>
-<span class="sourceLineNo">332</span>              compactionName, progress, rate, throughputController);<a name="line.332"></a>
-<span class="sourceLineNo">333</span>            lastMillis = now;<a name="line.333"></a>
-<span class="sourceLineNo">334</span>            bytesWrittenProgressForLog = 0;<a name="line.334"></a>
-<span class="sourceLineNo">335</span>          }<a name="line.335"></a>
-<span class="sourceLineNo">336</span>        }<a name="line.336"></a>
-<span class="sourceLineNo">337</span>        cells.clear();<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      } while (hasMore);<a name="line.338"></a>
-<span class="sourceLineNo">339</span>      finished = true;<a name="line.339"></a>
-<span class="sourceLineNo">340</span>    } catch (InterruptedException e) {<a name="line.340"></a>
-<span class="sourceLineNo">341</span>      progress.cancel();<a name="line.341"></a>
-<span class="sourceLineNo">342</span>      throw new InterruptedIOException(<a name="line.342"></a>
-<span class="sourceLineNo">343</span>          "Interrupted while control throughput of compacting " + compactionName);<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    } catch (FileNotFoundException e) {<a name="line.344"></a>
-<span class="sourceLineNo">345</span>      LOG.error("MOB Stress Test FAILED, region: " + store.getRegionInfo().getEncodedName(), e);<a name="line.345"></a>
-<span class="sourceLineNo">346</span>      System.exit(-1);<a name="line.346"></a>
-<span class="sourceLineNo">347</span>    } catch (IOException t) {<a name="line.347"></a>
-<span class="sourceLineNo">348</span>      LOG.error("Mob compaction failed for region: " + store.getRegionInfo().getEncodedName());<a name="line.348"></a>
-<span class="sourceLineNo">349</span>      throw t;<a name="line.349"></a>
-<span class="sourceLineNo">350</span>    } finally {<a name="line.350"></a>
-<span class="sourceLineNo">351</span>      // Clone last cell in the final because writer will append last cell when committing. If<a name="line.351"></a>
-<span class="sourceLineNo">352</span>      // don't clone here and once the scanner get closed, then the memory of last cell will be<a name="line.352"></a>
-<span class="sourceLineNo">353</span>      // released. (HBASE-22582)<a name="line.353"></a>
-<span class="sourceLineNo">354</span>      ((ShipperListener) writer).beforeShipped();<a name="line.354"></a>
-<span class="sourceLineNo">355</span>      throughputController.finish(compactionName);<a name="line.355"></a>
-<span class="sourceLineNo">356</span>      if (!finished &amp;&amp; mobFileWriter != null) {<a name="line.356"></a>
-<span class="sourceLineNo">357</span>        // Remove all MOB references because compaction failed<a name="line.357"></a>
-<span class="sourceLineNo">358</span>        mobRefSet.get().clear();<a name="line.358"></a>
-<span class="sourceLineNo">359</span>        // Abort writer<a name="line.359"></a>
-<span class="sourceLineNo">360</span>        abortWriter(mobFileWriter);<a name="line.360"></a>
-<span class="sourceLineNo">361</span>      }<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    }<a name="line.362"></a>
-<span class="sourceLineNo">363</span><a name="line.363"></a>
-<span class="sourceLineNo">364</span>    if (mobFileWriter != null) {<a name="line.364"></a>
-<span class="sourceLineNo">365</span>      if (mobCells &gt; 0) {<a name="line.365"></a>
-<span class="sourceLineNo">366</span>        // If the mob file is not empty, commit it.<a name="line.366"></a>
-<span class="sourceLineNo">367</span>        mobFileWriter.appendMetadata(fd.maxSeqId, major, mobCells);<a name="line.367"></a>
-<span class="sourceLineNo">368</span>        mobFileWriter.close();<a name="line.368"></a>
-<span class="sourceLineNo">369</span>        mobStore.commitFile(mobFileWriter.getPath(), path);<a name="line.369"></a>
-<span class="sourceLineNo">370</span>      } else {<a name="line.370"></a>
-<span class="sourceLineNo">371</span>        // If the mob file is empty, delete it instead of committing.<a name="line.371"></a>
-<span class="sourceLineNo">372</span>        abortWriter(mobFileWriter);<a name="line.372"></a>
-<span class="sourceLineNo">373</span>      }<a name="line.373"></a>
-<span class="sourceLineNo">374</span>    }<a name="line.374"></a>
-<span class="sourceLineNo">375</span>    mobStore.updateCellsCountCompactedFromMob(cellsCountCompactedFromMob);<a name="line.375"></a>
-<span class="sourceLineNo">376</span>    mobStore.updateCellsCountCompactedToMob(cellsCountCompactedToMob);<a name="line.376"></a>
-<span class="sourceLineNo">377</span>    mobStore.updateCellsSizeCompactedFromMob(cellsSizeCompactedFromMob);<a name="line.377"></a>
-<span class="sourceLineNo">378</span>    mobStore.updateCellsSizeCompactedToMob(cellsSizeCompactedToMob);<a name="line.378"></a>
-<span class="sourceLineNo">379</span>    progress.complete();<a name="line.379"></a>
-<span class="sourceLineNo">380</span>    return true;<a name="line.380"></a>
-<span class="sourceLineNo">381</span><a name="line.381"></a>
-<span class="sourceLineNo">382</span>  }<a name="line.382"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.DoNotRetryIOException;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.PrivateCellUtil;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.TableName;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.io.hfile.CorruptHFileException;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.regionserver.CellSink;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.regionserver.HStore;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.regionserver.InternalScanner;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.regionserver.KeyValueScanner;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.ScannerContext;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.ShipperListener;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.regionserver.StoreFileWriter;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.regionserver.compactions.CloseChecker;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.regionserver.throttle.ThroughputControlUtil;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.regionserver.throttle.ThroughputController;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.52"></a>
+<span class="sourceLineNo">053</span>import org.slf4j.Logger;<a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.slf4j.LoggerFactory;<a name="line.54"></a>
+<span class="sourceLineNo">055</span>/**<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * This class is used for testing only. The main purpose is to emulate<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * random failures during MOB compaction process.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * Example of usage:<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * &lt;pre&gt;{@code<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * public class SomeTest {<a name="line.60"></a>
+<span class="sourceLineNo">061</span> *<a name="line.61"></a>
+<span class="sourceLineNo">062</span> *   public void initConfiguration(Configuration conf){<a name="line.62"></a>
+<span class="sourceLineNo">063</span> *     conf.set(MobStoreEngine.DEFAULT_MOB_COMPACTOR_CLASS_KEY,<a name="line.63"></a>
+<span class="sourceLineNo">064</span>         FaultyMobStoreCompactor.class.getName());<a name="line.64"></a>
+<span class="sourceLineNo">065</span>       conf.setDouble("hbase.mob.compaction.fault.probability", 0.1);<a name="line.65"></a>
+<span class="sourceLineNo">066</span> *   }<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * }<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * }&lt;/pre&gt;<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * @see org.apache.hadoop.hbase.mob.MobStressToolRunner on how to use and configure<a name="line.69"></a>
+<span class="sourceLineNo">070</span> *   this class.<a name="line.70"></a>
+<span class="sourceLineNo">071</span> *<a name="line.71"></a>
+<span class="sourceLineNo">072</span> */<a name="line.72"></a>
+<span class="sourceLineNo">073</span>@InterfaceAudience.Private<a name="line.73"></a>
+<span class="sourceLineNo">074</span>public class FaultyMobStoreCompactor extends DefaultMobStoreCompactor {<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  private static final Logger LOG = LoggerFactory.getLogger(FaultyMobStoreCompactor.class);<a name="line.76"></a>
+<span class="sourceLineNo">077</span><a name="line.77"></a>
+<span class="sourceLineNo">078</span>  public static AtomicLong mobCounter = new AtomicLong();<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  public static AtomicLong totalFailures = new AtomicLong();<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  public static AtomicLong totalCompactions = new AtomicLong();<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  public static AtomicLong totalMajorCompactions = new AtomicLong();<a name="line.81"></a>
+<span class="sourceLineNo">082</span><a name="line.82"></a>
+<span class="sourceLineNo">083</span>  static double failureProb = 0.1d;<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  static Random rnd = new Random();<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  public FaultyMobStoreCompactor(Configuration conf, HStore store) {<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    super(conf, store);<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    failureProb = conf.getDouble("hbase.mob.compaction.fault.probability", 0.1);<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  }<a name="line.89"></a>
+<span class="sourceLineNo">090</span><a name="line.90"></a>
+<span class="sourceLineNo">091</span>  @Override<a name="line.91"></a>
+<span class="sourceLineNo">092</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.92"></a>
+<span class="sourceLineNo">093</span>      long smallestReadPoint, boolean cleanSeqId, ThroughputController throughputController,<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      boolean major, int numofFilesToCompact) throws IOException {<a name="line.94"></a>
+<span class="sourceLineNo">095</span><a name="line.95"></a>
+<span class="sourceLineNo">096</span>    totalCompactions.incrementAndGet();<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    if (major) {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>      totalMajorCompactions.incrementAndGet();<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    }<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    long bytesWrittenProgressForLog = 0;<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    long bytesWrittenProgressForShippedCall = 0;<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    // Clear old mob references<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    mobRefSet.get().clear();<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    boolean isUserRequest = userRequest.get();<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    boolean compactMOBs = major &amp;&amp; isUserRequest;<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    boolean discardMobMiss = conf.getBoolean(MobConstants.MOB_UNSAFE_DISCARD_MISS_KEY,<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      MobConstants.DEFAULT_MOB_DISCARD_MISS);<a name="line.107"></a>
+<span class="sourceLineNo">108</span><a name="line.108"></a>
+<span class="sourceLineNo">109</span>    boolean mustFail = false;<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    if (compactMOBs) {<a name="line.110"></a>
+<span class="sourceLineNo">111</span>      mobCounter.incrementAndGet();<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      double dv = rnd.nextDouble();<a name="line.112"></a>
+<span class="sourceLineNo">113</span>      if (dv &lt; failureProb) {<a name="line.113"></a>
+<span class="sourceLineNo">114</span>        mustFail = true;<a name="line.114"></a>
+<span class="sourceLineNo">115</span>        totalFailures.incrementAndGet();<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      }<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    }<a name="line.117"></a>
+<span class="sourceLineNo">118</span><a name="line.118"></a>
+<span class="sourceLineNo">119</span>    FileSystem fs = store.getFileSystem();<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    // we have to use a do/while loop.<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    List&lt;Cell&gt; cells = new ArrayList&lt;&gt;();<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    // Limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid OOME<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    long currentTime = EnvironmentEdgeManager.currentTime();<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    long lastMillis = 0;<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    if (LOG.isDebugEnabled()) {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      lastMillis = currentTime;<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    }<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    CloseChecker closeChecker = new CloseChecker(conf, currentTime);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    String compactionName = ThroughputControlUtil.getNameForThrottling(store, "compaction");<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    long now = 0;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    boolean hasMore;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    Path path = MobUtils.getMobFamilyPath(conf, store.getTableName(), store.getColumnFamilyName());<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    byte[] fileName = null;<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    StoreFileWriter mobFileWriter = null;<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    long mobCells = 0;<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    long cellsCountCompactedToMob = 0, cellsCountCompactedFromMob = 0;<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    long cellsSizeCompactedToMob = 0, cellsSizeCompactedFromMob = 0;<a name="line.139"></a>
+<span class="sourceLineNo">140</span>    boolean finished = false;<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>    ScannerContext scannerContext =<a name="line.142"></a>
+<span class="sourceLineNo">143</span>        ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    throughputController.start(compactionName);<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    KeyValueScanner kvs = (scanner instanceof KeyValueScanner) ? (KeyValueScanner) scanner : null;<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    long shippedCallSizeLimit =<a name="line.146"></a>
+<span class="sourceLineNo">147</span>        (long) numofFilesToCompact * this.store.getColumnFamilyDescriptor().getBlocksize();<a name="line.147"></a>
+<span class="sourceLineNo">148</span><a name="line.148"></a>
+<span class="sourceLineNo">149</span>    Cell mobCell = null;<a name="line.149"></a>
+<span class="sourceLineNo">150</span><a name="line.150"></a>
+<span class="sourceLineNo">151</span>    long counter = 0;<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    long countFailAt = -1;<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    if (mustFail) {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      countFailAt = rnd.nextInt(100); // randomly fail fast<a name="line.154"></a>
+<span class="sourceLineNo">155</span>    }<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>    try {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      try {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>        mobFileWriter = mobStore.createWriterInTmp(new Date(fd.latestPutTs), fd.maxKeyCount,<a name="line.159"></a>
+<span class="sourceLineNo">160</span>          major ? majorCompactionCompression : minorCompactionCompression,<a name="line.160"></a>
+<span class="sourceLineNo">161</span>          store.getRegionInfo().getStartKey(), true);<a name="line.161"></a>
+<span class="sourceLineNo">162</span>        fileName = Bytes.toBytes(mobFileWriter.getPath().getName());<a name="line.162"></a>
+<span class="sourceLineNo">163</span>      } catch (IOException e) {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>        // Bailing out<a name="line.164"></a>
+<span class="sourceLineNo">165</span>        LOG.error("Failed to create mob writer, ", e);<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        throw e;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      }<a name="line.167"></a>
+<span class="sourceLineNo">168</span>      if (compactMOBs) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>        // Add the only reference we get for compact MOB case<a name="line.169"></a>
+<span class="sourceLineNo">170</span>        // because new store file will have only one MOB reference<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        // in this case - of newly compacted MOB file<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        mobRefSet.get().put(store.getTableName(), mobFileWriter.getPath().getName());<a name="line.172"></a>
+<span class="sourceLineNo">173</span>      }<a name="line.173"></a>
+<span class="sourceLineNo">174</span>      do {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>        hasMore = scanner.next(cells, scannerContext);<a name="line.175"></a>
+<span class="sourceLineNo">176</span>        currentTime = EnvironmentEdgeManager.currentTime();<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        if (LOG.isDebugEnabled()) {<a name="line.177"></a>
+<span class="sourceLineNo">178</span>          now = currentTime;<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        }<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        if (closeChecker.isTimeLimit(store, currentTime)) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>          progress.cancel();<a name="line.181"></a>
+<span class="sourceLineNo">182</span>          return false;<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        }<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        for (Cell c : cells) {<a name="line.184"></a>
+<span class="sourceLineNo">185</span>          counter++;<a name="line.185"></a>
+<span class="sourceLineNo">186</span>          if (compactMOBs) {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>            if (MobUtils.isMobReferenceCell(c)) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>              if (counter == countFailAt) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>                LOG.warn("INJECTED FAULT mobCounter={}", mobCounter.get());<a name="line.189"></a>
+<span class="sourceLineNo">190</span>                throw new CorruptHFileException("injected fault");<a name="line.190"></a>
+<span class="sourceLineNo">191</span>              }<a name="line.191"></a>
+<span class="sourceLineNo">192</span>              String fName = MobUtils.getMobFileName(c);<a name="line.192"></a>
+<span class="sourceLineNo">193</span>              // Added to support migration<a name="line.193"></a>
+<span class="sourceLineNo">194</span>              try {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>                mobCell = mobStore.resolve(c, true, false).getCell();<a name="line.195"></a>
+<span class="sourceLineNo">196</span>              } catch (DoNotRetryIOException e) {<a name="line.196"></a>
+<span class="sourceLineNo">197</span>                if (discardMobMiss &amp;&amp; e.getCause() != null<a name="line.197"></a>
+<span class="sourceLineNo">198</span>                  &amp;&amp; e.getCause() instanceof FileNotFoundException) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>                  LOG.error("Missing MOB cell: file={} not found cell={}", fName, c);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>                  continue;<a name="line.200"></a>
+<span class="sourceLineNo">201</span>                } else {<a name="line.201"></a>
+<span class="sourceLineNo">202</span>                  throw e;<a name="line.202"></a>
+<span class="sourceLineNo">203</span>                }<a name="line.203"></a>
+<span class="sourceLineNo">204</span>              }<a name="line.204"></a>
+<span class="sourceLineNo">205</span><a name="line.205"></a>
+<span class="sourceLineNo">206</span>              if (discardMobMiss &amp;&amp; mobCell.getValueLength() == 0) {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>                LOG.error("Missing MOB cell value: file={} cell={}", fName, mobCell);<a name="line.207"></a>
+<span class="sourceLineNo">208</span>                continue;<a name="line.208"></a>
+<span class="sourceLineNo">209</span>              }<a name="line.209"></a>
+<span class="sourceLineNo">210</span><a name="line.210"></a>
+<span class="sourceLineNo">211</span>              if (mobCell.getValueLength() &gt; mobSizeThreshold) {<a name="line.211"></a>
+<span class="sourceLineNo">212</span>                // put the mob data back to the store file<a name="line.212"></a>
+<span class="sourceLineNo">213</span>                PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.213"></a>
+<span class="sourceLineNo">214</span>                mobFileWriter.append(mobCell);<a name="line.214"></a>
+<span class="sourceLineNo">215</span>                writer.append(<a name="line.215"></a>
+<span class="sourceLineNo">216</span>                  MobUtils.createMobRefCell(mobCell, fileName, this.mobStore.getRefCellTags()));<a name="line.216"></a>
+<span class="sourceLineNo">217</span>                mobCells++;<a name="line.217"></a>
+<span class="sourceLineNo">218</span>              } else {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>                // If MOB value is less than threshold, append it directly to a store file<a name="line.219"></a>
+<span class="sourceLineNo">220</span>                PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.220"></a>
+<span class="sourceLineNo">221</span>                writer.append(mobCell);<a name="line.221"></a>
+<span class="sourceLineNo">222</span>                cellsCountCompactedFromMob++;<a name="line.222"></a>
+<span class="sourceLineNo">223</span>                cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.223"></a>
+<span class="sourceLineNo">224</span>              }<a name="line.224"></a>
+<span class="sourceLineNo">225</span>            } else {<a name="line.225"></a>
+<span class="sourceLineNo">226</span>              // Not a MOB reference cell<a name="line.226"></a>
+<span class="sourceLineNo">227</span>              int size = c.getValueLength();<a name="line.227"></a>
+<span class="sourceLineNo">228</span>              if (size &gt; mobSizeThreshold) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>                mobFileWriter.append(c);<a name="line.229"></a>
+<span class="sourceLineNo">230</span>                writer<a name="line.230"></a>
+<span class="sourceLineNo">231</span>                    .append(MobUtils.createMobRefCell(c, fileName, this.mobStore.getRefCellTags()));<a name="line.231"></a>
+<span class="sourceLineNo">232</span>                mobCells++;<a name="line.232"></a>
+<span class="sourceLineNo">233</span>                cellsCountCompactedToMob++;<a name="line.233"></a>
+<span class="sourceLineNo">234</span>                cellsSizeCompactedToMob += c.getValueLength();<a name="line.234"></a>
+<span class="sourceLineNo">235</span>              } else {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>                writer.append(c);<a name="line.236"></a>
+<span class="sourceLineNo">237</span>              }<a name="line.237"></a>
+<span class="sourceLineNo">238</span>            }<a name="line.238"></a>
+<span class="sourceLineNo">239</span>          } else if (c.getTypeByte() != KeyValue.Type.Put.getCode()) {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>            // Not a major compaction or major with MOB disabled<a name="line.240"></a>
+<span class="sourceLineNo">241</span>            // If the kv type is not put, directly write the cell<a name="line.241"></a>
+<span class="sourceLineNo">242</span>            // to the store file.<a name="line.242"></a>
+<span class="sourceLineNo">243</span>            writer.append(c);<a name="line.243"></a>
+<span class="sourceLineNo">244</span>          } else if (MobUtils.isMobReferenceCell(c)) {<a name="line.244"></a>
+<span class="sourceLineNo">245</span>            // Not a major MOB compaction, Put MOB reference<a name="line.245"></a>
+<span class="sourceLineNo">246</span>            if (MobUtils.hasValidMobRefCellValue(c)) {<a name="line.246"></a>
+<span class="sourceLineNo">247</span>              int size = MobUtils.getMobValueLength(c);<a name="line.247"></a>
+<span class="sourceLineNo">248</span>              if (size &gt; mobSizeThreshold) {<a name="line.248"></a>
+<span class="sourceLineNo">249</span>                // If the value size is larger than the threshold, it's regarded as a mob. Since<a name="line.249"></a>
+<span class="sourceLineNo">250</span>                // its value is already in the mob file, directly write this cell to the store file<a name="line.250"></a>
+<span class="sourceLineNo">251</span>                Optional&lt;TableName&gt; refTable = MobUtils.getTableName(c);<a name="line.251"></a>
+<span class="sourceLineNo">252</span>                if (refTable.isPresent()) {<a name="line.252"></a>
+<span class="sourceLineNo">253</span>                  mobRefSet.get().put(refTable.get(), MobUtils.getMobFileName(c));<a name="line.253"></a>
+<span class="sourceLineNo">254</span>                  writer.append(c);<a name="line.254"></a>
+<span class="sourceLineNo">255</span>                } else {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>                  throw new IOException(String.format("MOB cell did not contain a tablename " +<a name="line.256"></a>
+<span class="sourceLineNo">257</span>                      "tag. should not be possible. see ref guide on mob troubleshooting. " +<a name="line.257"></a>
+<span class="sourceLineNo">258</span>                      "store=%s cell=%s", getStoreInfo(), c));<a name="line.258"></a>
+<span class="sourceLineNo">259</span>                }<a name="line.259"></a>
+<span class="sourceLineNo">260</span>              } else {<a name="line.260"></a>
+<span class="sourceLineNo">261</span>                // If the value is not larger than the threshold, it's not regarded a mob. Retrieve<a name="line.261"></a>
+<span class="sourceLineNo">262</span>                // the mob cell from the mob file, and write it back to the store file.<a name="line.262"></a>
+<span class="sourceLineNo">263</span>                mobCell = mobStore.resolve(c, true, false).getCell();<a name="line.263"></a>
+<span class="sourceLineNo">264</span>                if (mobCell.getValueLength() != 0) {<a name="line.264"></a>
+<span class="sourceLineNo">265</span>                  // put the mob data back to the store file<a name="line.265"></a>
+<span class="sourceLineNo">266</span>                  PrivateCellUtil.setSequenceId(mobCell, c.getSequenceId());<a name="line.266"></a>
+<span class="sourceLineNo">267</span>                  writer.append(mobCell);<a name="line.267"></a>
+<span class="sourceLineNo">268</span>                  cellsCountCompactedFromMob++;<a name="line.268"></a>
+<span class="sourceLineNo">269</span>                  cellsSizeCompactedFromMob += mobCell.getValueLength();<a name="line.269"></a>
+<span class="sourceLineNo">270</span>                } else {<a name="line.270"></a>
+<span class="sourceLineNo">271</span>                  // If the value of a file is empty, there might be issues when retrieving,<a name="line.271"></a>
+<span class="sourceLineNo">272</span>                  // directly write the cell to the store file, and leave it to be handled by the<a name="line.272"></a>
+<span class="sourceLineNo">273</span>                  // next compaction.<a name="line.273"></a>
+<span class="sourceLineNo">274</span>                  LOG.error("Empty value for: " + c);<a name="line.274"></a>
+<span class="sourceLineNo">275</span>                  Optional&lt;TableName&gt; refTable = MobUtils.getTableName(c);<a name="line.275"></a>
+<span class="sourceLineNo">276</span>                  if (refTable.isPresent()) {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>                    mobRefSet.get().put(refTable.get(), MobUtils.getMobFileName(c));<a name="line.277"></a>
+<span class="sourceLineNo">278</span>                    writer.append(c);<a name="line.278"></a>
+<span class="sourceLineNo">279</span>                  } else {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>                    throw new IOException(String.format("MOB cell did not contain a tablename " +<a name="line.280"></a>
+<span class="sourceLineNo">281</span>                        "tag. should not be possible. see ref guide on mob troubleshooting. " +<a name="line.281"></a>
+<span class="sourceLineNo">282</span>                        "store=%s cell=%s", getStoreInfo(), c));<a name="line.282"></a>
+<span class="sourceLineNo">283</span>                  }<a name="line.283"></a>
+<span class="sourceLineNo">284</span>                }<a name="line.284"></a>
+<span class="sourceLineNo">285</span>              }<a name="line.285"></a>
+<span class="sourceLineNo">286</span>            } else {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>              LOG.error("Corrupted MOB reference: {}", c);<a name="line.287"></a>
+<span class="sourceLineNo">288</span>              writer.append(c);<a name="line.288"></a>
+<span class="sourceLineNo">289</span>            }<a name="line.289"></a>
+<span class="sourceLineNo">290</span>          } else if (c.getValueLength() &lt;= mobSizeThreshold) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>            // If the value size of a cell is not larger than the threshold, directly write it to<a name="line.291"></a>
+<span class="sourceLineNo">292</span>            // the store file.<a name="line.292"></a>
+<span class="sourceLineNo">293</span>            writer.append(c);<a name="line.293"></a>
+<span class="sourceLineNo">294</span>          } else {<a name="line.294"></a>
+<span class="sourceLineNo">295</span>            // If the value size of a cell is larger than the threshold, it's regarded as a mob,<a name="line.295"></a>
+<span class="sourceLineNo">296</span>            // write this cell to a mob file, and write the path to the store file.<a name="line.296"></a>
+<span class="sourceLineNo">297</span>            mobCells++;<a name="line.297"></a>
+<span class="sourceLineNo">298</span>            // append the original keyValue in the mob file.<a name="line.298"></a>
+<span class="sourceLineNo">299</span>            mobFileWriter.append(c);<a name="line.299"></a>
+<span class="sourceLineNo">300</span>            Cell reference = MobUtils.createMobRefCell(c, fileName, this.mobStore.getRefCellTags());<a name="line.300"></a>
+<span class="sourceLineNo">301</span>            // write the cell whose value is the path of a mob file to the store file.<a name="line.301"></a>
+<span class="sourceLineNo">302</span>            writer.append(reference);<a name="line.302"></a>
+<span class="sourceLineNo">303</span>            cellsCountCompactedToMob++;<a name="line.303"></a>
+<span class="sourceLineNo">304</span>            cellsSizeCompactedToMob += c.getValueLength();<a name="line.304"></a>
+<span class="sourceLineNo">305</span>            // Add ref we get for compact MOB case<a name="line.305"></a>
+<span class="sourceLineNo">306</span>            mobRefSet.get().put(store.getTableName(), mobFileWriter.getPath().getName());<a name="line.306"></a>
+<span class="sourceLineNo">307</span>          }<a name="line.307"></a>
+<span class="sourceLineNo">308</span><a name="line.308"></a>
+<span class="sourceLineNo">309</span>          int len = c.getSerializedSize();<a name="line.309"></a>
+<span class="sourceLineNo">310</span>          ++progress.currentCompactedKVs;<a name="line.310"></a>
+<span class="sourceLineNo">311</span>          progress.totalCompactedSize += len;<a name="line.311"></a>
+<span class="sourceLineNo">312</span>          bytesWrittenProgressForShippedCall += len;<a name="line.312"></a>
+<span class="sourceLineNo">313</span>          if (LOG.isDebugEnabled()) {<a name="line.313"></a>
+<span class="sourceLineNo">314</span>            bytesWrittenProgressForLog += len;<a name="line.314"></a>
+<span class="sourceLineNo">315</span>          }<a name="line.315"></a>
+<span class="sourceLineNo">316</span>          throughputController.control(compactionName, len);<a name="line.316"></a>
+<span class="sourceLineNo">317</span>          if (closeChecker.isSizeLimit(store, len)) {<a name="line.317"></a>
+<span class="sourceLineNo">318</span>            progress.cancel();<a name="line.318"></a>
+<span class="sourceLineNo">319</span>            return false;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>          }<a name="line.320"></a>
+<span class="sourceLineNo">321</span>          if (kvs != null &amp;&amp; bytesWrittenProgressForShippedCall &gt; shippedCallSizeLimit) {<a name="line.321"></a>
+<span class="sourceLineNo">322</span>            ((ShipperListener) writer).beforeShipped();<a name="line.322"></a>
+<span class="sourceLineNo">323</span>            kvs.shipped();<a name="line.323"></a>
+<span class="sourceLineNo">324</span>            bytesWrittenProgressForShippedCall = 0;<a name="line.324"></a>
+<span class="sourceLineNo">325</span>          }<a name="line.325"></a>
+<span class="sourceLineNo">326</span>        }<a name="line.326"></a>
+<span class="sourceLineNo">327</span>        // Log the progress of long running compactions every minute if<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        // logging at DEBUG level<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        if (LOG.isDebugEnabled()) {<a name="line.329"></a>
+<span class="sourceLineNo">330</span>          if ((now - lastMillis) &gt;= COMPACTION_PROGRESS_LOG_INTERVAL) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>            String rate = String.format("%.2f",<a name="line.331"></a>
+<span class="sourceLineNo">332</span>              (bytesWrittenProgressForLog / 1024.0) / ((now - lastMillis) / 1000.0));<a name="line.332"></a>
+<span class="sourceLineNo">333</span>            LOG.debug("Compaction progress: {} {}, rate={} KB/sec, throughputController is {}",<a name="line.333"></a>
+<span class="sourceLineNo">334</span>              compactionName, progress, rate, throughputController);<a name="line.334"></a>
+<span class="sourceLineNo">335</span>            lastMillis = now;<a name="line.335"></a>
+<span class="sourceLineNo">336</span>            bytesWrittenProgressForLog = 0;<a name="line.336"></a>
+<span class="sourceLineNo">337</span>          }<a name="line.337"></a>
+<span class="sourceLineNo">338</span>        }<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        cells.clear();<a name="line.339"></a>
+<span class="sourceLineNo">340</span>      } while (hasMore);<a name="line.340"></a>
+<span class="sourceLineNo">341</span>      finished = true;<a name="line.341"></a>
+<span class="sourceLineNo">342</span>    } catch (InterruptedException e) {<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      progress.cancel();<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      throw new InterruptedIOException(<a name="line.344"></a>
+<span class="sourceLineNo">345</span>          "Interrupted while control throughput of compacting " + compactionName);<a name="line.345"></a>
+<span class="sourceLineNo">346</span>    } catch (FileNotFoundException e) {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      LOG.error("MOB Stress Test FAILED, region: " + store.getRegionInfo().getEncodedName(), e);<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      System.exit(-1);<a name="line.348"></a>
+<span class="sourceLineNo">349</span>    } catch (IOException t) {<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      LOG.error("Mob compaction failed for region: " + store.getRegionInfo().getEncodedName());<a name="line.350"></a>
+<span class="sourceLineNo">351</span>      throw t;<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    } finally {<a name="line.352"></a>
+<span class="sourceLineNo">353</span>      // Clone last cell in the final because writer will append last cell when committing. If<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      // don't clone here and once the scanner get closed, then the memory of last cell will be<a name="line.354"></a>
+<span class="sourceLineNo">355</span>      // released. (HBASE-22582)<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      ((ShipperListener) writer).beforeShipped();<a name="line.356"></a>
+<span class="sourceLineNo">357</span>      throughputController.finish(compactionName);<a name="line.357"></a>
+<span class="sourceLineNo">358</span>      if (!finished &amp;&amp; mobFileWriter != null) {<a name="line.358"></a>
+<span class="sourceLineNo">359</span>        // Remove all MOB references because compaction failed<a name="line.359"></a>
+<span class="sourceLineNo">360</span>        mobRefSet.get().clear();<a name="line.360"></a>
+<span class="sourceLineNo">361</span>        // Abort writer<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        abortWriter(mobFileWriter);<a name="line.362"></a>
+<span class="sourceLineNo">363</span>      }<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    }<a name="line.364"></a>
+<span class="sourceLineNo">365</span><a name="line.365"></a>
+<span class="sourceLineNo">366</span>    if (mobFileWriter != null) {<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      if (mobCells &gt; 0) {<a name="line.367"></a>
+<span class="sourceLineNo">368</span>        // If the mob file is not empty, commit it.<a name="line.368"></a>
+<span class="sourceLineNo">369</span>        mobFileWriter.appendMetadata(fd.maxSeqId, major, mobCells);<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        mobFileWriter.close();<a name="line.370"></a>
+<span class="sourceLineNo">371</span>        mobStore.commitFile(mobFileWriter.getPath(), path);<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      } else {<a name="line.372"></a>
+<span class="sourceLineNo">373</span>        // If the mob file is empty, delete it instead of committing.<a name="line.373"></a>
+<span class="sourceLineNo">374</span>        abortWriter(mobFileWriter);<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      }<a name="line.375"></a>
+<span class="sourceLineNo">376</span>    }<a name="line.376"></a>
+<span class="sourceLineNo">377</span>    mobStore.updateCellsCountCompactedFromMob(cellsCountCompactedFromMob);<a name="line.377"></a>
+<span class="sourceLineNo">378</span>    mobStore.updateCellsCountCompactedToMob(cellsCountCompactedToMob);<a name="line.378"></a>
+<span class="sourceLineNo">379</span>    mobStore.updateCellsSizeCompactedFromMob(cellsSizeCompactedFromMob);<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    mobStore.updateCellsSizeCompactedToMob(cellsSizeCompactedToMob);<a name="line.380"></a>
+<span class="sourceLineNo">381</span>    progress.complete();<a name="line.381"></a>
+<span class="sourceLineNo">382</span>    return true;<a name="line.382"></a>
 <span class="sourceLineNo">383</span><a name="line.383"></a>
-<span class="sourceLineNo">384</span>}<a name="line.384"></a>
+<span class="sourceLineNo">384</span>  }<a name="line.384"></a>
+<span class="sourceLineNo">385</span><a name="line.385"></a>
+<span class="sourceLineNo">386</span>}<a name="line.386"></a>
 
 
 
