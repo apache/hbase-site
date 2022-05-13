@@ -1,0 +1,217 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/*<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.regionserver.regionreplication;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.IOException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.Optional;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.concurrent.SynchronousQueue;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.util.concurrent.ThreadPoolExecutor;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import java.util.concurrent.TimeUnit;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import java.util.concurrent.atomic.AtomicLong;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.conf.Configuration;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.regionserver.FlushLifeCycleTracker;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.regionserver.HRegion;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.regionserver.HRegion.FlushResult;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.regionserver.RegionServerServices;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.util.StringUtils;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.slf4j.Logger;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.slf4j.LoggerFactory;<a name="line.34"></a>
+<span class="sourceLineNo">035</span><a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.36"></a>
+<span class="sourceLineNo">037</span><a name="line.37"></a>
+<span class="sourceLineNo">038</span>/**<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * Manager the buffer size for all {@link RegionReplicationSink}.<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * &lt;p/&gt;<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * If the buffer size exceeds the soft limit, we will find out the region with largest pending size<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * and trigger a flush, so it can drop all the pending entries and save memories.<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * &lt;p/&gt;<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * If the buffer size exceeds the hard limit, we will return {@code false} for<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * {@link #increase(long)} and let the {@link RegionReplicationSink} to drop the edits immediately.<a name="line.45"></a>
+<span class="sourceLineNo">046</span> */<a name="line.46"></a>
+<span class="sourceLineNo">047</span>@InterfaceAudience.Private<a name="line.47"></a>
+<span class="sourceLineNo">048</span>public class RegionReplicationBufferManager {<a name="line.48"></a>
+<span class="sourceLineNo">049</span><a name="line.49"></a>
+<span class="sourceLineNo">050</span>  private static final Logger LOG = LoggerFactory.getLogger(RegionReplicationBufferManager.class);<a name="line.50"></a>
+<span class="sourceLineNo">051</span><a name="line.51"></a>
+<span class="sourceLineNo">052</span>  /**<a name="line.52"></a>
+<span class="sourceLineNo">053</span>   * This is the total size of pending entries for all the sinks.<a name="line.53"></a>
+<span class="sourceLineNo">054</span>   */<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  public static final String MAX_PENDING_SIZE = "hbase.region.read-replica.sink.max-pending-size";<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>  public static final long MAX_PENDING_SIZE_DEFAULT = 100L * 1024 * 1024;<a name="line.57"></a>
+<span class="sourceLineNo">058</span><a name="line.58"></a>
+<span class="sourceLineNo">059</span>  public static final String SOFT_LIMIT_PERCENTAGE =<a name="line.59"></a>
+<span class="sourceLineNo">060</span>    "hbase.region.read-replica.sink.max-pending-size.soft-limit-percentage";<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  public static final float SOFT_LIMIT_PERCENTAGE_DEFAULT = 0.8f;<a name="line.62"></a>
+<span class="sourceLineNo">063</span><a name="line.63"></a>
+<span class="sourceLineNo">064</span>  private final RegionServerServices rsServices;<a name="line.64"></a>
+<span class="sourceLineNo">065</span><a name="line.65"></a>
+<span class="sourceLineNo">066</span>  private final long maxPendingSize;<a name="line.66"></a>
+<span class="sourceLineNo">067</span><a name="line.67"></a>
+<span class="sourceLineNo">068</span>  private final long softMaxPendingSize;<a name="line.68"></a>
+<span class="sourceLineNo">069</span><a name="line.69"></a>
+<span class="sourceLineNo">070</span>  private final AtomicLong pendingSize = new AtomicLong();<a name="line.70"></a>
+<span class="sourceLineNo">071</span><a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private final ThreadPoolExecutor executor;<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  public RegionReplicationBufferManager(RegionServerServices rsServices) {<a name="line.74"></a>
+<span class="sourceLineNo">075</span>    this.rsServices = rsServices;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    Configuration conf = rsServices.getConfiguration();<a name="line.76"></a>
+<span class="sourceLineNo">077</span>    this.maxPendingSize = conf.getLong(MAX_PENDING_SIZE, MAX_PENDING_SIZE_DEFAULT);<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    this.softMaxPendingSize =<a name="line.78"></a>
+<span class="sourceLineNo">079</span>      (long) (conf.getFloat(SOFT_LIMIT_PERCENTAGE, SOFT_LIMIT_PERCENTAGE_DEFAULT) * maxPendingSize);<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    this.executor = new ThreadPoolExecutor(<a name="line.80"></a>
+<span class="sourceLineNo">081</span>      1, 1, 1, TimeUnit.SECONDS, new SynchronousQueue&lt;&gt;(), new ThreadFactoryBuilder()<a name="line.81"></a>
+<span class="sourceLineNo">082</span>        .setDaemon(true).setNameFormat("Region-Replication-Flusher-%d").build(),<a name="line.82"></a>
+<span class="sourceLineNo">083</span>      (r, e) -&gt; LOG.debug("A flush task is ongoing, drop the new scheduled one"));<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    executor.allowCoreThreadTimeOut(true);<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  }<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>  private void flush() {<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    long max = Long.MIN_VALUE;<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    HRegion toFlush = null;<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    for (HRegion region : rsServices.getRegions()) {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>      Optional&lt;RegionReplicationSink&gt; sink = region.getRegionReplicationSink();<a name="line.91"></a>
+<span class="sourceLineNo">092</span>      if (sink.isPresent()) {<a name="line.92"></a>
+<span class="sourceLineNo">093</span>        RegionReplicationSink s = sink.get();<a name="line.93"></a>
+<span class="sourceLineNo">094</span>        long p = s.pendingSize();<a name="line.94"></a>
+<span class="sourceLineNo">095</span>        if (p &gt; max) {<a name="line.95"></a>
+<span class="sourceLineNo">096</span>          max = p;<a name="line.96"></a>
+<span class="sourceLineNo">097</span>          toFlush = region;<a name="line.97"></a>
+<span class="sourceLineNo">098</span>        }<a name="line.98"></a>
+<span class="sourceLineNo">099</span>      }<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    }<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    if (toFlush != null) {<a name="line.101"></a>
+<span class="sourceLineNo">102</span>      // here we need to write flush marker out, so we can drop all the pending edits in the region<a name="line.102"></a>
+<span class="sourceLineNo">103</span>      // replication sink.<a name="line.103"></a>
+<span class="sourceLineNo">104</span>      try {<a name="line.104"></a>
+<span class="sourceLineNo">105</span>        LOG.info("Going to flush {} with {} pending entry size", toFlush.getRegionInfo(),<a name="line.105"></a>
+<span class="sourceLineNo">106</span>          StringUtils.TraditionalBinaryPrefix.long2String(max, "", 1));<a name="line.106"></a>
+<span class="sourceLineNo">107</span>        FlushResult result = toFlush.flushcache(true, true, FlushLifeCycleTracker.DUMMY);<a name="line.107"></a>
+<span class="sourceLineNo">108</span>        if (!result.isFlushSucceeded()) {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>          LOG.warn("Failed to flush {}, the result is {}", toFlush.getRegionInfo(),<a name="line.109"></a>
+<span class="sourceLineNo">110</span>            result.getResult());<a name="line.110"></a>
+<span class="sourceLineNo">111</span>        }<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      } catch (IOException e) {<a name="line.112"></a>
+<span class="sourceLineNo">113</span>        LOG.warn("Failed to flush {}", toFlush.getRegionInfo(), e);<a name="line.113"></a>
+<span class="sourceLineNo">114</span>      }<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    } else {<a name="line.115"></a>
+<span class="sourceLineNo">116</span>      // usually this should not happen but since the flush operation is async, theoretically it<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      // could happen. Let's log it, no real harm.<a name="line.117"></a>
+<span class="sourceLineNo">118</span>      LOG.warn("Can not find a region to flush");<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    }<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  }<a name="line.120"></a>
+<span class="sourceLineNo">121</span><a name="line.121"></a>
+<span class="sourceLineNo">122</span>  /**<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   * Return whether we should just drop all the edits, if we have reached the hard limit of max<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * pending size.<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   * @return {@code true} means OK, {@code false} means drop all the edits.<a name="line.125"></a>
+<span class="sourceLineNo">126</span>   */<a name="line.126"></a>
+<span class="sourceLineNo">127</span>  public boolean increase(long size) {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    long sz = pendingSize.addAndGet(size);<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    if (sz &gt; softMaxPendingSize) {<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      executor.execute(this::flush);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    }<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    return sz &lt;= maxPendingSize;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  }<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>  /**<a name="line.135"></a>
+<span class="sourceLineNo">136</span>   * Called after you ship the edits out.<a name="line.136"></a>
+<span class="sourceLineNo">137</span>   */<a name="line.137"></a>
+<span class="sourceLineNo">138</span>  public void decrease(long size) {<a name="line.138"></a>
+<span class="sourceLineNo">139</span>    pendingSize.addAndGet(-size);<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  }<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>  public void stop() {<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    executor.shutdown();<a name="line.143"></a>
+<span class="sourceLineNo">144</span>  }<a name="line.144"></a>
+<span class="sourceLineNo">145</span>}<a name="line.145"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
