@@ -370,7 +370,7 @@
 <span class="sourceLineNo">362</span>      writer = sinkFactory.createWriter(scanner, fd, dropCache, request.isMajor(),<a name="line.362"></a>
 <span class="sourceLineNo">363</span>        request.getWriterCreationTracker());<a name="line.363"></a>
 <span class="sourceLineNo">364</span>      finished = performCompaction(fd, scanner, writer, smallestReadPoint, cleanSeqId,<a name="line.364"></a>
-<span class="sourceLineNo">365</span>        throughputController, request.isAllFiles(), request.getFiles().size(), progress);<a name="line.365"></a>
+<span class="sourceLineNo">365</span>        throughputController, request, progress);<a name="line.365"></a>
 <span class="sourceLineNo">366</span>      if (!finished) {<a name="line.366"></a>
 <span class="sourceLineNo">367</span>        throw new InterruptedIOException("Aborting compaction of store " + store + " in region "<a name="line.367"></a>
 <span class="sourceLineNo">368</span>          + store.getRegionInfo().getRegionNameAsString() + " because it was interrupted.");<a name="line.368"></a>
@@ -409,185 +409,184 @@
 <span class="sourceLineNo">401</span><a name="line.401"></a>
 <span class="sourceLineNo">402</span>  /**<a name="line.402"></a>
 <span class="sourceLineNo">403</span>   * Performs the compaction.<a name="line.403"></a>
-<span class="sourceLineNo">404</span>   * @param fd                  FileDetails of cell sink writer<a name="line.404"></a>
-<span class="sourceLineNo">405</span>   * @param scanner             Where to read from.<a name="line.405"></a>
-<span class="sourceLineNo">406</span>   * @param writer              Where to write to.<a name="line.406"></a>
-<span class="sourceLineNo">407</span>   * @param smallestReadPoint   Smallest read point.<a name="line.407"></a>
-<span class="sourceLineNo">408</span>   * @param cleanSeqId          When true, remove seqId(used to be mvcc) value which is &amp;lt;=<a name="line.408"></a>
-<span class="sourceLineNo">409</span>   *                            smallestReadPoint<a name="line.409"></a>
-<span class="sourceLineNo">410</span>   * @param major               Is a major compaction.<a name="line.410"></a>
-<span class="sourceLineNo">411</span>   * @param numofFilesToCompact the number of files to compact<a name="line.411"></a>
-<span class="sourceLineNo">412</span>   * @param progress            Progress reporter.<a name="line.412"></a>
-<span class="sourceLineNo">413</span>   * @return Whether compaction ended; false if it was interrupted for some reason.<a name="line.413"></a>
-<span class="sourceLineNo">414</span>   */<a name="line.414"></a>
-<span class="sourceLineNo">415</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.415"></a>
-<span class="sourceLineNo">416</span>    long smallestReadPoint, boolean cleanSeqId, ThroughputController throughputController,<a name="line.416"></a>
-<span class="sourceLineNo">417</span>    boolean major, int numofFilesToCompact, CompactionProgress progress) throws IOException {<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    assert writer instanceof ShipperListener;<a name="line.418"></a>
-<span class="sourceLineNo">419</span>    long bytesWrittenProgressForLog = 0;<a name="line.419"></a>
-<span class="sourceLineNo">420</span>    long bytesWrittenProgressForShippedCall = 0;<a name="line.420"></a>
-<span class="sourceLineNo">421</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.421"></a>
-<span class="sourceLineNo">422</span>    // we have to use a do/while loop.<a name="line.422"></a>
-<span class="sourceLineNo">423</span>    List&lt;Cell&gt; cells = new ArrayList&lt;&gt;();<a name="line.423"></a>
-<span class="sourceLineNo">424</span>    long currentTime = EnvironmentEdgeManager.currentTime();<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    long lastMillis = 0;<a name="line.425"></a>
-<span class="sourceLineNo">426</span>    if (LOG.isDebugEnabled()) {<a name="line.426"></a>
-<span class="sourceLineNo">427</span>      lastMillis = currentTime;<a name="line.427"></a>
-<span class="sourceLineNo">428</span>    }<a name="line.428"></a>
-<span class="sourceLineNo">429</span>    CloseChecker closeChecker = new CloseChecker(conf, currentTime);<a name="line.429"></a>
-<span class="sourceLineNo">430</span>    String compactionName = ThroughputControlUtil.getNameForThrottling(store, "compaction");<a name="line.430"></a>
-<span class="sourceLineNo">431</span>    long now = 0;<a name="line.431"></a>
-<span class="sourceLineNo">432</span>    boolean hasMore;<a name="line.432"></a>
-<span class="sourceLineNo">433</span>    ScannerContext scannerContext =<a name="line.433"></a>
-<span class="sourceLineNo">434</span>      ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.434"></a>
-<span class="sourceLineNo">435</span><a name="line.435"></a>
-<span class="sourceLineNo">436</span>    throughputController.start(compactionName);<a name="line.436"></a>
-<span class="sourceLineNo">437</span>    KeyValueScanner kvs = (scanner instanceof KeyValueScanner) ? (KeyValueScanner) scanner : null;<a name="line.437"></a>
-<span class="sourceLineNo">438</span>    long shippedCallSizeLimit =<a name="line.438"></a>
-<span class="sourceLineNo">439</span>      (long) numofFilesToCompact * this.store.getColumnFamilyDescriptor().getBlocksize();<a name="line.439"></a>
-<span class="sourceLineNo">440</span>    try {<a name="line.440"></a>
-<span class="sourceLineNo">441</span>      do {<a name="line.441"></a>
-<span class="sourceLineNo">442</span>        hasMore = scanner.next(cells, scannerContext);<a name="line.442"></a>
-<span class="sourceLineNo">443</span>        currentTime = EnvironmentEdgeManager.currentTime();<a name="line.443"></a>
-<span class="sourceLineNo">444</span>        if (LOG.isDebugEnabled()) {<a name="line.444"></a>
-<span class="sourceLineNo">445</span>          now = currentTime;<a name="line.445"></a>
-<span class="sourceLineNo">446</span>        }<a name="line.446"></a>
-<span class="sourceLineNo">447</span>        if (closeChecker.isTimeLimit(store, currentTime)) {<a name="line.447"></a>
-<span class="sourceLineNo">448</span>          progress.cancel();<a name="line.448"></a>
-<span class="sourceLineNo">449</span>          return false;<a name="line.449"></a>
-<span class="sourceLineNo">450</span>        }<a name="line.450"></a>
-<span class="sourceLineNo">451</span>        // output to writer:<a name="line.451"></a>
-<span class="sourceLineNo">452</span>        Cell lastCleanCell = null;<a name="line.452"></a>
-<span class="sourceLineNo">453</span>        long lastCleanCellSeqId = 0;<a name="line.453"></a>
-<span class="sourceLineNo">454</span>        for (Cell c : cells) {<a name="line.454"></a>
-<span class="sourceLineNo">455</span>          if (cleanSeqId &amp;&amp; c.getSequenceId() &lt;= smallestReadPoint) {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>            lastCleanCell = c;<a name="line.456"></a>
-<span class="sourceLineNo">457</span>            lastCleanCellSeqId = c.getSequenceId();<a name="line.457"></a>
-<span class="sourceLineNo">458</span>            PrivateCellUtil.setSequenceId(c, 0);<a name="line.458"></a>
-<span class="sourceLineNo">459</span>          } else {<a name="line.459"></a>
-<span class="sourceLineNo">460</span>            lastCleanCell = null;<a name="line.460"></a>
-<span class="sourceLineNo">461</span>            lastCleanCellSeqId = 0;<a name="line.461"></a>
-<span class="sourceLineNo">462</span>          }<a name="line.462"></a>
-<span class="sourceLineNo">463</span>          writer.append(c);<a name="line.463"></a>
-<span class="sourceLineNo">464</span>          int len = c.getSerializedSize();<a name="line.464"></a>
-<span class="sourceLineNo">465</span>          ++progress.currentCompactedKVs;<a name="line.465"></a>
-<span class="sourceLineNo">466</span>          progress.totalCompactedSize += len;<a name="line.466"></a>
-<span class="sourceLineNo">467</span>          bytesWrittenProgressForShippedCall += len;<a name="line.467"></a>
-<span class="sourceLineNo">468</span>          if (LOG.isDebugEnabled()) {<a name="line.468"></a>
-<span class="sourceLineNo">469</span>            bytesWrittenProgressForLog += len;<a name="line.469"></a>
-<span class="sourceLineNo">470</span>          }<a name="line.470"></a>
-<span class="sourceLineNo">471</span>          throughputController.control(compactionName, len);<a name="line.471"></a>
-<span class="sourceLineNo">472</span>          if (closeChecker.isSizeLimit(store, len)) {<a name="line.472"></a>
-<span class="sourceLineNo">473</span>            progress.cancel();<a name="line.473"></a>
-<span class="sourceLineNo">474</span>            return false;<a name="line.474"></a>
-<span class="sourceLineNo">475</span>          }<a name="line.475"></a>
-<span class="sourceLineNo">476</span>        }<a name="line.476"></a>
-<span class="sourceLineNo">477</span>        if (kvs != null &amp;&amp; bytesWrittenProgressForShippedCall &gt; shippedCallSizeLimit) {<a name="line.477"></a>
-<span class="sourceLineNo">478</span>          if (lastCleanCell != null) {<a name="line.478"></a>
-<span class="sourceLineNo">479</span>            // HBASE-16931, set back sequence id to avoid affecting scan order unexpectedly.<a name="line.479"></a>
-<span class="sourceLineNo">480</span>            // ShipperListener will do a clone of the last cells it refer, so need to set back<a name="line.480"></a>
-<span class="sourceLineNo">481</span>            // sequence id before ShipperListener.beforeShipped<a name="line.481"></a>
-<span class="sourceLineNo">482</span>            PrivateCellUtil.setSequenceId(lastCleanCell, lastCleanCellSeqId);<a name="line.482"></a>
-<span class="sourceLineNo">483</span>          }<a name="line.483"></a>
-<span class="sourceLineNo">484</span>          // Clone the cells that are in the writer so that they are freed of references,<a name="line.484"></a>
-<span class="sourceLineNo">485</span>          // if they are holding any.<a name="line.485"></a>
-<span class="sourceLineNo">486</span>          ((ShipperListener) writer).beforeShipped();<a name="line.486"></a>
-<span class="sourceLineNo">487</span>          // The SHARED block references, being read for compaction, will be kept in prevBlocks<a name="line.487"></a>
-<span class="sourceLineNo">488</span>          // list(See HFileScannerImpl#prevBlocks). In case of scan flow, after each set of cells<a name="line.488"></a>
-<span class="sourceLineNo">489</span>          // being returned to client, we will call shipped() which can clear this list. Here by<a name="line.489"></a>
-<span class="sourceLineNo">490</span>          // we are doing the similar thing. In between the compaction (after every N cells<a name="line.490"></a>
-<span class="sourceLineNo">491</span>          // written with collective size of 'shippedCallSizeLimit') we will call shipped which<a name="line.491"></a>
-<span class="sourceLineNo">492</span>          // may clear prevBlocks list.<a name="line.492"></a>
-<span class="sourceLineNo">493</span>          kvs.shipped();<a name="line.493"></a>
-<span class="sourceLineNo">494</span>          bytesWrittenProgressForShippedCall = 0;<a name="line.494"></a>
-<span class="sourceLineNo">495</span>        }<a name="line.495"></a>
-<span class="sourceLineNo">496</span>        if (lastCleanCell != null) {<a name="line.496"></a>
-<span class="sourceLineNo">497</span>          // HBASE-16931, set back sequence id to avoid affecting scan order unexpectedly<a name="line.497"></a>
-<span class="sourceLineNo">498</span>          PrivateCellUtil.setSequenceId(lastCleanCell, lastCleanCellSeqId);<a name="line.498"></a>
-<span class="sourceLineNo">499</span>        }<a name="line.499"></a>
-<span class="sourceLineNo">500</span>        // Log the progress of long running compactions every minute if<a name="line.500"></a>
-<span class="sourceLineNo">501</span>        // logging at DEBUG level<a name="line.501"></a>
-<span class="sourceLineNo">502</span>        if (LOG.isDebugEnabled()) {<a name="line.502"></a>
-<span class="sourceLineNo">503</span>          if ((now - lastMillis) &gt;= COMPACTION_PROGRESS_LOG_INTERVAL) {<a name="line.503"></a>
-<span class="sourceLineNo">504</span>            String rate = String.format("%.2f",<a name="line.504"></a>
-<span class="sourceLineNo">505</span>              (bytesWrittenProgressForLog / 1024.0) / ((now - lastMillis) / 1000.0));<a name="line.505"></a>
-<span class="sourceLineNo">506</span>            LOG.debug("Compaction progress: {} {}, rate={} KB/sec, throughputController is {}",<a name="line.506"></a>
-<span class="sourceLineNo">507</span>              compactionName, progress, rate, throughputController);<a name="line.507"></a>
-<span class="sourceLineNo">508</span>            lastMillis = now;<a name="line.508"></a>
-<span class="sourceLineNo">509</span>            bytesWrittenProgressForLog = 0;<a name="line.509"></a>
-<span class="sourceLineNo">510</span>          }<a name="line.510"></a>
-<span class="sourceLineNo">511</span>        }<a name="line.511"></a>
-<span class="sourceLineNo">512</span>        cells.clear();<a name="line.512"></a>
-<span class="sourceLineNo">513</span>      } while (hasMore);<a name="line.513"></a>
-<span class="sourceLineNo">514</span>    } catch (InterruptedException e) {<a name="line.514"></a>
-<span class="sourceLineNo">515</span>      progress.cancel();<a name="line.515"></a>
-<span class="sourceLineNo">516</span>      throw new InterruptedIOException(<a name="line.516"></a>
-<span class="sourceLineNo">517</span>        "Interrupted while control throughput of compacting " + compactionName);<a name="line.517"></a>
-<span class="sourceLineNo">518</span>    } finally {<a name="line.518"></a>
-<span class="sourceLineNo">519</span>      // Clone last cell in the final because writer will append last cell when committing. If<a name="line.519"></a>
-<span class="sourceLineNo">520</span>      // don't clone here and once the scanner get closed, then the memory of last cell will be<a name="line.520"></a>
-<span class="sourceLineNo">521</span>      // released. (HBASE-22582)<a name="line.521"></a>
-<span class="sourceLineNo">522</span>      ((ShipperListener) writer).beforeShipped();<a name="line.522"></a>
-<span class="sourceLineNo">523</span>      throughputController.finish(compactionName);<a name="line.523"></a>
-<span class="sourceLineNo">524</span>    }<a name="line.524"></a>
-<span class="sourceLineNo">525</span>    progress.complete();<a name="line.525"></a>
-<span class="sourceLineNo">526</span>    return true;<a name="line.526"></a>
-<span class="sourceLineNo">527</span>  }<a name="line.527"></a>
-<span class="sourceLineNo">528</span><a name="line.528"></a>
-<span class="sourceLineNo">529</span>  /**<a name="line.529"></a>
-<span class="sourceLineNo">530</span>   * @param store             store<a name="line.530"></a>
-<span class="sourceLineNo">531</span>   * @param scanners          Store file scanners.<a name="line.531"></a>
-<span class="sourceLineNo">532</span>   * @param scanType          Scan type.<a name="line.532"></a>
-<span class="sourceLineNo">533</span>   * @param smallestReadPoint Smallest MVCC read point.<a name="line.533"></a>
-<span class="sourceLineNo">534</span>   * @param earliestPutTs     Earliest put across all files.<a name="line.534"></a>
-<span class="sourceLineNo">535</span>   * @return A compaction scanner.<a name="line.535"></a>
-<span class="sourceLineNo">536</span>   */<a name="line.536"></a>
-<span class="sourceLineNo">537</span>  protected InternalScanner createScanner(HStore store, ScanInfo scanInfo,<a name="line.537"></a>
-<span class="sourceLineNo">538</span>    List&lt;StoreFileScanner&gt; scanners, ScanType scanType, long smallestReadPoint, long earliestPutTs)<a name="line.538"></a>
-<span class="sourceLineNo">539</span>    throws IOException {<a name="line.539"></a>
-<span class="sourceLineNo">540</span>    return new StoreScanner(store, scanInfo, scanners, scanType, smallestReadPoint, earliestPutTs);<a name="line.540"></a>
-<span class="sourceLineNo">541</span>  }<a name="line.541"></a>
-<span class="sourceLineNo">542</span><a name="line.542"></a>
-<span class="sourceLineNo">543</span>  /**<a name="line.543"></a>
-<span class="sourceLineNo">544</span>   * @param store              The store.<a name="line.544"></a>
-<span class="sourceLineNo">545</span>   * @param scanners           Store file scanners.<a name="line.545"></a>
-<span class="sourceLineNo">546</span>   * @param smallestReadPoint  Smallest MVCC read point.<a name="line.546"></a>
-<span class="sourceLineNo">547</span>   * @param earliestPutTs      Earliest put across all files.<a name="line.547"></a>
-<span class="sourceLineNo">548</span>   * @param dropDeletesFromRow Drop deletes starting with this row, inclusive. Can be null.<a name="line.548"></a>
-<span class="sourceLineNo">549</span>   * @param dropDeletesToRow   Drop deletes ending with this row, exclusive. Can be null.<a name="line.549"></a>
-<span class="sourceLineNo">550</span>   * @return A compaction scanner.<a name="line.550"></a>
-<span class="sourceLineNo">551</span>   */<a name="line.551"></a>
-<span class="sourceLineNo">552</span>  protected InternalScanner createScanner(HStore store, ScanInfo scanInfo,<a name="line.552"></a>
-<span class="sourceLineNo">553</span>    List&lt;StoreFileScanner&gt; scanners, long smallestReadPoint, long earliestPutTs,<a name="line.553"></a>
-<span class="sourceLineNo">554</span>    byte[] dropDeletesFromRow, byte[] dropDeletesToRow) throws IOException {<a name="line.554"></a>
-<span class="sourceLineNo">555</span>    return new StoreScanner(store, scanInfo, scanners, smallestReadPoint, earliestPutTs,<a name="line.555"></a>
-<span class="sourceLineNo">556</span>      dropDeletesFromRow, dropDeletesToRow);<a name="line.556"></a>
-<span class="sourceLineNo">557</span>  }<a name="line.557"></a>
-<span class="sourceLineNo">558</span><a name="line.558"></a>
-<span class="sourceLineNo">559</span>  /**<a name="line.559"></a>
-<span class="sourceLineNo">560</span>   * Return the aggregate progress for all currently active compactions.<a name="line.560"></a>
-<span class="sourceLineNo">561</span>   */<a name="line.561"></a>
-<span class="sourceLineNo">562</span>  public CompactionProgress getProgress() {<a name="line.562"></a>
-<span class="sourceLineNo">563</span>    synchronized (progressSet) {<a name="line.563"></a>
-<span class="sourceLineNo">564</span>      long totalCompactingKVs = 0;<a name="line.564"></a>
-<span class="sourceLineNo">565</span>      long currentCompactedKVs = 0;<a name="line.565"></a>
-<span class="sourceLineNo">566</span>      long totalCompactedSize = 0;<a name="line.566"></a>
-<span class="sourceLineNo">567</span>      for (CompactionProgress progress : progressSet) {<a name="line.567"></a>
-<span class="sourceLineNo">568</span>        totalCompactingKVs += progress.totalCompactingKVs;<a name="line.568"></a>
-<span class="sourceLineNo">569</span>        currentCompactedKVs += progress.currentCompactedKVs;<a name="line.569"></a>
-<span class="sourceLineNo">570</span>        totalCompactedSize += progress.totalCompactedSize;<a name="line.570"></a>
-<span class="sourceLineNo">571</span>      }<a name="line.571"></a>
-<span class="sourceLineNo">572</span>      CompactionProgress result = new CompactionProgress(totalCompactingKVs);<a name="line.572"></a>
-<span class="sourceLineNo">573</span>      result.currentCompactedKVs = currentCompactedKVs;<a name="line.573"></a>
-<span class="sourceLineNo">574</span>      result.totalCompactedSize = totalCompactedSize;<a name="line.574"></a>
-<span class="sourceLineNo">575</span>      return result;<a name="line.575"></a>
-<span class="sourceLineNo">576</span>    }<a name="line.576"></a>
-<span class="sourceLineNo">577</span>  }<a name="line.577"></a>
-<span class="sourceLineNo">578</span><a name="line.578"></a>
-<span class="sourceLineNo">579</span>  public boolean isCompacting() {<a name="line.579"></a>
-<span class="sourceLineNo">580</span>    return !progressSet.isEmpty();<a name="line.580"></a>
-<span class="sourceLineNo">581</span>  }<a name="line.581"></a>
-<span class="sourceLineNo">582</span>}<a name="line.582"></a>
+<span class="sourceLineNo">404</span>   * @param fd                FileDetails of cell sink writer<a name="line.404"></a>
+<span class="sourceLineNo">405</span>   * @param scanner           Where to read from.<a name="line.405"></a>
+<span class="sourceLineNo">406</span>   * @param writer            Where to write to.<a name="line.406"></a>
+<span class="sourceLineNo">407</span>   * @param smallestReadPoint Smallest read point.<a name="line.407"></a>
+<span class="sourceLineNo">408</span>   * @param cleanSeqId        When true, remove seqId(used to be mvcc) value which is &amp;lt;=<a name="line.408"></a>
+<span class="sourceLineNo">409</span>   *                          smallestReadPoint<a name="line.409"></a>
+<span class="sourceLineNo">410</span>   * @param request           compaction request.<a name="line.410"></a>
+<span class="sourceLineNo">411</span>   * @param progress          Progress reporter.<a name="line.411"></a>
+<span class="sourceLineNo">412</span>   * @return Whether compaction ended; false if it was interrupted for some reason.<a name="line.412"></a>
+<span class="sourceLineNo">413</span>   */<a name="line.413"></a>
+<span class="sourceLineNo">414</span>  protected boolean performCompaction(FileDetails fd, InternalScanner scanner, CellSink writer,<a name="line.414"></a>
+<span class="sourceLineNo">415</span>    long smallestReadPoint, boolean cleanSeqId, ThroughputController throughputController,<a name="line.415"></a>
+<span class="sourceLineNo">416</span>    CompactionRequestImpl request, CompactionProgress progress) throws IOException {<a name="line.416"></a>
+<span class="sourceLineNo">417</span>    assert writer instanceof ShipperListener;<a name="line.417"></a>
+<span class="sourceLineNo">418</span>    long bytesWrittenProgressForLog = 0;<a name="line.418"></a>
+<span class="sourceLineNo">419</span>    long bytesWrittenProgressForShippedCall = 0;<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    // Since scanner.next() can return 'false' but still be delivering data,<a name="line.420"></a>
+<span class="sourceLineNo">421</span>    // we have to use a do/while loop.<a name="line.421"></a>
+<span class="sourceLineNo">422</span>    List&lt;Cell&gt; cells = new ArrayList&lt;&gt;();<a name="line.422"></a>
+<span class="sourceLineNo">423</span>    long currentTime = EnvironmentEdgeManager.currentTime();<a name="line.423"></a>
+<span class="sourceLineNo">424</span>    long lastMillis = 0;<a name="line.424"></a>
+<span class="sourceLineNo">425</span>    if (LOG.isDebugEnabled()) {<a name="line.425"></a>
+<span class="sourceLineNo">426</span>      lastMillis = currentTime;<a name="line.426"></a>
+<span class="sourceLineNo">427</span>    }<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    CloseChecker closeChecker = new CloseChecker(conf, currentTime);<a name="line.428"></a>
+<span class="sourceLineNo">429</span>    String compactionName = ThroughputControlUtil.getNameForThrottling(store, "compaction");<a name="line.429"></a>
+<span class="sourceLineNo">430</span>    long now = 0;<a name="line.430"></a>
+<span class="sourceLineNo">431</span>    boolean hasMore;<a name="line.431"></a>
+<span class="sourceLineNo">432</span>    ScannerContext scannerContext =<a name="line.432"></a>
+<span class="sourceLineNo">433</span>      ScannerContext.newBuilder().setBatchLimit(compactionKVMax).build();<a name="line.433"></a>
+<span class="sourceLineNo">434</span><a name="line.434"></a>
+<span class="sourceLineNo">435</span>    throughputController.start(compactionName);<a name="line.435"></a>
+<span class="sourceLineNo">436</span>    KeyValueScanner kvs = (scanner instanceof KeyValueScanner) ? (KeyValueScanner) scanner : null;<a name="line.436"></a>
+<span class="sourceLineNo">437</span>    long shippedCallSizeLimit =<a name="line.437"></a>
+<span class="sourceLineNo">438</span>      (long) request.getFiles().size() * this.store.getColumnFamilyDescriptor().getBlocksize();<a name="line.438"></a>
+<span class="sourceLineNo">439</span>    try {<a name="line.439"></a>
+<span class="sourceLineNo">440</span>      do {<a name="line.440"></a>
+<span class="sourceLineNo">441</span>        hasMore = scanner.next(cells, scannerContext);<a name="line.441"></a>
+<span class="sourceLineNo">442</span>        currentTime = EnvironmentEdgeManager.currentTime();<a name="line.442"></a>
+<span class="sourceLineNo">443</span>        if (LOG.isDebugEnabled()) {<a name="line.443"></a>
+<span class="sourceLineNo">444</span>          now = currentTime;<a name="line.444"></a>
+<span class="sourceLineNo">445</span>        }<a name="line.445"></a>
+<span class="sourceLineNo">446</span>        if (closeChecker.isTimeLimit(store, currentTime)) {<a name="line.446"></a>
+<span class="sourceLineNo">447</span>          progress.cancel();<a name="line.447"></a>
+<span class="sourceLineNo">448</span>          return false;<a name="line.448"></a>
+<span class="sourceLineNo">449</span>        }<a name="line.449"></a>
+<span class="sourceLineNo">450</span>        // output to writer:<a name="line.450"></a>
+<span class="sourceLineNo">451</span>        Cell lastCleanCell = null;<a name="line.451"></a>
+<span class="sourceLineNo">452</span>        long lastCleanCellSeqId = 0;<a name="line.452"></a>
+<span class="sourceLineNo">453</span>        for (Cell c : cells) {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>          if (cleanSeqId &amp;&amp; c.getSequenceId() &lt;= smallestReadPoint) {<a name="line.454"></a>
+<span class="sourceLineNo">455</span>            lastCleanCell = c;<a name="line.455"></a>
+<span class="sourceLineNo">456</span>            lastCleanCellSeqId = c.getSequenceId();<a name="line.456"></a>
+<span class="sourceLineNo">457</span>            PrivateCellUtil.setSequenceId(c, 0);<a name="line.457"></a>
+<span class="sourceLineNo">458</span>          } else {<a name="line.458"></a>
+<span class="sourceLineNo">459</span>            lastCleanCell = null;<a name="line.459"></a>
+<span class="sourceLineNo">460</span>            lastCleanCellSeqId = 0;<a name="line.460"></a>
+<span class="sourceLineNo">461</span>          }<a name="line.461"></a>
+<span class="sourceLineNo">462</span>          writer.append(c);<a name="line.462"></a>
+<span class="sourceLineNo">463</span>          int len = c.getSerializedSize();<a name="line.463"></a>
+<span class="sourceLineNo">464</span>          ++progress.currentCompactedKVs;<a name="line.464"></a>
+<span class="sourceLineNo">465</span>          progress.totalCompactedSize += len;<a name="line.465"></a>
+<span class="sourceLineNo">466</span>          bytesWrittenProgressForShippedCall += len;<a name="line.466"></a>
+<span class="sourceLineNo">467</span>          if (LOG.isDebugEnabled()) {<a name="line.467"></a>
+<span class="sourceLineNo">468</span>            bytesWrittenProgressForLog += len;<a name="line.468"></a>
+<span class="sourceLineNo">469</span>          }<a name="line.469"></a>
+<span class="sourceLineNo">470</span>          throughputController.control(compactionName, len);<a name="line.470"></a>
+<span class="sourceLineNo">471</span>          if (closeChecker.isSizeLimit(store, len)) {<a name="line.471"></a>
+<span class="sourceLineNo">472</span>            progress.cancel();<a name="line.472"></a>
+<span class="sourceLineNo">473</span>            return false;<a name="line.473"></a>
+<span class="sourceLineNo">474</span>          }<a name="line.474"></a>
+<span class="sourceLineNo">475</span>        }<a name="line.475"></a>
+<span class="sourceLineNo">476</span>        if (kvs != null &amp;&amp; bytesWrittenProgressForShippedCall &gt; shippedCallSizeLimit) {<a name="line.476"></a>
+<span class="sourceLineNo">477</span>          if (lastCleanCell != null) {<a name="line.477"></a>
+<span class="sourceLineNo">478</span>            // HBASE-16931, set back sequence id to avoid affecting scan order unexpectedly.<a name="line.478"></a>
+<span class="sourceLineNo">479</span>            // ShipperListener will do a clone of the last cells it refer, so need to set back<a name="line.479"></a>
+<span class="sourceLineNo">480</span>            // sequence id before ShipperListener.beforeShipped<a name="line.480"></a>
+<span class="sourceLineNo">481</span>            PrivateCellUtil.setSequenceId(lastCleanCell, lastCleanCellSeqId);<a name="line.481"></a>
+<span class="sourceLineNo">482</span>          }<a name="line.482"></a>
+<span class="sourceLineNo">483</span>          // Clone the cells that are in the writer so that they are freed of references,<a name="line.483"></a>
+<span class="sourceLineNo">484</span>          // if they are holding any.<a name="line.484"></a>
+<span class="sourceLineNo">485</span>          ((ShipperListener) writer).beforeShipped();<a name="line.485"></a>
+<span class="sourceLineNo">486</span>          // The SHARED block references, being read for compaction, will be kept in prevBlocks<a name="line.486"></a>
+<span class="sourceLineNo">487</span>          // list(See HFileScannerImpl#prevBlocks). In case of scan flow, after each set of cells<a name="line.487"></a>
+<span class="sourceLineNo">488</span>          // being returned to client, we will call shipped() which can clear this list. Here by<a name="line.488"></a>
+<span class="sourceLineNo">489</span>          // we are doing the similar thing. In between the compaction (after every N cells<a name="line.489"></a>
+<span class="sourceLineNo">490</span>          // written with collective size of 'shippedCallSizeLimit') we will call shipped which<a name="line.490"></a>
+<span class="sourceLineNo">491</span>          // may clear prevBlocks list.<a name="line.491"></a>
+<span class="sourceLineNo">492</span>          kvs.shipped();<a name="line.492"></a>
+<span class="sourceLineNo">493</span>          bytesWrittenProgressForShippedCall = 0;<a name="line.493"></a>
+<span class="sourceLineNo">494</span>        }<a name="line.494"></a>
+<span class="sourceLineNo">495</span>        if (lastCleanCell != null) {<a name="line.495"></a>
+<span class="sourceLineNo">496</span>          // HBASE-16931, set back sequence id to avoid affecting scan order unexpectedly<a name="line.496"></a>
+<span class="sourceLineNo">497</span>          PrivateCellUtil.setSequenceId(lastCleanCell, lastCleanCellSeqId);<a name="line.497"></a>
+<span class="sourceLineNo">498</span>        }<a name="line.498"></a>
+<span class="sourceLineNo">499</span>        // Log the progress of long running compactions every minute if<a name="line.499"></a>
+<span class="sourceLineNo">500</span>        // logging at DEBUG level<a name="line.500"></a>
+<span class="sourceLineNo">501</span>        if (LOG.isDebugEnabled()) {<a name="line.501"></a>
+<span class="sourceLineNo">502</span>          if ((now - lastMillis) &gt;= COMPACTION_PROGRESS_LOG_INTERVAL) {<a name="line.502"></a>
+<span class="sourceLineNo">503</span>            String rate = String.format("%.2f",<a name="line.503"></a>
+<span class="sourceLineNo">504</span>              (bytesWrittenProgressForLog / 1024.0) / ((now - lastMillis) / 1000.0));<a name="line.504"></a>
+<span class="sourceLineNo">505</span>            LOG.debug("Compaction progress: {} {}, rate={} KB/sec, throughputController is {}",<a name="line.505"></a>
+<span class="sourceLineNo">506</span>              compactionName, progress, rate, throughputController);<a name="line.506"></a>
+<span class="sourceLineNo">507</span>            lastMillis = now;<a name="line.507"></a>
+<span class="sourceLineNo">508</span>            bytesWrittenProgressForLog = 0;<a name="line.508"></a>
+<span class="sourceLineNo">509</span>          }<a name="line.509"></a>
+<span class="sourceLineNo">510</span>        }<a name="line.510"></a>
+<span class="sourceLineNo">511</span>        cells.clear();<a name="line.511"></a>
+<span class="sourceLineNo">512</span>      } while (hasMore);<a name="line.512"></a>
+<span class="sourceLineNo">513</span>    } catch (InterruptedException e) {<a name="line.513"></a>
+<span class="sourceLineNo">514</span>      progress.cancel();<a name="line.514"></a>
+<span class="sourceLineNo">515</span>      throw new InterruptedIOException(<a name="line.515"></a>
+<span class="sourceLineNo">516</span>        "Interrupted while control throughput of compacting " + compactionName);<a name="line.516"></a>
+<span class="sourceLineNo">517</span>    } finally {<a name="line.517"></a>
+<span class="sourceLineNo">518</span>      // Clone last cell in the final because writer will append last cell when committing. If<a name="line.518"></a>
+<span class="sourceLineNo">519</span>      // don't clone here and once the scanner get closed, then the memory of last cell will be<a name="line.519"></a>
+<span class="sourceLineNo">520</span>      // released. (HBASE-22582)<a name="line.520"></a>
+<span class="sourceLineNo">521</span>      ((ShipperListener) writer).beforeShipped();<a name="line.521"></a>
+<span class="sourceLineNo">522</span>      throughputController.finish(compactionName);<a name="line.522"></a>
+<span class="sourceLineNo">523</span>    }<a name="line.523"></a>
+<span class="sourceLineNo">524</span>    progress.complete();<a name="line.524"></a>
+<span class="sourceLineNo">525</span>    return true;<a name="line.525"></a>
+<span class="sourceLineNo">526</span>  }<a name="line.526"></a>
+<span class="sourceLineNo">527</span><a name="line.527"></a>
+<span class="sourceLineNo">528</span>  /**<a name="line.528"></a>
+<span class="sourceLineNo">529</span>   * @param store             store<a name="line.529"></a>
+<span class="sourceLineNo">530</span>   * @param scanners          Store file scanners.<a name="line.530"></a>
+<span class="sourceLineNo">531</span>   * @param scanType          Scan type.<a name="line.531"></a>
+<span class="sourceLineNo">532</span>   * @param smallestReadPoint Smallest MVCC read point.<a name="line.532"></a>
+<span class="sourceLineNo">533</span>   * @param earliestPutTs     Earliest put across all files.<a name="line.533"></a>
+<span class="sourceLineNo">534</span>   * @return A compaction scanner.<a name="line.534"></a>
+<span class="sourceLineNo">535</span>   */<a name="line.535"></a>
+<span class="sourceLineNo">536</span>  protected InternalScanner createScanner(HStore store, ScanInfo scanInfo,<a name="line.536"></a>
+<span class="sourceLineNo">537</span>    List&lt;StoreFileScanner&gt; scanners, ScanType scanType, long smallestReadPoint, long earliestPutTs)<a name="line.537"></a>
+<span class="sourceLineNo">538</span>    throws IOException {<a name="line.538"></a>
+<span class="sourceLineNo">539</span>    return new StoreScanner(store, scanInfo, scanners, scanType, smallestReadPoint, earliestPutTs);<a name="line.539"></a>
+<span class="sourceLineNo">540</span>  }<a name="line.540"></a>
+<span class="sourceLineNo">541</span><a name="line.541"></a>
+<span class="sourceLineNo">542</span>  /**<a name="line.542"></a>
+<span class="sourceLineNo">543</span>   * @param store              The store.<a name="line.543"></a>
+<span class="sourceLineNo">544</span>   * @param scanners           Store file scanners.<a name="line.544"></a>
+<span class="sourceLineNo">545</span>   * @param smallestReadPoint  Smallest MVCC read point.<a name="line.545"></a>
+<span class="sourceLineNo">546</span>   * @param earliestPutTs      Earliest put across all files.<a name="line.546"></a>
+<span class="sourceLineNo">547</span>   * @param dropDeletesFromRow Drop deletes starting with this row, inclusive. Can be null.<a name="line.547"></a>
+<span class="sourceLineNo">548</span>   * @param dropDeletesToRow   Drop deletes ending with this row, exclusive. Can be null.<a name="line.548"></a>
+<span class="sourceLineNo">549</span>   * @return A compaction scanner.<a name="line.549"></a>
+<span class="sourceLineNo">550</span>   */<a name="line.550"></a>
+<span class="sourceLineNo">551</span>  protected InternalScanner createScanner(HStore store, ScanInfo scanInfo,<a name="line.551"></a>
+<span class="sourceLineNo">552</span>    List&lt;StoreFileScanner&gt; scanners, long smallestReadPoint, long earliestPutTs,<a name="line.552"></a>
+<span class="sourceLineNo">553</span>    byte[] dropDeletesFromRow, byte[] dropDeletesToRow) throws IOException {<a name="line.553"></a>
+<span class="sourceLineNo">554</span>    return new StoreScanner(store, scanInfo, scanners, smallestReadPoint, earliestPutTs,<a name="line.554"></a>
+<span class="sourceLineNo">555</span>      dropDeletesFromRow, dropDeletesToRow);<a name="line.555"></a>
+<span class="sourceLineNo">556</span>  }<a name="line.556"></a>
+<span class="sourceLineNo">557</span><a name="line.557"></a>
+<span class="sourceLineNo">558</span>  /**<a name="line.558"></a>
+<span class="sourceLineNo">559</span>   * Return the aggregate progress for all currently active compactions.<a name="line.559"></a>
+<span class="sourceLineNo">560</span>   */<a name="line.560"></a>
+<span class="sourceLineNo">561</span>  public CompactionProgress getProgress() {<a name="line.561"></a>
+<span class="sourceLineNo">562</span>    synchronized (progressSet) {<a name="line.562"></a>
+<span class="sourceLineNo">563</span>      long totalCompactingKVs = 0;<a name="line.563"></a>
+<span class="sourceLineNo">564</span>      long currentCompactedKVs = 0;<a name="line.564"></a>
+<span class="sourceLineNo">565</span>      long totalCompactedSize = 0;<a name="line.565"></a>
+<span class="sourceLineNo">566</span>      for (CompactionProgress progress : progressSet) {<a name="line.566"></a>
+<span class="sourceLineNo">567</span>        totalCompactingKVs += progress.totalCompactingKVs;<a name="line.567"></a>
+<span class="sourceLineNo">568</span>        currentCompactedKVs += progress.currentCompactedKVs;<a name="line.568"></a>
+<span class="sourceLineNo">569</span>        totalCompactedSize += progress.totalCompactedSize;<a name="line.569"></a>
+<span class="sourceLineNo">570</span>      }<a name="line.570"></a>
+<span class="sourceLineNo">571</span>      CompactionProgress result = new CompactionProgress(totalCompactingKVs);<a name="line.571"></a>
+<span class="sourceLineNo">572</span>      result.currentCompactedKVs = currentCompactedKVs;<a name="line.572"></a>
+<span class="sourceLineNo">573</span>      result.totalCompactedSize = totalCompactedSize;<a name="line.573"></a>
+<span class="sourceLineNo">574</span>      return result;<a name="line.574"></a>
+<span class="sourceLineNo">575</span>    }<a name="line.575"></a>
+<span class="sourceLineNo">576</span>  }<a name="line.576"></a>
+<span class="sourceLineNo">577</span><a name="line.577"></a>
+<span class="sourceLineNo">578</span>  public boolean isCompacting() {<a name="line.578"></a>
+<span class="sourceLineNo">579</span>    return !progressSet.isEmpty();<a name="line.579"></a>
+<span class="sourceLineNo">580</span>  }<a name="line.580"></a>
+<span class="sourceLineNo">581</span>}<a name="line.581"></a>
 
 
 
