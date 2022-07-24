@@ -1888,553 +1888,552 @@
 <span class="sourceLineNo">1880</span>   * across all of them.<a name="line.1880"></a>
 <span class="sourceLineNo">1881</span>   * @param readpoint readpoint below which we can safely remove duplicate KVs<a name="line.1881"></a>
 <span class="sourceLineNo">1882</span>   */<a name="line.1882"></a>
-<span class="sourceLineNo">1883</span>  public void upsert(Iterable&lt;Cell&gt; cells, long readpoint, MemStoreSizing memstoreSizing)<a name="line.1883"></a>
-<span class="sourceLineNo">1884</span>    throws IOException {<a name="line.1884"></a>
-<span class="sourceLineNo">1885</span>    this.storeEngine.readLock();<a name="line.1885"></a>
-<span class="sourceLineNo">1886</span>    try {<a name="line.1886"></a>
-<span class="sourceLineNo">1887</span>      this.memstore.upsert(cells, readpoint, memstoreSizing);<a name="line.1887"></a>
-<span class="sourceLineNo">1888</span>    } finally {<a name="line.1888"></a>
-<span class="sourceLineNo">1889</span>      this.storeEngine.readUnlock();<a name="line.1889"></a>
-<span class="sourceLineNo">1890</span>    }<a name="line.1890"></a>
-<span class="sourceLineNo">1891</span>  }<a name="line.1891"></a>
-<span class="sourceLineNo">1892</span><a name="line.1892"></a>
-<span class="sourceLineNo">1893</span>  public StoreFlushContext createFlushContext(long cacheFlushId, FlushLifeCycleTracker tracker) {<a name="line.1893"></a>
-<span class="sourceLineNo">1894</span>    return new StoreFlusherImpl(cacheFlushId, tracker);<a name="line.1894"></a>
-<span class="sourceLineNo">1895</span>  }<a name="line.1895"></a>
-<span class="sourceLineNo">1896</span><a name="line.1896"></a>
-<span class="sourceLineNo">1897</span>  private final class StoreFlusherImpl implements StoreFlushContext {<a name="line.1897"></a>
-<span class="sourceLineNo">1898</span><a name="line.1898"></a>
-<span class="sourceLineNo">1899</span>    private final FlushLifeCycleTracker tracker;<a name="line.1899"></a>
-<span class="sourceLineNo">1900</span>    private final StoreFileWriterCreationTracker writerCreationTracker;<a name="line.1900"></a>
-<span class="sourceLineNo">1901</span>    private final long cacheFlushSeqNum;<a name="line.1901"></a>
-<span class="sourceLineNo">1902</span>    private MemStoreSnapshot snapshot;<a name="line.1902"></a>
-<span class="sourceLineNo">1903</span>    private List&lt;Path&gt; tempFiles;<a name="line.1903"></a>
-<span class="sourceLineNo">1904</span>    private List&lt;Path&gt; committedFiles;<a name="line.1904"></a>
-<span class="sourceLineNo">1905</span>    private long cacheFlushCount;<a name="line.1905"></a>
-<span class="sourceLineNo">1906</span>    private long cacheFlushSize;<a name="line.1906"></a>
-<span class="sourceLineNo">1907</span>    private long outputFileSize;<a name="line.1907"></a>
-<span class="sourceLineNo">1908</span><a name="line.1908"></a>
-<span class="sourceLineNo">1909</span>    private StoreFlusherImpl(long cacheFlushSeqNum, FlushLifeCycleTracker tracker) {<a name="line.1909"></a>
-<span class="sourceLineNo">1910</span>      this.cacheFlushSeqNum = cacheFlushSeqNum;<a name="line.1910"></a>
-<span class="sourceLineNo">1911</span>      this.tracker = tracker;<a name="line.1911"></a>
-<span class="sourceLineNo">1912</span>      this.writerCreationTracker = storeFileWriterCreationTrackerFactory.get();<a name="line.1912"></a>
-<span class="sourceLineNo">1913</span>    }<a name="line.1913"></a>
-<span class="sourceLineNo">1914</span><a name="line.1914"></a>
-<span class="sourceLineNo">1915</span>    /**<a name="line.1915"></a>
-<span class="sourceLineNo">1916</span>     * This is not thread safe. The caller should have a lock on the region or the store. If<a name="line.1916"></a>
-<span class="sourceLineNo">1917</span>     * necessary, the lock can be added with the patch provided in HBASE-10087<a name="line.1917"></a>
-<span class="sourceLineNo">1918</span>     */<a name="line.1918"></a>
-<span class="sourceLineNo">1919</span>    @Override<a name="line.1919"></a>
-<span class="sourceLineNo">1920</span>    public MemStoreSize prepare() {<a name="line.1920"></a>
-<span class="sourceLineNo">1921</span>      // passing the current sequence number of the wal - to allow bookkeeping in the memstore<a name="line.1921"></a>
-<span class="sourceLineNo">1922</span>      this.snapshot = memstore.snapshot();<a name="line.1922"></a>
-<span class="sourceLineNo">1923</span>      this.cacheFlushCount = snapshot.getCellsCount();<a name="line.1923"></a>
-<span class="sourceLineNo">1924</span>      this.cacheFlushSize = snapshot.getDataSize();<a name="line.1924"></a>
-<span class="sourceLineNo">1925</span>      committedFiles = new ArrayList&lt;&gt;(1);<a name="line.1925"></a>
-<span class="sourceLineNo">1926</span>      return snapshot.getMemStoreSize();<a name="line.1926"></a>
-<span class="sourceLineNo">1927</span>    }<a name="line.1927"></a>
-<span class="sourceLineNo">1928</span><a name="line.1928"></a>
-<span class="sourceLineNo">1929</span>    @Override<a name="line.1929"></a>
-<span class="sourceLineNo">1930</span>    public void flushCache(MonitoredTask status) throws IOException {<a name="line.1930"></a>
-<span class="sourceLineNo">1931</span>      RegionServerServices rsService = region.getRegionServerServices();<a name="line.1931"></a>
-<span class="sourceLineNo">1932</span>      ThroughputController throughputController =<a name="line.1932"></a>
-<span class="sourceLineNo">1933</span>        rsService == null ? null : rsService.getFlushThroughputController();<a name="line.1933"></a>
-<span class="sourceLineNo">1934</span>      // it could be null if we do not need to track the creation of store file writer due to<a name="line.1934"></a>
-<span class="sourceLineNo">1935</span>      // different SFT implementation.<a name="line.1935"></a>
-<span class="sourceLineNo">1936</span>      if (writerCreationTracker != null) {<a name="line.1936"></a>
-<span class="sourceLineNo">1937</span>        HStore.this.storeFileWriterCreationTrackers.add(writerCreationTracker);<a name="line.1937"></a>
-<span class="sourceLineNo">1938</span>      }<a name="line.1938"></a>
-<span class="sourceLineNo">1939</span>      tempFiles = HStore.this.flushCache(cacheFlushSeqNum, snapshot, status, throughputController,<a name="line.1939"></a>
-<span class="sourceLineNo">1940</span>        tracker, writerCreationTracker);<a name="line.1940"></a>
-<span class="sourceLineNo">1941</span>    }<a name="line.1941"></a>
-<span class="sourceLineNo">1942</span><a name="line.1942"></a>
-<span class="sourceLineNo">1943</span>    @Override<a name="line.1943"></a>
-<span class="sourceLineNo">1944</span>    public boolean commit(MonitoredTask status) throws IOException {<a name="line.1944"></a>
-<span class="sourceLineNo">1945</span>      try {<a name="line.1945"></a>
-<span class="sourceLineNo">1946</span>        if (CollectionUtils.isEmpty(this.tempFiles)) {<a name="line.1946"></a>
-<span class="sourceLineNo">1947</span>          return false;<a name="line.1947"></a>
-<span class="sourceLineNo">1948</span>        }<a name="line.1948"></a>
-<span class="sourceLineNo">1949</span>        status.setStatus("Flushing " + this + ": reopening flushed file");<a name="line.1949"></a>
-<span class="sourceLineNo">1950</span>        List&lt;HStoreFile&gt; storeFiles = storeEngine.commitStoreFiles(tempFiles, false);<a name="line.1950"></a>
-<span class="sourceLineNo">1951</span>        for (HStoreFile sf : storeFiles) {<a name="line.1951"></a>
-<span class="sourceLineNo">1952</span>          StoreFileReader r = sf.getReader();<a name="line.1952"></a>
-<span class="sourceLineNo">1953</span>          if (LOG.isInfoEnabled()) {<a name="line.1953"></a>
-<span class="sourceLineNo">1954</span>            LOG.info("Added {}, entries={}, sequenceid={}, filesize={}", sf, r.getEntries(),<a name="line.1954"></a>
-<span class="sourceLineNo">1955</span>              cacheFlushSeqNum, TraditionalBinaryPrefix.long2String(r.length(), "", 1));<a name="line.1955"></a>
-<span class="sourceLineNo">1956</span>          }<a name="line.1956"></a>
-<span class="sourceLineNo">1957</span>          outputFileSize += r.length();<a name="line.1957"></a>
-<span class="sourceLineNo">1958</span>          storeSize.addAndGet(r.length());<a name="line.1958"></a>
-<span class="sourceLineNo">1959</span>          totalUncompressedBytes.addAndGet(r.getTotalUncompressedBytes());<a name="line.1959"></a>
-<span class="sourceLineNo">1960</span>          committedFiles.add(sf.getPath());<a name="line.1960"></a>
-<span class="sourceLineNo">1961</span>        }<a name="line.1961"></a>
-<span class="sourceLineNo">1962</span><a name="line.1962"></a>
-<span class="sourceLineNo">1963</span>        flushedCellsCount.addAndGet(cacheFlushCount);<a name="line.1963"></a>
-<span class="sourceLineNo">1964</span>        flushedCellsSize.addAndGet(cacheFlushSize);<a name="line.1964"></a>
-<span class="sourceLineNo">1965</span>        flushedOutputFileSize.addAndGet(outputFileSize);<a name="line.1965"></a>
-<span class="sourceLineNo">1966</span>        // call coprocessor after we have done all the accounting above<a name="line.1966"></a>
-<span class="sourceLineNo">1967</span>        for (HStoreFile sf : storeFiles) {<a name="line.1967"></a>
-<span class="sourceLineNo">1968</span>          if (getCoprocessorHost() != null) {<a name="line.1968"></a>
-<span class="sourceLineNo">1969</span>            getCoprocessorHost().postFlush(HStore.this, sf, tracker);<a name="line.1969"></a>
-<span class="sourceLineNo">1970</span>          }<a name="line.1970"></a>
-<span class="sourceLineNo">1971</span>        }<a name="line.1971"></a>
-<span class="sourceLineNo">1972</span>        // Add new file to store files. Clear snapshot too while we have the Store write lock.<a name="line.1972"></a>
-<span class="sourceLineNo">1973</span>        return completeFlush(storeFiles, snapshot.getId());<a name="line.1973"></a>
-<span class="sourceLineNo">1974</span>      } finally {<a name="line.1974"></a>
-<span class="sourceLineNo">1975</span>        if (writerCreationTracker != null) {<a name="line.1975"></a>
-<span class="sourceLineNo">1976</span>          HStore.this.storeFileWriterCreationTrackers.remove(writerCreationTracker);<a name="line.1976"></a>
-<span class="sourceLineNo">1977</span>        }<a name="line.1977"></a>
-<span class="sourceLineNo">1978</span>      }<a name="line.1978"></a>
-<span class="sourceLineNo">1979</span>    }<a name="line.1979"></a>
-<span class="sourceLineNo">1980</span><a name="line.1980"></a>
-<span class="sourceLineNo">1981</span>    @Override<a name="line.1981"></a>
-<span class="sourceLineNo">1982</span>    public long getOutputFileSize() {<a name="line.1982"></a>
-<span class="sourceLineNo">1983</span>      return outputFileSize;<a name="line.1983"></a>
-<span class="sourceLineNo">1984</span>    }<a name="line.1984"></a>
-<span class="sourceLineNo">1985</span><a name="line.1985"></a>
-<span class="sourceLineNo">1986</span>    @Override<a name="line.1986"></a>
-<span class="sourceLineNo">1987</span>    public List&lt;Path&gt; getCommittedFiles() {<a name="line.1987"></a>
-<span class="sourceLineNo">1988</span>      return committedFiles;<a name="line.1988"></a>
-<span class="sourceLineNo">1989</span>    }<a name="line.1989"></a>
-<span class="sourceLineNo">1990</span><a name="line.1990"></a>
-<span class="sourceLineNo">1991</span>    /**<a name="line.1991"></a>
-<span class="sourceLineNo">1992</span>     * Similar to commit, but called in secondary region replicas for replaying the flush cache from<a name="line.1992"></a>
-<span class="sourceLineNo">1993</span>     * primary region. Adds the new files to the store, and drops the snapshot depending on<a name="line.1993"></a>
-<span class="sourceLineNo">1994</span>     * dropMemstoreSnapshot argument.<a name="line.1994"></a>
-<span class="sourceLineNo">1995</span>     * @param fileNames            names of the flushed files<a name="line.1995"></a>
-<span class="sourceLineNo">1996</span>     * @param dropMemstoreSnapshot whether to drop the prepared memstore snapshot<a name="line.1996"></a>
-<span class="sourceLineNo">1997</span>     */<a name="line.1997"></a>
-<span class="sourceLineNo">1998</span>    @Override<a name="line.1998"></a>
-<span class="sourceLineNo">1999</span>    public void replayFlush(List&lt;String&gt; fileNames, boolean dropMemstoreSnapshot)<a name="line.1999"></a>
-<span class="sourceLineNo">2000</span>      throws IOException {<a name="line.2000"></a>
-<span class="sourceLineNo">2001</span>      List&lt;HStoreFile&gt; storeFiles = new ArrayList&lt;&gt;(fileNames.size());<a name="line.2001"></a>
-<span class="sourceLineNo">2002</span>      for (String file : fileNames) {<a name="line.2002"></a>
-<span class="sourceLineNo">2003</span>        // open the file as a store file (hfile link, etc)<a name="line.2003"></a>
-<span class="sourceLineNo">2004</span>        StoreFileInfo storeFileInfo =<a name="line.2004"></a>
-<span class="sourceLineNo">2005</span>          getRegionFileSystem().getStoreFileInfo(getColumnFamilyName(), file);<a name="line.2005"></a>
-<span class="sourceLineNo">2006</span>        HStoreFile storeFile = storeEngine.createStoreFileAndReader(storeFileInfo);<a name="line.2006"></a>
-<span class="sourceLineNo">2007</span>        storeFiles.add(storeFile);<a name="line.2007"></a>
-<span class="sourceLineNo">2008</span>        HStore.this.storeSize.addAndGet(storeFile.getReader().length());<a name="line.2008"></a>
-<span class="sourceLineNo">2009</span>        HStore.this.totalUncompressedBytes<a name="line.2009"></a>
-<span class="sourceLineNo">2010</span>          .addAndGet(storeFile.getReader().getTotalUncompressedBytes());<a name="line.2010"></a>
-<span class="sourceLineNo">2011</span>        if (LOG.isInfoEnabled()) {<a name="line.2011"></a>
-<span class="sourceLineNo">2012</span>          LOG.info(this + " added " + storeFile + ", entries=" + storeFile.getReader().getEntries()<a name="line.2012"></a>
-<span class="sourceLineNo">2013</span>            + ", sequenceid=" + storeFile.getReader().getSequenceID() + ", filesize="<a name="line.2013"></a>
-<span class="sourceLineNo">2014</span>            + TraditionalBinaryPrefix.long2String(storeFile.getReader().length(), "", 1));<a name="line.2014"></a>
-<span class="sourceLineNo">2015</span>        }<a name="line.2015"></a>
-<span class="sourceLineNo">2016</span>      }<a name="line.2016"></a>
-<span class="sourceLineNo">2017</span><a name="line.2017"></a>
-<span class="sourceLineNo">2018</span>      long snapshotId = -1; // -1 means do not drop<a name="line.2018"></a>
-<span class="sourceLineNo">2019</span>      if (dropMemstoreSnapshot &amp;&amp; snapshot != null) {<a name="line.2019"></a>
-<span class="sourceLineNo">2020</span>        snapshotId = snapshot.getId();<a name="line.2020"></a>
-<span class="sourceLineNo">2021</span>      }<a name="line.2021"></a>
-<span class="sourceLineNo">2022</span>      HStore.this.completeFlush(storeFiles, snapshotId);<a name="line.2022"></a>
-<span class="sourceLineNo">2023</span>    }<a name="line.2023"></a>
-<span class="sourceLineNo">2024</span><a name="line.2024"></a>
-<span class="sourceLineNo">2025</span>    /**<a name="line.2025"></a>
-<span class="sourceLineNo">2026</span>     * Abort the snapshot preparation. Drops the snapshot if any.<a name="line.2026"></a>
-<span class="sourceLineNo">2027</span>     */<a name="line.2027"></a>
-<span class="sourceLineNo">2028</span>    @Override<a name="line.2028"></a>
-<span class="sourceLineNo">2029</span>    public void abort() throws IOException {<a name="line.2029"></a>
-<span class="sourceLineNo">2030</span>      if (snapshot != null) {<a name="line.2030"></a>
-<span class="sourceLineNo">2031</span>        HStore.this.completeFlush(Collections.emptyList(), snapshot.getId());<a name="line.2031"></a>
-<span class="sourceLineNo">2032</span>      }<a name="line.2032"></a>
-<span class="sourceLineNo">2033</span>    }<a name="line.2033"></a>
-<span class="sourceLineNo">2034</span>  }<a name="line.2034"></a>
-<span class="sourceLineNo">2035</span><a name="line.2035"></a>
-<span class="sourceLineNo">2036</span>  @Override<a name="line.2036"></a>
-<span class="sourceLineNo">2037</span>  public boolean needsCompaction() {<a name="line.2037"></a>
-<span class="sourceLineNo">2038</span>    List&lt;HStoreFile&gt; filesCompactingClone = null;<a name="line.2038"></a>
-<span class="sourceLineNo">2039</span>    synchronized (filesCompacting) {<a name="line.2039"></a>
-<span class="sourceLineNo">2040</span>      filesCompactingClone = Lists.newArrayList(filesCompacting);<a name="line.2040"></a>
-<span class="sourceLineNo">2041</span>    }<a name="line.2041"></a>
-<span class="sourceLineNo">2042</span>    return this.storeEngine.needsCompaction(filesCompactingClone);<a name="line.2042"></a>
-<span class="sourceLineNo">2043</span>  }<a name="line.2043"></a>
-<span class="sourceLineNo">2044</span><a name="line.2044"></a>
-<span class="sourceLineNo">2045</span>  /**<a name="line.2045"></a>
-<span class="sourceLineNo">2046</span>   * Used for tests.<a name="line.2046"></a>
-<span class="sourceLineNo">2047</span>   * @return cache configuration for this Store.<a name="line.2047"></a>
-<span class="sourceLineNo">2048</span>   */<a name="line.2048"></a>
-<span class="sourceLineNo">2049</span>  public CacheConfig getCacheConfig() {<a name="line.2049"></a>
-<span class="sourceLineNo">2050</span>    return storeContext.getCacheConf();<a name="line.2050"></a>
-<span class="sourceLineNo">2051</span>  }<a name="line.2051"></a>
-<span class="sourceLineNo">2052</span><a name="line.2052"></a>
-<span class="sourceLineNo">2053</span>  public static final long FIXED_OVERHEAD = ClassSize.estimateBase(HStore.class, false);<a name="line.2053"></a>
-<span class="sourceLineNo">2054</span><a name="line.2054"></a>
-<span class="sourceLineNo">2055</span>  public static final long DEEP_OVERHEAD = ClassSize.align(<a name="line.2055"></a>
-<span class="sourceLineNo">2056</span>    FIXED_OVERHEAD + ClassSize.OBJECT + ClassSize.REENTRANT_LOCK + ClassSize.CONCURRENT_SKIPLISTMAP<a name="line.2056"></a>
-<span class="sourceLineNo">2057</span>      + ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + ClassSize.OBJECT + ScanInfo.FIXED_OVERHEAD);<a name="line.2057"></a>
-<span class="sourceLineNo">2058</span><a name="line.2058"></a>
-<span class="sourceLineNo">2059</span>  @Override<a name="line.2059"></a>
-<span class="sourceLineNo">2060</span>  public long heapSize() {<a name="line.2060"></a>
-<span class="sourceLineNo">2061</span>    MemStoreSize memstoreSize = this.memstore.size();<a name="line.2061"></a>
-<span class="sourceLineNo">2062</span>    return DEEP_OVERHEAD + memstoreSize.getHeapSize() + storeContext.heapSize();<a name="line.2062"></a>
-<span class="sourceLineNo">2063</span>  }<a name="line.2063"></a>
-<span class="sourceLineNo">2064</span><a name="line.2064"></a>
-<span class="sourceLineNo">2065</span>  @Override<a name="line.2065"></a>
-<span class="sourceLineNo">2066</span>  public CellComparator getComparator() {<a name="line.2066"></a>
-<span class="sourceLineNo">2067</span>    return storeContext.getComparator();<a name="line.2067"></a>
-<span class="sourceLineNo">2068</span>  }<a name="line.2068"></a>
-<span class="sourceLineNo">2069</span><a name="line.2069"></a>
-<span class="sourceLineNo">2070</span>  public ScanInfo getScanInfo() {<a name="line.2070"></a>
-<span class="sourceLineNo">2071</span>    return scanInfo;<a name="line.2071"></a>
-<span class="sourceLineNo">2072</span>  }<a name="line.2072"></a>
-<span class="sourceLineNo">2073</span><a name="line.2073"></a>
-<span class="sourceLineNo">2074</span>  /**<a name="line.2074"></a>
-<span class="sourceLineNo">2075</span>   * Set scan info, used by test<a name="line.2075"></a>
-<span class="sourceLineNo">2076</span>   * @param scanInfo new scan info to use for test<a name="line.2076"></a>
-<span class="sourceLineNo">2077</span>   */<a name="line.2077"></a>
-<span class="sourceLineNo">2078</span>  void setScanInfo(ScanInfo scanInfo) {<a name="line.2078"></a>
-<span class="sourceLineNo">2079</span>    this.scanInfo = scanInfo;<a name="line.2079"></a>
-<span class="sourceLineNo">2080</span>  }<a name="line.2080"></a>
-<span class="sourceLineNo">2081</span><a name="line.2081"></a>
-<span class="sourceLineNo">2082</span>  @Override<a name="line.2082"></a>
-<span class="sourceLineNo">2083</span>  public boolean hasTooManyStoreFiles() {<a name="line.2083"></a>
-<span class="sourceLineNo">2084</span>    return getStorefilesCount() &gt; this.blockingFileCount;<a name="line.2084"></a>
-<span class="sourceLineNo">2085</span>  }<a name="line.2085"></a>
-<span class="sourceLineNo">2086</span><a name="line.2086"></a>
-<span class="sourceLineNo">2087</span>  @Override<a name="line.2087"></a>
-<span class="sourceLineNo">2088</span>  public long getFlushedCellsCount() {<a name="line.2088"></a>
-<span class="sourceLineNo">2089</span>    return flushedCellsCount.get();<a name="line.2089"></a>
-<span class="sourceLineNo">2090</span>  }<a name="line.2090"></a>
-<span class="sourceLineNo">2091</span><a name="line.2091"></a>
-<span class="sourceLineNo">2092</span>  @Override<a name="line.2092"></a>
-<span class="sourceLineNo">2093</span>  public long getFlushedCellsSize() {<a name="line.2093"></a>
-<span class="sourceLineNo">2094</span>    return flushedCellsSize.get();<a name="line.2094"></a>
-<span class="sourceLineNo">2095</span>  }<a name="line.2095"></a>
-<span class="sourceLineNo">2096</span><a name="line.2096"></a>
-<span class="sourceLineNo">2097</span>  @Override<a name="line.2097"></a>
-<span class="sourceLineNo">2098</span>  public long getFlushedOutputFileSize() {<a name="line.2098"></a>
-<span class="sourceLineNo">2099</span>    return flushedOutputFileSize.get();<a name="line.2099"></a>
-<span class="sourceLineNo">2100</span>  }<a name="line.2100"></a>
-<span class="sourceLineNo">2101</span><a name="line.2101"></a>
-<span class="sourceLineNo">2102</span>  @Override<a name="line.2102"></a>
-<span class="sourceLineNo">2103</span>  public long getCompactedCellsCount() {<a name="line.2103"></a>
-<span class="sourceLineNo">2104</span>    return compactedCellsCount.get();<a name="line.2104"></a>
-<span class="sourceLineNo">2105</span>  }<a name="line.2105"></a>
-<span class="sourceLineNo">2106</span><a name="line.2106"></a>
-<span class="sourceLineNo">2107</span>  @Override<a name="line.2107"></a>
-<span class="sourceLineNo">2108</span>  public long getCompactedCellsSize() {<a name="line.2108"></a>
-<span class="sourceLineNo">2109</span>    return compactedCellsSize.get();<a name="line.2109"></a>
-<span class="sourceLineNo">2110</span>  }<a name="line.2110"></a>
-<span class="sourceLineNo">2111</span><a name="line.2111"></a>
-<span class="sourceLineNo">2112</span>  @Override<a name="line.2112"></a>
-<span class="sourceLineNo">2113</span>  public long getMajorCompactedCellsCount() {<a name="line.2113"></a>
-<span class="sourceLineNo">2114</span>    return majorCompactedCellsCount.get();<a name="line.2114"></a>
-<span class="sourceLineNo">2115</span>  }<a name="line.2115"></a>
-<span class="sourceLineNo">2116</span><a name="line.2116"></a>
-<span class="sourceLineNo">2117</span>  @Override<a name="line.2117"></a>
-<span class="sourceLineNo">2118</span>  public long getMajorCompactedCellsSize() {<a name="line.2118"></a>
-<span class="sourceLineNo">2119</span>    return majorCompactedCellsSize.get();<a name="line.2119"></a>
-<span class="sourceLineNo">2120</span>  }<a name="line.2120"></a>
-<span class="sourceLineNo">2121</span><a name="line.2121"></a>
-<span class="sourceLineNo">2122</span>  public void updateCompactedMetrics(boolean isMajor, CompactionProgress progress) {<a name="line.2122"></a>
-<span class="sourceLineNo">2123</span>    if (isMajor) {<a name="line.2123"></a>
-<span class="sourceLineNo">2124</span>      majorCompactedCellsCount.addAndGet(progress.getTotalCompactingKVs());<a name="line.2124"></a>
-<span class="sourceLineNo">2125</span>      majorCompactedCellsSize.addAndGet(progress.totalCompactedSize);<a name="line.2125"></a>
-<span class="sourceLineNo">2126</span>    } else {<a name="line.2126"></a>
-<span class="sourceLineNo">2127</span>      compactedCellsCount.addAndGet(progress.getTotalCompactingKVs());<a name="line.2127"></a>
-<span class="sourceLineNo">2128</span>      compactedCellsSize.addAndGet(progress.totalCompactedSize);<a name="line.2128"></a>
-<span class="sourceLineNo">2129</span>    }<a name="line.2129"></a>
-<span class="sourceLineNo">2130</span>  }<a name="line.2130"></a>
-<span class="sourceLineNo">2131</span><a name="line.2131"></a>
-<span class="sourceLineNo">2132</span>  /**<a name="line.2132"></a>
-<span class="sourceLineNo">2133</span>   * Returns the StoreEngine that is backing this concrete implementation of Store.<a name="line.2133"></a>
-<span class="sourceLineNo">2134</span>   * @return Returns the {@link StoreEngine} object used internally inside this HStore object.<a name="line.2134"></a>
-<span class="sourceLineNo">2135</span>   */<a name="line.2135"></a>
-<span class="sourceLineNo">2136</span>  public StoreEngine&lt;?, ?, ?, ?&gt; getStoreEngine() {<a name="line.2136"></a>
-<span class="sourceLineNo">2137</span>    return this.storeEngine;<a name="line.2137"></a>
-<span class="sourceLineNo">2138</span>  }<a name="line.2138"></a>
-<span class="sourceLineNo">2139</span><a name="line.2139"></a>
-<span class="sourceLineNo">2140</span>  protected OffPeakHours getOffPeakHours() {<a name="line.2140"></a>
-<span class="sourceLineNo">2141</span>    return this.offPeakHours;<a name="line.2141"></a>
-<span class="sourceLineNo">2142</span>  }<a name="line.2142"></a>
-<span class="sourceLineNo">2143</span><a name="line.2143"></a>
-<span class="sourceLineNo">2144</span>  @Override<a name="line.2144"></a>
-<span class="sourceLineNo">2145</span>  public void onConfigurationChange(Configuration conf) {<a name="line.2145"></a>
-<span class="sourceLineNo">2146</span>    Configuration storeConf = StoreUtils.createStoreConfiguration(conf, region.getTableDescriptor(),<a name="line.2146"></a>
-<span class="sourceLineNo">2147</span>      getColumnFamilyDescriptor());<a name="line.2147"></a>
-<span class="sourceLineNo">2148</span>    this.conf = storeConf;<a name="line.2148"></a>
-<span class="sourceLineNo">2149</span>    this.storeEngine.compactionPolicy.setConf(storeConf);<a name="line.2149"></a>
-<span class="sourceLineNo">2150</span>    this.offPeakHours = OffPeakHours.getInstance(storeConf);<a name="line.2150"></a>
-<span class="sourceLineNo">2151</span>  }<a name="line.2151"></a>
-<span class="sourceLineNo">2152</span><a name="line.2152"></a>
-<span class="sourceLineNo">2153</span>  /**<a name="line.2153"></a>
-<span class="sourceLineNo">2154</span>   * {@inheritDoc}<a name="line.2154"></a>
-<span class="sourceLineNo">2155</span>   */<a name="line.2155"></a>
-<span class="sourceLineNo">2156</span>  @Override<a name="line.2156"></a>
-<span class="sourceLineNo">2157</span>  public void registerChildren(ConfigurationManager manager) {<a name="line.2157"></a>
-<span class="sourceLineNo">2158</span>    // No children to register<a name="line.2158"></a>
-<span class="sourceLineNo">2159</span>  }<a name="line.2159"></a>
-<span class="sourceLineNo">2160</span><a name="line.2160"></a>
-<span class="sourceLineNo">2161</span>  /**<a name="line.2161"></a>
-<span class="sourceLineNo">2162</span>   * {@inheritDoc}<a name="line.2162"></a>
-<span class="sourceLineNo">2163</span>   */<a name="line.2163"></a>
-<span class="sourceLineNo">2164</span>  @Override<a name="line.2164"></a>
-<span class="sourceLineNo">2165</span>  public void deregisterChildren(ConfigurationManager manager) {<a name="line.2165"></a>
-<span class="sourceLineNo">2166</span>    // No children to deregister<a name="line.2166"></a>
-<span class="sourceLineNo">2167</span>  }<a name="line.2167"></a>
-<span class="sourceLineNo">2168</span><a name="line.2168"></a>
-<span class="sourceLineNo">2169</span>  @Override<a name="line.2169"></a>
-<span class="sourceLineNo">2170</span>  public double getCompactionPressure() {<a name="line.2170"></a>
-<span class="sourceLineNo">2171</span>    return storeEngine.getStoreFileManager().getCompactionPressure();<a name="line.2171"></a>
-<span class="sourceLineNo">2172</span>  }<a name="line.2172"></a>
-<span class="sourceLineNo">2173</span><a name="line.2173"></a>
-<span class="sourceLineNo">2174</span>  @Override<a name="line.2174"></a>
-<span class="sourceLineNo">2175</span>  public boolean isPrimaryReplicaStore() {<a name="line.2175"></a>
-<span class="sourceLineNo">2176</span>    return getRegionInfo().getReplicaId() == RegionInfo.DEFAULT_REPLICA_ID;<a name="line.2176"></a>
-<span class="sourceLineNo">2177</span>  }<a name="line.2177"></a>
-<span class="sourceLineNo">2178</span><a name="line.2178"></a>
-<span class="sourceLineNo">2179</span>  /**<a name="line.2179"></a>
-<span class="sourceLineNo">2180</span>   * Sets the store up for a region level snapshot operation.<a name="line.2180"></a>
-<span class="sourceLineNo">2181</span>   * @see #postSnapshotOperation()<a name="line.2181"></a>
-<span class="sourceLineNo">2182</span>   */<a name="line.2182"></a>
-<span class="sourceLineNo">2183</span>  public void preSnapshotOperation() {<a name="line.2183"></a>
-<span class="sourceLineNo">2184</span>    archiveLock.lock();<a name="line.2184"></a>
-<span class="sourceLineNo">2185</span>  }<a name="line.2185"></a>
-<span class="sourceLineNo">2186</span><a name="line.2186"></a>
-<span class="sourceLineNo">2187</span>  /**<a name="line.2187"></a>
-<span class="sourceLineNo">2188</span>   * Perform tasks needed after the completion of snapshot operation.<a name="line.2188"></a>
-<span class="sourceLineNo">2189</span>   * @see #preSnapshotOperation()<a name="line.2189"></a>
-<span class="sourceLineNo">2190</span>   */<a name="line.2190"></a>
-<span class="sourceLineNo">2191</span>  public void postSnapshotOperation() {<a name="line.2191"></a>
-<span class="sourceLineNo">2192</span>    archiveLock.unlock();<a name="line.2192"></a>
-<span class="sourceLineNo">2193</span>  }<a name="line.2193"></a>
-<span class="sourceLineNo">2194</span><a name="line.2194"></a>
-<span class="sourceLineNo">2195</span>  /**<a name="line.2195"></a>
-<span class="sourceLineNo">2196</span>   * Closes and archives the compacted files under this store<a name="line.2196"></a>
-<span class="sourceLineNo">2197</span>   */<a name="line.2197"></a>
-<span class="sourceLineNo">2198</span>  public synchronized void closeAndArchiveCompactedFiles() throws IOException {<a name="line.2198"></a>
-<span class="sourceLineNo">2199</span>    // ensure other threads do not attempt to archive the same files on close()<a name="line.2199"></a>
-<span class="sourceLineNo">2200</span>    archiveLock.lock();<a name="line.2200"></a>
-<span class="sourceLineNo">2201</span>    try {<a name="line.2201"></a>
-<span class="sourceLineNo">2202</span>      storeEngine.readLock();<a name="line.2202"></a>
-<span class="sourceLineNo">2203</span>      Collection&lt;HStoreFile&gt; copyCompactedfiles = null;<a name="line.2203"></a>
-<span class="sourceLineNo">2204</span>      try {<a name="line.2204"></a>
-<span class="sourceLineNo">2205</span>        Collection&lt;HStoreFile&gt; compactedfiles =<a name="line.2205"></a>
-<span class="sourceLineNo">2206</span>          this.getStoreEngine().getStoreFileManager().getCompactedfiles();<a name="line.2206"></a>
-<span class="sourceLineNo">2207</span>        if (CollectionUtils.isNotEmpty(compactedfiles)) {<a name="line.2207"></a>
-<span class="sourceLineNo">2208</span>          // Do a copy under read lock<a name="line.2208"></a>
-<span class="sourceLineNo">2209</span>          copyCompactedfiles = new ArrayList&lt;&gt;(compactedfiles);<a name="line.2209"></a>
-<span class="sourceLineNo">2210</span>        } else {<a name="line.2210"></a>
-<span class="sourceLineNo">2211</span>          LOG.trace("No compacted files to archive");<a name="line.2211"></a>
-<span class="sourceLineNo">2212</span>        }<a name="line.2212"></a>
-<span class="sourceLineNo">2213</span>      } finally {<a name="line.2213"></a>
-<span class="sourceLineNo">2214</span>        storeEngine.readUnlock();<a name="line.2214"></a>
-<span class="sourceLineNo">2215</span>      }<a name="line.2215"></a>
-<span class="sourceLineNo">2216</span>      if (CollectionUtils.isNotEmpty(copyCompactedfiles)) {<a name="line.2216"></a>
-<span class="sourceLineNo">2217</span>        removeCompactedfiles(copyCompactedfiles, true);<a name="line.2217"></a>
-<span class="sourceLineNo">2218</span>      }<a name="line.2218"></a>
-<span class="sourceLineNo">2219</span>    } finally {<a name="line.2219"></a>
-<span class="sourceLineNo">2220</span>      archiveLock.unlock();<a name="line.2220"></a>
-<span class="sourceLineNo">2221</span>    }<a name="line.2221"></a>
-<span class="sourceLineNo">2222</span>  }<a name="line.2222"></a>
-<span class="sourceLineNo">2223</span><a name="line.2223"></a>
-<span class="sourceLineNo">2224</span>  /**<a name="line.2224"></a>
-<span class="sourceLineNo">2225</span>   * Archives and removes the compacted files<a name="line.2225"></a>
-<span class="sourceLineNo">2226</span>   * @param compactedfiles The compacted files in this store that are not active in reads<a name="line.2226"></a>
-<span class="sourceLineNo">2227</span>   * @param evictOnClose   true if blocks should be evicted from the cache when an HFile reader is<a name="line.2227"></a>
-<span class="sourceLineNo">2228</span>   *                       closed, false if not<a name="line.2228"></a>
-<span class="sourceLineNo">2229</span>   */<a name="line.2229"></a>
-<span class="sourceLineNo">2230</span>  private void removeCompactedfiles(Collection&lt;HStoreFile&gt; compactedfiles, boolean evictOnClose)<a name="line.2230"></a>
-<span class="sourceLineNo">2231</span>    throws IOException {<a name="line.2231"></a>
-<span class="sourceLineNo">2232</span>    final List&lt;HStoreFile&gt; filesToRemove = new ArrayList&lt;&gt;(compactedfiles.size());<a name="line.2232"></a>
-<span class="sourceLineNo">2233</span>    final List&lt;Long&gt; storeFileSizes = new ArrayList&lt;&gt;(compactedfiles.size());<a name="line.2233"></a>
-<span class="sourceLineNo">2234</span>    for (final HStoreFile file : compactedfiles) {<a name="line.2234"></a>
-<span class="sourceLineNo">2235</span>      synchronized (file) {<a name="line.2235"></a>
-<span class="sourceLineNo">2236</span>        try {<a name="line.2236"></a>
-<span class="sourceLineNo">2237</span>          StoreFileReader r = file.getReader();<a name="line.2237"></a>
-<span class="sourceLineNo">2238</span>          if (r == null) {<a name="line.2238"></a>
-<span class="sourceLineNo">2239</span>            LOG.debug("The file {} was closed but still not archived", file);<a name="line.2239"></a>
-<span class="sourceLineNo">2240</span>            // HACK: Temporarily re-open the reader so we can get the size of the file. Ideally,<a name="line.2240"></a>
-<span class="sourceLineNo">2241</span>            // we should know the size of an HStoreFile without having to ask the HStoreFileReader<a name="line.2241"></a>
-<span class="sourceLineNo">2242</span>            // for that.<a name="line.2242"></a>
-<span class="sourceLineNo">2243</span>            long length = getStoreFileSize(file);<a name="line.2243"></a>
-<span class="sourceLineNo">2244</span>            filesToRemove.add(file);<a name="line.2244"></a>
-<span class="sourceLineNo">2245</span>            storeFileSizes.add(length);<a name="line.2245"></a>
-<span class="sourceLineNo">2246</span>            continue;<a name="line.2246"></a>
-<span class="sourceLineNo">2247</span>          }<a name="line.2247"></a>
-<span class="sourceLineNo">2248</span><a name="line.2248"></a>
-<span class="sourceLineNo">2249</span>          if (file.isCompactedAway() &amp;&amp; !file.isReferencedInReads()) {<a name="line.2249"></a>
-<span class="sourceLineNo">2250</span>            // Even if deleting fails we need not bother as any new scanners won't be<a name="line.2250"></a>
-<span class="sourceLineNo">2251</span>            // able to use the compacted file as the status is already compactedAway<a name="line.2251"></a>
-<span class="sourceLineNo">2252</span>            LOG.trace("Closing and archiving the file {}", file);<a name="line.2252"></a>
-<span class="sourceLineNo">2253</span>            // Copy the file size before closing the reader<a name="line.2253"></a>
-<span class="sourceLineNo">2254</span>            final long length = r.length();<a name="line.2254"></a>
-<span class="sourceLineNo">2255</span>            r.close(evictOnClose);<a name="line.2255"></a>
-<span class="sourceLineNo">2256</span>            // Just close and return<a name="line.2256"></a>
-<span class="sourceLineNo">2257</span>            filesToRemove.add(file);<a name="line.2257"></a>
-<span class="sourceLineNo">2258</span>            // Only add the length if we successfully added the file to `filesToRemove`<a name="line.2258"></a>
-<span class="sourceLineNo">2259</span>            storeFileSizes.add(length);<a name="line.2259"></a>
-<span class="sourceLineNo">2260</span>          } else {<a name="line.2260"></a>
-<span class="sourceLineNo">2261</span>            LOG.info("Can't archive compacted file " + file.getPath()<a name="line.2261"></a>
-<span class="sourceLineNo">2262</span>              + " because of either isCompactedAway=" + file.isCompactedAway()<a name="line.2262"></a>
-<span class="sourceLineNo">2263</span>              + " or file has reference, isReferencedInReads=" + file.isReferencedInReads()<a name="line.2263"></a>
-<span class="sourceLineNo">2264</span>              + ", refCount=" + r.getRefCount() + ", skipping for now.");<a name="line.2264"></a>
-<span class="sourceLineNo">2265</span>          }<a name="line.2265"></a>
-<span class="sourceLineNo">2266</span>        } catch (Exception e) {<a name="line.2266"></a>
-<span class="sourceLineNo">2267</span>          LOG.error("Exception while trying to close the compacted store file {}", file.getPath(),<a name="line.2267"></a>
-<span class="sourceLineNo">2268</span>            e);<a name="line.2268"></a>
-<span class="sourceLineNo">2269</span>        }<a name="line.2269"></a>
-<span class="sourceLineNo">2270</span>      }<a name="line.2270"></a>
-<span class="sourceLineNo">2271</span>    }<a name="line.2271"></a>
-<span class="sourceLineNo">2272</span>    if (this.isPrimaryReplicaStore()) {<a name="line.2272"></a>
-<span class="sourceLineNo">2273</span>      // Only the primary region is allowed to move the file to archive.<a name="line.2273"></a>
-<span class="sourceLineNo">2274</span>      // The secondary region does not move the files to archive. Any active reads from<a name="line.2274"></a>
-<span class="sourceLineNo">2275</span>      // the secondary region will still work because the file as such has active readers on it.<a name="line.2275"></a>
-<span class="sourceLineNo">2276</span>      if (!filesToRemove.isEmpty()) {<a name="line.2276"></a>
-<span class="sourceLineNo">2277</span>        LOG.debug("Moving the files {} to archive", filesToRemove);<a name="line.2277"></a>
-<span class="sourceLineNo">2278</span>        // Only if this is successful it has to be removed<a name="line.2278"></a>
-<span class="sourceLineNo">2279</span>        try {<a name="line.2279"></a>
-<span class="sourceLineNo">2280</span>          getRegionFileSystem().removeStoreFiles(this.getColumnFamilyDescriptor().getNameAsString(),<a name="line.2280"></a>
-<span class="sourceLineNo">2281</span>            filesToRemove);<a name="line.2281"></a>
-<span class="sourceLineNo">2282</span>        } catch (FailedArchiveException fae) {<a name="line.2282"></a>
-<span class="sourceLineNo">2283</span>          // Even if archiving some files failed, we still need to clear out any of the<a name="line.2283"></a>
-<span class="sourceLineNo">2284</span>          // files which were successfully archived. Otherwise we will receive a<a name="line.2284"></a>
-<span class="sourceLineNo">2285</span>          // FileNotFoundException when we attempt to re-archive them in the next go around.<a name="line.2285"></a>
-<span class="sourceLineNo">2286</span>          Collection&lt;Path&gt; failedFiles = fae.getFailedFiles();<a name="line.2286"></a>
-<span class="sourceLineNo">2287</span>          Iterator&lt;HStoreFile&gt; iter = filesToRemove.iterator();<a name="line.2287"></a>
-<span class="sourceLineNo">2288</span>          Iterator&lt;Long&gt; sizeIter = storeFileSizes.iterator();<a name="line.2288"></a>
-<span class="sourceLineNo">2289</span>          while (iter.hasNext()) {<a name="line.2289"></a>
-<span class="sourceLineNo">2290</span>            sizeIter.next();<a name="line.2290"></a>
-<span class="sourceLineNo">2291</span>            if (failedFiles.contains(iter.next().getPath())) {<a name="line.2291"></a>
-<span class="sourceLineNo">2292</span>              iter.remove();<a name="line.2292"></a>
-<span class="sourceLineNo">2293</span>              sizeIter.remove();<a name="line.2293"></a>
-<span class="sourceLineNo">2294</span>            }<a name="line.2294"></a>
-<span class="sourceLineNo">2295</span>          }<a name="line.2295"></a>
-<span class="sourceLineNo">2296</span>          if (!filesToRemove.isEmpty()) {<a name="line.2296"></a>
-<span class="sourceLineNo">2297</span>            clearCompactedfiles(filesToRemove);<a name="line.2297"></a>
-<span class="sourceLineNo">2298</span>          }<a name="line.2298"></a>
-<span class="sourceLineNo">2299</span>          throw fae;<a name="line.2299"></a>
-<span class="sourceLineNo">2300</span>        }<a name="line.2300"></a>
-<span class="sourceLineNo">2301</span>      }<a name="line.2301"></a>
-<span class="sourceLineNo">2302</span>    }<a name="line.2302"></a>
-<span class="sourceLineNo">2303</span>    if (!filesToRemove.isEmpty()) {<a name="line.2303"></a>
-<span class="sourceLineNo">2304</span>      // Clear the compactedfiles from the store file manager<a name="line.2304"></a>
-<span class="sourceLineNo">2305</span>      clearCompactedfiles(filesToRemove);<a name="line.2305"></a>
-<span class="sourceLineNo">2306</span>      // Try to send report of this archival to the Master for updating quota usage faster<a name="line.2306"></a>
-<span class="sourceLineNo">2307</span>      reportArchivedFilesForQuota(filesToRemove, storeFileSizes);<a name="line.2307"></a>
-<span class="sourceLineNo">2308</span>    }<a name="line.2308"></a>
-<span class="sourceLineNo">2309</span>  }<a name="line.2309"></a>
-<span class="sourceLineNo">2310</span><a name="line.2310"></a>
-<span class="sourceLineNo">2311</span>  /**<a name="line.2311"></a>
-<span class="sourceLineNo">2312</span>   * Computes the length of a store file without succumbing to any errors along the way. If an error<a name="line.2312"></a>
-<span class="sourceLineNo">2313</span>   * is encountered, the implementation returns {@code 0} instead of the actual size.<a name="line.2313"></a>
-<span class="sourceLineNo">2314</span>   * @param file The file to compute the size of.<a name="line.2314"></a>
-<span class="sourceLineNo">2315</span>   * @return The size in bytes of the provided {@code file}.<a name="line.2315"></a>
-<span class="sourceLineNo">2316</span>   */<a name="line.2316"></a>
-<span class="sourceLineNo">2317</span>  long getStoreFileSize(HStoreFile file) {<a name="line.2317"></a>
-<span class="sourceLineNo">2318</span>    long length = 0;<a name="line.2318"></a>
-<span class="sourceLineNo">2319</span>    try {<a name="line.2319"></a>
-<span class="sourceLineNo">2320</span>      file.initReader();<a name="line.2320"></a>
-<span class="sourceLineNo">2321</span>      length = file.getReader().length();<a name="line.2321"></a>
-<span class="sourceLineNo">2322</span>    } catch (IOException e) {<a name="line.2322"></a>
-<span class="sourceLineNo">2323</span>      LOG.trace("Failed to open reader when trying to compute store file size for {}, ignoring",<a name="line.2323"></a>
-<span class="sourceLineNo">2324</span>        file, e);<a name="line.2324"></a>
-<span class="sourceLineNo">2325</span>    } finally {<a name="line.2325"></a>
-<span class="sourceLineNo">2326</span>      try {<a name="line.2326"></a>
-<span class="sourceLineNo">2327</span>        file.closeStoreFile(<a name="line.2327"></a>
-<span class="sourceLineNo">2328</span>          file.getCacheConf() != null ? file.getCacheConf().shouldEvictOnClose() : true);<a name="line.2328"></a>
-<span class="sourceLineNo">2329</span>      } catch (IOException e) {<a name="line.2329"></a>
-<span class="sourceLineNo">2330</span>        LOG.trace("Failed to close reader after computing store file size for {}, ignoring", file,<a name="line.2330"></a>
-<span class="sourceLineNo">2331</span>          e);<a name="line.2331"></a>
-<span class="sourceLineNo">2332</span>      }<a name="line.2332"></a>
-<span class="sourceLineNo">2333</span>    }<a name="line.2333"></a>
-<span class="sourceLineNo">2334</span>    return length;<a name="line.2334"></a>
-<span class="sourceLineNo">2335</span>  }<a name="line.2335"></a>
-<span class="sourceLineNo">2336</span><a name="line.2336"></a>
-<span class="sourceLineNo">2337</span>  public Long preFlushSeqIDEstimation() {<a name="line.2337"></a>
-<span class="sourceLineNo">2338</span>    return memstore.preFlushSeqIDEstimation();<a name="line.2338"></a>
-<span class="sourceLineNo">2339</span>  }<a name="line.2339"></a>
-<span class="sourceLineNo">2340</span><a name="line.2340"></a>
-<span class="sourceLineNo">2341</span>  @Override<a name="line.2341"></a>
-<span class="sourceLineNo">2342</span>  public boolean isSloppyMemStore() {<a name="line.2342"></a>
-<span class="sourceLineNo">2343</span>    return this.memstore.isSloppy();<a name="line.2343"></a>
-<span class="sourceLineNo">2344</span>  }<a name="line.2344"></a>
-<span class="sourceLineNo">2345</span><a name="line.2345"></a>
-<span class="sourceLineNo">2346</span>  private void clearCompactedfiles(List&lt;HStoreFile&gt; filesToRemove) throws IOException {<a name="line.2346"></a>
-<span class="sourceLineNo">2347</span>    LOG.trace("Clearing the compacted file {} from this store", filesToRemove);<a name="line.2347"></a>
-<span class="sourceLineNo">2348</span>    storeEngine.removeCompactedFiles(filesToRemove);<a name="line.2348"></a>
-<span class="sourceLineNo">2349</span>  }<a name="line.2349"></a>
-<span class="sourceLineNo">2350</span><a name="line.2350"></a>
-<span class="sourceLineNo">2351</span>  void reportArchivedFilesForQuota(List&lt;? extends StoreFile&gt; archivedFiles, List&lt;Long&gt; fileSizes) {<a name="line.2351"></a>
-<span class="sourceLineNo">2352</span>    // Sanity check from the caller<a name="line.2352"></a>
-<span class="sourceLineNo">2353</span>    if (archivedFiles.size() != fileSizes.size()) {<a name="line.2353"></a>
-<span class="sourceLineNo">2354</span>      throw new RuntimeException("Coding error: should never see lists of varying size");<a name="line.2354"></a>
-<span class="sourceLineNo">2355</span>    }<a name="line.2355"></a>
-<span class="sourceLineNo">2356</span>    RegionServerServices rss = this.region.getRegionServerServices();<a name="line.2356"></a>
-<span class="sourceLineNo">2357</span>    if (rss == null) {<a name="line.2357"></a>
-<span class="sourceLineNo">2358</span>      return;<a name="line.2358"></a>
-<span class="sourceLineNo">2359</span>    }<a name="line.2359"></a>
-<span class="sourceLineNo">2360</span>    List&lt;Entry&lt;String, Long&gt;&gt; filesWithSizes = new ArrayList&lt;&gt;(archivedFiles.size());<a name="line.2360"></a>
-<span class="sourceLineNo">2361</span>    Iterator&lt;Long&gt; fileSizeIter = fileSizes.iterator();<a name="line.2361"></a>
-<span class="sourceLineNo">2362</span>    for (StoreFile storeFile : archivedFiles) {<a name="line.2362"></a>
-<span class="sourceLineNo">2363</span>      final long fileSize = fileSizeIter.next();<a name="line.2363"></a>
-<span class="sourceLineNo">2364</span>      if (storeFile.isHFile() &amp;&amp; fileSize != 0) {<a name="line.2364"></a>
-<span class="sourceLineNo">2365</span>        filesWithSizes.add(Maps.immutableEntry(storeFile.getPath().getName(), fileSize));<a name="line.2365"></a>
-<span class="sourceLineNo">2366</span>      }<a name="line.2366"></a>
-<span class="sourceLineNo">2367</span>    }<a name="line.2367"></a>
-<span class="sourceLineNo">2368</span>    if (LOG.isTraceEnabled()) {<a name="line.2368"></a>
-<span class="sourceLineNo">2369</span>      LOG.trace("Files archived: " + archivedFiles + ", reporting the following to the Master: "<a name="line.2369"></a>
-<span class="sourceLineNo">2370</span>        + filesWithSizes);<a name="line.2370"></a>
-<span class="sourceLineNo">2371</span>    }<a name="line.2371"></a>
-<span class="sourceLineNo">2372</span>    boolean success = rss.reportFileArchivalForQuotas(getTableName(), filesWithSizes);<a name="line.2372"></a>
-<span class="sourceLineNo">2373</span>    if (!success) {<a name="line.2373"></a>
-<span class="sourceLineNo">2374</span>      LOG.warn("Failed to report archival of files: " + filesWithSizes);<a name="line.2374"></a>
-<span class="sourceLineNo">2375</span>    }<a name="line.2375"></a>
-<span class="sourceLineNo">2376</span>  }<a name="line.2376"></a>
-<span class="sourceLineNo">2377</span><a name="line.2377"></a>
-<span class="sourceLineNo">2378</span>  @Override<a name="line.2378"></a>
-<span class="sourceLineNo">2379</span>  public int getCurrentParallelPutCount() {<a name="line.2379"></a>
-<span class="sourceLineNo">2380</span>    return currentParallelPutCount.get();<a name="line.2380"></a>
-<span class="sourceLineNo">2381</span>  }<a name="line.2381"></a>
-<span class="sourceLineNo">2382</span><a name="line.2382"></a>
-<span class="sourceLineNo">2383</span>  public int getStoreRefCount() {<a name="line.2383"></a>
-<span class="sourceLineNo">2384</span>    return this.storeEngine.getStoreFileManager().getStorefiles().stream()<a name="line.2384"></a>
-<span class="sourceLineNo">2385</span>      .filter(sf -&gt; sf.getReader() != null).filter(HStoreFile::isHFile)<a name="line.2385"></a>
-<span class="sourceLineNo">2386</span>      .mapToInt(HStoreFile::getRefCount).sum();<a name="line.2386"></a>
-<span class="sourceLineNo">2387</span>  }<a name="line.2387"></a>
-<span class="sourceLineNo">2388</span><a name="line.2388"></a>
-<span class="sourceLineNo">2389</span>  /** Returns get maximum ref count of storeFile among all compacted HStore Files for the HStore */<a name="line.2389"></a>
-<span class="sourceLineNo">2390</span>  public int getMaxCompactedStoreFileRefCount() {<a name="line.2390"></a>
-<span class="sourceLineNo">2391</span>    OptionalInt maxCompactedStoreFileRefCount = this.storeEngine.getStoreFileManager()<a name="line.2391"></a>
-<span class="sourceLineNo">2392</span>      .getCompactedfiles().stream().filter(sf -&gt; sf.getReader() != null).filter(HStoreFile::isHFile)<a name="line.2392"></a>
-<span class="sourceLineNo">2393</span>      .mapToInt(HStoreFile::getRefCount).max();<a name="line.2393"></a>
-<span class="sourceLineNo">2394</span>    return maxCompactedStoreFileRefCount.isPresent() ? maxCompactedStoreFileRefCount.getAsInt() : 0;<a name="line.2394"></a>
-<span class="sourceLineNo">2395</span>  }<a name="line.2395"></a>
-<span class="sourceLineNo">2396</span><a name="line.2396"></a>
-<span class="sourceLineNo">2397</span>  @Override<a name="line.2397"></a>
-<span class="sourceLineNo">2398</span>  public long getMemstoreOnlyRowReadsCount() {<a name="line.2398"></a>
-<span class="sourceLineNo">2399</span>    return memstoreOnlyRowReadsCount.sum();<a name="line.2399"></a>
-<span class="sourceLineNo">2400</span>  }<a name="line.2400"></a>
-<span class="sourceLineNo">2401</span><a name="line.2401"></a>
-<span class="sourceLineNo">2402</span>  @Override<a name="line.2402"></a>
-<span class="sourceLineNo">2403</span>  public long getMixedRowReadsCount() {<a name="line.2403"></a>
-<span class="sourceLineNo">2404</span>    return mixedRowReadsCount.sum();<a name="line.2404"></a>
-<span class="sourceLineNo">2405</span>  }<a name="line.2405"></a>
-<span class="sourceLineNo">2406</span><a name="line.2406"></a>
-<span class="sourceLineNo">2407</span>  @Override<a name="line.2407"></a>
-<span class="sourceLineNo">2408</span>  public Configuration getReadOnlyConfiguration() {<a name="line.2408"></a>
-<span class="sourceLineNo">2409</span>    return new ReadOnlyConfiguration(this.conf);<a name="line.2409"></a>
-<span class="sourceLineNo">2410</span>  }<a name="line.2410"></a>
-<span class="sourceLineNo">2411</span><a name="line.2411"></a>
-<span class="sourceLineNo">2412</span>  void updateMetricsStore(boolean memstoreRead) {<a name="line.2412"></a>
-<span class="sourceLineNo">2413</span>    if (memstoreRead) {<a name="line.2413"></a>
-<span class="sourceLineNo">2414</span>      memstoreOnlyRowReadsCount.increment();<a name="line.2414"></a>
-<span class="sourceLineNo">2415</span>    } else {<a name="line.2415"></a>
-<span class="sourceLineNo">2416</span>      mixedRowReadsCount.increment();<a name="line.2416"></a>
-<span class="sourceLineNo">2417</span>    }<a name="line.2417"></a>
-<span class="sourceLineNo">2418</span>  }<a name="line.2418"></a>
-<span class="sourceLineNo">2419</span><a name="line.2419"></a>
-<span class="sourceLineNo">2420</span>  /**<a name="line.2420"></a>
-<span class="sourceLineNo">2421</span>   * Return the storefiles which are currently being written to. Mainly used by<a name="line.2421"></a>
-<span class="sourceLineNo">2422</span>   * {@link BrokenStoreFileCleaner} to prevent deleting the these files as they are not present in<a name="line.2422"></a>
-<span class="sourceLineNo">2423</span>   * SFT yet.<a name="line.2423"></a>
-<span class="sourceLineNo">2424</span>   */<a name="line.2424"></a>
-<span class="sourceLineNo">2425</span>  public Set&lt;Path&gt; getStoreFilesBeingWritten() {<a name="line.2425"></a>
-<span class="sourceLineNo">2426</span>    return storeFileWriterCreationTrackers.stream().flatMap(t -&gt; t.get().stream())<a name="line.2426"></a>
-<span class="sourceLineNo">2427</span>      .collect(Collectors.toSet());<a name="line.2427"></a>
-<span class="sourceLineNo">2428</span>  }<a name="line.2428"></a>
-<span class="sourceLineNo">2429</span>}<a name="line.2429"></a>
+<span class="sourceLineNo">1883</span>  public void upsert(Iterable&lt;Cell&gt; cells, long readpoint, MemStoreSizing memstoreSizing) {<a name="line.1883"></a>
+<span class="sourceLineNo">1884</span>    this.storeEngine.readLock();<a name="line.1884"></a>
+<span class="sourceLineNo">1885</span>    try {<a name="line.1885"></a>
+<span class="sourceLineNo">1886</span>      this.memstore.upsert(cells, readpoint, memstoreSizing);<a name="line.1886"></a>
+<span class="sourceLineNo">1887</span>    } finally {<a name="line.1887"></a>
+<span class="sourceLineNo">1888</span>      this.storeEngine.readUnlock();<a name="line.1888"></a>
+<span class="sourceLineNo">1889</span>    }<a name="line.1889"></a>
+<span class="sourceLineNo">1890</span>  }<a name="line.1890"></a>
+<span class="sourceLineNo">1891</span><a name="line.1891"></a>
+<span class="sourceLineNo">1892</span>  public StoreFlushContext createFlushContext(long cacheFlushId, FlushLifeCycleTracker tracker) {<a name="line.1892"></a>
+<span class="sourceLineNo">1893</span>    return new StoreFlusherImpl(cacheFlushId, tracker);<a name="line.1893"></a>
+<span class="sourceLineNo">1894</span>  }<a name="line.1894"></a>
+<span class="sourceLineNo">1895</span><a name="line.1895"></a>
+<span class="sourceLineNo">1896</span>  private final class StoreFlusherImpl implements StoreFlushContext {<a name="line.1896"></a>
+<span class="sourceLineNo">1897</span><a name="line.1897"></a>
+<span class="sourceLineNo">1898</span>    private final FlushLifeCycleTracker tracker;<a name="line.1898"></a>
+<span class="sourceLineNo">1899</span>    private final StoreFileWriterCreationTracker writerCreationTracker;<a name="line.1899"></a>
+<span class="sourceLineNo">1900</span>    private final long cacheFlushSeqNum;<a name="line.1900"></a>
+<span class="sourceLineNo">1901</span>    private MemStoreSnapshot snapshot;<a name="line.1901"></a>
+<span class="sourceLineNo">1902</span>    private List&lt;Path&gt; tempFiles;<a name="line.1902"></a>
+<span class="sourceLineNo">1903</span>    private List&lt;Path&gt; committedFiles;<a name="line.1903"></a>
+<span class="sourceLineNo">1904</span>    private long cacheFlushCount;<a name="line.1904"></a>
+<span class="sourceLineNo">1905</span>    private long cacheFlushSize;<a name="line.1905"></a>
+<span class="sourceLineNo">1906</span>    private long outputFileSize;<a name="line.1906"></a>
+<span class="sourceLineNo">1907</span><a name="line.1907"></a>
+<span class="sourceLineNo">1908</span>    private StoreFlusherImpl(long cacheFlushSeqNum, FlushLifeCycleTracker tracker) {<a name="line.1908"></a>
+<span class="sourceLineNo">1909</span>      this.cacheFlushSeqNum = cacheFlushSeqNum;<a name="line.1909"></a>
+<span class="sourceLineNo">1910</span>      this.tracker = tracker;<a name="line.1910"></a>
+<span class="sourceLineNo">1911</span>      this.writerCreationTracker = storeFileWriterCreationTrackerFactory.get();<a name="line.1911"></a>
+<span class="sourceLineNo">1912</span>    }<a name="line.1912"></a>
+<span class="sourceLineNo">1913</span><a name="line.1913"></a>
+<span class="sourceLineNo">1914</span>    /**<a name="line.1914"></a>
+<span class="sourceLineNo">1915</span>     * This is not thread safe. The caller should have a lock on the region or the store. If<a name="line.1915"></a>
+<span class="sourceLineNo">1916</span>     * necessary, the lock can be added with the patch provided in HBASE-10087<a name="line.1916"></a>
+<span class="sourceLineNo">1917</span>     */<a name="line.1917"></a>
+<span class="sourceLineNo">1918</span>    @Override<a name="line.1918"></a>
+<span class="sourceLineNo">1919</span>    public MemStoreSize prepare() {<a name="line.1919"></a>
+<span class="sourceLineNo">1920</span>      // passing the current sequence number of the wal - to allow bookkeeping in the memstore<a name="line.1920"></a>
+<span class="sourceLineNo">1921</span>      this.snapshot = memstore.snapshot();<a name="line.1921"></a>
+<span class="sourceLineNo">1922</span>      this.cacheFlushCount = snapshot.getCellsCount();<a name="line.1922"></a>
+<span class="sourceLineNo">1923</span>      this.cacheFlushSize = snapshot.getDataSize();<a name="line.1923"></a>
+<span class="sourceLineNo">1924</span>      committedFiles = new ArrayList&lt;&gt;(1);<a name="line.1924"></a>
+<span class="sourceLineNo">1925</span>      return snapshot.getMemStoreSize();<a name="line.1925"></a>
+<span class="sourceLineNo">1926</span>    }<a name="line.1926"></a>
+<span class="sourceLineNo">1927</span><a name="line.1927"></a>
+<span class="sourceLineNo">1928</span>    @Override<a name="line.1928"></a>
+<span class="sourceLineNo">1929</span>    public void flushCache(MonitoredTask status) throws IOException {<a name="line.1929"></a>
+<span class="sourceLineNo">1930</span>      RegionServerServices rsService = region.getRegionServerServices();<a name="line.1930"></a>
+<span class="sourceLineNo">1931</span>      ThroughputController throughputController =<a name="line.1931"></a>
+<span class="sourceLineNo">1932</span>        rsService == null ? null : rsService.getFlushThroughputController();<a name="line.1932"></a>
+<span class="sourceLineNo">1933</span>      // it could be null if we do not need to track the creation of store file writer due to<a name="line.1933"></a>
+<span class="sourceLineNo">1934</span>      // different SFT implementation.<a name="line.1934"></a>
+<span class="sourceLineNo">1935</span>      if (writerCreationTracker != null) {<a name="line.1935"></a>
+<span class="sourceLineNo">1936</span>        HStore.this.storeFileWriterCreationTrackers.add(writerCreationTracker);<a name="line.1936"></a>
+<span class="sourceLineNo">1937</span>      }<a name="line.1937"></a>
+<span class="sourceLineNo">1938</span>      tempFiles = HStore.this.flushCache(cacheFlushSeqNum, snapshot, status, throughputController,<a name="line.1938"></a>
+<span class="sourceLineNo">1939</span>        tracker, writerCreationTracker);<a name="line.1939"></a>
+<span class="sourceLineNo">1940</span>    }<a name="line.1940"></a>
+<span class="sourceLineNo">1941</span><a name="line.1941"></a>
+<span class="sourceLineNo">1942</span>    @Override<a name="line.1942"></a>
+<span class="sourceLineNo">1943</span>    public boolean commit(MonitoredTask status) throws IOException {<a name="line.1943"></a>
+<span class="sourceLineNo">1944</span>      try {<a name="line.1944"></a>
+<span class="sourceLineNo">1945</span>        if (CollectionUtils.isEmpty(this.tempFiles)) {<a name="line.1945"></a>
+<span class="sourceLineNo">1946</span>          return false;<a name="line.1946"></a>
+<span class="sourceLineNo">1947</span>        }<a name="line.1947"></a>
+<span class="sourceLineNo">1948</span>        status.setStatus("Flushing " + this + ": reopening flushed file");<a name="line.1948"></a>
+<span class="sourceLineNo">1949</span>        List&lt;HStoreFile&gt; storeFiles = storeEngine.commitStoreFiles(tempFiles, false);<a name="line.1949"></a>
+<span class="sourceLineNo">1950</span>        for (HStoreFile sf : storeFiles) {<a name="line.1950"></a>
+<span class="sourceLineNo">1951</span>          StoreFileReader r = sf.getReader();<a name="line.1951"></a>
+<span class="sourceLineNo">1952</span>          if (LOG.isInfoEnabled()) {<a name="line.1952"></a>
+<span class="sourceLineNo">1953</span>            LOG.info("Added {}, entries={}, sequenceid={}, filesize={}", sf, r.getEntries(),<a name="line.1953"></a>
+<span class="sourceLineNo">1954</span>              cacheFlushSeqNum, TraditionalBinaryPrefix.long2String(r.length(), "", 1));<a name="line.1954"></a>
+<span class="sourceLineNo">1955</span>          }<a name="line.1955"></a>
+<span class="sourceLineNo">1956</span>          outputFileSize += r.length();<a name="line.1956"></a>
+<span class="sourceLineNo">1957</span>          storeSize.addAndGet(r.length());<a name="line.1957"></a>
+<span class="sourceLineNo">1958</span>          totalUncompressedBytes.addAndGet(r.getTotalUncompressedBytes());<a name="line.1958"></a>
+<span class="sourceLineNo">1959</span>          committedFiles.add(sf.getPath());<a name="line.1959"></a>
+<span class="sourceLineNo">1960</span>        }<a name="line.1960"></a>
+<span class="sourceLineNo">1961</span><a name="line.1961"></a>
+<span class="sourceLineNo">1962</span>        flushedCellsCount.addAndGet(cacheFlushCount);<a name="line.1962"></a>
+<span class="sourceLineNo">1963</span>        flushedCellsSize.addAndGet(cacheFlushSize);<a name="line.1963"></a>
+<span class="sourceLineNo">1964</span>        flushedOutputFileSize.addAndGet(outputFileSize);<a name="line.1964"></a>
+<span class="sourceLineNo">1965</span>        // call coprocessor after we have done all the accounting above<a name="line.1965"></a>
+<span class="sourceLineNo">1966</span>        for (HStoreFile sf : storeFiles) {<a name="line.1966"></a>
+<span class="sourceLineNo">1967</span>          if (getCoprocessorHost() != null) {<a name="line.1967"></a>
+<span class="sourceLineNo">1968</span>            getCoprocessorHost().postFlush(HStore.this, sf, tracker);<a name="line.1968"></a>
+<span class="sourceLineNo">1969</span>          }<a name="line.1969"></a>
+<span class="sourceLineNo">1970</span>        }<a name="line.1970"></a>
+<span class="sourceLineNo">1971</span>        // Add new file to store files. Clear snapshot too while we have the Store write lock.<a name="line.1971"></a>
+<span class="sourceLineNo">1972</span>        return completeFlush(storeFiles, snapshot.getId());<a name="line.1972"></a>
+<span class="sourceLineNo">1973</span>      } finally {<a name="line.1973"></a>
+<span class="sourceLineNo">1974</span>        if (writerCreationTracker != null) {<a name="line.1974"></a>
+<span class="sourceLineNo">1975</span>          HStore.this.storeFileWriterCreationTrackers.remove(writerCreationTracker);<a name="line.1975"></a>
+<span class="sourceLineNo">1976</span>        }<a name="line.1976"></a>
+<span class="sourceLineNo">1977</span>      }<a name="line.1977"></a>
+<span class="sourceLineNo">1978</span>    }<a name="line.1978"></a>
+<span class="sourceLineNo">1979</span><a name="line.1979"></a>
+<span class="sourceLineNo">1980</span>    @Override<a name="line.1980"></a>
+<span class="sourceLineNo">1981</span>    public long getOutputFileSize() {<a name="line.1981"></a>
+<span class="sourceLineNo">1982</span>      return outputFileSize;<a name="line.1982"></a>
+<span class="sourceLineNo">1983</span>    }<a name="line.1983"></a>
+<span class="sourceLineNo">1984</span><a name="line.1984"></a>
+<span class="sourceLineNo">1985</span>    @Override<a name="line.1985"></a>
+<span class="sourceLineNo">1986</span>    public List&lt;Path&gt; getCommittedFiles() {<a name="line.1986"></a>
+<span class="sourceLineNo">1987</span>      return committedFiles;<a name="line.1987"></a>
+<span class="sourceLineNo">1988</span>    }<a name="line.1988"></a>
+<span class="sourceLineNo">1989</span><a name="line.1989"></a>
+<span class="sourceLineNo">1990</span>    /**<a name="line.1990"></a>
+<span class="sourceLineNo">1991</span>     * Similar to commit, but called in secondary region replicas for replaying the flush cache from<a name="line.1991"></a>
+<span class="sourceLineNo">1992</span>     * primary region. Adds the new files to the store, and drops the snapshot depending on<a name="line.1992"></a>
+<span class="sourceLineNo">1993</span>     * dropMemstoreSnapshot argument.<a name="line.1993"></a>
+<span class="sourceLineNo">1994</span>     * @param fileNames            names of the flushed files<a name="line.1994"></a>
+<span class="sourceLineNo">1995</span>     * @param dropMemstoreSnapshot whether to drop the prepared memstore snapshot<a name="line.1995"></a>
+<span class="sourceLineNo">1996</span>     */<a name="line.1996"></a>
+<span class="sourceLineNo">1997</span>    @Override<a name="line.1997"></a>
+<span class="sourceLineNo">1998</span>    public void replayFlush(List&lt;String&gt; fileNames, boolean dropMemstoreSnapshot)<a name="line.1998"></a>
+<span class="sourceLineNo">1999</span>      throws IOException {<a name="line.1999"></a>
+<span class="sourceLineNo">2000</span>      List&lt;HStoreFile&gt; storeFiles = new ArrayList&lt;&gt;(fileNames.size());<a name="line.2000"></a>
+<span class="sourceLineNo">2001</span>      for (String file : fileNames) {<a name="line.2001"></a>
+<span class="sourceLineNo">2002</span>        // open the file as a store file (hfile link, etc)<a name="line.2002"></a>
+<span class="sourceLineNo">2003</span>        StoreFileInfo storeFileInfo =<a name="line.2003"></a>
+<span class="sourceLineNo">2004</span>          getRegionFileSystem().getStoreFileInfo(getColumnFamilyName(), file);<a name="line.2004"></a>
+<span class="sourceLineNo">2005</span>        HStoreFile storeFile = storeEngine.createStoreFileAndReader(storeFileInfo);<a name="line.2005"></a>
+<span class="sourceLineNo">2006</span>        storeFiles.add(storeFile);<a name="line.2006"></a>
+<span class="sourceLineNo">2007</span>        HStore.this.storeSize.addAndGet(storeFile.getReader().length());<a name="line.2007"></a>
+<span class="sourceLineNo">2008</span>        HStore.this.totalUncompressedBytes<a name="line.2008"></a>
+<span class="sourceLineNo">2009</span>          .addAndGet(storeFile.getReader().getTotalUncompressedBytes());<a name="line.2009"></a>
+<span class="sourceLineNo">2010</span>        if (LOG.isInfoEnabled()) {<a name="line.2010"></a>
+<span class="sourceLineNo">2011</span>          LOG.info(this + " added " + storeFile + ", entries=" + storeFile.getReader().getEntries()<a name="line.2011"></a>
+<span class="sourceLineNo">2012</span>            + ", sequenceid=" + storeFile.getReader().getSequenceID() + ", filesize="<a name="line.2012"></a>
+<span class="sourceLineNo">2013</span>            + TraditionalBinaryPrefix.long2String(storeFile.getReader().length(), "", 1));<a name="line.2013"></a>
+<span class="sourceLineNo">2014</span>        }<a name="line.2014"></a>
+<span class="sourceLineNo">2015</span>      }<a name="line.2015"></a>
+<span class="sourceLineNo">2016</span><a name="line.2016"></a>
+<span class="sourceLineNo">2017</span>      long snapshotId = -1; // -1 means do not drop<a name="line.2017"></a>
+<span class="sourceLineNo">2018</span>      if (dropMemstoreSnapshot &amp;&amp; snapshot != null) {<a name="line.2018"></a>
+<span class="sourceLineNo">2019</span>        snapshotId = snapshot.getId();<a name="line.2019"></a>
+<span class="sourceLineNo">2020</span>      }<a name="line.2020"></a>
+<span class="sourceLineNo">2021</span>      HStore.this.completeFlush(storeFiles, snapshotId);<a name="line.2021"></a>
+<span class="sourceLineNo">2022</span>    }<a name="line.2022"></a>
+<span class="sourceLineNo">2023</span><a name="line.2023"></a>
+<span class="sourceLineNo">2024</span>    /**<a name="line.2024"></a>
+<span class="sourceLineNo">2025</span>     * Abort the snapshot preparation. Drops the snapshot if any.<a name="line.2025"></a>
+<span class="sourceLineNo">2026</span>     */<a name="line.2026"></a>
+<span class="sourceLineNo">2027</span>    @Override<a name="line.2027"></a>
+<span class="sourceLineNo">2028</span>    public void abort() throws IOException {<a name="line.2028"></a>
+<span class="sourceLineNo">2029</span>      if (snapshot != null) {<a name="line.2029"></a>
+<span class="sourceLineNo">2030</span>        HStore.this.completeFlush(Collections.emptyList(), snapshot.getId());<a name="line.2030"></a>
+<span class="sourceLineNo">2031</span>      }<a name="line.2031"></a>
+<span class="sourceLineNo">2032</span>    }<a name="line.2032"></a>
+<span class="sourceLineNo">2033</span>  }<a name="line.2033"></a>
+<span class="sourceLineNo">2034</span><a name="line.2034"></a>
+<span class="sourceLineNo">2035</span>  @Override<a name="line.2035"></a>
+<span class="sourceLineNo">2036</span>  public boolean needsCompaction() {<a name="line.2036"></a>
+<span class="sourceLineNo">2037</span>    List&lt;HStoreFile&gt; filesCompactingClone = null;<a name="line.2037"></a>
+<span class="sourceLineNo">2038</span>    synchronized (filesCompacting) {<a name="line.2038"></a>
+<span class="sourceLineNo">2039</span>      filesCompactingClone = Lists.newArrayList(filesCompacting);<a name="line.2039"></a>
+<span class="sourceLineNo">2040</span>    }<a name="line.2040"></a>
+<span class="sourceLineNo">2041</span>    return this.storeEngine.needsCompaction(filesCompactingClone);<a name="line.2041"></a>
+<span class="sourceLineNo">2042</span>  }<a name="line.2042"></a>
+<span class="sourceLineNo">2043</span><a name="line.2043"></a>
+<span class="sourceLineNo">2044</span>  /**<a name="line.2044"></a>
+<span class="sourceLineNo">2045</span>   * Used for tests.<a name="line.2045"></a>
+<span class="sourceLineNo">2046</span>   * @return cache configuration for this Store.<a name="line.2046"></a>
+<span class="sourceLineNo">2047</span>   */<a name="line.2047"></a>
+<span class="sourceLineNo">2048</span>  public CacheConfig getCacheConfig() {<a name="line.2048"></a>
+<span class="sourceLineNo">2049</span>    return storeContext.getCacheConf();<a name="line.2049"></a>
+<span class="sourceLineNo">2050</span>  }<a name="line.2050"></a>
+<span class="sourceLineNo">2051</span><a name="line.2051"></a>
+<span class="sourceLineNo">2052</span>  public static final long FIXED_OVERHEAD = ClassSize.estimateBase(HStore.class, false);<a name="line.2052"></a>
+<span class="sourceLineNo">2053</span><a name="line.2053"></a>
+<span class="sourceLineNo">2054</span>  public static final long DEEP_OVERHEAD = ClassSize.align(<a name="line.2054"></a>
+<span class="sourceLineNo">2055</span>    FIXED_OVERHEAD + ClassSize.OBJECT + ClassSize.REENTRANT_LOCK + ClassSize.CONCURRENT_SKIPLISTMAP<a name="line.2055"></a>
+<span class="sourceLineNo">2056</span>      + ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + ClassSize.OBJECT + ScanInfo.FIXED_OVERHEAD);<a name="line.2056"></a>
+<span class="sourceLineNo">2057</span><a name="line.2057"></a>
+<span class="sourceLineNo">2058</span>  @Override<a name="line.2058"></a>
+<span class="sourceLineNo">2059</span>  public long heapSize() {<a name="line.2059"></a>
+<span class="sourceLineNo">2060</span>    MemStoreSize memstoreSize = this.memstore.size();<a name="line.2060"></a>
+<span class="sourceLineNo">2061</span>    return DEEP_OVERHEAD + memstoreSize.getHeapSize() + storeContext.heapSize();<a name="line.2061"></a>
+<span class="sourceLineNo">2062</span>  }<a name="line.2062"></a>
+<span class="sourceLineNo">2063</span><a name="line.2063"></a>
+<span class="sourceLineNo">2064</span>  @Override<a name="line.2064"></a>
+<span class="sourceLineNo">2065</span>  public CellComparator getComparator() {<a name="line.2065"></a>
+<span class="sourceLineNo">2066</span>    return storeContext.getComparator();<a name="line.2066"></a>
+<span class="sourceLineNo">2067</span>  }<a name="line.2067"></a>
+<span class="sourceLineNo">2068</span><a name="line.2068"></a>
+<span class="sourceLineNo">2069</span>  public ScanInfo getScanInfo() {<a name="line.2069"></a>
+<span class="sourceLineNo">2070</span>    return scanInfo;<a name="line.2070"></a>
+<span class="sourceLineNo">2071</span>  }<a name="line.2071"></a>
+<span class="sourceLineNo">2072</span><a name="line.2072"></a>
+<span class="sourceLineNo">2073</span>  /**<a name="line.2073"></a>
+<span class="sourceLineNo">2074</span>   * Set scan info, used by test<a name="line.2074"></a>
+<span class="sourceLineNo">2075</span>   * @param scanInfo new scan info to use for test<a name="line.2075"></a>
+<span class="sourceLineNo">2076</span>   */<a name="line.2076"></a>
+<span class="sourceLineNo">2077</span>  void setScanInfo(ScanInfo scanInfo) {<a name="line.2077"></a>
+<span class="sourceLineNo">2078</span>    this.scanInfo = scanInfo;<a name="line.2078"></a>
+<span class="sourceLineNo">2079</span>  }<a name="line.2079"></a>
+<span class="sourceLineNo">2080</span><a name="line.2080"></a>
+<span class="sourceLineNo">2081</span>  @Override<a name="line.2081"></a>
+<span class="sourceLineNo">2082</span>  public boolean hasTooManyStoreFiles() {<a name="line.2082"></a>
+<span class="sourceLineNo">2083</span>    return getStorefilesCount() &gt; this.blockingFileCount;<a name="line.2083"></a>
+<span class="sourceLineNo">2084</span>  }<a name="line.2084"></a>
+<span class="sourceLineNo">2085</span><a name="line.2085"></a>
+<span class="sourceLineNo">2086</span>  @Override<a name="line.2086"></a>
+<span class="sourceLineNo">2087</span>  public long getFlushedCellsCount() {<a name="line.2087"></a>
+<span class="sourceLineNo">2088</span>    return flushedCellsCount.get();<a name="line.2088"></a>
+<span class="sourceLineNo">2089</span>  }<a name="line.2089"></a>
+<span class="sourceLineNo">2090</span><a name="line.2090"></a>
+<span class="sourceLineNo">2091</span>  @Override<a name="line.2091"></a>
+<span class="sourceLineNo">2092</span>  public long getFlushedCellsSize() {<a name="line.2092"></a>
+<span class="sourceLineNo">2093</span>    return flushedCellsSize.get();<a name="line.2093"></a>
+<span class="sourceLineNo">2094</span>  }<a name="line.2094"></a>
+<span class="sourceLineNo">2095</span><a name="line.2095"></a>
+<span class="sourceLineNo">2096</span>  @Override<a name="line.2096"></a>
+<span class="sourceLineNo">2097</span>  public long getFlushedOutputFileSize() {<a name="line.2097"></a>
+<span class="sourceLineNo">2098</span>    return flushedOutputFileSize.get();<a name="line.2098"></a>
+<span class="sourceLineNo">2099</span>  }<a name="line.2099"></a>
+<span class="sourceLineNo">2100</span><a name="line.2100"></a>
+<span class="sourceLineNo">2101</span>  @Override<a name="line.2101"></a>
+<span class="sourceLineNo">2102</span>  public long getCompactedCellsCount() {<a name="line.2102"></a>
+<span class="sourceLineNo">2103</span>    return compactedCellsCount.get();<a name="line.2103"></a>
+<span class="sourceLineNo">2104</span>  }<a name="line.2104"></a>
+<span class="sourceLineNo">2105</span><a name="line.2105"></a>
+<span class="sourceLineNo">2106</span>  @Override<a name="line.2106"></a>
+<span class="sourceLineNo">2107</span>  public long getCompactedCellsSize() {<a name="line.2107"></a>
+<span class="sourceLineNo">2108</span>    return compactedCellsSize.get();<a name="line.2108"></a>
+<span class="sourceLineNo">2109</span>  }<a name="line.2109"></a>
+<span class="sourceLineNo">2110</span><a name="line.2110"></a>
+<span class="sourceLineNo">2111</span>  @Override<a name="line.2111"></a>
+<span class="sourceLineNo">2112</span>  public long getMajorCompactedCellsCount() {<a name="line.2112"></a>
+<span class="sourceLineNo">2113</span>    return majorCompactedCellsCount.get();<a name="line.2113"></a>
+<span class="sourceLineNo">2114</span>  }<a name="line.2114"></a>
+<span class="sourceLineNo">2115</span><a name="line.2115"></a>
+<span class="sourceLineNo">2116</span>  @Override<a name="line.2116"></a>
+<span class="sourceLineNo">2117</span>  public long getMajorCompactedCellsSize() {<a name="line.2117"></a>
+<span class="sourceLineNo">2118</span>    return majorCompactedCellsSize.get();<a name="line.2118"></a>
+<span class="sourceLineNo">2119</span>  }<a name="line.2119"></a>
+<span class="sourceLineNo">2120</span><a name="line.2120"></a>
+<span class="sourceLineNo">2121</span>  public void updateCompactedMetrics(boolean isMajor, CompactionProgress progress) {<a name="line.2121"></a>
+<span class="sourceLineNo">2122</span>    if (isMajor) {<a name="line.2122"></a>
+<span class="sourceLineNo">2123</span>      majorCompactedCellsCount.addAndGet(progress.getTotalCompactingKVs());<a name="line.2123"></a>
+<span class="sourceLineNo">2124</span>      majorCompactedCellsSize.addAndGet(progress.totalCompactedSize);<a name="line.2124"></a>
+<span class="sourceLineNo">2125</span>    } else {<a name="line.2125"></a>
+<span class="sourceLineNo">2126</span>      compactedCellsCount.addAndGet(progress.getTotalCompactingKVs());<a name="line.2126"></a>
+<span class="sourceLineNo">2127</span>      compactedCellsSize.addAndGet(progress.totalCompactedSize);<a name="line.2127"></a>
+<span class="sourceLineNo">2128</span>    }<a name="line.2128"></a>
+<span class="sourceLineNo">2129</span>  }<a name="line.2129"></a>
+<span class="sourceLineNo">2130</span><a name="line.2130"></a>
+<span class="sourceLineNo">2131</span>  /**<a name="line.2131"></a>
+<span class="sourceLineNo">2132</span>   * Returns the StoreEngine that is backing this concrete implementation of Store.<a name="line.2132"></a>
+<span class="sourceLineNo">2133</span>   * @return Returns the {@link StoreEngine} object used internally inside this HStore object.<a name="line.2133"></a>
+<span class="sourceLineNo">2134</span>   */<a name="line.2134"></a>
+<span class="sourceLineNo">2135</span>  public StoreEngine&lt;?, ?, ?, ?&gt; getStoreEngine() {<a name="line.2135"></a>
+<span class="sourceLineNo">2136</span>    return this.storeEngine;<a name="line.2136"></a>
+<span class="sourceLineNo">2137</span>  }<a name="line.2137"></a>
+<span class="sourceLineNo">2138</span><a name="line.2138"></a>
+<span class="sourceLineNo">2139</span>  protected OffPeakHours getOffPeakHours() {<a name="line.2139"></a>
+<span class="sourceLineNo">2140</span>    return this.offPeakHours;<a name="line.2140"></a>
+<span class="sourceLineNo">2141</span>  }<a name="line.2141"></a>
+<span class="sourceLineNo">2142</span><a name="line.2142"></a>
+<span class="sourceLineNo">2143</span>  @Override<a name="line.2143"></a>
+<span class="sourceLineNo">2144</span>  public void onConfigurationChange(Configuration conf) {<a name="line.2144"></a>
+<span class="sourceLineNo">2145</span>    Configuration storeConf = StoreUtils.createStoreConfiguration(conf, region.getTableDescriptor(),<a name="line.2145"></a>
+<span class="sourceLineNo">2146</span>      getColumnFamilyDescriptor());<a name="line.2146"></a>
+<span class="sourceLineNo">2147</span>    this.conf = storeConf;<a name="line.2147"></a>
+<span class="sourceLineNo">2148</span>    this.storeEngine.compactionPolicy.setConf(storeConf);<a name="line.2148"></a>
+<span class="sourceLineNo">2149</span>    this.offPeakHours = OffPeakHours.getInstance(storeConf);<a name="line.2149"></a>
+<span class="sourceLineNo">2150</span>  }<a name="line.2150"></a>
+<span class="sourceLineNo">2151</span><a name="line.2151"></a>
+<span class="sourceLineNo">2152</span>  /**<a name="line.2152"></a>
+<span class="sourceLineNo">2153</span>   * {@inheritDoc}<a name="line.2153"></a>
+<span class="sourceLineNo">2154</span>   */<a name="line.2154"></a>
+<span class="sourceLineNo">2155</span>  @Override<a name="line.2155"></a>
+<span class="sourceLineNo">2156</span>  public void registerChildren(ConfigurationManager manager) {<a name="line.2156"></a>
+<span class="sourceLineNo">2157</span>    // No children to register<a name="line.2157"></a>
+<span class="sourceLineNo">2158</span>  }<a name="line.2158"></a>
+<span class="sourceLineNo">2159</span><a name="line.2159"></a>
+<span class="sourceLineNo">2160</span>  /**<a name="line.2160"></a>
+<span class="sourceLineNo">2161</span>   * {@inheritDoc}<a name="line.2161"></a>
+<span class="sourceLineNo">2162</span>   */<a name="line.2162"></a>
+<span class="sourceLineNo">2163</span>  @Override<a name="line.2163"></a>
+<span class="sourceLineNo">2164</span>  public void deregisterChildren(ConfigurationManager manager) {<a name="line.2164"></a>
+<span class="sourceLineNo">2165</span>    // No children to deregister<a name="line.2165"></a>
+<span class="sourceLineNo">2166</span>  }<a name="line.2166"></a>
+<span class="sourceLineNo">2167</span><a name="line.2167"></a>
+<span class="sourceLineNo">2168</span>  @Override<a name="line.2168"></a>
+<span class="sourceLineNo">2169</span>  public double getCompactionPressure() {<a name="line.2169"></a>
+<span class="sourceLineNo">2170</span>    return storeEngine.getStoreFileManager().getCompactionPressure();<a name="line.2170"></a>
+<span class="sourceLineNo">2171</span>  }<a name="line.2171"></a>
+<span class="sourceLineNo">2172</span><a name="line.2172"></a>
+<span class="sourceLineNo">2173</span>  @Override<a name="line.2173"></a>
+<span class="sourceLineNo">2174</span>  public boolean isPrimaryReplicaStore() {<a name="line.2174"></a>
+<span class="sourceLineNo">2175</span>    return getRegionInfo().getReplicaId() == RegionInfo.DEFAULT_REPLICA_ID;<a name="line.2175"></a>
+<span class="sourceLineNo">2176</span>  }<a name="line.2176"></a>
+<span class="sourceLineNo">2177</span><a name="line.2177"></a>
+<span class="sourceLineNo">2178</span>  /**<a name="line.2178"></a>
+<span class="sourceLineNo">2179</span>   * Sets the store up for a region level snapshot operation.<a name="line.2179"></a>
+<span class="sourceLineNo">2180</span>   * @see #postSnapshotOperation()<a name="line.2180"></a>
+<span class="sourceLineNo">2181</span>   */<a name="line.2181"></a>
+<span class="sourceLineNo">2182</span>  public void preSnapshotOperation() {<a name="line.2182"></a>
+<span class="sourceLineNo">2183</span>    archiveLock.lock();<a name="line.2183"></a>
+<span class="sourceLineNo">2184</span>  }<a name="line.2184"></a>
+<span class="sourceLineNo">2185</span><a name="line.2185"></a>
+<span class="sourceLineNo">2186</span>  /**<a name="line.2186"></a>
+<span class="sourceLineNo">2187</span>   * Perform tasks needed after the completion of snapshot operation.<a name="line.2187"></a>
+<span class="sourceLineNo">2188</span>   * @see #preSnapshotOperation()<a name="line.2188"></a>
+<span class="sourceLineNo">2189</span>   */<a name="line.2189"></a>
+<span class="sourceLineNo">2190</span>  public void postSnapshotOperation() {<a name="line.2190"></a>
+<span class="sourceLineNo">2191</span>    archiveLock.unlock();<a name="line.2191"></a>
+<span class="sourceLineNo">2192</span>  }<a name="line.2192"></a>
+<span class="sourceLineNo">2193</span><a name="line.2193"></a>
+<span class="sourceLineNo">2194</span>  /**<a name="line.2194"></a>
+<span class="sourceLineNo">2195</span>   * Closes and archives the compacted files under this store<a name="line.2195"></a>
+<span class="sourceLineNo">2196</span>   */<a name="line.2196"></a>
+<span class="sourceLineNo">2197</span>  public synchronized void closeAndArchiveCompactedFiles() throws IOException {<a name="line.2197"></a>
+<span class="sourceLineNo">2198</span>    // ensure other threads do not attempt to archive the same files on close()<a name="line.2198"></a>
+<span class="sourceLineNo">2199</span>    archiveLock.lock();<a name="line.2199"></a>
+<span class="sourceLineNo">2200</span>    try {<a name="line.2200"></a>
+<span class="sourceLineNo">2201</span>      storeEngine.readLock();<a name="line.2201"></a>
+<span class="sourceLineNo">2202</span>      Collection&lt;HStoreFile&gt; copyCompactedfiles = null;<a name="line.2202"></a>
+<span class="sourceLineNo">2203</span>      try {<a name="line.2203"></a>
+<span class="sourceLineNo">2204</span>        Collection&lt;HStoreFile&gt; compactedfiles =<a name="line.2204"></a>
+<span class="sourceLineNo">2205</span>          this.getStoreEngine().getStoreFileManager().getCompactedfiles();<a name="line.2205"></a>
+<span class="sourceLineNo">2206</span>        if (CollectionUtils.isNotEmpty(compactedfiles)) {<a name="line.2206"></a>
+<span class="sourceLineNo">2207</span>          // Do a copy under read lock<a name="line.2207"></a>
+<span class="sourceLineNo">2208</span>          copyCompactedfiles = new ArrayList&lt;&gt;(compactedfiles);<a name="line.2208"></a>
+<span class="sourceLineNo">2209</span>        } else {<a name="line.2209"></a>
+<span class="sourceLineNo">2210</span>          LOG.trace("No compacted files to archive");<a name="line.2210"></a>
+<span class="sourceLineNo">2211</span>        }<a name="line.2211"></a>
+<span class="sourceLineNo">2212</span>      } finally {<a name="line.2212"></a>
+<span class="sourceLineNo">2213</span>        storeEngine.readUnlock();<a name="line.2213"></a>
+<span class="sourceLineNo">2214</span>      }<a name="line.2214"></a>
+<span class="sourceLineNo">2215</span>      if (CollectionUtils.isNotEmpty(copyCompactedfiles)) {<a name="line.2215"></a>
+<span class="sourceLineNo">2216</span>        removeCompactedfiles(copyCompactedfiles, true);<a name="line.2216"></a>
+<span class="sourceLineNo">2217</span>      }<a name="line.2217"></a>
+<span class="sourceLineNo">2218</span>    } finally {<a name="line.2218"></a>
+<span class="sourceLineNo">2219</span>      archiveLock.unlock();<a name="line.2219"></a>
+<span class="sourceLineNo">2220</span>    }<a name="line.2220"></a>
+<span class="sourceLineNo">2221</span>  }<a name="line.2221"></a>
+<span class="sourceLineNo">2222</span><a name="line.2222"></a>
+<span class="sourceLineNo">2223</span>  /**<a name="line.2223"></a>
+<span class="sourceLineNo">2224</span>   * Archives and removes the compacted files<a name="line.2224"></a>
+<span class="sourceLineNo">2225</span>   * @param compactedfiles The compacted files in this store that are not active in reads<a name="line.2225"></a>
+<span class="sourceLineNo">2226</span>   * @param evictOnClose   true if blocks should be evicted from the cache when an HFile reader is<a name="line.2226"></a>
+<span class="sourceLineNo">2227</span>   *                       closed, false if not<a name="line.2227"></a>
+<span class="sourceLineNo">2228</span>   */<a name="line.2228"></a>
+<span class="sourceLineNo">2229</span>  private void removeCompactedfiles(Collection&lt;HStoreFile&gt; compactedfiles, boolean evictOnClose)<a name="line.2229"></a>
+<span class="sourceLineNo">2230</span>    throws IOException {<a name="line.2230"></a>
+<span class="sourceLineNo">2231</span>    final List&lt;HStoreFile&gt; filesToRemove = new ArrayList&lt;&gt;(compactedfiles.size());<a name="line.2231"></a>
+<span class="sourceLineNo">2232</span>    final List&lt;Long&gt; storeFileSizes = new ArrayList&lt;&gt;(compactedfiles.size());<a name="line.2232"></a>
+<span class="sourceLineNo">2233</span>    for (final HStoreFile file : compactedfiles) {<a name="line.2233"></a>
+<span class="sourceLineNo">2234</span>      synchronized (file) {<a name="line.2234"></a>
+<span class="sourceLineNo">2235</span>        try {<a name="line.2235"></a>
+<span class="sourceLineNo">2236</span>          StoreFileReader r = file.getReader();<a name="line.2236"></a>
+<span class="sourceLineNo">2237</span>          if (r == null) {<a name="line.2237"></a>
+<span class="sourceLineNo">2238</span>            LOG.debug("The file {} was closed but still not archived", file);<a name="line.2238"></a>
+<span class="sourceLineNo">2239</span>            // HACK: Temporarily re-open the reader so we can get the size of the file. Ideally,<a name="line.2239"></a>
+<span class="sourceLineNo">2240</span>            // we should know the size of an HStoreFile without having to ask the HStoreFileReader<a name="line.2240"></a>
+<span class="sourceLineNo">2241</span>            // for that.<a name="line.2241"></a>
+<span class="sourceLineNo">2242</span>            long length = getStoreFileSize(file);<a name="line.2242"></a>
+<span class="sourceLineNo">2243</span>            filesToRemove.add(file);<a name="line.2243"></a>
+<span class="sourceLineNo">2244</span>            storeFileSizes.add(length);<a name="line.2244"></a>
+<span class="sourceLineNo">2245</span>            continue;<a name="line.2245"></a>
+<span class="sourceLineNo">2246</span>          }<a name="line.2246"></a>
+<span class="sourceLineNo">2247</span><a name="line.2247"></a>
+<span class="sourceLineNo">2248</span>          if (file.isCompactedAway() &amp;&amp; !file.isReferencedInReads()) {<a name="line.2248"></a>
+<span class="sourceLineNo">2249</span>            // Even if deleting fails we need not bother as any new scanners won't be<a name="line.2249"></a>
+<span class="sourceLineNo">2250</span>            // able to use the compacted file as the status is already compactedAway<a name="line.2250"></a>
+<span class="sourceLineNo">2251</span>            LOG.trace("Closing and archiving the file {}", file);<a name="line.2251"></a>
+<span class="sourceLineNo">2252</span>            // Copy the file size before closing the reader<a name="line.2252"></a>
+<span class="sourceLineNo">2253</span>            final long length = r.length();<a name="line.2253"></a>
+<span class="sourceLineNo">2254</span>            r.close(evictOnClose);<a name="line.2254"></a>
+<span class="sourceLineNo">2255</span>            // Just close and return<a name="line.2255"></a>
+<span class="sourceLineNo">2256</span>            filesToRemove.add(file);<a name="line.2256"></a>
+<span class="sourceLineNo">2257</span>            // Only add the length if we successfully added the file to `filesToRemove`<a name="line.2257"></a>
+<span class="sourceLineNo">2258</span>            storeFileSizes.add(length);<a name="line.2258"></a>
+<span class="sourceLineNo">2259</span>          } else {<a name="line.2259"></a>
+<span class="sourceLineNo">2260</span>            LOG.info("Can't archive compacted file " + file.getPath()<a name="line.2260"></a>
+<span class="sourceLineNo">2261</span>              + " because of either isCompactedAway=" + file.isCompactedAway()<a name="line.2261"></a>
+<span class="sourceLineNo">2262</span>              + " or file has reference, isReferencedInReads=" + file.isReferencedInReads()<a name="line.2262"></a>
+<span class="sourceLineNo">2263</span>              + ", refCount=" + r.getRefCount() + ", skipping for now.");<a name="line.2263"></a>
+<span class="sourceLineNo">2264</span>          }<a name="line.2264"></a>
+<span class="sourceLineNo">2265</span>        } catch (Exception e) {<a name="line.2265"></a>
+<span class="sourceLineNo">2266</span>          LOG.error("Exception while trying to close the compacted store file {}", file.getPath(),<a name="line.2266"></a>
+<span class="sourceLineNo">2267</span>            e);<a name="line.2267"></a>
+<span class="sourceLineNo">2268</span>        }<a name="line.2268"></a>
+<span class="sourceLineNo">2269</span>      }<a name="line.2269"></a>
+<span class="sourceLineNo">2270</span>    }<a name="line.2270"></a>
+<span class="sourceLineNo">2271</span>    if (this.isPrimaryReplicaStore()) {<a name="line.2271"></a>
+<span class="sourceLineNo">2272</span>      // Only the primary region is allowed to move the file to archive.<a name="line.2272"></a>
+<span class="sourceLineNo">2273</span>      // The secondary region does not move the files to archive. Any active reads from<a name="line.2273"></a>
+<span class="sourceLineNo">2274</span>      // the secondary region will still work because the file as such has active readers on it.<a name="line.2274"></a>
+<span class="sourceLineNo">2275</span>      if (!filesToRemove.isEmpty()) {<a name="line.2275"></a>
+<span class="sourceLineNo">2276</span>        LOG.debug("Moving the files {} to archive", filesToRemove);<a name="line.2276"></a>
+<span class="sourceLineNo">2277</span>        // Only if this is successful it has to be removed<a name="line.2277"></a>
+<span class="sourceLineNo">2278</span>        try {<a name="line.2278"></a>
+<span class="sourceLineNo">2279</span>          getRegionFileSystem().removeStoreFiles(this.getColumnFamilyDescriptor().getNameAsString(),<a name="line.2279"></a>
+<span class="sourceLineNo">2280</span>            filesToRemove);<a name="line.2280"></a>
+<span class="sourceLineNo">2281</span>        } catch (FailedArchiveException fae) {<a name="line.2281"></a>
+<span class="sourceLineNo">2282</span>          // Even if archiving some files failed, we still need to clear out any of the<a name="line.2282"></a>
+<span class="sourceLineNo">2283</span>          // files which were successfully archived. Otherwise we will receive a<a name="line.2283"></a>
+<span class="sourceLineNo">2284</span>          // FileNotFoundException when we attempt to re-archive them in the next go around.<a name="line.2284"></a>
+<span class="sourceLineNo">2285</span>          Collection&lt;Path&gt; failedFiles = fae.getFailedFiles();<a name="line.2285"></a>
+<span class="sourceLineNo">2286</span>          Iterator&lt;HStoreFile&gt; iter = filesToRemove.iterator();<a name="line.2286"></a>
+<span class="sourceLineNo">2287</span>          Iterator&lt;Long&gt; sizeIter = storeFileSizes.iterator();<a name="line.2287"></a>
+<span class="sourceLineNo">2288</span>          while (iter.hasNext()) {<a name="line.2288"></a>
+<span class="sourceLineNo">2289</span>            sizeIter.next();<a name="line.2289"></a>
+<span class="sourceLineNo">2290</span>            if (failedFiles.contains(iter.next().getPath())) {<a name="line.2290"></a>
+<span class="sourceLineNo">2291</span>              iter.remove();<a name="line.2291"></a>
+<span class="sourceLineNo">2292</span>              sizeIter.remove();<a name="line.2292"></a>
+<span class="sourceLineNo">2293</span>            }<a name="line.2293"></a>
+<span class="sourceLineNo">2294</span>          }<a name="line.2294"></a>
+<span class="sourceLineNo">2295</span>          if (!filesToRemove.isEmpty()) {<a name="line.2295"></a>
+<span class="sourceLineNo">2296</span>            clearCompactedfiles(filesToRemove);<a name="line.2296"></a>
+<span class="sourceLineNo">2297</span>          }<a name="line.2297"></a>
+<span class="sourceLineNo">2298</span>          throw fae;<a name="line.2298"></a>
+<span class="sourceLineNo">2299</span>        }<a name="line.2299"></a>
+<span class="sourceLineNo">2300</span>      }<a name="line.2300"></a>
+<span class="sourceLineNo">2301</span>    }<a name="line.2301"></a>
+<span class="sourceLineNo">2302</span>    if (!filesToRemove.isEmpty()) {<a name="line.2302"></a>
+<span class="sourceLineNo">2303</span>      // Clear the compactedfiles from the store file manager<a name="line.2303"></a>
+<span class="sourceLineNo">2304</span>      clearCompactedfiles(filesToRemove);<a name="line.2304"></a>
+<span class="sourceLineNo">2305</span>      // Try to send report of this archival to the Master for updating quota usage faster<a name="line.2305"></a>
+<span class="sourceLineNo">2306</span>      reportArchivedFilesForQuota(filesToRemove, storeFileSizes);<a name="line.2306"></a>
+<span class="sourceLineNo">2307</span>    }<a name="line.2307"></a>
+<span class="sourceLineNo">2308</span>  }<a name="line.2308"></a>
+<span class="sourceLineNo">2309</span><a name="line.2309"></a>
+<span class="sourceLineNo">2310</span>  /**<a name="line.2310"></a>
+<span class="sourceLineNo">2311</span>   * Computes the length of a store file without succumbing to any errors along the way. If an error<a name="line.2311"></a>
+<span class="sourceLineNo">2312</span>   * is encountered, the implementation returns {@code 0} instead of the actual size.<a name="line.2312"></a>
+<span class="sourceLineNo">2313</span>   * @param file The file to compute the size of.<a name="line.2313"></a>
+<span class="sourceLineNo">2314</span>   * @return The size in bytes of the provided {@code file}.<a name="line.2314"></a>
+<span class="sourceLineNo">2315</span>   */<a name="line.2315"></a>
+<span class="sourceLineNo">2316</span>  long getStoreFileSize(HStoreFile file) {<a name="line.2316"></a>
+<span class="sourceLineNo">2317</span>    long length = 0;<a name="line.2317"></a>
+<span class="sourceLineNo">2318</span>    try {<a name="line.2318"></a>
+<span class="sourceLineNo">2319</span>      file.initReader();<a name="line.2319"></a>
+<span class="sourceLineNo">2320</span>      length = file.getReader().length();<a name="line.2320"></a>
+<span class="sourceLineNo">2321</span>    } catch (IOException e) {<a name="line.2321"></a>
+<span class="sourceLineNo">2322</span>      LOG.trace("Failed to open reader when trying to compute store file size for {}, ignoring",<a name="line.2322"></a>
+<span class="sourceLineNo">2323</span>        file, e);<a name="line.2323"></a>
+<span class="sourceLineNo">2324</span>    } finally {<a name="line.2324"></a>
+<span class="sourceLineNo">2325</span>      try {<a name="line.2325"></a>
+<span class="sourceLineNo">2326</span>        file.closeStoreFile(<a name="line.2326"></a>
+<span class="sourceLineNo">2327</span>          file.getCacheConf() != null ? file.getCacheConf().shouldEvictOnClose() : true);<a name="line.2327"></a>
+<span class="sourceLineNo">2328</span>      } catch (IOException e) {<a name="line.2328"></a>
+<span class="sourceLineNo">2329</span>        LOG.trace("Failed to close reader after computing store file size for {}, ignoring", file,<a name="line.2329"></a>
+<span class="sourceLineNo">2330</span>          e);<a name="line.2330"></a>
+<span class="sourceLineNo">2331</span>      }<a name="line.2331"></a>
+<span class="sourceLineNo">2332</span>    }<a name="line.2332"></a>
+<span class="sourceLineNo">2333</span>    return length;<a name="line.2333"></a>
+<span class="sourceLineNo">2334</span>  }<a name="line.2334"></a>
+<span class="sourceLineNo">2335</span><a name="line.2335"></a>
+<span class="sourceLineNo">2336</span>  public Long preFlushSeqIDEstimation() {<a name="line.2336"></a>
+<span class="sourceLineNo">2337</span>    return memstore.preFlushSeqIDEstimation();<a name="line.2337"></a>
+<span class="sourceLineNo">2338</span>  }<a name="line.2338"></a>
+<span class="sourceLineNo">2339</span><a name="line.2339"></a>
+<span class="sourceLineNo">2340</span>  @Override<a name="line.2340"></a>
+<span class="sourceLineNo">2341</span>  public boolean isSloppyMemStore() {<a name="line.2341"></a>
+<span class="sourceLineNo">2342</span>    return this.memstore.isSloppy();<a name="line.2342"></a>
+<span class="sourceLineNo">2343</span>  }<a name="line.2343"></a>
+<span class="sourceLineNo">2344</span><a name="line.2344"></a>
+<span class="sourceLineNo">2345</span>  private void clearCompactedfiles(List&lt;HStoreFile&gt; filesToRemove) throws IOException {<a name="line.2345"></a>
+<span class="sourceLineNo">2346</span>    LOG.trace("Clearing the compacted file {} from this store", filesToRemove);<a name="line.2346"></a>
+<span class="sourceLineNo">2347</span>    storeEngine.removeCompactedFiles(filesToRemove);<a name="line.2347"></a>
+<span class="sourceLineNo">2348</span>  }<a name="line.2348"></a>
+<span class="sourceLineNo">2349</span><a name="line.2349"></a>
+<span class="sourceLineNo">2350</span>  void reportArchivedFilesForQuota(List&lt;? extends StoreFile&gt; archivedFiles, List&lt;Long&gt; fileSizes) {<a name="line.2350"></a>
+<span class="sourceLineNo">2351</span>    // Sanity check from the caller<a name="line.2351"></a>
+<span class="sourceLineNo">2352</span>    if (archivedFiles.size() != fileSizes.size()) {<a name="line.2352"></a>
+<span class="sourceLineNo">2353</span>      throw new RuntimeException("Coding error: should never see lists of varying size");<a name="line.2353"></a>
+<span class="sourceLineNo">2354</span>    }<a name="line.2354"></a>
+<span class="sourceLineNo">2355</span>    RegionServerServices rss = this.region.getRegionServerServices();<a name="line.2355"></a>
+<span class="sourceLineNo">2356</span>    if (rss == null) {<a name="line.2356"></a>
+<span class="sourceLineNo">2357</span>      return;<a name="line.2357"></a>
+<span class="sourceLineNo">2358</span>    }<a name="line.2358"></a>
+<span class="sourceLineNo">2359</span>    List&lt;Entry&lt;String, Long&gt;&gt; filesWithSizes = new ArrayList&lt;&gt;(archivedFiles.size());<a name="line.2359"></a>
+<span class="sourceLineNo">2360</span>    Iterator&lt;Long&gt; fileSizeIter = fileSizes.iterator();<a name="line.2360"></a>
+<span class="sourceLineNo">2361</span>    for (StoreFile storeFile : archivedFiles) {<a name="line.2361"></a>
+<span class="sourceLineNo">2362</span>      final long fileSize = fileSizeIter.next();<a name="line.2362"></a>
+<span class="sourceLineNo">2363</span>      if (storeFile.isHFile() &amp;&amp; fileSize != 0) {<a name="line.2363"></a>
+<span class="sourceLineNo">2364</span>        filesWithSizes.add(Maps.immutableEntry(storeFile.getPath().getName(), fileSize));<a name="line.2364"></a>
+<span class="sourceLineNo">2365</span>      }<a name="line.2365"></a>
+<span class="sourceLineNo">2366</span>    }<a name="line.2366"></a>
+<span class="sourceLineNo">2367</span>    if (LOG.isTraceEnabled()) {<a name="line.2367"></a>
+<span class="sourceLineNo">2368</span>      LOG.trace("Files archived: " + archivedFiles + ", reporting the following to the Master: "<a name="line.2368"></a>
+<span class="sourceLineNo">2369</span>        + filesWithSizes);<a name="line.2369"></a>
+<span class="sourceLineNo">2370</span>    }<a name="line.2370"></a>
+<span class="sourceLineNo">2371</span>    boolean success = rss.reportFileArchivalForQuotas(getTableName(), filesWithSizes);<a name="line.2371"></a>
+<span class="sourceLineNo">2372</span>    if (!success) {<a name="line.2372"></a>
+<span class="sourceLineNo">2373</span>      LOG.warn("Failed to report archival of files: " + filesWithSizes);<a name="line.2373"></a>
+<span class="sourceLineNo">2374</span>    }<a name="line.2374"></a>
+<span class="sourceLineNo">2375</span>  }<a name="line.2375"></a>
+<span class="sourceLineNo">2376</span><a name="line.2376"></a>
+<span class="sourceLineNo">2377</span>  @Override<a name="line.2377"></a>
+<span class="sourceLineNo">2378</span>  public int getCurrentParallelPutCount() {<a name="line.2378"></a>
+<span class="sourceLineNo">2379</span>    return currentParallelPutCount.get();<a name="line.2379"></a>
+<span class="sourceLineNo">2380</span>  }<a name="line.2380"></a>
+<span class="sourceLineNo">2381</span><a name="line.2381"></a>
+<span class="sourceLineNo">2382</span>  public int getStoreRefCount() {<a name="line.2382"></a>
+<span class="sourceLineNo">2383</span>    return this.storeEngine.getStoreFileManager().getStorefiles().stream()<a name="line.2383"></a>
+<span class="sourceLineNo">2384</span>      .filter(sf -&gt; sf.getReader() != null).filter(HStoreFile::isHFile)<a name="line.2384"></a>
+<span class="sourceLineNo">2385</span>      .mapToInt(HStoreFile::getRefCount).sum();<a name="line.2385"></a>
+<span class="sourceLineNo">2386</span>  }<a name="line.2386"></a>
+<span class="sourceLineNo">2387</span><a name="line.2387"></a>
+<span class="sourceLineNo">2388</span>  /** Returns get maximum ref count of storeFile among all compacted HStore Files for the HStore */<a name="line.2388"></a>
+<span class="sourceLineNo">2389</span>  public int getMaxCompactedStoreFileRefCount() {<a name="line.2389"></a>
+<span class="sourceLineNo">2390</span>    OptionalInt maxCompactedStoreFileRefCount = this.storeEngine.getStoreFileManager()<a name="line.2390"></a>
+<span class="sourceLineNo">2391</span>      .getCompactedfiles().stream().filter(sf -&gt; sf.getReader() != null).filter(HStoreFile::isHFile)<a name="line.2391"></a>
+<span class="sourceLineNo">2392</span>      .mapToInt(HStoreFile::getRefCount).max();<a name="line.2392"></a>
+<span class="sourceLineNo">2393</span>    return maxCompactedStoreFileRefCount.isPresent() ? maxCompactedStoreFileRefCount.getAsInt() : 0;<a name="line.2393"></a>
+<span class="sourceLineNo">2394</span>  }<a name="line.2394"></a>
+<span class="sourceLineNo">2395</span><a name="line.2395"></a>
+<span class="sourceLineNo">2396</span>  @Override<a name="line.2396"></a>
+<span class="sourceLineNo">2397</span>  public long getMemstoreOnlyRowReadsCount() {<a name="line.2397"></a>
+<span class="sourceLineNo">2398</span>    return memstoreOnlyRowReadsCount.sum();<a name="line.2398"></a>
+<span class="sourceLineNo">2399</span>  }<a name="line.2399"></a>
+<span class="sourceLineNo">2400</span><a name="line.2400"></a>
+<span class="sourceLineNo">2401</span>  @Override<a name="line.2401"></a>
+<span class="sourceLineNo">2402</span>  public long getMixedRowReadsCount() {<a name="line.2402"></a>
+<span class="sourceLineNo">2403</span>    return mixedRowReadsCount.sum();<a name="line.2403"></a>
+<span class="sourceLineNo">2404</span>  }<a name="line.2404"></a>
+<span class="sourceLineNo">2405</span><a name="line.2405"></a>
+<span class="sourceLineNo">2406</span>  @Override<a name="line.2406"></a>
+<span class="sourceLineNo">2407</span>  public Configuration getReadOnlyConfiguration() {<a name="line.2407"></a>
+<span class="sourceLineNo">2408</span>    return new ReadOnlyConfiguration(this.conf);<a name="line.2408"></a>
+<span class="sourceLineNo">2409</span>  }<a name="line.2409"></a>
+<span class="sourceLineNo">2410</span><a name="line.2410"></a>
+<span class="sourceLineNo">2411</span>  void updateMetricsStore(boolean memstoreRead) {<a name="line.2411"></a>
+<span class="sourceLineNo">2412</span>    if (memstoreRead) {<a name="line.2412"></a>
+<span class="sourceLineNo">2413</span>      memstoreOnlyRowReadsCount.increment();<a name="line.2413"></a>
+<span class="sourceLineNo">2414</span>    } else {<a name="line.2414"></a>
+<span class="sourceLineNo">2415</span>      mixedRowReadsCount.increment();<a name="line.2415"></a>
+<span class="sourceLineNo">2416</span>    }<a name="line.2416"></a>
+<span class="sourceLineNo">2417</span>  }<a name="line.2417"></a>
+<span class="sourceLineNo">2418</span><a name="line.2418"></a>
+<span class="sourceLineNo">2419</span>  /**<a name="line.2419"></a>
+<span class="sourceLineNo">2420</span>   * Return the storefiles which are currently being written to. Mainly used by<a name="line.2420"></a>
+<span class="sourceLineNo">2421</span>   * {@link BrokenStoreFileCleaner} to prevent deleting the these files as they are not present in<a name="line.2421"></a>
+<span class="sourceLineNo">2422</span>   * SFT yet.<a name="line.2422"></a>
+<span class="sourceLineNo">2423</span>   */<a name="line.2423"></a>
+<span class="sourceLineNo">2424</span>  public Set&lt;Path&gt; getStoreFilesBeingWritten() {<a name="line.2424"></a>
+<span class="sourceLineNo">2425</span>    return storeFileWriterCreationTrackers.stream().flatMap(t -&gt; t.get().stream())<a name="line.2425"></a>
+<span class="sourceLineNo">2426</span>      .collect(Collectors.toSet());<a name="line.2426"></a>
+<span class="sourceLineNo">2427</span>  }<a name="line.2427"></a>
+<span class="sourceLineNo">2428</span>}<a name="line.2428"></a>
 
 
 
