@@ -1,0 +1,293 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/*<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.regionserver.throttle;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.util.List;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.util.Map;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.util.concurrent.ConcurrentSkipListMap;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.util.concurrent.atomic.AtomicInteger;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.hadoop.conf.Configuration;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.hadoop.hbase.Cell;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.hbase.RegionTooBusyException;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.regionserver.Region;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.regionserver.Store;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.util.ClassSize;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.slf4j.Logger;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.slf4j.LoggerFactory;<a name="line.33"></a>
+<span class="sourceLineNo">034</span><a name="line.34"></a>
+<span class="sourceLineNo">035</span>/**<a name="line.35"></a>
+<span class="sourceLineNo">036</span> * StoreHotnessProtector is designed to help limit the concurrency of puts with dense columns, it<a name="line.36"></a>
+<span class="sourceLineNo">037</span> * does best-effort to avoid exhausting all RS's handlers. When a lot of clients write requests with<a name="line.37"></a>
+<span class="sourceLineNo">038</span> * dense (hundreds) columns to a Store at the same time, it will lead to blocking of RS because CSLM<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * degrades when concurrency goes up. It's not a kind of throttling. Throttling is user-oriented,<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * while StoreHotnessProtector is system-oriented, RS-self-protected mechanism.<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * &lt;p&gt;<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * There are three key parameters:<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * &lt;p&gt;<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * 1. parallelPutToStoreThreadLimitCheckMinColumnCount: If the amount of columns exceed this<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * threshold, the HotProtector will work, 100 by default<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * &lt;p&gt;<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * 2. parallelPutToStoreThreadLimit: The amount of concurrency allowed to write puts to a Store at<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * the same time.<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * &lt;p&gt;<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * 3. parallelPreparePutToStoreThreadLimit: The amount of concurrency allowed to prepare writing<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * puts to a Store at the same time.<a name="line.51"></a>
+<span class="sourceLineNo">052</span> * &lt;p&gt;<a name="line.52"></a>
+<span class="sourceLineNo">053</span> * Notice that our writing pipeline includes three key process: MVCC acquire, writing MemStore, and<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * WAL. Only limit the concurrency of writing puts to Store(parallelPutToStoreThreadLimit) is not<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * enough since the actual concurrency of puts may still exceed the limit when MVCC contention or<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * slow WAL sync happens. This is why parallelPreparePutToStoreThreadLimit is needed.<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * &lt;p&gt;<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * This protector is enabled by default and could be turned off by setting<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * hbase.region.store.parallel.put.limit to 0, supporting online configuration change.<a name="line.59"></a>
+<span class="sourceLineNo">060</span> */<a name="line.60"></a>
+<span class="sourceLineNo">061</span>@InterfaceAudience.Private<a name="line.61"></a>
+<span class="sourceLineNo">062</span>public class StoreHotnessProtector {<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  private static final Logger LOG = LoggerFactory.getLogger(StoreHotnessProtector.class);<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private static volatile boolean loggedDisableMessage;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private volatile int parallelPutToStoreThreadLimit;<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private volatile int parallelPreparePutToStoreThreadLimit;<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  public final static String PARALLEL_PUT_STORE_THREADS_LIMIT =<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    "hbase.region.store.parallel.put.limit";<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  public final static String PARALLEL_PREPARE_PUT_STORE_MULTIPLIER =<a name="line.72"></a>
+<span class="sourceLineNo">073</span>    "hbase.region.store.parallel.prepare.put.multiplier";<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private final static int DEFAULT_PARALLEL_PUT_STORE_THREADS_LIMIT = 0;<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  private volatile int parallelPutToStoreThreadLimitCheckMinColumnCount;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  public final static String PARALLEL_PUT_STORE_THREADS_LIMIT_MIN_COLUMN_COUNT =<a name="line.76"></a>
+<span class="sourceLineNo">077</span>    "hbase.region.store.parallel.put.limit.min.column.count";<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  private final static int DEFAULT_PARALLEL_PUT_STORE_THREADS_LIMIT_MIN_COLUMN_NUM = 100;<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  private final static int DEFAULT_PARALLEL_PREPARE_PUT_STORE_MULTIPLIER = 2;<a name="line.79"></a>
+<span class="sourceLineNo">080</span><a name="line.80"></a>
+<span class="sourceLineNo">081</span>  private final Map&lt;byte[], AtomicInteger&gt; preparePutToStoreMap =<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    new ConcurrentSkipListMap&lt;&gt;(Bytes.BYTES_RAWCOMPARATOR);<a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private final Region region;<a name="line.83"></a>
+<span class="sourceLineNo">084</span><a name="line.84"></a>
+<span class="sourceLineNo">085</span>  public StoreHotnessProtector(Region region, Configuration conf) {<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    init(conf);<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    this.region = region;<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  }<a name="line.88"></a>
+<span class="sourceLineNo">089</span><a name="line.89"></a>
+<span class="sourceLineNo">090</span>  public void init(Configuration conf) {<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    this.parallelPutToStoreThreadLimit =<a name="line.91"></a>
+<span class="sourceLineNo">092</span>      conf.getInt(PARALLEL_PUT_STORE_THREADS_LIMIT, DEFAULT_PARALLEL_PUT_STORE_THREADS_LIMIT);<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    this.parallelPreparePutToStoreThreadLimit = conf.getInt(PARALLEL_PREPARE_PUT_STORE_MULTIPLIER,<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      DEFAULT_PARALLEL_PREPARE_PUT_STORE_MULTIPLIER) * parallelPutToStoreThreadLimit;<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    this.parallelPutToStoreThreadLimitCheckMinColumnCount =<a name="line.95"></a>
+<span class="sourceLineNo">096</span>      conf.getInt(PARALLEL_PUT_STORE_THREADS_LIMIT_MIN_COLUMN_COUNT,<a name="line.96"></a>
+<span class="sourceLineNo">097</span>        DEFAULT_PARALLEL_PUT_STORE_THREADS_LIMIT_MIN_COLUMN_NUM);<a name="line.97"></a>
+<span class="sourceLineNo">098</span><a name="line.98"></a>
+<span class="sourceLineNo">099</span>    if (!isEnable()) {<a name="line.99"></a>
+<span class="sourceLineNo">100</span>      logDisabledMessageOnce();<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    }<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  }<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>  /**<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   * {@link #init(Configuration)} is called for every Store that opens on a RegionServer. Here we<a name="line.105"></a>
+<span class="sourceLineNo">106</span>   * make a lightweight attempt to log this message once per RegionServer, rather than per-Store.<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   * The goal is just to draw attention to this feature if debugging overload due to heavy writes.<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   */<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  private static void logDisabledMessageOnce() {<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    if (!loggedDisableMessage) {<a name="line.110"></a>
+<span class="sourceLineNo">111</span>      LOG.info(<a name="line.111"></a>
+<span class="sourceLineNo">112</span>        "StoreHotnessProtector is disabled. Set {} &gt; 0 to enable, "<a name="line.112"></a>
+<span class="sourceLineNo">113</span>          + "which may help mitigate load under heavy write pressure.",<a name="line.113"></a>
+<span class="sourceLineNo">114</span>        PARALLEL_PUT_STORE_THREADS_LIMIT);<a name="line.114"></a>
+<span class="sourceLineNo">115</span>      loggedDisableMessage = true;<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    }<a name="line.116"></a>
+<span class="sourceLineNo">117</span>  }<a name="line.117"></a>
+<span class="sourceLineNo">118</span><a name="line.118"></a>
+<span class="sourceLineNo">119</span>  public void update(Configuration conf) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    init(conf);<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    preparePutToStoreMap.clear();<a name="line.121"></a>
+<span class="sourceLineNo">122</span>    LOG.debug("update config: " + toString());<a name="line.122"></a>
+<span class="sourceLineNo">123</span>  }<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>  public void start(Map&lt;byte[], List&lt;Cell&gt;&gt; familyMaps) throws RegionTooBusyException {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    if (!isEnable()) {<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      return;<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    }<a name="line.128"></a>
+<span class="sourceLineNo">129</span><a name="line.129"></a>
+<span class="sourceLineNo">130</span>    String tooBusyStore = null;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    boolean aboveParallelThreadLimit = false;<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    boolean aboveParallelPrePutLimit = false;<a name="line.132"></a>
+<span class="sourceLineNo">133</span><a name="line.133"></a>
+<span class="sourceLineNo">134</span>    for (Map.Entry&lt;byte[], List&lt;Cell&gt;&gt; e : familyMaps.entrySet()) {<a name="line.134"></a>
+<span class="sourceLineNo">135</span>      Store store = this.region.getStore(e.getKey());<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      if (store == null || e.getValue() == null) {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>        continue;<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      }<a name="line.138"></a>
+<span class="sourceLineNo">139</span><a name="line.139"></a>
+<span class="sourceLineNo">140</span>      if (e.getValue().size() &gt; this.parallelPutToStoreThreadLimitCheckMinColumnCount) {<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>        // we need to try to add #preparePutCount at first because preparePutToStoreMap will be<a name="line.142"></a>
+<span class="sourceLineNo">143</span>        // cleared when changing the configuration.<a name="line.143"></a>
+<span class="sourceLineNo">144</span>        int preparePutCount = preparePutToStoreMap<a name="line.144"></a>
+<span class="sourceLineNo">145</span>          .computeIfAbsent(e.getKey(), key -&gt; new AtomicInteger()).incrementAndGet();<a name="line.145"></a>
+<span class="sourceLineNo">146</span>        boolean storeAboveThread =<a name="line.146"></a>
+<span class="sourceLineNo">147</span>          store.getCurrentParallelPutCount() &gt; this.parallelPutToStoreThreadLimit;<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        boolean storeAbovePrePut = preparePutCount &gt; this.parallelPreparePutToStoreThreadLimit;<a name="line.148"></a>
+<span class="sourceLineNo">149</span>        if (storeAboveThread || storeAbovePrePut) {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>          tooBusyStore = (tooBusyStore == null<a name="line.150"></a>
+<span class="sourceLineNo">151</span>            ? store.getColumnFamilyName()<a name="line.151"></a>
+<span class="sourceLineNo">152</span>            : tooBusyStore + "," + store.getColumnFamilyName());<a name="line.152"></a>
+<span class="sourceLineNo">153</span>        }<a name="line.153"></a>
+<span class="sourceLineNo">154</span>        aboveParallelThreadLimit |= storeAboveThread;<a name="line.154"></a>
+<span class="sourceLineNo">155</span>        aboveParallelPrePutLimit |= storeAbovePrePut;<a name="line.155"></a>
+<span class="sourceLineNo">156</span><a name="line.156"></a>
+<span class="sourceLineNo">157</span>        if (LOG.isTraceEnabled()) {<a name="line.157"></a>
+<span class="sourceLineNo">158</span>          LOG.trace(store.getColumnFamilyName() + ": preparePutCount=" + preparePutCount<a name="line.158"></a>
+<span class="sourceLineNo">159</span>            + "; currentParallelPutCount=" + store.getCurrentParallelPutCount());<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        }<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      }<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    }<a name="line.162"></a>
+<span class="sourceLineNo">163</span><a name="line.163"></a>
+<span class="sourceLineNo">164</span>    if (aboveParallelThreadLimit || aboveParallelPrePutLimit) {<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      String msg = "StoreTooBusy," + this.region.getRegionInfo().getRegionNameAsString() + ":"<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        + tooBusyStore + " Above "<a name="line.166"></a>
+<span class="sourceLineNo">167</span>        + (aboveParallelThreadLimit<a name="line.167"></a>
+<span class="sourceLineNo">168</span>          ? "parallelPutToStoreThreadLimit(" + this.parallelPutToStoreThreadLimit + ")"<a name="line.168"></a>
+<span class="sourceLineNo">169</span>          : "")<a name="line.169"></a>
+<span class="sourceLineNo">170</span>        + (aboveParallelThreadLimit &amp;&amp; aboveParallelPrePutLimit ? " or " : "")<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        + (aboveParallelPrePutLimit<a name="line.171"></a>
+<span class="sourceLineNo">172</span>          ? "parallelPreparePutToStoreThreadLimit(" + this.parallelPreparePutToStoreThreadLimit<a name="line.172"></a>
+<span class="sourceLineNo">173</span>            + ")"<a name="line.173"></a>
+<span class="sourceLineNo">174</span>          : "");<a name="line.174"></a>
+<span class="sourceLineNo">175</span>      LOG.trace(msg);<a name="line.175"></a>
+<span class="sourceLineNo">176</span>      throw new RegionTooBusyException(msg);<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    }<a name="line.177"></a>
+<span class="sourceLineNo">178</span>  }<a name="line.178"></a>
+<span class="sourceLineNo">179</span><a name="line.179"></a>
+<span class="sourceLineNo">180</span>  public void finish(Map&lt;byte[], List&lt;Cell&gt;&gt; familyMaps) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    if (!isEnable()) {<a name="line.181"></a>
+<span class="sourceLineNo">182</span>      return;<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    }<a name="line.183"></a>
+<span class="sourceLineNo">184</span><a name="line.184"></a>
+<span class="sourceLineNo">185</span>    for (Map.Entry&lt;byte[], List&lt;Cell&gt;&gt; e : familyMaps.entrySet()) {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      Store store = this.region.getStore(e.getKey());<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      if (store == null || e.getValue() == null) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        continue;<a name="line.188"></a>
+<span class="sourceLineNo">189</span>      }<a name="line.189"></a>
+<span class="sourceLineNo">190</span>      if (e.getValue().size() &gt; this.parallelPutToStoreThreadLimitCheckMinColumnCount) {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        AtomicInteger counter = preparePutToStoreMap.get(e.getKey());<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        // preparePutToStoreMap will be cleared when changing the configuration, so it may turn<a name="line.192"></a>
+<span class="sourceLineNo">193</span>        // into a negative value. It will be not accuracy in a short time, it's a trade-off for<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        // performance.<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        if (counter != null &amp;&amp; counter.decrementAndGet() &lt; 0) {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>          counter.incrementAndGet();<a name="line.196"></a>
+<span class="sourceLineNo">197</span>        }<a name="line.197"></a>
+<span class="sourceLineNo">198</span>      }<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    }<a name="line.199"></a>
+<span class="sourceLineNo">200</span>  }<a name="line.200"></a>
+<span class="sourceLineNo">201</span><a name="line.201"></a>
+<span class="sourceLineNo">202</span>  public String toString() {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    return "StoreHotnessProtector, parallelPutToStoreThreadLimit="<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      + this.parallelPutToStoreThreadLimit + " ; minColumnNum="<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      + this.parallelPutToStoreThreadLimitCheckMinColumnCount + " ; preparePutThreadLimit="<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      + this.parallelPreparePutToStoreThreadLimit + " ; hotProtect now "<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      + (this.isEnable() ? "enable" : "disable");<a name="line.207"></a>
+<span class="sourceLineNo">208</span>  }<a name="line.208"></a>
+<span class="sourceLineNo">209</span><a name="line.209"></a>
+<span class="sourceLineNo">210</span>  public boolean isEnable() {<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    // feature is enabled when parallelPutToStoreThreadLimit &gt; 0<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    return this.parallelPutToStoreThreadLimit &gt; 0;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>  }<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>  Map&lt;byte[], AtomicInteger&gt; getPreparePutToStoreMap() {<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    return preparePutToStoreMap;<a name="line.216"></a>
+<span class="sourceLineNo">217</span>  }<a name="line.217"></a>
+<span class="sourceLineNo">218</span><a name="line.218"></a>
+<span class="sourceLineNo">219</span>  public static final long FIXED_SIZE =<a name="line.219"></a>
+<span class="sourceLineNo">220</span>    ClassSize.align(ClassSize.OBJECT + 2 * ClassSize.REFERENCE + 3 * Bytes.SIZEOF_INT);<a name="line.220"></a>
+<span class="sourceLineNo">221</span>}<a name="line.221"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>

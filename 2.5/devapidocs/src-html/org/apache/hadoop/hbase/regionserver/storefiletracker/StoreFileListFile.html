@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/*<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.regionserver.storefiletracker;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>import java.io.EOFException;<a name="line.20"></a>
+<span class="sourceLineNo">021</span>import java.io.FileNotFoundException;<a name="line.21"></a>
+<span class="sourceLineNo">022</span>import java.io.IOException;<a name="line.22"></a>
+<span class="sourceLineNo">023</span>import java.util.zip.CRC32;<a name="line.23"></a>
+<span class="sourceLineNo">024</span>import org.apache.hadoop.fs.FSDataInputStream;<a name="line.24"></a>
+<span class="sourceLineNo">025</span>import org.apache.hadoop.fs.FSDataOutputStream;<a name="line.25"></a>
+<span class="sourceLineNo">026</span>import org.apache.hadoop.fs.FileSystem;<a name="line.26"></a>
+<span class="sourceLineNo">027</span>import org.apache.hadoop.fs.Path;<a name="line.27"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.regionserver.StoreContext;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.slf4j.Logger;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.slf4j.LoggerFactory;<a name="line.32"></a>
+<span class="sourceLineNo">033</span><a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.StoreFileTrackerProtos.StoreFileList;<a name="line.34"></a>
+<span class="sourceLineNo">035</span><a name="line.35"></a>
+<span class="sourceLineNo">036</span>/**<a name="line.36"></a>
+<span class="sourceLineNo">037</span> * To fully avoid listing, here we use two files for tracking. When loading, we will try to read<a name="line.37"></a>
+<span class="sourceLineNo">038</span> * both the two files, if only one exists, we will trust this one, if both exist, we will compare<a name="line.38"></a>
+<span class="sourceLineNo">039</span> * the timestamp to see which one is newer and trust that one. And we will record in memory that<a name="line.39"></a>
+<span class="sourceLineNo">040</span> * which one is trusted by us, and when we need to update the store file list, we will write to the<a name="line.40"></a>
+<span class="sourceLineNo">041</span> * other file.<a name="line.41"></a>
+<span class="sourceLineNo">042</span> * &lt;p/&gt;<a name="line.42"></a>
+<span class="sourceLineNo">043</span> * So in this way, we could avoid listing when we want to load the store file list file.<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * &lt;p/&gt;<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * To prevent loading partial file, we use the first 4 bytes as file length, and also append a 4<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * bytes crc32 checksum at the end. This is because the protobuf message parser sometimes can return<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * without error on partial bytes if you stop at some special points, but the return message will<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * have incorrect field value. We should try our best to prevent this happens because loading an<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * incorrect store file list file usually leads to data loss.<a name="line.49"></a>
+<span class="sourceLineNo">050</span> */<a name="line.50"></a>
+<span class="sourceLineNo">051</span>@InterfaceAudience.Private<a name="line.51"></a>
+<span class="sourceLineNo">052</span>class StoreFileListFile {<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>  private static final Logger LOG = LoggerFactory.getLogger(StoreFileListFile.class);<a name="line.54"></a>
+<span class="sourceLineNo">055</span><a name="line.55"></a>
+<span class="sourceLineNo">056</span>  static final String TRACK_FILE_DIR = ".filelist";<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private static final String TRACK_FILE = "f1";<a name="line.58"></a>
+<span class="sourceLineNo">059</span><a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private static final String TRACK_FILE_ROTATE = "f2";<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  // 16 MB, which is big enough for a tracker file<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  private static final int MAX_FILE_SIZE = 16 * 1024 * 1024;<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private final StoreContext ctx;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private final Path trackFileDir;<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private final Path[] trackFiles = new Path[2];<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  // this is used to make sure that we do not go backwards<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  private long prevTimestamp = -1;<a name="line.72"></a>
+<span class="sourceLineNo">073</span><a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private int nextTrackFile = -1;<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  StoreFileListFile(StoreContext ctx) {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>    this.ctx = ctx;<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    trackFileDir = new Path(ctx.getFamilyStoreDirectoryPath(), TRACK_FILE_DIR);<a name="line.78"></a>
+<span class="sourceLineNo">079</span>    trackFiles[0] = new Path(trackFileDir, TRACK_FILE);<a name="line.79"></a>
+<span class="sourceLineNo">080</span>    trackFiles[1] = new Path(trackFileDir, TRACK_FILE_ROTATE);<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  }<a name="line.81"></a>
+<span class="sourceLineNo">082</span><a name="line.82"></a>
+<span class="sourceLineNo">083</span>  private StoreFileList load(Path path) throws IOException {<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    FileSystem fs = ctx.getRegionFileSystem().getFileSystem();<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    byte[] data;<a name="line.85"></a>
+<span class="sourceLineNo">086</span>    int expectedChecksum;<a name="line.86"></a>
+<span class="sourceLineNo">087</span>    try (FSDataInputStream in = fs.open(path)) {<a name="line.87"></a>
+<span class="sourceLineNo">088</span>      int length = in.readInt();<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      if (length &lt;= 0 || length &gt; MAX_FILE_SIZE) {<a name="line.89"></a>
+<span class="sourceLineNo">090</span>        throw new IOException("Invalid file length " + length<a name="line.90"></a>
+<span class="sourceLineNo">091</span>          + ", either less than 0 or greater then max allowed size " + MAX_FILE_SIZE);<a name="line.91"></a>
+<span class="sourceLineNo">092</span>      }<a name="line.92"></a>
+<span class="sourceLineNo">093</span>      data = new byte[length];<a name="line.93"></a>
+<span class="sourceLineNo">094</span>      in.readFully(data);<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      expectedChecksum = in.readInt();<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    }<a name="line.96"></a>
+<span class="sourceLineNo">097</span>    CRC32 crc32 = new CRC32();<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    crc32.update(data);<a name="line.98"></a>
+<span class="sourceLineNo">099</span>    int calculatedChecksum = (int) crc32.getValue();<a name="line.99"></a>
+<span class="sourceLineNo">100</span>    if (expectedChecksum != calculatedChecksum) {<a name="line.100"></a>
+<span class="sourceLineNo">101</span>      throw new IOException(<a name="line.101"></a>
+<span class="sourceLineNo">102</span>        "Checksum mismatch, expected " + expectedChecksum + ", actual " + calculatedChecksum);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    }<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    return StoreFileList.parseFrom(data);<a name="line.104"></a>
+<span class="sourceLineNo">105</span>  }<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>  private int select(StoreFileList[] lists) {<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    if (lists[0] == null) {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      return 1;<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    }<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    if (lists[1] == null) {<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      return 0;<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    }<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    return lists[0].getTimestamp() &gt;= lists[1].getTimestamp() ? 0 : 1;<a name="line.114"></a>
+<span class="sourceLineNo">115</span>  }<a name="line.115"></a>
+<span class="sourceLineNo">116</span><a name="line.116"></a>
+<span class="sourceLineNo">117</span>  StoreFileList load() throws IOException {<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    StoreFileList[] lists = new StoreFileList[2];<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    for (int i = 0; i &lt; 2; i++) {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>      try {<a name="line.120"></a>
+<span class="sourceLineNo">121</span>        lists[i] = load(trackFiles[i]);<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      } catch (FileNotFoundException | EOFException e) {<a name="line.122"></a>
+<span class="sourceLineNo">123</span>        // this is normal case, so just log at debug<a name="line.123"></a>
+<span class="sourceLineNo">124</span>        LOG.debug("EOF loading track file {}, ignoring the exception", trackFiles[i], e);<a name="line.124"></a>
+<span class="sourceLineNo">125</span>      }<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    }<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    int winnerIndex = select(lists);<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    if (lists[winnerIndex] != null) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      nextTrackFile = 1 - winnerIndex;<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      prevTimestamp = lists[winnerIndex].getTimestamp();<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    } else {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>      nextTrackFile = 0;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    }<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    return lists[winnerIndex];<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  }<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>  /**<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   * We will set the timestamp in this method so just pass the builder in<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   */<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  void update(StoreFileList.Builder builder) throws IOException {<a name="line.140"></a>
+<span class="sourceLineNo">141</span>    if (nextTrackFile &lt; 0) {<a name="line.141"></a>
+<span class="sourceLineNo">142</span>      // we need to call load first to load the prevTimestamp and also the next file<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      load();<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    }<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    long timestamp = Math.max(prevTimestamp + 1, EnvironmentEdgeManager.currentTime());<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    byte[] actualData = builder.setTimestamp(timestamp).build().toByteArray();<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    CRC32 crc32 = new CRC32();<a name="line.147"></a>
+<span class="sourceLineNo">148</span>    crc32.update(actualData);<a name="line.148"></a>
+<span class="sourceLineNo">149</span>    int checksum = (int) crc32.getValue();<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    // 4 bytes length at the beginning, plus 4 bytes checksum<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    FileSystem fs = ctx.getRegionFileSystem().getFileSystem();<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    try (FSDataOutputStream out = fs.create(trackFiles[nextTrackFile], true)) {<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      out.writeInt(actualData.length);<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      out.write(actualData);<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      out.writeInt(checksum);<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    // record timestamp<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    prevTimestamp = timestamp;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    // rotate the file<a name="line.159"></a>
+<span class="sourceLineNo">160</span>    nextTrackFile = 1 - nextTrackFile;<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    try {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      fs.delete(trackFiles[nextTrackFile], false);<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    } catch (IOException e) {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      // we will create new file with overwrite = true, so not a big deal here, only for speed up<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      // loading as we do not need to read this file when loading<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      LOG.debug("Failed to delete old track file {}, ignoring the exception", e);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    }<a name="line.167"></a>
+<span class="sourceLineNo">168</span>  }<a name="line.168"></a>
+<span class="sourceLineNo">169</span>}<a name="line.169"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
