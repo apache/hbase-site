@@ -33,239 +33,240 @@
 <span class="sourceLineNo">025</span>import org.apache.commons.lang3.StringUtils;<a name="line.25"></a>
 <span class="sourceLineNo">026</span>import org.apache.hadoop.conf.Configuration;<a name="line.26"></a>
 <span class="sourceLineNo">027</span>import org.apache.hadoop.hbase.HConstants;<a name="line.27"></a>
-<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.client.SlowLogParams;<a name="line.28"></a>
-<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.ipc.RpcCall;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.namequeues.LogHandlerUtils;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.namequeues.NamedQueuePayload;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.namequeues.NamedQueueService;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.namequeues.RpcLogDetails;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.namequeues.SlowLogPersistentService;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.namequeues.request.NamedQueueGetRequest;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.namequeues.response.NamedQueueGetResponse;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.slf4j.Logger;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.slf4j.LoggerFactory;<a name="line.40"></a>
-<span class="sourceLineNo">041</span><a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.hbase.thirdparty.com.google.common.collect.EvictingQueue;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hbase.thirdparty.com.google.common.collect.Queues;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hbase.thirdparty.com.google.protobuf.Message;<a name="line.45"></a>
-<span class="sourceLineNo">046</span><a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.TooSlowLog;<a name="line.50"></a>
-<span class="sourceLineNo">051</span><a name="line.51"></a>
-<span class="sourceLineNo">052</span>/**<a name="line.52"></a>
-<span class="sourceLineNo">053</span> * In-memory Queue service provider for Slow/LargeLog events<a name="line.53"></a>
-<span class="sourceLineNo">054</span> */<a name="line.54"></a>
-<span class="sourceLineNo">055</span>@InterfaceAudience.Private<a name="line.55"></a>
-<span class="sourceLineNo">056</span>public class SlowLogQueueService implements NamedQueueService {<a name="line.56"></a>
-<span class="sourceLineNo">057</span><a name="line.57"></a>
-<span class="sourceLineNo">058</span>  private static final Logger LOG = LoggerFactory.getLogger(SlowLogQueueService.class);<a name="line.58"></a>
-<span class="sourceLineNo">059</span><a name="line.59"></a>
-<span class="sourceLineNo">060</span>  private static final String SLOW_LOG_RING_BUFFER_SIZE =<a name="line.60"></a>
-<span class="sourceLineNo">061</span>    "hbase.regionserver.slowlog.ringbuffer.size";<a name="line.61"></a>
-<span class="sourceLineNo">062</span><a name="line.62"></a>
-<span class="sourceLineNo">063</span>  private final boolean isOnlineLogProviderEnabled;<a name="line.63"></a>
-<span class="sourceLineNo">064</span>  private final boolean isSlowLogTableEnabled;<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  private final SlowLogPersistentService slowLogPersistentService;<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  private final Queue&lt;TooSlowLog.SlowLogPayload&gt; slowLogQueue;<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>  public SlowLogQueueService(Configuration conf) {<a name="line.68"></a>
-<span class="sourceLineNo">069</span>    this.isOnlineLogProviderEnabled = conf.getBoolean(HConstants.SLOW_LOG_BUFFER_ENABLED_KEY,<a name="line.69"></a>
-<span class="sourceLineNo">070</span>      HConstants.DEFAULT_ONLINE_LOG_PROVIDER_ENABLED);<a name="line.70"></a>
-<span class="sourceLineNo">071</span><a name="line.71"></a>
-<span class="sourceLineNo">072</span>    if (!isOnlineLogProviderEnabled) {<a name="line.72"></a>
-<span class="sourceLineNo">073</span>      this.isSlowLogTableEnabled = false;<a name="line.73"></a>
-<span class="sourceLineNo">074</span>      this.slowLogPersistentService = null;<a name="line.74"></a>
-<span class="sourceLineNo">075</span>      this.slowLogQueue = null;<a name="line.75"></a>
-<span class="sourceLineNo">076</span>      return;<a name="line.76"></a>
-<span class="sourceLineNo">077</span>    }<a name="line.77"></a>
-<span class="sourceLineNo">078</span><a name="line.78"></a>
-<span class="sourceLineNo">079</span>    // Initialize SlowLog Queue<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    int slowLogQueueSize =<a name="line.80"></a>
-<span class="sourceLineNo">081</span>      conf.getInt(SLOW_LOG_RING_BUFFER_SIZE, HConstants.DEFAULT_SLOW_LOG_RING_BUFFER_SIZE);<a name="line.81"></a>
-<span class="sourceLineNo">082</span><a name="line.82"></a>
-<span class="sourceLineNo">083</span>    EvictingQueue&lt;TooSlowLog.SlowLogPayload&gt; evictingQueue = EvictingQueue.create(slowLogQueueSize);<a name="line.83"></a>
-<span class="sourceLineNo">084</span>    slowLogQueue = Queues.synchronizedQueue(evictingQueue);<a name="line.84"></a>
-<span class="sourceLineNo">085</span><a name="line.85"></a>
-<span class="sourceLineNo">086</span>    this.isSlowLogTableEnabled = conf.getBoolean(HConstants.SLOW_LOG_SYS_TABLE_ENABLED_KEY,<a name="line.86"></a>
-<span class="sourceLineNo">087</span>      HConstants.DEFAULT_SLOW_LOG_SYS_TABLE_ENABLED_KEY);<a name="line.87"></a>
-<span class="sourceLineNo">088</span>    if (isSlowLogTableEnabled) {<a name="line.88"></a>
-<span class="sourceLineNo">089</span>      slowLogPersistentService = new SlowLogPersistentService(conf);<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    } else {<a name="line.90"></a>
-<span class="sourceLineNo">091</span>      slowLogPersistentService = null;<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    }<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  }<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>  @Override<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  public NamedQueuePayload.NamedQueueEvent getEvent() {<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    return NamedQueuePayload.NamedQueueEvent.SLOW_LOG;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  /**<a name="line.100"></a>
-<span class="sourceLineNo">101</span>   * This implementation is specific to slowLog event. This consumes slowLog event from disruptor<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   * and inserts records to EvictingQueue.<a name="line.102"></a>
-<span class="sourceLineNo">103</span>   * @param namedQueuePayload namedQueue payload from disruptor ring buffer<a name="line.103"></a>
-<span class="sourceLineNo">104</span>   */<a name="line.104"></a>
-<span class="sourceLineNo">105</span>  @Override<a name="line.105"></a>
-<span class="sourceLineNo">106</span>  public void consumeEventFromDisruptor(NamedQueuePayload namedQueuePayload) {<a name="line.106"></a>
-<span class="sourceLineNo">107</span>    if (!isOnlineLogProviderEnabled) {<a name="line.107"></a>
-<span class="sourceLineNo">108</span>      return;<a name="line.108"></a>
-<span class="sourceLineNo">109</span>    }<a name="line.109"></a>
-<span class="sourceLineNo">110</span>    if (!(namedQueuePayload instanceof RpcLogDetails)) {<a name="line.110"></a>
-<span class="sourceLineNo">111</span>      LOG.warn("SlowLogQueueService: NamedQueuePayload is not of type RpcLogDetails.");<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      return;<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    }<a name="line.113"></a>
-<span class="sourceLineNo">114</span>    final RpcLogDetails rpcLogDetails = (RpcLogDetails) namedQueuePayload;<a name="line.114"></a>
-<span class="sourceLineNo">115</span>    final RpcCall rpcCall = rpcLogDetails.getRpcCall();<a name="line.115"></a>
-<span class="sourceLineNo">116</span>    final String clientAddress = rpcLogDetails.getClientAddress();<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    final long responseSize = rpcLogDetails.getResponseSize();<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    final String className = rpcLogDetails.getClassName();<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    final TooSlowLog.SlowLogPayload.Type type = getLogType(rpcLogDetails);<a name="line.119"></a>
-<span class="sourceLineNo">120</span>    if (type == null) {<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      return;<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    }<a name="line.122"></a>
-<span class="sourceLineNo">123</span>    Descriptors.MethodDescriptor methodDescriptor = rpcCall.getMethod();<a name="line.123"></a>
-<span class="sourceLineNo">124</span>    Message param = rpcLogDetails.getParam();<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    long receiveTime = rpcCall.getReceiveTime();<a name="line.125"></a>
-<span class="sourceLineNo">126</span>    long startTime = rpcCall.getStartTime();<a name="line.126"></a>
-<span class="sourceLineNo">127</span>    long endTime = EnvironmentEdgeManager.currentTime();<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    int processingTime = (int) (endTime - startTime);<a name="line.128"></a>
-<span class="sourceLineNo">129</span>    int qTime = (int) (startTime - receiveTime);<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    final SlowLogParams slowLogParams = ProtobufUtil.getSlowLogParams(param);<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    int numGets = 0;<a name="line.131"></a>
-<span class="sourceLineNo">132</span>    int numMutations = 0;<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    int numServiceCalls = 0;<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    if (param instanceof ClientProtos.MultiRequest) {<a name="line.134"></a>
-<span class="sourceLineNo">135</span>      ClientProtos.MultiRequest multi = (ClientProtos.MultiRequest) param;<a name="line.135"></a>
-<span class="sourceLineNo">136</span>      for (ClientProtos.RegionAction regionAction : multi.getRegionActionList()) {<a name="line.136"></a>
-<span class="sourceLineNo">137</span>        for (ClientProtos.Action action : regionAction.getActionList()) {<a name="line.137"></a>
-<span class="sourceLineNo">138</span>          if (action.hasMutation()) {<a name="line.138"></a>
-<span class="sourceLineNo">139</span>            numMutations++;<a name="line.139"></a>
-<span class="sourceLineNo">140</span>          }<a name="line.140"></a>
-<span class="sourceLineNo">141</span>          if (action.hasGet()) {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>            numGets++;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>          }<a name="line.143"></a>
-<span class="sourceLineNo">144</span>          if (action.hasServiceCall()) {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>            numServiceCalls++;<a name="line.145"></a>
-<span class="sourceLineNo">146</span>          }<a name="line.146"></a>
-<span class="sourceLineNo">147</span>        }<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      }<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    }<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    final String userName = rpcCall.getRequestUserName().orElse(StringUtils.EMPTY);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    final String methodDescriptorName =<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      methodDescriptor != null ? methodDescriptor.getName() : StringUtils.EMPTY;<a name="line.152"></a>
-<span class="sourceLineNo">153</span>    TooSlowLog.SlowLogPayload slowLogPayload = TooSlowLog.SlowLogPayload.newBuilder()<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      .setCallDetails(methodDescriptorName + "(" + param.getClass().getName() + ")")<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      .setClientAddress(clientAddress).setMethodName(methodDescriptorName).setMultiGets(numGets)<a name="line.155"></a>
-<span class="sourceLineNo">156</span>      .setMultiMutations(numMutations).setMultiServiceCalls(numServiceCalls)<a name="line.156"></a>
-<span class="sourceLineNo">157</span>      .setParam(slowLogParams != null ? slowLogParams.getParams() : StringUtils.EMPTY)<a name="line.157"></a>
-<span class="sourceLineNo">158</span>      .setProcessingTime(processingTime).setQueueTime(qTime)<a name="line.158"></a>
-<span class="sourceLineNo">159</span>      .setRegionName(slowLogParams != null ? slowLogParams.getRegionName() : StringUtils.EMPTY)<a name="line.159"></a>
-<span class="sourceLineNo">160</span>      .setResponseSize(responseSize).setServerClass(className).setStartTime(startTime).setType(type)<a name="line.160"></a>
-<span class="sourceLineNo">161</span>      .setUserName(userName).build();<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    slowLogQueue.add(slowLogPayload);<a name="line.162"></a>
-<span class="sourceLineNo">163</span>    if (isSlowLogTableEnabled) {<a name="line.163"></a>
-<span class="sourceLineNo">164</span>      if (!slowLogPayload.getRegionName().startsWith("hbase:slowlog")) {<a name="line.164"></a>
-<span class="sourceLineNo">165</span>        slowLogPersistentService.addToQueueForSysTable(slowLogPayload);<a name="line.165"></a>
-<span class="sourceLineNo">166</span>      }<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    }<a name="line.167"></a>
-<span class="sourceLineNo">168</span>  }<a name="line.168"></a>
-<span class="sourceLineNo">169</span><a name="line.169"></a>
-<span class="sourceLineNo">170</span>  @Override<a name="line.170"></a>
-<span class="sourceLineNo">171</span>  public boolean clearNamedQueue() {<a name="line.171"></a>
-<span class="sourceLineNo">172</span>    if (!isOnlineLogProviderEnabled) {<a name="line.172"></a>
-<span class="sourceLineNo">173</span>      return false;<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    }<a name="line.174"></a>
-<span class="sourceLineNo">175</span>    LOG.debug("Received request to clean up online slowlog buffer.");<a name="line.175"></a>
-<span class="sourceLineNo">176</span>    slowLogQueue.clear();<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    return true;<a name="line.177"></a>
-<span class="sourceLineNo">178</span>  }<a name="line.178"></a>
-<span class="sourceLineNo">179</span><a name="line.179"></a>
-<span class="sourceLineNo">180</span>  @Override<a name="line.180"></a>
-<span class="sourceLineNo">181</span>  public NamedQueueGetResponse getNamedQueueRecords(NamedQueueGetRequest request) {<a name="line.181"></a>
-<span class="sourceLineNo">182</span>    if (!isOnlineLogProviderEnabled) {<a name="line.182"></a>
-<span class="sourceLineNo">183</span>      return null;<a name="line.183"></a>
-<span class="sourceLineNo">184</span>    }<a name="line.184"></a>
-<span class="sourceLineNo">185</span>    final AdminProtos.SlowLogResponseRequest slowLogResponseRequest =<a name="line.185"></a>
-<span class="sourceLineNo">186</span>      request.getSlowLogResponseRequest();<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    final List&lt;TooSlowLog.SlowLogPayload&gt; slowLogPayloads;<a name="line.187"></a>
-<span class="sourceLineNo">188</span>    if (<a name="line.188"></a>
-<span class="sourceLineNo">189</span>      AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG<a name="line.189"></a>
-<span class="sourceLineNo">190</span>        .equals(slowLogResponseRequest.getLogType())<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    ) {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>      slowLogPayloads = getLargeLogPayloads(slowLogResponseRequest);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    } else {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      slowLogPayloads = getSlowLogPayloads(slowLogResponseRequest);<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    NamedQueueGetResponse response = new NamedQueueGetResponse();<a name="line.196"></a>
-<span class="sourceLineNo">197</span>    response.setNamedQueueEvent(RpcLogDetails.SLOW_LOG_EVENT);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>    response.setSlowLogPayloads(slowLogPayloads);<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    return response;<a name="line.199"></a>
-<span class="sourceLineNo">200</span>  }<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>  private TooSlowLog.SlowLogPayload.Type getLogType(RpcLogDetails rpcCallDetails) {<a name="line.202"></a>
-<span class="sourceLineNo">203</span>    final boolean isSlowLog = rpcCallDetails.isSlowLog();<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    final boolean isLargeLog = rpcCallDetails.isLargeLog();<a name="line.204"></a>
-<span class="sourceLineNo">205</span>    final TooSlowLog.SlowLogPayload.Type type;<a name="line.205"></a>
-<span class="sourceLineNo">206</span>    if (!isSlowLog &amp;&amp; !isLargeLog) {<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      LOG.error("slowLog and largeLog both are false. Ignoring the event. rpcCallDetails: {}",<a name="line.207"></a>
-<span class="sourceLineNo">208</span>        rpcCallDetails);<a name="line.208"></a>
-<span class="sourceLineNo">209</span>      return null;<a name="line.209"></a>
-<span class="sourceLineNo">210</span>    }<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    if (isSlowLog &amp;&amp; isLargeLog) {<a name="line.211"></a>
-<span class="sourceLineNo">212</span>      type = TooSlowLog.SlowLogPayload.Type.ALL;<a name="line.212"></a>
-<span class="sourceLineNo">213</span>    } else if (isSlowLog) {<a name="line.213"></a>
-<span class="sourceLineNo">214</span>      type = TooSlowLog.SlowLogPayload.Type.SLOW_LOG;<a name="line.214"></a>
-<span class="sourceLineNo">215</span>    } else {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>      type = TooSlowLog.SlowLogPayload.Type.LARGE_LOG;<a name="line.216"></a>
-<span class="sourceLineNo">217</span>    }<a name="line.217"></a>
-<span class="sourceLineNo">218</span>    return type;<a name="line.218"></a>
-<span class="sourceLineNo">219</span>  }<a name="line.219"></a>
-<span class="sourceLineNo">220</span><a name="line.220"></a>
-<span class="sourceLineNo">221</span>  /**<a name="line.221"></a>
-<span class="sourceLineNo">222</span>   * Add all slowLog events to system table. This is only for slowLog event's persistence on system<a name="line.222"></a>
-<span class="sourceLineNo">223</span>   * table.<a name="line.223"></a>
-<span class="sourceLineNo">224</span>   */<a name="line.224"></a>
-<span class="sourceLineNo">225</span>  @Override<a name="line.225"></a>
-<span class="sourceLineNo">226</span>  public void persistAll() {<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    if (!isOnlineLogProviderEnabled) {<a name="line.227"></a>
-<span class="sourceLineNo">228</span>      return;<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    }<a name="line.229"></a>
-<span class="sourceLineNo">230</span>    if (slowLogPersistentService != null) {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>      slowLogPersistentService.addAllLogsToSysTable();<a name="line.231"></a>
-<span class="sourceLineNo">232</span>    }<a name="line.232"></a>
-<span class="sourceLineNo">233</span>  }<a name="line.233"></a>
-<span class="sourceLineNo">234</span><a name="line.234"></a>
-<span class="sourceLineNo">235</span>  private List&lt;TooSlowLog.SlowLogPayload&gt;<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    getSlowLogPayloads(final AdminProtos.SlowLogResponseRequest request) {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>    List&lt;TooSlowLog.SlowLogPayload&gt; slowLogPayloadList =<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      Arrays.stream(slowLogQueue.toArray(new TooSlowLog.SlowLogPayload[0]))<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        .filter(e -&gt; e.getType() == TooSlowLog.SlowLogPayload.Type.ALL<a name="line.239"></a>
-<span class="sourceLineNo">240</span>          || e.getType() == TooSlowLog.SlowLogPayload.Type.SLOW_LOG)<a name="line.240"></a>
-<span class="sourceLineNo">241</span>        .collect(Collectors.toList());<a name="line.241"></a>
-<span class="sourceLineNo">242</span>    // latest slow logs first, operator is interested in latest records from in-memory buffer<a name="line.242"></a>
-<span class="sourceLineNo">243</span>    Collections.reverse(slowLogPayloadList);<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    return LogHandlerUtils.getFilteredLogs(request, slowLogPayloadList);<a name="line.244"></a>
-<span class="sourceLineNo">245</span>  }<a name="line.245"></a>
-<span class="sourceLineNo">246</span><a name="line.246"></a>
-<span class="sourceLineNo">247</span>  private List&lt;TooSlowLog.SlowLogPayload&gt;<a name="line.247"></a>
-<span class="sourceLineNo">248</span>    getLargeLogPayloads(final AdminProtos.SlowLogResponseRequest request) {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    List&lt;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>      TooSlowLog.SlowLogPayload&gt; slowLogPayloadList =<a name="line.250"></a>
-<span class="sourceLineNo">251</span>        Arrays.stream(slowLogQueue.toArray(new TooSlowLog.SlowLogPayload[0]))<a name="line.251"></a>
-<span class="sourceLineNo">252</span>          .filter(e -&gt; e.getType() == TooSlowLog.SlowLogPayload.Type.ALL<a name="line.252"></a>
-<span class="sourceLineNo">253</span>            || e.getType() == TooSlowLog.SlowLogPayload.Type.LARGE_LOG)<a name="line.253"></a>
-<span class="sourceLineNo">254</span>          .collect(Collectors.toList());<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    // latest large logs first, operator is interested in latest records from in-memory buffer<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    Collections.reverse(slowLogPayloadList);<a name="line.256"></a>
-<span class="sourceLineNo">257</span>    return LogHandlerUtils.getFilteredLogs(request, slowLogPayloadList);<a name="line.257"></a>
-<span class="sourceLineNo">258</span>  }<a name="line.258"></a>
-<span class="sourceLineNo">259</span><a name="line.259"></a>
-<span class="sourceLineNo">260</span>}<a name="line.260"></a>
+<span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.client.Connection;<a name="line.28"></a>
+<span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.client.SlowLogParams;<a name="line.29"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.ipc.RpcCall;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.namequeues.LogHandlerUtils;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.namequeues.NamedQueuePayload;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.namequeues.NamedQueueService;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.namequeues.RpcLogDetails;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.namequeues.SlowLogPersistentService;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.namequeues.request.NamedQueueGetRequest;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.namequeues.response.NamedQueueGetResponse;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.slf4j.Logger;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.slf4j.LoggerFactory;<a name="line.41"></a>
+<span class="sourceLineNo">042</span><a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hbase.thirdparty.com.google.common.collect.EvictingQueue;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hbase.thirdparty.com.google.common.collect.Queues;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hbase.thirdparty.com.google.protobuf.Descriptors;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hbase.thirdparty.com.google.protobuf.Message;<a name="line.46"></a>
+<span class="sourceLineNo">047</span><a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.TooSlowLog;<a name="line.51"></a>
+<span class="sourceLineNo">052</span><a name="line.52"></a>
+<span class="sourceLineNo">053</span>/**<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * In-memory Queue service provider for Slow/LargeLog events<a name="line.54"></a>
+<span class="sourceLineNo">055</span> */<a name="line.55"></a>
+<span class="sourceLineNo">056</span>@InterfaceAudience.Private<a name="line.56"></a>
+<span class="sourceLineNo">057</span>public class SlowLogQueueService implements NamedQueueService {<a name="line.57"></a>
+<span class="sourceLineNo">058</span><a name="line.58"></a>
+<span class="sourceLineNo">059</span>  private static final Logger LOG = LoggerFactory.getLogger(SlowLogQueueService.class);<a name="line.59"></a>
+<span class="sourceLineNo">060</span><a name="line.60"></a>
+<span class="sourceLineNo">061</span>  private static final String SLOW_LOG_RING_BUFFER_SIZE =<a name="line.61"></a>
+<span class="sourceLineNo">062</span>    "hbase.regionserver.slowlog.ringbuffer.size";<a name="line.62"></a>
+<span class="sourceLineNo">063</span><a name="line.63"></a>
+<span class="sourceLineNo">064</span>  private final boolean isOnlineLogProviderEnabled;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private final boolean isSlowLogTableEnabled;<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  private final SlowLogPersistentService slowLogPersistentService;<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private final Queue&lt;TooSlowLog.SlowLogPayload&gt; slowLogQueue;<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  public SlowLogQueueService(Configuration conf) {<a name="line.69"></a>
+<span class="sourceLineNo">070</span>    this.isOnlineLogProviderEnabled = conf.getBoolean(HConstants.SLOW_LOG_BUFFER_ENABLED_KEY,<a name="line.70"></a>
+<span class="sourceLineNo">071</span>      HConstants.DEFAULT_ONLINE_LOG_PROVIDER_ENABLED);<a name="line.71"></a>
+<span class="sourceLineNo">072</span><a name="line.72"></a>
+<span class="sourceLineNo">073</span>    if (!isOnlineLogProviderEnabled) {<a name="line.73"></a>
+<span class="sourceLineNo">074</span>      this.isSlowLogTableEnabled = false;<a name="line.74"></a>
+<span class="sourceLineNo">075</span>      this.slowLogPersistentService = null;<a name="line.75"></a>
+<span class="sourceLineNo">076</span>      this.slowLogQueue = null;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>      return;<a name="line.77"></a>
+<span class="sourceLineNo">078</span>    }<a name="line.78"></a>
+<span class="sourceLineNo">079</span><a name="line.79"></a>
+<span class="sourceLineNo">080</span>    // Initialize SlowLog Queue<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    int slowLogQueueSize =<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      conf.getInt(SLOW_LOG_RING_BUFFER_SIZE, HConstants.DEFAULT_SLOW_LOG_RING_BUFFER_SIZE);<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>    EvictingQueue&lt;TooSlowLog.SlowLogPayload&gt; evictingQueue = EvictingQueue.create(slowLogQueueSize);<a name="line.84"></a>
+<span class="sourceLineNo">085</span>    slowLogQueue = Queues.synchronizedQueue(evictingQueue);<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>    this.isSlowLogTableEnabled = conf.getBoolean(HConstants.SLOW_LOG_SYS_TABLE_ENABLED_KEY,<a name="line.87"></a>
+<span class="sourceLineNo">088</span>      HConstants.DEFAULT_SLOW_LOG_SYS_TABLE_ENABLED_KEY);<a name="line.88"></a>
+<span class="sourceLineNo">089</span>    if (isSlowLogTableEnabled) {<a name="line.89"></a>
+<span class="sourceLineNo">090</span>      slowLogPersistentService = new SlowLogPersistentService(conf);<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    } else {<a name="line.91"></a>
+<span class="sourceLineNo">092</span>      slowLogPersistentService = null;<a name="line.92"></a>
+<span class="sourceLineNo">093</span>    }<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  }<a name="line.94"></a>
+<span class="sourceLineNo">095</span><a name="line.95"></a>
+<span class="sourceLineNo">096</span>  @Override<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  public NamedQueuePayload.NamedQueueEvent getEvent() {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    return NamedQueuePayload.NamedQueueEvent.SLOW_LOG;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  }<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  /**<a name="line.101"></a>
+<span class="sourceLineNo">102</span>   * This implementation is specific to slowLog event. This consumes slowLog event from disruptor<a name="line.102"></a>
+<span class="sourceLineNo">103</span>   * and inserts records to EvictingQueue.<a name="line.103"></a>
+<span class="sourceLineNo">104</span>   * @param namedQueuePayload namedQueue payload from disruptor ring buffer<a name="line.104"></a>
+<span class="sourceLineNo">105</span>   */<a name="line.105"></a>
+<span class="sourceLineNo">106</span>  @Override<a name="line.106"></a>
+<span class="sourceLineNo">107</span>  public void consumeEventFromDisruptor(NamedQueuePayload namedQueuePayload) {<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    if (!isOnlineLogProviderEnabled) {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      return;<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    }<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    if (!(namedQueuePayload instanceof RpcLogDetails)) {<a name="line.111"></a>
+<span class="sourceLineNo">112</span>      LOG.warn("SlowLogQueueService: NamedQueuePayload is not of type RpcLogDetails.");<a name="line.112"></a>
+<span class="sourceLineNo">113</span>      return;<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    }<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    final RpcLogDetails rpcLogDetails = (RpcLogDetails) namedQueuePayload;<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    final RpcCall rpcCall = rpcLogDetails.getRpcCall();<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    final String clientAddress = rpcLogDetails.getClientAddress();<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    final long responseSize = rpcLogDetails.getResponseSize();<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    final String className = rpcLogDetails.getClassName();<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    final TooSlowLog.SlowLogPayload.Type type = getLogType(rpcLogDetails);<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    if (type == null) {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      return;<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    }<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    Descriptors.MethodDescriptor methodDescriptor = rpcCall.getMethod();<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    Message param = rpcLogDetails.getParam();<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    long receiveTime = rpcCall.getReceiveTime();<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    long startTime = rpcCall.getStartTime();<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    long endTime = EnvironmentEdgeManager.currentTime();<a name="line.128"></a>
+<span class="sourceLineNo">129</span>    int processingTime = (int) (endTime - startTime);<a name="line.129"></a>
+<span class="sourceLineNo">130</span>    int qTime = (int) (startTime - receiveTime);<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    final SlowLogParams slowLogParams = ProtobufUtil.getSlowLogParams(param);<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    int numGets = 0;<a name="line.132"></a>
+<span class="sourceLineNo">133</span>    int numMutations = 0;<a name="line.133"></a>
+<span class="sourceLineNo">134</span>    int numServiceCalls = 0;<a name="line.134"></a>
+<span class="sourceLineNo">135</span>    if (param instanceof ClientProtos.MultiRequest) {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>      ClientProtos.MultiRequest multi = (ClientProtos.MultiRequest) param;<a name="line.136"></a>
+<span class="sourceLineNo">137</span>      for (ClientProtos.RegionAction regionAction : multi.getRegionActionList()) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>        for (ClientProtos.Action action : regionAction.getActionList()) {<a name="line.138"></a>
+<span class="sourceLineNo">139</span>          if (action.hasMutation()) {<a name="line.139"></a>
+<span class="sourceLineNo">140</span>            numMutations++;<a name="line.140"></a>
+<span class="sourceLineNo">141</span>          }<a name="line.141"></a>
+<span class="sourceLineNo">142</span>          if (action.hasGet()) {<a name="line.142"></a>
+<span class="sourceLineNo">143</span>            numGets++;<a name="line.143"></a>
+<span class="sourceLineNo">144</span>          }<a name="line.144"></a>
+<span class="sourceLineNo">145</span>          if (action.hasServiceCall()) {<a name="line.145"></a>
+<span class="sourceLineNo">146</span>            numServiceCalls++;<a name="line.146"></a>
+<span class="sourceLineNo">147</span>          }<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        }<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      }<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    }<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    final String userName = rpcCall.getRequestUserName().orElse(StringUtils.EMPTY);<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    final String methodDescriptorName =<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      methodDescriptor != null ? methodDescriptor.getName() : StringUtils.EMPTY;<a name="line.153"></a>
+<span class="sourceLineNo">154</span>    TooSlowLog.SlowLogPayload slowLogPayload = TooSlowLog.SlowLogPayload.newBuilder()<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      .setCallDetails(methodDescriptorName + "(" + param.getClass().getName() + ")")<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      .setClientAddress(clientAddress).setMethodName(methodDescriptorName).setMultiGets(numGets)<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      .setMultiMutations(numMutations).setMultiServiceCalls(numServiceCalls)<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      .setParam(slowLogParams != null ? slowLogParams.getParams() : StringUtils.EMPTY)<a name="line.158"></a>
+<span class="sourceLineNo">159</span>      .setProcessingTime(processingTime).setQueueTime(qTime)<a name="line.159"></a>
+<span class="sourceLineNo">160</span>      .setRegionName(slowLogParams != null ? slowLogParams.getRegionName() : StringUtils.EMPTY)<a name="line.160"></a>
+<span class="sourceLineNo">161</span>      .setResponseSize(responseSize).setServerClass(className).setStartTime(startTime).setType(type)<a name="line.161"></a>
+<span class="sourceLineNo">162</span>      .setUserName(userName).build();<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    slowLogQueue.add(slowLogPayload);<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    if (isSlowLogTableEnabled) {<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      if (!slowLogPayload.getRegionName().startsWith("hbase:slowlog")) {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        slowLogPersistentService.addToQueueForSysTable(slowLogPayload);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>      }<a name="line.167"></a>
+<span class="sourceLineNo">168</span>    }<a name="line.168"></a>
+<span class="sourceLineNo">169</span>  }<a name="line.169"></a>
+<span class="sourceLineNo">170</span><a name="line.170"></a>
+<span class="sourceLineNo">171</span>  @Override<a name="line.171"></a>
+<span class="sourceLineNo">172</span>  public boolean clearNamedQueue() {<a name="line.172"></a>
+<span class="sourceLineNo">173</span>    if (!isOnlineLogProviderEnabled) {<a name="line.173"></a>
+<span class="sourceLineNo">174</span>      return false;<a name="line.174"></a>
+<span class="sourceLineNo">175</span>    }<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    LOG.debug("Received request to clean up online slowlog buffer.");<a name="line.176"></a>
+<span class="sourceLineNo">177</span>    slowLogQueue.clear();<a name="line.177"></a>
+<span class="sourceLineNo">178</span>    return true;<a name="line.178"></a>
+<span class="sourceLineNo">179</span>  }<a name="line.179"></a>
+<span class="sourceLineNo">180</span><a name="line.180"></a>
+<span class="sourceLineNo">181</span>  @Override<a name="line.181"></a>
+<span class="sourceLineNo">182</span>  public NamedQueueGetResponse getNamedQueueRecords(NamedQueueGetRequest request) {<a name="line.182"></a>
+<span class="sourceLineNo">183</span>    if (!isOnlineLogProviderEnabled) {<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      return null;<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    }<a name="line.185"></a>
+<span class="sourceLineNo">186</span>    final AdminProtos.SlowLogResponseRequest slowLogResponseRequest =<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      request.getSlowLogResponseRequest();<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    final List&lt;TooSlowLog.SlowLogPayload&gt; slowLogPayloads;<a name="line.188"></a>
+<span class="sourceLineNo">189</span>    if (<a name="line.189"></a>
+<span class="sourceLineNo">190</span>      AdminProtos.SlowLogResponseRequest.LogType.LARGE_LOG<a name="line.190"></a>
+<span class="sourceLineNo">191</span>        .equals(slowLogResponseRequest.getLogType())<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    ) {<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      slowLogPayloads = getLargeLogPayloads(slowLogResponseRequest);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    } else {<a name="line.194"></a>
+<span class="sourceLineNo">195</span>      slowLogPayloads = getSlowLogPayloads(slowLogResponseRequest);<a name="line.195"></a>
+<span class="sourceLineNo">196</span>    }<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    NamedQueueGetResponse response = new NamedQueueGetResponse();<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    response.setNamedQueueEvent(RpcLogDetails.SLOW_LOG_EVENT);<a name="line.198"></a>
+<span class="sourceLineNo">199</span>    response.setSlowLogPayloads(slowLogPayloads);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    return response;<a name="line.200"></a>
+<span class="sourceLineNo">201</span>  }<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>  private TooSlowLog.SlowLogPayload.Type getLogType(RpcLogDetails rpcCallDetails) {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    final boolean isSlowLog = rpcCallDetails.isSlowLog();<a name="line.204"></a>
+<span class="sourceLineNo">205</span>    final boolean isLargeLog = rpcCallDetails.isLargeLog();<a name="line.205"></a>
+<span class="sourceLineNo">206</span>    final TooSlowLog.SlowLogPayload.Type type;<a name="line.206"></a>
+<span class="sourceLineNo">207</span>    if (!isSlowLog &amp;&amp; !isLargeLog) {<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      LOG.error("slowLog and largeLog both are false. Ignoring the event. rpcCallDetails: {}",<a name="line.208"></a>
+<span class="sourceLineNo">209</span>        rpcCallDetails);<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      return null;<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    }<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    if (isSlowLog &amp;&amp; isLargeLog) {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      type = TooSlowLog.SlowLogPayload.Type.ALL;<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    } else if (isSlowLog) {<a name="line.214"></a>
+<span class="sourceLineNo">215</span>      type = TooSlowLog.SlowLogPayload.Type.SLOW_LOG;<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    } else {<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      type = TooSlowLog.SlowLogPayload.Type.LARGE_LOG;<a name="line.217"></a>
+<span class="sourceLineNo">218</span>    }<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    return type;<a name="line.219"></a>
+<span class="sourceLineNo">220</span>  }<a name="line.220"></a>
+<span class="sourceLineNo">221</span><a name="line.221"></a>
+<span class="sourceLineNo">222</span>  /**<a name="line.222"></a>
+<span class="sourceLineNo">223</span>   * Add all slowLog events to system table. This is only for slowLog event's persistence on system<a name="line.223"></a>
+<span class="sourceLineNo">224</span>   * table.<a name="line.224"></a>
+<span class="sourceLineNo">225</span>   */<a name="line.225"></a>
+<span class="sourceLineNo">226</span>  @Override<a name="line.226"></a>
+<span class="sourceLineNo">227</span>  public void persistAll(Connection connection) {<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    if (!isOnlineLogProviderEnabled) {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>      return;<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    }<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    if (slowLogPersistentService != null) {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      slowLogPersistentService.addAllLogsToSysTable(connection);<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>  }<a name="line.234"></a>
+<span class="sourceLineNo">235</span><a name="line.235"></a>
+<span class="sourceLineNo">236</span>  private List&lt;TooSlowLog.SlowLogPayload&gt;<a name="line.236"></a>
+<span class="sourceLineNo">237</span>    getSlowLogPayloads(final AdminProtos.SlowLogResponseRequest request) {<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    List&lt;TooSlowLog.SlowLogPayload&gt; slowLogPayloadList =<a name="line.238"></a>
+<span class="sourceLineNo">239</span>      Arrays.stream(slowLogQueue.toArray(new TooSlowLog.SlowLogPayload[0]))<a name="line.239"></a>
+<span class="sourceLineNo">240</span>        .filter(e -&gt; e.getType() == TooSlowLog.SlowLogPayload.Type.ALL<a name="line.240"></a>
+<span class="sourceLineNo">241</span>          || e.getType() == TooSlowLog.SlowLogPayload.Type.SLOW_LOG)<a name="line.241"></a>
+<span class="sourceLineNo">242</span>        .collect(Collectors.toList());<a name="line.242"></a>
+<span class="sourceLineNo">243</span>    // latest slow logs first, operator is interested in latest records from in-memory buffer<a name="line.243"></a>
+<span class="sourceLineNo">244</span>    Collections.reverse(slowLogPayloadList);<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    return LogHandlerUtils.getFilteredLogs(request, slowLogPayloadList);<a name="line.245"></a>
+<span class="sourceLineNo">246</span>  }<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>  private List&lt;TooSlowLog.SlowLogPayload&gt;<a name="line.248"></a>
+<span class="sourceLineNo">249</span>    getLargeLogPayloads(final AdminProtos.SlowLogResponseRequest request) {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    List&lt;<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      TooSlowLog.SlowLogPayload&gt; slowLogPayloadList =<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        Arrays.stream(slowLogQueue.toArray(new TooSlowLog.SlowLogPayload[0]))<a name="line.252"></a>
+<span class="sourceLineNo">253</span>          .filter(e -&gt; e.getType() == TooSlowLog.SlowLogPayload.Type.ALL<a name="line.253"></a>
+<span class="sourceLineNo">254</span>            || e.getType() == TooSlowLog.SlowLogPayload.Type.LARGE_LOG)<a name="line.254"></a>
+<span class="sourceLineNo">255</span>          .collect(Collectors.toList());<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    // latest large logs first, operator is interested in latest records from in-memory buffer<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    Collections.reverse(slowLogPayloadList);<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    return LogHandlerUtils.getFilteredLogs(request, slowLogPayloadList);<a name="line.258"></a>
+<span class="sourceLineNo">259</span>  }<a name="line.259"></a>
+<span class="sourceLineNo">260</span><a name="line.260"></a>
+<span class="sourceLineNo">261</span>}<a name="line.261"></a>
 
 
 

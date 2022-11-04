@@ -5925,7 +5925,7 @@ through code review.</p>
 </div>
 <div class="paragraph">
 <div class="title">Default</div>
-<p><code>org.apache.hadoop.hbase.namequeues.impl.SlowLogQueueService,org.apache.hadoop.hbase.namequeues.impl.BalancerDecisionQueueService,org.apache.hadoop.hbase.namequeues.impl.BalancerRejectionQueueService</code></p>
+<p><code>org.apache.hadoop.hbase.namequeues.impl.SlowLogQueueService,org.apache.hadoop.hbase.namequeues.impl.BalancerDecisionQueueService,org.apache.hadoop.hbase.namequeues.impl.BalancerRejectionQueueService,org.apache.hadoop.hbase.namequeues.WALEventTrackerQueueService</code></p>
 </div>
 </dd>
 </dl>
@@ -34415,6 +34415,142 @@ in the source cluster tables.</p>
 </div>
 </div>
 </div>
+<div class="sect2">
+<h3 id="_replication_observability_framework"><a class="anchor" href="#_replication_observability_framework"></a>165.9. Replication Observability Framework</h3>
+<div class="paragraph">
+<p>The core idea is to create <code>replication marker rows</code> periodically and insert them into WAL.
+These marker rows will help track the replication delays/bugs back to the <code>originating region
+server, WAL and timestamp of occurrence</code>. This tracker rows' WAL entries are interleaved with
+the regular table WAL entries and have a very high chance of running into the same replication
+delays/bugs that the user tables are seeing. Details as follows:</p>
+</div>
+<div class="sect3">
+<h4 id="_replication_waleventtracker_table"><a class="anchor" href="#_replication_waleventtracker_table"></a>165.9.1. REPLICATION.WALEVENTTRACKER table</h4>
+<div class="paragraph">
+<p>Create  a new table called <code>REPLICATION.WALEVENTTRACKER</code> table and persist all the WAL events
+(like <code>ACTIVE</code>, <code>ROLLING</code>, <code>ROLLED</code>) to this table.<br>
+The properties of this table are: Replication is set to 0, Block Cache is Disabled,
+Max versions is 1, TTL is 1 year.</p>
+</div>
+<div class="paragraph">
+<p>This table has single ColumnFamily: <code>info</code><br>
+<code>info</code> contains multiple qualifiers:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>info:region_server_name</code></p>
+</li>
+<li>
+<p><code>info:wal_name</code></p>
+</li>
+<li>
+<p><code>info:timestamp</code></p>
+</li>
+<li>
+<p><code>info:wal_state</code></p>
+</li>
+<li>
+<p><code>info:wal_length</code></p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Whenever we roll a WAL (<code>old-wal-name</code> &#8594; <code>new-wal-name</code>), it will create 3 rows in this table.<br>
+<code>&lt;region_server_name&gt;, &lt;old-wal-name&gt;, &lt;current timestamp&gt;, &lt;ROLLING&gt;, &lt;length of old-wal-name&gt;</code><br>
+<code>&lt;region_server_name&gt;, &lt;old-wal-name&gt;, &lt;current timestamp&gt;, &lt;ROLLED&gt;,  &lt;length of old-wal-name&gt;</code><br>
+<code>&lt;region_server_name&gt;, &lt;new-wal-name&gt;, &lt;current timestamp&gt;, &lt;ACTIVE&gt;,  0</code><br></p>
+</div>
+<div class="paragraph">
+<div class="title">Configuration</div>
+<p>To enable persisting WAL events, there is a configuration property:
+<code>hbase.regionserver.wal.event.tracker.enabled</code> (defaults to false)</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_replication_sink_tracker_table"><a class="anchor" href="#_replication_sink_tracker_table"></a>165.9.2. REPLICATION.SINK_TRACKER table</h4>
+<div class="paragraph">
+<p>Create a new table called <code>REPLICATION.SINK_TRACKER</code>.<br>
+The properties of this table are: Replication is set to 0, Block Cache is Disabled,
+Max versions is 1, TTL is 1 year.</p>
+</div>
+<div class="paragraph">
+<p>This table has single ColumnFamily: <code>info</code><br>
+<code>info</code> contains multiple qualifiers:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>info:region_server_name</code></p>
+</li>
+<li>
+<p><code>info:wal_name</code></p>
+</li>
+<li>
+<p><code>info:timestamp</code></p>
+</li>
+<li>
+<p><code>info:offset</code></p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<div class="title">Configuration</div>
+<p>To create the above table, there is a configuration property:
+<code>hbase.regionserver.replication.sink.tracker.enabled</code> (defaults to false)</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_replicationmarker_chore"><a class="anchor" href="#_replicationmarker_chore"></a>165.9.3. ReplicationMarker Chore</h4>
+<div class="paragraph">
+<p>We introduced a new chore called <code>ReplicationMarkerChore</code> which will create the marker rows
+periodically into active WAL. The marker rows has the following metadata: <code>region_server_name,
+wal_name, timestamp and offset within WAL</code>. These markers are replicated (with special handling)
+and they are persisted into a sink side table <code>REPLICATION.SINK_TRACKER</code>.</p>
+</div>
+<div class="paragraph">
+<div class="title">Configuration:</div>
+<p><code>ReplicationMarkerChore</code> is enabled with configuration property:
+<code>hbase.regionserver.replication.marker.enabled</code> (defaults to false) and the period at which it
+creates marker rows is controlled by <code>hbase.regionserver.replication.marker.chore.duration</code>
+(defaults to 30 seconds). Sink cluster can choose to process these marker rows and persist
+to <code>REPLICATION.SINK_TRACKER</code> table or it can ignore these rows. This behavior is controlled by
+configuration property <code>hbase.regionserver.replication.sink.tracker.enabled</code> (defaults to false).
+If set to false, it will ignore the marker rows.</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_how_to_enable_end_to_end_feature"><a class="anchor" href="#_how_to_enable_end_to_end_feature"></a>165.9.4. How to enable end-to-end feature ?</h4>
+<div class="paragraph">
+<p>To use this whole feature, we will need to enable the above configuration properties in 2
+phases/releases.<br>
+In first phase/release, set the following configuration properties to <code>true</code>:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>hbase.regionserver.wal.event.tracker.enabled</code>: This will just persist all the WAL events to
+REPLICATION.WALEVENTTRACKER table.</p>
+</li>
+<li>
+<p><code>hbase.regionserver.replication.sink.tracker.enabled</code>: This will create REPLICATION.SINK_TRACKER
+table and will process special marker rows coming from source cluster.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>In second phase/release, set the following configuration property to <code>true</code>:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><code>hbase.regionserver.replication.marker.enabled</code>: This will create marker rows periodically and
+sink cluster will persist these marker rows in <code>REPLICATION.SINK_TRACKER</code> table.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
 </div>
 </div>
 <div class="sect1">
@@ -48058,7 +48194,7 @@ org/apache/hadoop/hbase/security/access/AccessControlClient.revoke:(Lorg/apache/
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-alpha-4-SNAPSHOT<br>
-Last updated 2022-11-03 14:29:41 UTC
+Last updated 2022-11-04 14:29:40 UTC
 </div>
 </div>
 <script type="text/x-mathjax-config">
