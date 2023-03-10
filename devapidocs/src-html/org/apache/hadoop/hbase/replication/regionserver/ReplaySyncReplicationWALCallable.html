@@ -36,135 +36,144 @@
 <span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.executor.EventType;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.procedure2.BaseRSProcedureCallable;<a name="line.29"></a>
 <span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.protobuf.ReplicationProtobufUtil;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.regionserver.wal.WALUtil;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.util.KeyLocker;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.RecoverLeaseFSUtils;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.wal.WAL.Entry;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.wal.WAL.Reader;<a name="line.36"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.regionserver.wal.WALHeaderEOFException;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.regionserver.wal.WALUtil;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.util.KeyLocker;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.hadoop.hbase.util.RecoverLeaseFSUtils;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.wal.WAL.Entry;<a name="line.36"></a>
 <span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.wal.WALEdit;<a name="line.37"></a>
 <span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.wal.WALFactory;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.slf4j.Logger;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.slf4j.LoggerFactory;<a name="line.41"></a>
-<span class="sourceLineNo">042</span><a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferException;<a name="line.43"></a>
-<span class="sourceLineNo">044</span><a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ReplicateWALEntryRequest;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.ReplaySyncReplicationWALParameter;<a name="line.47"></a>
-<span class="sourceLineNo">048</span><a name="line.48"></a>
-<span class="sourceLineNo">049</span>/**<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * This callable executed at RS side to replay sync replication wal.<a name="line.50"></a>
-<span class="sourceLineNo">051</span> */<a name="line.51"></a>
-<span class="sourceLineNo">052</span>@InterfaceAudience.Private<a name="line.52"></a>
-<span class="sourceLineNo">053</span>public class ReplaySyncReplicationWALCallable extends BaseRSProcedureCallable {<a name="line.53"></a>
-<span class="sourceLineNo">054</span><a name="line.54"></a>
-<span class="sourceLineNo">055</span>  private static final Logger LOG = LoggerFactory.getLogger(ReplaySyncReplicationWALCallable.class);<a name="line.55"></a>
-<span class="sourceLineNo">056</span><a name="line.56"></a>
-<span class="sourceLineNo">057</span>  private static final String REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE =<a name="line.57"></a>
-<span class="sourceLineNo">058</span>    "hbase.replay.sync.replication.wal.batch.size";<a name="line.58"></a>
-<span class="sourceLineNo">059</span><a name="line.59"></a>
-<span class="sourceLineNo">060</span>  private static final long DEFAULT_REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE = 8 * 1024 * 1024;<a name="line.60"></a>
-<span class="sourceLineNo">061</span><a name="line.61"></a>
-<span class="sourceLineNo">062</span>  private String peerId;<a name="line.62"></a>
-<span class="sourceLineNo">063</span><a name="line.63"></a>
-<span class="sourceLineNo">064</span>  private List&lt;String&gt; wals = new ArrayList&lt;&gt;();<a name="line.64"></a>
-<span class="sourceLineNo">065</span><a name="line.65"></a>
-<span class="sourceLineNo">066</span>  private long batchSize;<a name="line.66"></a>
-<span class="sourceLineNo">067</span><a name="line.67"></a>
-<span class="sourceLineNo">068</span>  private final KeyLocker&lt;String&gt; peersLock = new KeyLocker&lt;&gt;();<a name="line.68"></a>
-<span class="sourceLineNo">069</span><a name="line.69"></a>
-<span class="sourceLineNo">070</span>  @Override<a name="line.70"></a>
-<span class="sourceLineNo">071</span>  protected void doCall() throws Exception {<a name="line.71"></a>
-<span class="sourceLineNo">072</span>    LOG.info("Received a replay sync replication wals {} event, peerId={}", wals, peerId);<a name="line.72"></a>
-<span class="sourceLineNo">073</span>    if (rs.getReplicationSinkService() != null) {<a name="line.73"></a>
-<span class="sourceLineNo">074</span>      Lock peerLock = peersLock.acquireLock(wals.get(0));<a name="line.74"></a>
-<span class="sourceLineNo">075</span>      try {<a name="line.75"></a>
-<span class="sourceLineNo">076</span>        for (String wal : wals) {<a name="line.76"></a>
-<span class="sourceLineNo">077</span>          replayWAL(wal);<a name="line.77"></a>
-<span class="sourceLineNo">078</span>        }<a name="line.78"></a>
-<span class="sourceLineNo">079</span>      } finally {<a name="line.79"></a>
-<span class="sourceLineNo">080</span>        peerLock.unlock();<a name="line.80"></a>
-<span class="sourceLineNo">081</span>      }<a name="line.81"></a>
-<span class="sourceLineNo">082</span>    }<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  }<a name="line.83"></a>
-<span class="sourceLineNo">084</span><a name="line.84"></a>
-<span class="sourceLineNo">085</span>  @Override<a name="line.85"></a>
-<span class="sourceLineNo">086</span>  protected void initParameter(byte[] parameter) throws InvalidProtocolBufferException {<a name="line.86"></a>
-<span class="sourceLineNo">087</span>    ReplaySyncReplicationWALParameter param =<a name="line.87"></a>
-<span class="sourceLineNo">088</span>      ReplaySyncReplicationWALParameter.parseFrom(parameter);<a name="line.88"></a>
-<span class="sourceLineNo">089</span>    this.peerId = param.getPeerId();<a name="line.89"></a>
-<span class="sourceLineNo">090</span>    param.getWalList().forEach(this.wals::add);<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    this.batchSize = rs.getConfiguration().getLong(REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE,<a name="line.91"></a>
-<span class="sourceLineNo">092</span>      DEFAULT_REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE);<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  }<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>  @Override<a name="line.95"></a>
-<span class="sourceLineNo">096</span>  public EventType getEventType() {<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    return EventType.RS_REPLAY_SYNC_REPLICATION_WAL;<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  }<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  private void replayWAL(String wal) throws IOException {<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    try (Reader reader = getReader(wal)) {<a name="line.101"></a>
-<span class="sourceLineNo">102</span>      List&lt;Entry&gt; entries = readWALEntries(reader);<a name="line.102"></a>
-<span class="sourceLineNo">103</span>      while (!entries.isEmpty()) {<a name="line.103"></a>
-<span class="sourceLineNo">104</span>        Pair&lt;AdminProtos.ReplicateWALEntryRequest, CellScanner&gt; pair = ReplicationProtobufUtil<a name="line.104"></a>
-<span class="sourceLineNo">105</span>          .buildReplicateWALEntryRequest(entries.toArray(new Entry[entries.size()]));<a name="line.105"></a>
-<span class="sourceLineNo">106</span>        ReplicateWALEntryRequest request = pair.getFirst();<a name="line.106"></a>
-<span class="sourceLineNo">107</span>        rs.getReplicationSinkService().replicateLogEntries(request.getEntryList(), pair.getSecond(),<a name="line.107"></a>
-<span class="sourceLineNo">108</span>          request.getReplicationClusterId(), request.getSourceBaseNamespaceDirPath(),<a name="line.108"></a>
-<span class="sourceLineNo">109</span>          request.getSourceHFileArchiveDirPath());<a name="line.109"></a>
-<span class="sourceLineNo">110</span>        // Read next entries.<a name="line.110"></a>
-<span class="sourceLineNo">111</span>        entries = readWALEntries(reader);<a name="line.111"></a>
-<span class="sourceLineNo">112</span>      }<a name="line.112"></a>
-<span class="sourceLineNo">113</span>    }<a name="line.113"></a>
-<span class="sourceLineNo">114</span>  }<a name="line.114"></a>
-<span class="sourceLineNo">115</span><a name="line.115"></a>
-<span class="sourceLineNo">116</span>  private Reader getReader(String wal) throws IOException {<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    Path path = new Path(rs.getWALRootDir(), wal);<a name="line.117"></a>
-<span class="sourceLineNo">118</span>    long length = rs.getWALFileSystem().getFileStatus(path).getLen();<a name="line.118"></a>
-<span class="sourceLineNo">119</span>    try {<a name="line.119"></a>
-<span class="sourceLineNo">120</span>      RecoverLeaseFSUtils.recoverFileLease(rs.getWALFileSystem(), path, rs.getConfiguration());<a name="line.120"></a>
-<span class="sourceLineNo">121</span>      return WALFactory.createReader(rs.getWALFileSystem(), path, rs.getConfiguration());<a name="line.121"></a>
-<span class="sourceLineNo">122</span>    } catch (EOFException e) {<a name="line.122"></a>
-<span class="sourceLineNo">123</span>      if (length &lt;= 0) {<a name="line.123"></a>
-<span class="sourceLineNo">124</span>        LOG.warn("File is empty. Could not open {} for reading because {}", path, e);<a name="line.124"></a>
-<span class="sourceLineNo">125</span>        return null;<a name="line.125"></a>
-<span class="sourceLineNo">126</span>      }<a name="line.126"></a>
-<span class="sourceLineNo">127</span>      throw e;<a name="line.127"></a>
-<span class="sourceLineNo">128</span>    }<a name="line.128"></a>
-<span class="sourceLineNo">129</span>  }<a name="line.129"></a>
-<span class="sourceLineNo">130</span><a name="line.130"></a>
-<span class="sourceLineNo">131</span>  // return whether we should include this entry.<a name="line.131"></a>
-<span class="sourceLineNo">132</span>  private boolean filter(Entry entry) {<a name="line.132"></a>
-<span class="sourceLineNo">133</span>    WALEdit edit = entry.getEdit();<a name="line.133"></a>
-<span class="sourceLineNo">134</span>    WALUtil.filterCells(edit, c -&gt; CellUtil.matchingFamily(c, WALEdit.METAFAMILY) ? null : c);<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    return !edit.isEmpty();<a name="line.135"></a>
-<span class="sourceLineNo">136</span>  }<a name="line.136"></a>
-<span class="sourceLineNo">137</span><a name="line.137"></a>
-<span class="sourceLineNo">138</span>  private List&lt;Entry&gt; readWALEntries(Reader reader) throws IOException {<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    List&lt;Entry&gt; entries = new ArrayList&lt;&gt;();<a name="line.139"></a>
-<span class="sourceLineNo">140</span>    if (reader == null) {<a name="line.140"></a>
-<span class="sourceLineNo">141</span>      return entries;<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    }<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    long size = 0;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    for (;;) {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>      Entry entry = reader.next();<a name="line.145"></a>
-<span class="sourceLineNo">146</span>      if (entry == null) {<a name="line.146"></a>
-<span class="sourceLineNo">147</span>        break;<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      }<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      if (filter(entry)) {<a name="line.149"></a>
-<span class="sourceLineNo">150</span>        entries.add(entry);<a name="line.150"></a>
-<span class="sourceLineNo">151</span>        size += entry.getEdit().heapSize();<a name="line.151"></a>
-<span class="sourceLineNo">152</span>        if (size &gt; batchSize) {<a name="line.152"></a>
-<span class="sourceLineNo">153</span>          break;<a name="line.153"></a>
-<span class="sourceLineNo">154</span>        }<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      }<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    return entries;<a name="line.157"></a>
-<span class="sourceLineNo">158</span>  }<a name="line.158"></a>
-<span class="sourceLineNo">159</span>}<a name="line.159"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.wal.WALStreamReader;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.slf4j.Logger;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.slf4j.LoggerFactory;<a name="line.42"></a>
+<span class="sourceLineNo">043</span><a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferException;<a name="line.44"></a>
+<span class="sourceLineNo">045</span><a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.ReplicateWALEntryRequest;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.ReplaySyncReplicationWALParameter;<a name="line.48"></a>
+<span class="sourceLineNo">049</span><a name="line.49"></a>
+<span class="sourceLineNo">050</span>/**<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * This callable executed at RS side to replay sync replication wal.<a name="line.51"></a>
+<span class="sourceLineNo">052</span> */<a name="line.52"></a>
+<span class="sourceLineNo">053</span>@InterfaceAudience.Private<a name="line.53"></a>
+<span class="sourceLineNo">054</span>public class ReplaySyncReplicationWALCallable extends BaseRSProcedureCallable {<a name="line.54"></a>
+<span class="sourceLineNo">055</span><a name="line.55"></a>
+<span class="sourceLineNo">056</span>  private static final Logger LOG = LoggerFactory.getLogger(ReplaySyncReplicationWALCallable.class);<a name="line.56"></a>
+<span class="sourceLineNo">057</span><a name="line.57"></a>
+<span class="sourceLineNo">058</span>  private static final String REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE =<a name="line.58"></a>
+<span class="sourceLineNo">059</span>    "hbase.replay.sync.replication.wal.batch.size";<a name="line.59"></a>
+<span class="sourceLineNo">060</span><a name="line.60"></a>
+<span class="sourceLineNo">061</span>  private static final long DEFAULT_REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE = 8 * 1024 * 1024;<a name="line.61"></a>
+<span class="sourceLineNo">062</span><a name="line.62"></a>
+<span class="sourceLineNo">063</span>  private String peerId;<a name="line.63"></a>
+<span class="sourceLineNo">064</span><a name="line.64"></a>
+<span class="sourceLineNo">065</span>  private List&lt;String&gt; wals = new ArrayList&lt;&gt;();<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  private long batchSize;<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  private final KeyLocker&lt;String&gt; peersLock = new KeyLocker&lt;&gt;();<a name="line.69"></a>
+<span class="sourceLineNo">070</span><a name="line.70"></a>
+<span class="sourceLineNo">071</span>  @Override<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  protected void doCall() throws Exception {<a name="line.72"></a>
+<span class="sourceLineNo">073</span>    LOG.info("Received a replay sync replication wals {} event, peerId={}", wals, peerId);<a name="line.73"></a>
+<span class="sourceLineNo">074</span>    if (rs.getReplicationSinkService() != null) {<a name="line.74"></a>
+<span class="sourceLineNo">075</span>      Lock peerLock = peersLock.acquireLock(wals.get(0));<a name="line.75"></a>
+<span class="sourceLineNo">076</span>      try {<a name="line.76"></a>
+<span class="sourceLineNo">077</span>        for (String wal : wals) {<a name="line.77"></a>
+<span class="sourceLineNo">078</span>          replayWAL(wal);<a name="line.78"></a>
+<span class="sourceLineNo">079</span>        }<a name="line.79"></a>
+<span class="sourceLineNo">080</span>      } finally {<a name="line.80"></a>
+<span class="sourceLineNo">081</span>        peerLock.unlock();<a name="line.81"></a>
+<span class="sourceLineNo">082</span>      }<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    }<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  }<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  @Override<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  protected void initParameter(byte[] parameter) throws InvalidProtocolBufferException {<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    ReplaySyncReplicationWALParameter param =<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      ReplaySyncReplicationWALParameter.parseFrom(parameter);<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    this.peerId = param.getPeerId();<a name="line.90"></a>
+<span class="sourceLineNo">091</span>    param.getWalList().forEach(this.wals::add);<a name="line.91"></a>
+<span class="sourceLineNo">092</span>    this.batchSize = rs.getConfiguration().getLong(REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE,<a name="line.92"></a>
+<span class="sourceLineNo">093</span>      DEFAULT_REPLAY_SYNC_REPLICATION_WAL_BATCH_SIZE);<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  }<a name="line.94"></a>
+<span class="sourceLineNo">095</span><a name="line.95"></a>
+<span class="sourceLineNo">096</span>  @Override<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  public EventType getEventType() {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    return EventType.RS_REPLAY_SYNC_REPLICATION_WAL;<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  }<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  private void replayWAL(String wal) throws IOException {<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    WALStreamReader reader = getReader(wal);<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    if (reader == null) {<a name="line.103"></a>
+<span class="sourceLineNo">104</span>      return;<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    }<a name="line.105"></a>
+<span class="sourceLineNo">106</span>    try {<a name="line.106"></a>
+<span class="sourceLineNo">107</span>      List&lt;Entry&gt; entries = readWALEntries(reader, wal);<a name="line.107"></a>
+<span class="sourceLineNo">108</span>      while (!entries.isEmpty()) {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>        Pair&lt;AdminProtos.ReplicateWALEntryRequest, CellScanner&gt; pair = ReplicationProtobufUtil<a name="line.109"></a>
+<span class="sourceLineNo">110</span>          .buildReplicateWALEntryRequest(entries.toArray(new Entry[entries.size()]));<a name="line.110"></a>
+<span class="sourceLineNo">111</span>        ReplicateWALEntryRequest request = pair.getFirst();<a name="line.111"></a>
+<span class="sourceLineNo">112</span>        rs.getReplicationSinkService().replicateLogEntries(request.getEntryList(), pair.getSecond(),<a name="line.112"></a>
+<span class="sourceLineNo">113</span>          request.getReplicationClusterId(), request.getSourceBaseNamespaceDirPath(),<a name="line.113"></a>
+<span class="sourceLineNo">114</span>          request.getSourceHFileArchiveDirPath());<a name="line.114"></a>
+<span class="sourceLineNo">115</span>        // Read next entries.<a name="line.115"></a>
+<span class="sourceLineNo">116</span>        entries = readWALEntries(reader, wal);<a name="line.116"></a>
+<span class="sourceLineNo">117</span>      }<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    } finally {<a name="line.118"></a>
+<span class="sourceLineNo">119</span>      reader.close();<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    }<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  }<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  private WALStreamReader getReader(String wal) throws IOException {<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    Path path = new Path(rs.getWALRootDir(), wal);<a name="line.124"></a>
+<span class="sourceLineNo">125</span>    try {<a name="line.125"></a>
+<span class="sourceLineNo">126</span>      RecoverLeaseFSUtils.recoverFileLease(rs.getWALFileSystem(), path, rs.getConfiguration());<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      return WALFactory.createStreamReader(rs.getWALFileSystem(), path, rs.getConfiguration());<a name="line.127"></a>
+<span class="sourceLineNo">128</span>    } catch (WALHeaderEOFException e) {<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      LOG.warn("EOF while opening WAL reader for {}", path, e);<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      return null;<a name="line.130"></a>
+<span class="sourceLineNo">131</span>    }<a name="line.131"></a>
+<span class="sourceLineNo">132</span>  }<a name="line.132"></a>
+<span class="sourceLineNo">133</span><a name="line.133"></a>
+<span class="sourceLineNo">134</span>  // return whether we should include this entry.<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  private boolean filter(Entry entry) {<a name="line.135"></a>
+<span class="sourceLineNo">136</span>    WALEdit edit = entry.getEdit();<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    WALUtil.filterCells(edit, c -&gt; CellUtil.matchingFamily(c, WALEdit.METAFAMILY) ? null : c);<a name="line.137"></a>
+<span class="sourceLineNo">138</span>    return !edit.isEmpty();<a name="line.138"></a>
+<span class="sourceLineNo">139</span>  }<a name="line.139"></a>
+<span class="sourceLineNo">140</span><a name="line.140"></a>
+<span class="sourceLineNo">141</span>  private List&lt;Entry&gt; readWALEntries(WALStreamReader reader, String wal) throws IOException {<a name="line.141"></a>
+<span class="sourceLineNo">142</span>    List&lt;Entry&gt; entries = new ArrayList&lt;&gt;();<a name="line.142"></a>
+<span class="sourceLineNo">143</span>    if (reader == null) {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      return entries;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    }<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    long size = 0;<a name="line.146"></a>
+<span class="sourceLineNo">147</span>    for (;;) {<a name="line.147"></a>
+<span class="sourceLineNo">148</span>      Entry entry;<a name="line.148"></a>
+<span class="sourceLineNo">149</span>      try {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>        entry = reader.next();<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      } catch (EOFException e) {<a name="line.151"></a>
+<span class="sourceLineNo">152</span>        LOG.info("EOF while reading WAL entries from {}: {}, continuing", wal, e.toString());<a name="line.152"></a>
+<span class="sourceLineNo">153</span>        break;<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      }<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      if (entry == null) {<a name="line.155"></a>
+<span class="sourceLineNo">156</span>        break;<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      }<a name="line.157"></a>
+<span class="sourceLineNo">158</span>      if (filter(entry)) {<a name="line.158"></a>
+<span class="sourceLineNo">159</span>        entries.add(entry);<a name="line.159"></a>
+<span class="sourceLineNo">160</span>        size += entry.getEdit().heapSize();<a name="line.160"></a>
+<span class="sourceLineNo">161</span>        if (size &gt; batchSize) {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>          break;<a name="line.162"></a>
+<span class="sourceLineNo">163</span>        }<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      }<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    }<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    return entries;<a name="line.166"></a>
+<span class="sourceLineNo">167</span>  }<a name="line.167"></a>
+<span class="sourceLineNo">168</span>}<a name="line.168"></a>
 
 
 
