@@ -35,269 +35,352 @@
 <span class="sourceLineNo">027</span>import java.util.List;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import java.util.NoSuchElementException;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import java.util.concurrent.ExecutionException;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import net.spy.memcached.CachedData;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import net.spy.memcached.ConnectionFactoryBuilder;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import net.spy.memcached.FailureMode;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import net.spy.memcached.MemcachedClient;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import net.spy.memcached.transcoders.Transcoder;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.apache.hadoop.conf.Configuration;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.apache.hadoop.hbase.HConstants;<a name="line.36"></a>
-<span class="sourceLineNo">037</span>import org.apache.hadoop.hbase.io.ByteBuffAllocator;<a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hadoop.hbase.nio.ByteBuff;<a name="line.38"></a>
-<span class="sourceLineNo">039</span>import org.apache.hadoop.hbase.nio.SingleByteBuff;<a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.trace.TraceUtil;<a name="line.40"></a>
-<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.util.Addressing;<a name="line.41"></a>
-<span class="sourceLineNo">042</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.slf4j.Logger;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.slf4j.LoggerFactory;<a name="line.44"></a>
-<span class="sourceLineNo">045</span><a name="line.45"></a>
-<span class="sourceLineNo">046</span>/**<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * Class to store blocks into memcached. This should only be used on a cluster of Memcached daemons<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * that are tuned well and have a good network connection to the HBase regionservers. Any other use<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * will likely slow down HBase greatly.<a name="line.49"></a>
-<span class="sourceLineNo">050</span> */<a name="line.50"></a>
-<span class="sourceLineNo">051</span>@InterfaceAudience.Private<a name="line.51"></a>
-<span class="sourceLineNo">052</span>public class MemcachedBlockCache implements BlockCache {<a name="line.52"></a>
-<span class="sourceLineNo">053</span>  private static final Logger LOG = LoggerFactory.getLogger(MemcachedBlockCache.class.getName());<a name="line.53"></a>
-<span class="sourceLineNo">054</span><a name="line.54"></a>
-<span class="sourceLineNo">055</span>  // Some memcache versions won't take more than 1024 * 1024. So set the limit below<a name="line.55"></a>
-<span class="sourceLineNo">056</span>  // that just in case this client is used with those versions.<a name="line.56"></a>
-<span class="sourceLineNo">057</span>  public static final int MAX_SIZE = 1020 * 1024;<a name="line.57"></a>
-<span class="sourceLineNo">058</span><a name="line.58"></a>
-<span class="sourceLineNo">059</span>  // Config key for what memcached servers to use.<a name="line.59"></a>
-<span class="sourceLineNo">060</span>  // They should be specified in a comma sperated list with ports.<a name="line.60"></a>
-<span class="sourceLineNo">061</span>  // like:<a name="line.61"></a>
-<span class="sourceLineNo">062</span>  //<a name="line.62"></a>
-<span class="sourceLineNo">063</span>  // host1:11211,host3:8080,host4:11211<a name="line.63"></a>
-<span class="sourceLineNo">064</span>  public static final String MEMCACHED_CONFIG_KEY = "hbase.cache.memcached.servers";<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  public static final String MEMCACHED_TIMEOUT_KEY = "hbase.cache.memcached.timeout";<a name="line.65"></a>
-<span class="sourceLineNo">066</span>  public static final String MEMCACHED_OPTIMEOUT_KEY = "hbase.cache.memcached.optimeout";<a name="line.66"></a>
-<span class="sourceLineNo">067</span>  public static final String MEMCACHED_OPTIMIZE_KEY = "hbase.cache.memcached.spy.optimze";<a name="line.67"></a>
-<span class="sourceLineNo">068</span>  public static final long MEMCACHED_DEFAULT_TIMEOUT = 500;<a name="line.68"></a>
-<span class="sourceLineNo">069</span>  public static final boolean MEMCACHED_OPTIMIZE_DEFAULT = false;<a name="line.69"></a>
+<span class="sourceLineNo">030</span>import java.util.concurrent.Executors;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.concurrent.ScheduledExecutorService;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import java.util.concurrent.TimeUnit;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import java.util.concurrent.atomic.AtomicLong;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import net.spy.memcached.CachedData;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import net.spy.memcached.ConnectionFactoryBuilder;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import net.spy.memcached.FailureMode;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import net.spy.memcached.MemcachedClient;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import net.spy.memcached.OperationTimeoutException;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import net.spy.memcached.transcoders.Transcoder;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.conf.Configuration;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.io.ByteBuffAllocator;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.nio.ByteBuff;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.nio.SingleByteBuff;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.trace.TraceUtil;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.Addressing;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.util.StringUtils;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.slf4j.Logger;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.slf4j.LoggerFactory;<a name="line.49"></a>
+<span class="sourceLineNo">050</span><a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.apache.hbase.thirdparty.com.google.common.util.concurrent.ThreadFactoryBuilder;<a name="line.51"></a>
+<span class="sourceLineNo">052</span><a name="line.52"></a>
+<span class="sourceLineNo">053</span>/**<a name="line.53"></a>
+<span class="sourceLineNo">054</span> * Class to store blocks into memcached. This should only be used on a cluster of Memcached daemons<a name="line.54"></a>
+<span class="sourceLineNo">055</span> * that are tuned well and have a good network connection to the HBase regionservers. Any other use<a name="line.55"></a>
+<span class="sourceLineNo">056</span> * will likely slow down HBase greatly.<a name="line.56"></a>
+<span class="sourceLineNo">057</span> */<a name="line.57"></a>
+<span class="sourceLineNo">058</span>@InterfaceAudience.Private<a name="line.58"></a>
+<span class="sourceLineNo">059</span>@SuppressWarnings("FutureReturnValueIgnored")<a name="line.59"></a>
+<span class="sourceLineNo">060</span>public class MemcachedBlockCache implements BlockCache {<a name="line.60"></a>
+<span class="sourceLineNo">061</span>  private static final Logger LOG = LoggerFactory.getLogger(MemcachedBlockCache.class.getName());<a name="line.61"></a>
+<span class="sourceLineNo">062</span><a name="line.62"></a>
+<span class="sourceLineNo">063</span>  // Some memcache versions won't take more than 1024 * 1024. So set the limit below<a name="line.63"></a>
+<span class="sourceLineNo">064</span>  // that just in case this client is used with those versions.<a name="line.64"></a>
+<span class="sourceLineNo">065</span>  public static final int MAX_SIZE = 1020 * 1024;<a name="line.65"></a>
+<span class="sourceLineNo">066</span><a name="line.66"></a>
+<span class="sourceLineNo">067</span>  // Start memcached with -I &lt;MAX_SIZE&gt; to ensure it has the ability to store blocks of this size<a name="line.67"></a>
+<span class="sourceLineNo">068</span>  public static final int MAX_TIME = 60 * 60 * 24 * 30; // 30 days, max allowed per the memcached<a name="line.68"></a>
+<span class="sourceLineNo">069</span>                                                        // spec<a name="line.69"></a>
 <span class="sourceLineNo">070</span><a name="line.70"></a>
-<span class="sourceLineNo">071</span>  private final MemcachedClient client;<a name="line.71"></a>
-<span class="sourceLineNo">072</span>  private final HFileBlockTranscoder tc = new HFileBlockTranscoder();<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private final CacheStats cacheStats = new CacheStats("MemcachedBlockCache");<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  public MemcachedBlockCache(Configuration c) throws IOException {<a name="line.75"></a>
-<span class="sourceLineNo">076</span>    LOG.info("Creating MemcachedBlockCache");<a name="line.76"></a>
-<span class="sourceLineNo">077</span><a name="line.77"></a>
-<span class="sourceLineNo">078</span>    long opTimeout = c.getLong(MEMCACHED_OPTIMEOUT_KEY, MEMCACHED_DEFAULT_TIMEOUT);<a name="line.78"></a>
-<span class="sourceLineNo">079</span>    long queueTimeout = c.getLong(MEMCACHED_TIMEOUT_KEY, opTimeout + MEMCACHED_DEFAULT_TIMEOUT);<a name="line.79"></a>
-<span class="sourceLineNo">080</span>    boolean optimize = c.getBoolean(MEMCACHED_OPTIMIZE_KEY, MEMCACHED_OPTIMIZE_DEFAULT);<a name="line.80"></a>
-<span class="sourceLineNo">081</span><a name="line.81"></a>
-<span class="sourceLineNo">082</span>    ConnectionFactoryBuilder builder =<a name="line.82"></a>
-<span class="sourceLineNo">083</span>      // Cap the max time before anything times out<a name="line.83"></a>
-<span class="sourceLineNo">084</span>      new ConnectionFactoryBuilder().setOpTimeout(opTimeout).setOpQueueMaxBlockTime(queueTimeout)<a name="line.84"></a>
-<span class="sourceLineNo">085</span>        // Don't keep threads around past the end of days.<a name="line.85"></a>
-<span class="sourceLineNo">086</span>        .setFailureMode(FailureMode.Redistribute).setShouldOptimize(optimize).setDaemon(true)<a name="line.86"></a>
-<span class="sourceLineNo">087</span>        .setUseNagleAlgorithm(false) // Ain't nobody got time for that<a name="line.87"></a>
-<span class="sourceLineNo">088</span>        .setReadBufferSize(HConstants.DEFAULT_BLOCKSIZE * 4 * 1024); // Much larger just in case<a name="line.88"></a>
-<span class="sourceLineNo">089</span><a name="line.89"></a>
-<span class="sourceLineNo">090</span>    // Assume only the localhost is serving memecached.<a name="line.90"></a>
-<span class="sourceLineNo">091</span>    // A la mcrouter or co-locating memcached with split regionservers.<a name="line.91"></a>
-<span class="sourceLineNo">092</span>    //<a name="line.92"></a>
-<span class="sourceLineNo">093</span>    // If this config is a pool of memecached servers they will all be used according to the<a name="line.93"></a>
-<span class="sourceLineNo">094</span>    // default hashing scheme defined by the memcache client. Spy Memecache client in this<a name="line.94"></a>
-<span class="sourceLineNo">095</span>    // case.<a name="line.95"></a>
-<span class="sourceLineNo">096</span>    String serverListString = c.get(MEMCACHED_CONFIG_KEY, "localhost:11211");<a name="line.96"></a>
-<span class="sourceLineNo">097</span>    String[] servers = serverListString.split(",");<a name="line.97"></a>
-<span class="sourceLineNo">098</span>    // MemcachedClient requires InetSocketAddresses, we have to create them now. Implies any<a name="line.98"></a>
-<span class="sourceLineNo">099</span>    // resolved identities cannot have their address mappings changed while the MemcachedClient<a name="line.99"></a>
-<span class="sourceLineNo">100</span>    // instance is alive. We won't get a chance to trigger re-resolution.<a name="line.100"></a>
-<span class="sourceLineNo">101</span>    List&lt;InetSocketAddress&gt; serverAddresses = new ArrayList&lt;&gt;(servers.length);<a name="line.101"></a>
-<span class="sourceLineNo">102</span>    for (String s : servers) {<a name="line.102"></a>
-<span class="sourceLineNo">103</span>      serverAddresses.add(Addressing.createInetSocketAddressFromHostAndPortStr(s));<a name="line.103"></a>
-<span class="sourceLineNo">104</span>    }<a name="line.104"></a>
-<span class="sourceLineNo">105</span><a name="line.105"></a>
-<span class="sourceLineNo">106</span>    client = new MemcachedClient(builder.build(), serverAddresses);<a name="line.106"></a>
-<span class="sourceLineNo">107</span>  }<a name="line.107"></a>
+<span class="sourceLineNo">071</span>  // Config key for what memcached servers to use.<a name="line.71"></a>
+<span class="sourceLineNo">072</span>  // They should be specified in a comma sperated list with ports.<a name="line.72"></a>
+<span class="sourceLineNo">073</span>  // like:<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  //<a name="line.74"></a>
+<span class="sourceLineNo">075</span>  // host1:11211,host3:8080,host4:11211<a name="line.75"></a>
+<span class="sourceLineNo">076</span>  public static final String MEMCACHED_CONFIG_KEY = "hbase.cache.memcached.servers";<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  public static final String MEMCACHED_TIMEOUT_KEY = "hbase.cache.memcached.timeout";<a name="line.77"></a>
+<span class="sourceLineNo">078</span>  public static final String MEMCACHED_OPTIMEOUT_KEY = "hbase.cache.memcached.optimeout";<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  public static final String MEMCACHED_OPTIMIZE_KEY = "hbase.cache.memcached.spy.optimze";<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  public static final long MEMCACHED_DEFAULT_TIMEOUT = 500;<a name="line.80"></a>
+<span class="sourceLineNo">081</span>  public static final boolean MEMCACHED_OPTIMIZE_DEFAULT = false;<a name="line.81"></a>
+<span class="sourceLineNo">082</span>  public static final int STAT_THREAD_PERIOD = 60 * 5;<a name="line.82"></a>
+<span class="sourceLineNo">083</span><a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private final MemcachedClient client;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  private final HFileBlockTranscoder tc = new HFileBlockTranscoder();<a name="line.85"></a>
+<span class="sourceLineNo">086</span>  private final CacheStats cacheStats = new CacheStats("MemcachedBlockCache");<a name="line.86"></a>
+<span class="sourceLineNo">087</span>  private final AtomicLong cachedCount = new AtomicLong();<a name="line.87"></a>
+<span class="sourceLineNo">088</span>  private final AtomicLong notCachedCount = new AtomicLong();<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  private final AtomicLong cacheErrorCount = new AtomicLong();<a name="line.89"></a>
+<span class="sourceLineNo">090</span>  private final AtomicLong timeoutCount = new AtomicLong();<a name="line.90"></a>
+<span class="sourceLineNo">091</span><a name="line.91"></a>
+<span class="sourceLineNo">092</span>  /** Statistics thread schedule pool (for heavy debugging, could remove) */<a name="line.92"></a>
+<span class="sourceLineNo">093</span>  private transient final ScheduledExecutorService scheduleThreadPool =<a name="line.93"></a>
+<span class="sourceLineNo">094</span>    Executors.newScheduledThreadPool(1, new ThreadFactoryBuilder()<a name="line.94"></a>
+<span class="sourceLineNo">095</span>      .setNameFormat("MemcachedBlockCacheStatsExecutor").setDaemon(true).build());<a name="line.95"></a>
+<span class="sourceLineNo">096</span><a name="line.96"></a>
+<span class="sourceLineNo">097</span>  public MemcachedBlockCache(Configuration c) throws IOException {<a name="line.97"></a>
+<span class="sourceLineNo">098</span>    LOG.info("Creating MemcachedBlockCache");<a name="line.98"></a>
+<span class="sourceLineNo">099</span><a name="line.99"></a>
+<span class="sourceLineNo">100</span>    long opTimeout = c.getLong(MEMCACHED_OPTIMEOUT_KEY, MEMCACHED_DEFAULT_TIMEOUT);<a name="line.100"></a>
+<span class="sourceLineNo">101</span>    long queueTimeout = c.getLong(MEMCACHED_TIMEOUT_KEY, opTimeout + MEMCACHED_DEFAULT_TIMEOUT);<a name="line.101"></a>
+<span class="sourceLineNo">102</span>    boolean optimize = c.getBoolean(MEMCACHED_OPTIMIZE_KEY, MEMCACHED_OPTIMIZE_DEFAULT);<a name="line.102"></a>
+<span class="sourceLineNo">103</span><a name="line.103"></a>
+<span class="sourceLineNo">104</span>    ConnectionFactoryBuilder builder =<a name="line.104"></a>
+<span class="sourceLineNo">105</span>      new ConnectionFactoryBuilder().setOpTimeout(opTimeout).setOpQueueMaxBlockTime(queueTimeout)<a name="line.105"></a>
+<span class="sourceLineNo">106</span>        .setFailureMode(FailureMode.Redistribute).setShouldOptimize(optimize).setDaemon(true)<a name="line.106"></a>
+<span class="sourceLineNo">107</span>        .setUseNagleAlgorithm(false).setReadBufferSize(MAX_SIZE);<a name="line.107"></a>
 <span class="sourceLineNo">108</span><a name="line.108"></a>
-<span class="sourceLineNo">109</span>  @Override<a name="line.109"></a>
-<span class="sourceLineNo">110</span>  public void cacheBlock(BlockCacheKey cacheKey, Cacheable buf, boolean inMemory) {<a name="line.110"></a>
-<span class="sourceLineNo">111</span>    cacheBlock(cacheKey, buf);<a name="line.111"></a>
-<span class="sourceLineNo">112</span>  }<a name="line.112"></a>
-<span class="sourceLineNo">113</span><a name="line.113"></a>
-<span class="sourceLineNo">114</span>  @SuppressWarnings("FutureReturnValueIgnored")<a name="line.114"></a>
-<span class="sourceLineNo">115</span>  @Override<a name="line.115"></a>
-<span class="sourceLineNo">116</span>  public void cacheBlock(BlockCacheKey cacheKey, Cacheable buf) {<a name="line.116"></a>
-<span class="sourceLineNo">117</span>    if (buf instanceof HFileBlock) {<a name="line.117"></a>
-<span class="sourceLineNo">118</span>      client.add(cacheKey.toString(), MAX_SIZE, (HFileBlock) buf, tc).addListener(f -&gt; {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>        try {<a name="line.119"></a>
-<span class="sourceLineNo">120</span>          f.get();<a name="line.120"></a>
-<span class="sourceLineNo">121</span>        } catch (ExecutionException e) {<a name="line.121"></a>
-<span class="sourceLineNo">122</span>          LOG.warn("Failed to cache block", e);<a name="line.122"></a>
-<span class="sourceLineNo">123</span>        }<a name="line.123"></a>
-<span class="sourceLineNo">124</span>      });<a name="line.124"></a>
-<span class="sourceLineNo">125</span>    } else {<a name="line.125"></a>
-<span class="sourceLineNo">126</span>      if (LOG.isDebugEnabled()) {<a name="line.126"></a>
-<span class="sourceLineNo">127</span>        LOG.debug(<a name="line.127"></a>
-<span class="sourceLineNo">128</span>          "MemcachedBlockCache can not cache Cacheable's of type " + buf.getClass().toString());<a name="line.128"></a>
-<span class="sourceLineNo">129</span>      }<a name="line.129"></a>
-<span class="sourceLineNo">130</span>    }<a name="line.130"></a>
-<span class="sourceLineNo">131</span>  }<a name="line.131"></a>
-<span class="sourceLineNo">132</span><a name="line.132"></a>
-<span class="sourceLineNo">133</span>  @Override<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  public Cacheable getBlock(BlockCacheKey cacheKey, boolean caching, boolean repeat,<a name="line.134"></a>
-<span class="sourceLineNo">135</span>    boolean updateCacheMetrics) {<a name="line.135"></a>
-<span class="sourceLineNo">136</span>    // Assume that nothing is the block cache<a name="line.136"></a>
-<span class="sourceLineNo">137</span>    HFileBlock result = null;<a name="line.137"></a>
-<span class="sourceLineNo">138</span>    Span span = TraceUtil.getGlobalTracer().spanBuilder("MemcachedBlockCache.getBlock").startSpan();<a name="line.138"></a>
-<span class="sourceLineNo">139</span>    try (Scope traceScope = span.makeCurrent()) {<a name="line.139"></a>
-<span class="sourceLineNo">140</span>      result = client.get(cacheKey.toString(), tc);<a name="line.140"></a>
-<span class="sourceLineNo">141</span>    } catch (Exception e) {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>      // Catch a pretty broad set of exceptions to limit any changes in the memecache client<a name="line.142"></a>
-<span class="sourceLineNo">143</span>      // and how it handles failures from leaking into the read path.<a name="line.143"></a>
-<span class="sourceLineNo">144</span>      if (LOG.isDebugEnabled()) {<a name="line.144"></a>
-<span class="sourceLineNo">145</span>        LOG.debug(<a name="line.145"></a>
-<span class="sourceLineNo">146</span>          "Exception pulling from memcached [ " + cacheKey.toString() + " ]. Treating as a miss.",<a name="line.146"></a>
-<span class="sourceLineNo">147</span>          e);<a name="line.147"></a>
-<span class="sourceLineNo">148</span>      }<a name="line.148"></a>
-<span class="sourceLineNo">149</span>      result = null;<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    } finally {<a name="line.150"></a>
-<span class="sourceLineNo">151</span>      span.end();<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      // Update stats if this request doesn't have it turned off 100% of the time<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      if (updateCacheMetrics) {<a name="line.153"></a>
-<span class="sourceLineNo">154</span>        if (result == null) {<a name="line.154"></a>
-<span class="sourceLineNo">155</span>          cacheStats.miss(caching, cacheKey.isPrimary(), cacheKey.getBlockType());<a name="line.155"></a>
-<span class="sourceLineNo">156</span>        } else {<a name="line.156"></a>
-<span class="sourceLineNo">157</span>          cacheStats.hit(caching, cacheKey.isPrimary(), cacheKey.getBlockType());<a name="line.157"></a>
-<span class="sourceLineNo">158</span>        }<a name="line.158"></a>
-<span class="sourceLineNo">159</span>      }<a name="line.159"></a>
-<span class="sourceLineNo">160</span>    }<a name="line.160"></a>
-<span class="sourceLineNo">161</span><a name="line.161"></a>
-<span class="sourceLineNo">162</span>    return result;<a name="line.162"></a>
-<span class="sourceLineNo">163</span>  }<a name="line.163"></a>
-<span class="sourceLineNo">164</span><a name="line.164"></a>
-<span class="sourceLineNo">165</span>  @Override<a name="line.165"></a>
-<span class="sourceLineNo">166</span>  public boolean evictBlock(BlockCacheKey cacheKey) {<a name="line.166"></a>
-<span class="sourceLineNo">167</span>    try {<a name="line.167"></a>
-<span class="sourceLineNo">168</span>      cacheStats.evict();<a name="line.168"></a>
-<span class="sourceLineNo">169</span>      return client.delete(cacheKey.toString()).get();<a name="line.169"></a>
-<span class="sourceLineNo">170</span>    } catch (InterruptedException e) {<a name="line.170"></a>
-<span class="sourceLineNo">171</span>      LOG.warn("Error deleting " + cacheKey.toString(), e);<a name="line.171"></a>
-<span class="sourceLineNo">172</span>      Thread.currentThread().interrupt();<a name="line.172"></a>
-<span class="sourceLineNo">173</span>    } catch (ExecutionException e) {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>      if (LOG.isDebugEnabled()) {<a name="line.174"></a>
-<span class="sourceLineNo">175</span>        LOG.debug("Error deleting " + cacheKey.toString(), e);<a name="line.175"></a>
-<span class="sourceLineNo">176</span>      }<a name="line.176"></a>
-<span class="sourceLineNo">177</span>    }<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    return false;<a name="line.178"></a>
-<span class="sourceLineNo">179</span>  }<a name="line.179"></a>
-<span class="sourceLineNo">180</span><a name="line.180"></a>
-<span class="sourceLineNo">181</span>  /**<a name="line.181"></a>
-<span class="sourceLineNo">182</span>   * This method does nothing so that memcached can handle all evictions.<a name="line.182"></a>
-<span class="sourceLineNo">183</span>   */<a name="line.183"></a>
-<span class="sourceLineNo">184</span>  @Override<a name="line.184"></a>
-<span class="sourceLineNo">185</span>  public int evictBlocksByHfileName(String hfileName) {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    return 0;<a name="line.186"></a>
-<span class="sourceLineNo">187</span>  }<a name="line.187"></a>
-<span class="sourceLineNo">188</span><a name="line.188"></a>
-<span class="sourceLineNo">189</span>  @Override<a name="line.189"></a>
-<span class="sourceLineNo">190</span>  public CacheStats getStats() {<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    return cacheStats;<a name="line.191"></a>
-<span class="sourceLineNo">192</span>  }<a name="line.192"></a>
-<span class="sourceLineNo">193</span><a name="line.193"></a>
-<span class="sourceLineNo">194</span>  @Override<a name="line.194"></a>
-<span class="sourceLineNo">195</span>  public void shutdown() {<a name="line.195"></a>
-<span class="sourceLineNo">196</span>    client.shutdown();<a name="line.196"></a>
-<span class="sourceLineNo">197</span>  }<a name="line.197"></a>
-<span class="sourceLineNo">198</span><a name="line.198"></a>
-<span class="sourceLineNo">199</span>  @Override<a name="line.199"></a>
-<span class="sourceLineNo">200</span>  public long size() {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>    return 0;<a name="line.201"></a>
-<span class="sourceLineNo">202</span>  }<a name="line.202"></a>
-<span class="sourceLineNo">203</span><a name="line.203"></a>
-<span class="sourceLineNo">204</span>  @Override<a name="line.204"></a>
-<span class="sourceLineNo">205</span>  public long getMaxSize() {<a name="line.205"></a>
-<span class="sourceLineNo">206</span>    return 0;<a name="line.206"></a>
-<span class="sourceLineNo">207</span>  }<a name="line.207"></a>
-<span class="sourceLineNo">208</span><a name="line.208"></a>
-<span class="sourceLineNo">209</span>  @Override<a name="line.209"></a>
-<span class="sourceLineNo">210</span>  public long getFreeSize() {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    return 0;<a name="line.211"></a>
+<span class="sourceLineNo">109</span>    // Assume only the localhost is serving memcached.<a name="line.109"></a>
+<span class="sourceLineNo">110</span>    // A la mcrouter or co-locating memcached with split regionservers.<a name="line.110"></a>
+<span class="sourceLineNo">111</span>    //<a name="line.111"></a>
+<span class="sourceLineNo">112</span>    // If this config is a pool of memcached servers they will all be used according to the<a name="line.112"></a>
+<span class="sourceLineNo">113</span>    // default hashing scheme defined by the memcached client. Spy Memecache client in this<a name="line.113"></a>
+<span class="sourceLineNo">114</span>    // case.<a name="line.114"></a>
+<span class="sourceLineNo">115</span>    String serverListString = c.get(MEMCACHED_CONFIG_KEY, "localhost:11211");<a name="line.115"></a>
+<span class="sourceLineNo">116</span>    String[] servers = serverListString.split(",");<a name="line.116"></a>
+<span class="sourceLineNo">117</span>    // MemcachedClient requires InetSocketAddresses, we have to create them now. Implies any<a name="line.117"></a>
+<span class="sourceLineNo">118</span>    // resolved identities cannot have their address mappings changed while the MemcachedClient<a name="line.118"></a>
+<span class="sourceLineNo">119</span>    // instance is alive. We won't get a chance to trigger re-resolution.<a name="line.119"></a>
+<span class="sourceLineNo">120</span>    List&lt;InetSocketAddress&gt; serverAddresses = new ArrayList&lt;&gt;(servers.length);<a name="line.120"></a>
+<span class="sourceLineNo">121</span>    for (String s : servers) {<a name="line.121"></a>
+<span class="sourceLineNo">122</span>      serverAddresses.add(Addressing.createInetSocketAddressFromHostAndPortStr(s));<a name="line.122"></a>
+<span class="sourceLineNo">123</span>    }<a name="line.123"></a>
+<span class="sourceLineNo">124</span><a name="line.124"></a>
+<span class="sourceLineNo">125</span>    client = new MemcachedClient(builder.build(), serverAddresses);<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    this.scheduleThreadPool.scheduleAtFixedRate(new StatisticsThread(this), STAT_THREAD_PERIOD,<a name="line.126"></a>
+<span class="sourceLineNo">127</span>      STAT_THREAD_PERIOD, TimeUnit.SECONDS);<a name="line.127"></a>
+<span class="sourceLineNo">128</span>  }<a name="line.128"></a>
+<span class="sourceLineNo">129</span><a name="line.129"></a>
+<span class="sourceLineNo">130</span>  @Override<a name="line.130"></a>
+<span class="sourceLineNo">131</span>  public void cacheBlock(BlockCacheKey cacheKey, Cacheable buf, boolean inMemory) {<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    cacheBlock(cacheKey, buf);<a name="line.132"></a>
+<span class="sourceLineNo">133</span>  }<a name="line.133"></a>
+<span class="sourceLineNo">134</span><a name="line.134"></a>
+<span class="sourceLineNo">135</span>  @Override<a name="line.135"></a>
+<span class="sourceLineNo">136</span>  public void cacheBlock(BlockCacheKey cacheKey, Cacheable buf) {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>    if (buf instanceof HFileBlock) {<a name="line.137"></a>
+<span class="sourceLineNo">138</span>      if (buf.getSerializedLength() &gt; MAX_SIZE) {<a name="line.138"></a>
+<span class="sourceLineNo">139</span>        LOG.debug("Block of type {} with key {} is too large, size={}, max={}, will not cache",<a name="line.139"></a>
+<span class="sourceLineNo">140</span>          buf.getClass(), cacheKey, buf.getSerializedLength(), MAX_SIZE);<a name="line.140"></a>
+<span class="sourceLineNo">141</span>        notCachedCount.incrementAndGet();<a name="line.141"></a>
+<span class="sourceLineNo">142</span>        return;<a name="line.142"></a>
+<span class="sourceLineNo">143</span>      }<a name="line.143"></a>
+<span class="sourceLineNo">144</span>      client.set(cacheKey.toString(), MAX_TIME, (HFileBlock) buf, tc).addListener(f -&gt; {<a name="line.144"></a>
+<span class="sourceLineNo">145</span>        try {<a name="line.145"></a>
+<span class="sourceLineNo">146</span>          f.get();<a name="line.146"></a>
+<span class="sourceLineNo">147</span>          cachedCount.incrementAndGet();<a name="line.147"></a>
+<span class="sourceLineNo">148</span>        } catch (Exception e) {<a name="line.148"></a>
+<span class="sourceLineNo">149</span>          LOG.warn("Failed to cache block with key " + cacheKey, e);<a name="line.149"></a>
+<span class="sourceLineNo">150</span>          cacheErrorCount.incrementAndGet();<a name="line.150"></a>
+<span class="sourceLineNo">151</span>        }<a name="line.151"></a>
+<span class="sourceLineNo">152</span>      });<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    } else {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      LOG.debug("Can not cache Cacheables of type {} with key {}", buf.getClass(), cacheKey);<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      notCachedCount.incrementAndGet();<a name="line.155"></a>
+<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
+<span class="sourceLineNo">157</span>  }<a name="line.157"></a>
+<span class="sourceLineNo">158</span><a name="line.158"></a>
+<span class="sourceLineNo">159</span>  @Override<a name="line.159"></a>
+<span class="sourceLineNo">160</span>  public Cacheable getBlock(BlockCacheKey cacheKey, boolean caching, boolean repeat,<a name="line.160"></a>
+<span class="sourceLineNo">161</span>    boolean updateCacheMetrics) {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    // Assume that nothing is the block cache<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    HFileBlock result = null;<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    Span span = TraceUtil.getGlobalTracer().spanBuilder("MemcachedBlockCache.getBlock").startSpan();<a name="line.164"></a>
+<span class="sourceLineNo">165</span>    try (Scope traceScope = span.makeCurrent()) {<a name="line.165"></a>
+<span class="sourceLineNo">166</span>      result = client.get(cacheKey.toString(), tc);<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    } catch (Exception e) {<a name="line.167"></a>
+<span class="sourceLineNo">168</span>      // Catch a pretty broad set of exceptions to limit any changes in the memcache client<a name="line.168"></a>
+<span class="sourceLineNo">169</span>      // and how it handles failures from leaking into the read path.<a name="line.169"></a>
+<span class="sourceLineNo">170</span>      if (<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        (e instanceof OperationTimeoutException) || ((e instanceof RuntimeException)<a name="line.171"></a>
+<span class="sourceLineNo">172</span>          &amp;&amp; (e.getCause() instanceof OperationTimeoutException))<a name="line.172"></a>
+<span class="sourceLineNo">173</span>      ) {<a name="line.173"></a>
+<span class="sourceLineNo">174</span>        timeoutCount.incrementAndGet();<a name="line.174"></a>
+<span class="sourceLineNo">175</span>        if (LOG.isDebugEnabled()) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>          LOG.debug("Timeout getting key " + cacheKey.toString(), e);<a name="line.176"></a>
+<span class="sourceLineNo">177</span>        }<a name="line.177"></a>
+<span class="sourceLineNo">178</span>      } else {<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        cacheErrorCount.incrementAndGet();<a name="line.179"></a>
+<span class="sourceLineNo">180</span>        if (LOG.isDebugEnabled()) {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>          LOG.debug("Exception getting key " + cacheKey.toString(), e);<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        }<a name="line.182"></a>
+<span class="sourceLineNo">183</span>      }<a name="line.183"></a>
+<span class="sourceLineNo">184</span>      result = null;<a name="line.184"></a>
+<span class="sourceLineNo">185</span>    } finally {<a name="line.185"></a>
+<span class="sourceLineNo">186</span>      span.end();<a name="line.186"></a>
+<span class="sourceLineNo">187</span>      if (updateCacheMetrics) {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>        if (result == null) {<a name="line.188"></a>
+<span class="sourceLineNo">189</span>          cacheStats.miss(caching, cacheKey.isPrimary(), cacheKey.getBlockType());<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        } else {<a name="line.190"></a>
+<span class="sourceLineNo">191</span>          cacheStats.hit(caching, cacheKey.isPrimary(), cacheKey.getBlockType());<a name="line.191"></a>
+<span class="sourceLineNo">192</span>        }<a name="line.192"></a>
+<span class="sourceLineNo">193</span>      }<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    }<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    return result;<a name="line.195"></a>
+<span class="sourceLineNo">196</span>  }<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>  @Override<a name="line.198"></a>
+<span class="sourceLineNo">199</span>  public boolean evictBlock(BlockCacheKey cacheKey) {<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    try {<a name="line.200"></a>
+<span class="sourceLineNo">201</span>      cacheStats.evict();<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      return client.delete(cacheKey.toString()).get();<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    } catch (InterruptedException e) {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      LOG.warn("Error deleting " + cacheKey.toString(), e);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      Thread.currentThread().interrupt();<a name="line.205"></a>
+<span class="sourceLineNo">206</span>    } catch (ExecutionException e) {<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      if (LOG.isDebugEnabled()) {<a name="line.207"></a>
+<span class="sourceLineNo">208</span>        LOG.debug("Error deleting " + cacheKey.toString(), e);<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      }<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    }<a name="line.210"></a>
+<span class="sourceLineNo">211</span>    return false;<a name="line.211"></a>
 <span class="sourceLineNo">212</span>  }<a name="line.212"></a>
 <span class="sourceLineNo">213</span><a name="line.213"></a>
-<span class="sourceLineNo">214</span>  @Override<a name="line.214"></a>
-<span class="sourceLineNo">215</span>  public long getCurrentSize() {<a name="line.215"></a>
-<span class="sourceLineNo">216</span>    return 0;<a name="line.216"></a>
-<span class="sourceLineNo">217</span>  }<a name="line.217"></a>
-<span class="sourceLineNo">218</span><a name="line.218"></a>
-<span class="sourceLineNo">219</span>  @Override<a name="line.219"></a>
-<span class="sourceLineNo">220</span>  public long getCurrentDataSize() {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    return 0;<a name="line.221"></a>
-<span class="sourceLineNo">222</span>  }<a name="line.222"></a>
-<span class="sourceLineNo">223</span><a name="line.223"></a>
-<span class="sourceLineNo">224</span>  @Override<a name="line.224"></a>
-<span class="sourceLineNo">225</span>  public long getBlockCount() {<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    return 0;<a name="line.226"></a>
-<span class="sourceLineNo">227</span>  }<a name="line.227"></a>
-<span class="sourceLineNo">228</span><a name="line.228"></a>
-<span class="sourceLineNo">229</span>  @Override<a name="line.229"></a>
-<span class="sourceLineNo">230</span>  public long getDataBlockCount() {<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    return 0;<a name="line.231"></a>
-<span class="sourceLineNo">232</span>  }<a name="line.232"></a>
-<span class="sourceLineNo">233</span><a name="line.233"></a>
-<span class="sourceLineNo">234</span>  @Override<a name="line.234"></a>
-<span class="sourceLineNo">235</span>  public Iterator&lt;CachedBlock&gt; iterator() {<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    return new Iterator&lt;CachedBlock&gt;() {<a name="line.236"></a>
-<span class="sourceLineNo">237</span>      @Override<a name="line.237"></a>
-<span class="sourceLineNo">238</span>      public boolean hasNext() {<a name="line.238"></a>
-<span class="sourceLineNo">239</span>        return false;<a name="line.239"></a>
+<span class="sourceLineNo">214</span>  /**<a name="line.214"></a>
+<span class="sourceLineNo">215</span>   * This method does nothing so that memcached can handle all evictions.<a name="line.215"></a>
+<span class="sourceLineNo">216</span>   */<a name="line.216"></a>
+<span class="sourceLineNo">217</span>  @Override<a name="line.217"></a>
+<span class="sourceLineNo">218</span>  public int evictBlocksByHfileName(String hfileName) {<a name="line.218"></a>
+<span class="sourceLineNo">219</span>    return 0;<a name="line.219"></a>
+<span class="sourceLineNo">220</span>  }<a name="line.220"></a>
+<span class="sourceLineNo">221</span><a name="line.221"></a>
+<span class="sourceLineNo">222</span>  @Override<a name="line.222"></a>
+<span class="sourceLineNo">223</span>  public CacheStats getStats() {<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    return cacheStats;<a name="line.224"></a>
+<span class="sourceLineNo">225</span>  }<a name="line.225"></a>
+<span class="sourceLineNo">226</span><a name="line.226"></a>
+<span class="sourceLineNo">227</span>  @Override<a name="line.227"></a>
+<span class="sourceLineNo">228</span>  public void shutdown() {<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    client.shutdown();<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    this.scheduleThreadPool.shutdown();<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    for (int i = 0; i &lt; 10; i++) {<a name="line.231"></a>
+<span class="sourceLineNo">232</span>      if (!this.scheduleThreadPool.isShutdown()) {<a name="line.232"></a>
+<span class="sourceLineNo">233</span>        try {<a name="line.233"></a>
+<span class="sourceLineNo">234</span>          Thread.sleep(10);<a name="line.234"></a>
+<span class="sourceLineNo">235</span>        } catch (InterruptedException e) {<a name="line.235"></a>
+<span class="sourceLineNo">236</span>          LOG.warn("Interrupted while sleeping");<a name="line.236"></a>
+<span class="sourceLineNo">237</span>          Thread.currentThread().interrupt();<a name="line.237"></a>
+<span class="sourceLineNo">238</span>          break;<a name="line.238"></a>
+<span class="sourceLineNo">239</span>        }<a name="line.239"></a>
 <span class="sourceLineNo">240</span>      }<a name="line.240"></a>
-<span class="sourceLineNo">241</span><a name="line.241"></a>
-<span class="sourceLineNo">242</span>      @Override<a name="line.242"></a>
-<span class="sourceLineNo">243</span>      public CachedBlock next() {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>        throw new NoSuchElementException("MemcachedBlockCache can't iterate over blocks.");<a name="line.244"></a>
-<span class="sourceLineNo">245</span>      }<a name="line.245"></a>
-<span class="sourceLineNo">246</span><a name="line.246"></a>
-<span class="sourceLineNo">247</span>      @Override<a name="line.247"></a>
-<span class="sourceLineNo">248</span>      public void remove() {<a name="line.248"></a>
-<span class="sourceLineNo">249</span><a name="line.249"></a>
-<span class="sourceLineNo">250</span>      }<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    };<a name="line.251"></a>
-<span class="sourceLineNo">252</span>  }<a name="line.252"></a>
-<span class="sourceLineNo">253</span><a name="line.253"></a>
-<span class="sourceLineNo">254</span>  @Override<a name="line.254"></a>
-<span class="sourceLineNo">255</span>  public BlockCache[] getBlockCaches() {<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    return null;<a name="line.256"></a>
-<span class="sourceLineNo">257</span>  }<a name="line.257"></a>
-<span class="sourceLineNo">258</span><a name="line.258"></a>
-<span class="sourceLineNo">259</span>  /**<a name="line.259"></a>
-<span class="sourceLineNo">260</span>   * Class to encode and decode an HFileBlock to and from memecached's resulting byte arrays.<a name="line.260"></a>
-<span class="sourceLineNo">261</span>   */<a name="line.261"></a>
-<span class="sourceLineNo">262</span>  private static class HFileBlockTranscoder implements Transcoder&lt;HFileBlock&gt; {<a name="line.262"></a>
-<span class="sourceLineNo">263</span><a name="line.263"></a>
-<span class="sourceLineNo">264</span>    @Override<a name="line.264"></a>
-<span class="sourceLineNo">265</span>    public boolean asyncDecode(CachedData d) {<a name="line.265"></a>
-<span class="sourceLineNo">266</span>      return false;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>    }<a name="line.267"></a>
-<span class="sourceLineNo">268</span><a name="line.268"></a>
-<span class="sourceLineNo">269</span>    @Override<a name="line.269"></a>
-<span class="sourceLineNo">270</span>    public CachedData encode(HFileBlock block) {<a name="line.270"></a>
-<span class="sourceLineNo">271</span>      ByteBuffer bb = ByteBuffer.allocate(block.getSerializedLength());<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      block.serialize(bb, true);<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      return new CachedData(0, bb.array(), CachedData.MAX_SIZE);<a name="line.273"></a>
-<span class="sourceLineNo">274</span>    }<a name="line.274"></a>
-<span class="sourceLineNo">275</span><a name="line.275"></a>
-<span class="sourceLineNo">276</span>    @Override<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    public HFileBlock decode(CachedData d) {<a name="line.277"></a>
-<span class="sourceLineNo">278</span>      try {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>        ByteBuff buf = new SingleByteBuff(ByteBuffer.wrap(d.getData()));<a name="line.279"></a>
-<span class="sourceLineNo">280</span>        return (HFileBlock) HFileBlock.BLOCK_DESERIALIZER.deserialize(buf, ByteBuffAllocator.HEAP);<a name="line.280"></a>
-<span class="sourceLineNo">281</span>      } catch (IOException e) {<a name="line.281"></a>
-<span class="sourceLineNo">282</span>        LOG.warn("Failed to deserialize data from memcached", e);<a name="line.282"></a>
-<span class="sourceLineNo">283</span>      }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      return null;<a name="line.284"></a>
-<span class="sourceLineNo">285</span>    }<a name="line.285"></a>
-<span class="sourceLineNo">286</span><a name="line.286"></a>
-<span class="sourceLineNo">287</span>    @Override<a name="line.287"></a>
-<span class="sourceLineNo">288</span>    public int getMaxSize() {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>      return MAX_SIZE;<a name="line.289"></a>
-<span class="sourceLineNo">290</span>    }<a name="line.290"></a>
-<span class="sourceLineNo">291</span>  }<a name="line.291"></a>
-<span class="sourceLineNo">292</span>}<a name="line.292"></a>
+<span class="sourceLineNo">241</span>    }<a name="line.241"></a>
+<span class="sourceLineNo">242</span>    if (!this.scheduleThreadPool.isShutdown()) {<a name="line.242"></a>
+<span class="sourceLineNo">243</span>      List&lt;Runnable&gt; runnables = this.scheduleThreadPool.shutdownNow();<a name="line.243"></a>
+<span class="sourceLineNo">244</span>      LOG.debug("Still running " + runnables);<a name="line.244"></a>
+<span class="sourceLineNo">245</span>    }<a name="line.245"></a>
+<span class="sourceLineNo">246</span>  }<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>  @Override<a name="line.248"></a>
+<span class="sourceLineNo">249</span>  public long size() {<a name="line.249"></a>
+<span class="sourceLineNo">250</span>    return 0;<a name="line.250"></a>
+<span class="sourceLineNo">251</span>  }<a name="line.251"></a>
+<span class="sourceLineNo">252</span><a name="line.252"></a>
+<span class="sourceLineNo">253</span>  @Override<a name="line.253"></a>
+<span class="sourceLineNo">254</span>  public long getMaxSize() {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    return 0;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>  }<a name="line.256"></a>
+<span class="sourceLineNo">257</span><a name="line.257"></a>
+<span class="sourceLineNo">258</span>  @Override<a name="line.258"></a>
+<span class="sourceLineNo">259</span>  public long getFreeSize() {<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    return 0;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>  }<a name="line.261"></a>
+<span class="sourceLineNo">262</span><a name="line.262"></a>
+<span class="sourceLineNo">263</span>  @Override<a name="line.263"></a>
+<span class="sourceLineNo">264</span>  public long getCurrentSize() {<a name="line.264"></a>
+<span class="sourceLineNo">265</span>    return 0;<a name="line.265"></a>
+<span class="sourceLineNo">266</span>  }<a name="line.266"></a>
+<span class="sourceLineNo">267</span><a name="line.267"></a>
+<span class="sourceLineNo">268</span>  @Override<a name="line.268"></a>
+<span class="sourceLineNo">269</span>  public long getCurrentDataSize() {<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    return 0;<a name="line.270"></a>
+<span class="sourceLineNo">271</span>  }<a name="line.271"></a>
+<span class="sourceLineNo">272</span><a name="line.272"></a>
+<span class="sourceLineNo">273</span>  @Override<a name="line.273"></a>
+<span class="sourceLineNo">274</span>  public long getBlockCount() {<a name="line.274"></a>
+<span class="sourceLineNo">275</span>    return 0;<a name="line.275"></a>
+<span class="sourceLineNo">276</span>  }<a name="line.276"></a>
+<span class="sourceLineNo">277</span><a name="line.277"></a>
+<span class="sourceLineNo">278</span>  @Override<a name="line.278"></a>
+<span class="sourceLineNo">279</span>  public long getDataBlockCount() {<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    return 0;<a name="line.280"></a>
+<span class="sourceLineNo">281</span>  }<a name="line.281"></a>
+<span class="sourceLineNo">282</span><a name="line.282"></a>
+<span class="sourceLineNo">283</span>  @Override<a name="line.283"></a>
+<span class="sourceLineNo">284</span>  public Iterator&lt;CachedBlock&gt; iterator() {<a name="line.284"></a>
+<span class="sourceLineNo">285</span>    return new Iterator&lt;CachedBlock&gt;() {<a name="line.285"></a>
+<span class="sourceLineNo">286</span>      @Override<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      public boolean hasNext() {<a name="line.287"></a>
+<span class="sourceLineNo">288</span>        return false;<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      }<a name="line.289"></a>
+<span class="sourceLineNo">290</span><a name="line.290"></a>
+<span class="sourceLineNo">291</span>      @Override<a name="line.291"></a>
+<span class="sourceLineNo">292</span>      public CachedBlock next() {<a name="line.292"></a>
+<span class="sourceLineNo">293</span>        throw new NoSuchElementException("MemcachedBlockCache can't iterate over blocks.");<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      }<a name="line.294"></a>
+<span class="sourceLineNo">295</span><a name="line.295"></a>
+<span class="sourceLineNo">296</span>      @Override<a name="line.296"></a>
+<span class="sourceLineNo">297</span>      public void remove() {<a name="line.297"></a>
+<span class="sourceLineNo">298</span><a name="line.298"></a>
+<span class="sourceLineNo">299</span>      }<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    };<a name="line.300"></a>
+<span class="sourceLineNo">301</span>  }<a name="line.301"></a>
+<span class="sourceLineNo">302</span><a name="line.302"></a>
+<span class="sourceLineNo">303</span>  @Override<a name="line.303"></a>
+<span class="sourceLineNo">304</span>  public BlockCache[] getBlockCaches() {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>    return null;<a name="line.305"></a>
+<span class="sourceLineNo">306</span>  }<a name="line.306"></a>
+<span class="sourceLineNo">307</span><a name="line.307"></a>
+<span class="sourceLineNo">308</span>  /**<a name="line.308"></a>
+<span class="sourceLineNo">309</span>   * Class to encode and decode an HFileBlock to and from memecached's resulting byte arrays.<a name="line.309"></a>
+<span class="sourceLineNo">310</span>   */<a name="line.310"></a>
+<span class="sourceLineNo">311</span>  private static class HFileBlockTranscoder implements Transcoder&lt;HFileBlock&gt; {<a name="line.311"></a>
+<span class="sourceLineNo">312</span><a name="line.312"></a>
+<span class="sourceLineNo">313</span>    @Override<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    public boolean asyncDecode(CachedData d) {<a name="line.314"></a>
+<span class="sourceLineNo">315</span>      return false;<a name="line.315"></a>
+<span class="sourceLineNo">316</span>    }<a name="line.316"></a>
+<span class="sourceLineNo">317</span><a name="line.317"></a>
+<span class="sourceLineNo">318</span>    @Override<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    public CachedData encode(HFileBlock block) {<a name="line.319"></a>
+<span class="sourceLineNo">320</span>      ByteBuffer bb = ByteBuffer.allocate(block.getSerializedLength());<a name="line.320"></a>
+<span class="sourceLineNo">321</span>      block.serialize(bb, true);<a name="line.321"></a>
+<span class="sourceLineNo">322</span>      return new CachedData(0, bb.array(), CachedData.MAX_SIZE);<a name="line.322"></a>
+<span class="sourceLineNo">323</span>    }<a name="line.323"></a>
+<span class="sourceLineNo">324</span><a name="line.324"></a>
+<span class="sourceLineNo">325</span>    @Override<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    public HFileBlock decode(CachedData d) {<a name="line.326"></a>
+<span class="sourceLineNo">327</span>      try {<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        ByteBuff buf = new SingleByteBuff(ByteBuffer.wrap(d.getData()));<a name="line.328"></a>
+<span class="sourceLineNo">329</span>        return (HFileBlock) HFileBlock.BLOCK_DESERIALIZER.deserialize(buf, ByteBuffAllocator.HEAP);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>      } catch (IOException e) {<a name="line.330"></a>
+<span class="sourceLineNo">331</span>        LOG.warn("Failed to deserialize data from memcached", e);<a name="line.331"></a>
+<span class="sourceLineNo">332</span>      }<a name="line.332"></a>
+<span class="sourceLineNo">333</span>      return null;<a name="line.333"></a>
+<span class="sourceLineNo">334</span>    }<a name="line.334"></a>
+<span class="sourceLineNo">335</span><a name="line.335"></a>
+<span class="sourceLineNo">336</span>    @Override<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    public int getMaxSize() {<a name="line.337"></a>
+<span class="sourceLineNo">338</span>      return MAX_SIZE;<a name="line.338"></a>
+<span class="sourceLineNo">339</span>    }<a name="line.339"></a>
+<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
+<span class="sourceLineNo">341</span><a name="line.341"></a>
+<span class="sourceLineNo">342</span>  private static class StatisticsThread extends Thread {<a name="line.342"></a>
+<span class="sourceLineNo">343</span><a name="line.343"></a>
+<span class="sourceLineNo">344</span>    private final MemcachedBlockCache c;<a name="line.344"></a>
+<span class="sourceLineNo">345</span><a name="line.345"></a>
+<span class="sourceLineNo">346</span>    public StatisticsThread(MemcachedBlockCache c) {<a name="line.346"></a>
+<span class="sourceLineNo">347</span>      super("MemcachedBlockCacheStats");<a name="line.347"></a>
+<span class="sourceLineNo">348</span>      setDaemon(true);<a name="line.348"></a>
+<span class="sourceLineNo">349</span>      this.c = c;<a name="line.349"></a>
+<span class="sourceLineNo">350</span>    }<a name="line.350"></a>
+<span class="sourceLineNo">351</span><a name="line.351"></a>
+<span class="sourceLineNo">352</span>    @Override<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    public void run() {<a name="line.353"></a>
+<span class="sourceLineNo">354</span>      c.logStats();<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    }<a name="line.355"></a>
+<span class="sourceLineNo">356</span><a name="line.356"></a>
+<span class="sourceLineNo">357</span>  }<a name="line.357"></a>
+<span class="sourceLineNo">358</span><a name="line.358"></a>
+<span class="sourceLineNo">359</span>  public void logStats() {<a name="line.359"></a>
+<span class="sourceLineNo">360</span>    LOG.info("cached=" + cachedCount.get() + ", notCached=" + notCachedCount.get()<a name="line.360"></a>
+<span class="sourceLineNo">361</span>      + ", cacheErrors=" + cacheErrorCount.get() + ", timeouts=" + timeoutCount.get() + ", reads="<a name="line.361"></a>
+<span class="sourceLineNo">362</span>      + cacheStats.getRequestCount() + ", " + "hits=" + cacheStats.getHitCount() + ", hitRatio="<a name="line.362"></a>
+<span class="sourceLineNo">363</span>      + (cacheStats.getHitCount() == 0<a name="line.363"></a>
+<span class="sourceLineNo">364</span>        ? "0"<a name="line.364"></a>
+<span class="sourceLineNo">365</span>        : (StringUtils.formatPercent(cacheStats.getHitRatio(), 2) + ", "))<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      + "cachingAccesses=" + cacheStats.getRequestCachingCount() + ", " + "cachingHits="<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      + cacheStats.getHitCachingCount() + ", " + "cachingHitsRatio="<a name="line.367"></a>
+<span class="sourceLineNo">368</span>      + (cacheStats.getHitCachingCount() == 0<a name="line.368"></a>
+<span class="sourceLineNo">369</span>        ? "0,"<a name="line.369"></a>
+<span class="sourceLineNo">370</span>        : (StringUtils.formatPercent(cacheStats.getHitCachingRatio(), 2) + ", "))<a name="line.370"></a>
+<span class="sourceLineNo">371</span>      + "evictions=" + cacheStats.getEvictionCount() + ", " + "evicted="<a name="line.371"></a>
+<span class="sourceLineNo">372</span>      + cacheStats.getEvictedCount() + ", " + "evictedPerRun=" + cacheStats.evictedPerEviction());<a name="line.372"></a>
+<span class="sourceLineNo">373</span>  }<a name="line.373"></a>
+<span class="sourceLineNo">374</span><a name="line.374"></a>
+<span class="sourceLineNo">375</span>}<a name="line.375"></a>
 
 
 
