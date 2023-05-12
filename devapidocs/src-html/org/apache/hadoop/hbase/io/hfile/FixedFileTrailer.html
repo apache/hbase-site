@@ -35,667 +35,675 @@
 <span class="sourceLineNo">027</span>import org.apache.hadoop.fs.FSDataInputStream;<a name="line.27"></a>
 <span class="sourceLineNo">028</span>import org.apache.hadoop.hbase.CellComparator;<a name="line.28"></a>
 <span class="sourceLineNo">029</span>import org.apache.hadoop.hbase.CellComparatorImpl;<a name="line.29"></a>
-<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.30"></a>
-<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.MetaCellComparator;<a name="line.31"></a>
-<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.io.compress.Compression;<a name="line.32"></a>
-<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.33"></a>
-<span class="sourceLineNo">034</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.34"></a>
-<span class="sourceLineNo">035</span>import org.slf4j.Logger;<a name="line.35"></a>
-<span class="sourceLineNo">036</span>import org.slf4j.LoggerFactory;<a name="line.36"></a>
-<span class="sourceLineNo">037</span><a name="line.37"></a>
-<span class="sourceLineNo">038</span>import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;<a name="line.38"></a>
-<span class="sourceLineNo">039</span><a name="line.39"></a>
-<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.HFileProtos;<a name="line.40"></a>
-<span class="sourceLineNo">041</span><a name="line.41"></a>
-<span class="sourceLineNo">042</span>/**<a name="line.42"></a>
-<span class="sourceLineNo">043</span> * The {@link HFile} has a fixed trailer which contains offsets to other variable parts of the file.<a name="line.43"></a>
-<span class="sourceLineNo">044</span> * Also includes basic metadata on this file. The trailer size is fixed within a given {@link HFile}<a name="line.44"></a>
-<span class="sourceLineNo">045</span> * format version only, but we always store the version number as the last four-byte integer of the<a name="line.45"></a>
-<span class="sourceLineNo">046</span> * file. The version number itself is split into two portions, a major version and a minor version.<a name="line.46"></a>
-<span class="sourceLineNo">047</span> * The last three bytes of a file are the major version and a single preceding byte is the minor<a name="line.47"></a>
-<span class="sourceLineNo">048</span> * number. The major version determines which readers/writers to use to read/write a hfile while a<a name="line.48"></a>
-<span class="sourceLineNo">049</span> * minor version determines smaller changes in hfile format that do not need a new reader/writer<a name="line.49"></a>
-<span class="sourceLineNo">050</span> * type.<a name="line.50"></a>
-<span class="sourceLineNo">051</span> */<a name="line.51"></a>
-<span class="sourceLineNo">052</span>@InterfaceAudience.Private<a name="line.52"></a>
-<span class="sourceLineNo">053</span>public class FixedFileTrailer {<a name="line.53"></a>
-<span class="sourceLineNo">054</span>  private static final Logger LOG = LoggerFactory.getLogger(FixedFileTrailer.class);<a name="line.54"></a>
-<span class="sourceLineNo">055</span><a name="line.55"></a>
-<span class="sourceLineNo">056</span>  /**<a name="line.56"></a>
-<span class="sourceLineNo">057</span>   * We store the comparator class name as a fixed-length field in the trailer.<a name="line.57"></a>
-<span class="sourceLineNo">058</span>   */<a name="line.58"></a>
-<span class="sourceLineNo">059</span>  private static final int MAX_COMPARATOR_NAME_LENGTH = 128;<a name="line.59"></a>
-<span class="sourceLineNo">060</span><a name="line.60"></a>
-<span class="sourceLineNo">061</span>  /**<a name="line.61"></a>
-<span class="sourceLineNo">062</span>   * Offset to the fileinfo data, a small block of vitals. Necessary in v1 but only potentially<a name="line.62"></a>
-<span class="sourceLineNo">063</span>   * useful for pretty-printing in v2.<a name="line.63"></a>
-<span class="sourceLineNo">064</span>   */<a name="line.64"></a>
-<span class="sourceLineNo">065</span>  private long fileInfoOffset;<a name="line.65"></a>
-<span class="sourceLineNo">066</span><a name="line.66"></a>
-<span class="sourceLineNo">067</span>  /**<a name="line.67"></a>
-<span class="sourceLineNo">068</span>   * In version 1, the offset to the data block index. Starting from version 2, the meaning of this<a name="line.68"></a>
-<span class="sourceLineNo">069</span>   * field is the offset to the section of the file that should be loaded at the time the file is<a name="line.69"></a>
-<span class="sourceLineNo">070</span>   * being opened: i.e. on open we load the root index, file info, etc. See<a name="line.70"></a>
-<span class="sourceLineNo">071</span>   * http://hbase.apache.org/book.html#_hfile_format_2 in the reference guide.<a name="line.71"></a>
-<span class="sourceLineNo">072</span>   */<a name="line.72"></a>
-<span class="sourceLineNo">073</span>  private long loadOnOpenDataOffset;<a name="line.73"></a>
-<span class="sourceLineNo">074</span><a name="line.74"></a>
-<span class="sourceLineNo">075</span>  /**<a name="line.75"></a>
-<span class="sourceLineNo">076</span>   * The number of entries in the root data index.<a name="line.76"></a>
-<span class="sourceLineNo">077</span>   */<a name="line.77"></a>
-<span class="sourceLineNo">078</span>  private int dataIndexCount;<a name="line.78"></a>
-<span class="sourceLineNo">079</span><a name="line.79"></a>
-<span class="sourceLineNo">080</span>  /**<a name="line.80"></a>
-<span class="sourceLineNo">081</span>   * Total uncompressed size of all blocks of the data index<a name="line.81"></a>
-<span class="sourceLineNo">082</span>   */<a name="line.82"></a>
-<span class="sourceLineNo">083</span>  private long uncompressedDataIndexSize;<a name="line.83"></a>
-<span class="sourceLineNo">084</span><a name="line.84"></a>
-<span class="sourceLineNo">085</span>  /**<a name="line.85"></a>
-<span class="sourceLineNo">086</span>   * The number of entries in the meta index<a name="line.86"></a>
-<span class="sourceLineNo">087</span>   */<a name="line.87"></a>
-<span class="sourceLineNo">088</span>  private int metaIndexCount;<a name="line.88"></a>
-<span class="sourceLineNo">089</span><a name="line.89"></a>
-<span class="sourceLineNo">090</span>  /**<a name="line.90"></a>
-<span class="sourceLineNo">091</span>   * The total uncompressed size of keys/values stored in the file.<a name="line.91"></a>
-<span class="sourceLineNo">092</span>   */<a name="line.92"></a>
-<span class="sourceLineNo">093</span>  private long totalUncompressedBytes;<a name="line.93"></a>
-<span class="sourceLineNo">094</span><a name="line.94"></a>
-<span class="sourceLineNo">095</span>  /**<a name="line.95"></a>
-<span class="sourceLineNo">096</span>   * The number of key/value pairs in the file. This field was int in version 1, but is now long.<a name="line.96"></a>
-<span class="sourceLineNo">097</span>   */<a name="line.97"></a>
-<span class="sourceLineNo">098</span>  private long entryCount;<a name="line.98"></a>
-<span class="sourceLineNo">099</span><a name="line.99"></a>
-<span class="sourceLineNo">100</span>  /**<a name="line.100"></a>
-<span class="sourceLineNo">101</span>   * The compression codec used for all blocks.<a name="line.101"></a>
-<span class="sourceLineNo">102</span>   */<a name="line.102"></a>
-<span class="sourceLineNo">103</span>  private Compression.Algorithm compressionCodec = Compression.Algorithm.NONE;<a name="line.103"></a>
-<span class="sourceLineNo">104</span><a name="line.104"></a>
-<span class="sourceLineNo">105</span>  /**<a name="line.105"></a>
-<span class="sourceLineNo">106</span>   * The number of levels in the potentially multi-level data index. Used from version 2 onwards.<a name="line.106"></a>
-<span class="sourceLineNo">107</span>   */<a name="line.107"></a>
-<span class="sourceLineNo">108</span>  private int numDataIndexLevels;<a name="line.108"></a>
-<span class="sourceLineNo">109</span><a name="line.109"></a>
-<span class="sourceLineNo">110</span>  /**<a name="line.110"></a>
-<span class="sourceLineNo">111</span>   * The offset of the first data block.<a name="line.111"></a>
-<span class="sourceLineNo">112</span>   */<a name="line.112"></a>
-<span class="sourceLineNo">113</span>  private long firstDataBlockOffset;<a name="line.113"></a>
-<span class="sourceLineNo">114</span><a name="line.114"></a>
-<span class="sourceLineNo">115</span>  /**<a name="line.115"></a>
-<span class="sourceLineNo">116</span>   * It is guaranteed that no key/value data blocks start after this offset in the file.<a name="line.116"></a>
-<span class="sourceLineNo">117</span>   */<a name="line.117"></a>
-<span class="sourceLineNo">118</span>  private long lastDataBlockOffset;<a name="line.118"></a>
-<span class="sourceLineNo">119</span><a name="line.119"></a>
-<span class="sourceLineNo">120</span>  /**<a name="line.120"></a>
-<span class="sourceLineNo">121</span>   * Raw key comparator class name in version 3<a name="line.121"></a>
-<span class="sourceLineNo">122</span>   */<a name="line.122"></a>
-<span class="sourceLineNo">123</span>  // We could write the actual class name from 2.0 onwards and handle BC<a name="line.123"></a>
-<span class="sourceLineNo">124</span>  private String comparatorClassName = CellComparator.getInstance().getClass().getName();<a name="line.124"></a>
-<span class="sourceLineNo">125</span><a name="line.125"></a>
-<span class="sourceLineNo">126</span>  /**<a name="line.126"></a>
-<span class="sourceLineNo">127</span>   * The encryption key<a name="line.127"></a>
-<span class="sourceLineNo">128</span>   */<a name="line.128"></a>
-<span class="sourceLineNo">129</span>  private byte[] encryptionKey;<a name="line.129"></a>
-<span class="sourceLineNo">130</span><a name="line.130"></a>
-<span class="sourceLineNo">131</span>  /**<a name="line.131"></a>
-<span class="sourceLineNo">132</span>   * The {@link HFile} format major version.<a name="line.132"></a>
-<span class="sourceLineNo">133</span>   */<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  private final int majorVersion;<a name="line.134"></a>
-<span class="sourceLineNo">135</span><a name="line.135"></a>
-<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * The {@link HFile} format minor version.<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   */<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  private final int minorVersion;<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>  FixedFileTrailer(int majorVersion, int minorVersion) {<a name="line.141"></a>
-<span class="sourceLineNo">142</span>    this.majorVersion = majorVersion;<a name="line.142"></a>
-<span class="sourceLineNo">143</span>    this.minorVersion = minorVersion;<a name="line.143"></a>
-<span class="sourceLineNo">144</span>    HFile.checkFormatVersion(majorVersion);<a name="line.144"></a>
-<span class="sourceLineNo">145</span>  }<a name="line.145"></a>
-<span class="sourceLineNo">146</span><a name="line.146"></a>
-<span class="sourceLineNo">147</span>  private static int[] computeTrailerSizeByVersion() {<a name="line.147"></a>
-<span class="sourceLineNo">148</span>    int[] versionToSize = new int[HFile.MAX_FORMAT_VERSION + 1];<a name="line.148"></a>
-<span class="sourceLineNo">149</span>    // We support only 2 major versions now. ie. V2, V3<a name="line.149"></a>
-<span class="sourceLineNo">150</span>    versionToSize[2] = 212;<a name="line.150"></a>
-<span class="sourceLineNo">151</span>    for (int version = 3; version &lt;= HFile.MAX_FORMAT_VERSION; version++) {<a name="line.151"></a>
-<span class="sourceLineNo">152</span>      // Max FFT size for V3 and above is taken as 4KB for future enhancements<a name="line.152"></a>
-<span class="sourceLineNo">153</span>      // if any.<a name="line.153"></a>
-<span class="sourceLineNo">154</span>      // Unless the trailer size exceeds 4K this can continue<a name="line.154"></a>
-<span class="sourceLineNo">155</span>      versionToSize[version] = 1024 * 4;<a name="line.155"></a>
-<span class="sourceLineNo">156</span>    }<a name="line.156"></a>
-<span class="sourceLineNo">157</span>    return versionToSize;<a name="line.157"></a>
-<span class="sourceLineNo">158</span>  }<a name="line.158"></a>
-<span class="sourceLineNo">159</span><a name="line.159"></a>
-<span class="sourceLineNo">160</span>  private static int getMaxTrailerSize() {<a name="line.160"></a>
-<span class="sourceLineNo">161</span>    int maxSize = 0;<a name="line.161"></a>
-<span class="sourceLineNo">162</span>    for (int version = HFile.MIN_FORMAT_VERSION; version &lt;= HFile.MAX_FORMAT_VERSION; ++version) {<a name="line.162"></a>
-<span class="sourceLineNo">163</span>      maxSize = Math.max(getTrailerSize(version), maxSize);<a name="line.163"></a>
-<span class="sourceLineNo">164</span>    }<a name="line.164"></a>
-<span class="sourceLineNo">165</span>    return maxSize;<a name="line.165"></a>
-<span class="sourceLineNo">166</span>  }<a name="line.166"></a>
-<span class="sourceLineNo">167</span><a name="line.167"></a>
-<span class="sourceLineNo">168</span>  private static final int[] TRAILER_SIZE = computeTrailerSizeByVersion();<a name="line.168"></a>
-<span class="sourceLineNo">169</span>  private static final int MAX_TRAILER_SIZE = getMaxTrailerSize();<a name="line.169"></a>
-<span class="sourceLineNo">170</span><a name="line.170"></a>
-<span class="sourceLineNo">171</span>  private static final int NOT_PB_SIZE = BlockType.MAGIC_LENGTH + Bytes.SIZEOF_INT;<a name="line.171"></a>
+<span class="sourceLineNo">030</span>import org.apache.hadoop.hbase.InnerStoreCellComparator;<a name="line.30"></a>
+<span class="sourceLineNo">031</span>import org.apache.hadoop.hbase.KeyValue;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import org.apache.hadoop.hbase.MetaCellComparator;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import org.apache.hadoop.hbase.io.compress.Compression;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import org.slf4j.Logger;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import org.slf4j.LoggerFactory;<a name="line.37"></a>
+<span class="sourceLineNo">038</span><a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hbase.thirdparty.com.google.protobuf.UnsafeByteOperations;<a name="line.39"></a>
+<span class="sourceLineNo">040</span><a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.shaded.protobuf.generated.HFileProtos;<a name="line.41"></a>
+<span class="sourceLineNo">042</span><a name="line.42"></a>
+<span class="sourceLineNo">043</span>/**<a name="line.43"></a>
+<span class="sourceLineNo">044</span> * The {@link HFile} has a fixed trailer which contains offsets to other variable parts of the file.<a name="line.44"></a>
+<span class="sourceLineNo">045</span> * Also includes basic metadata on this file. The trailer size is fixed within a given {@link HFile}<a name="line.45"></a>
+<span class="sourceLineNo">046</span> * format version only, but we always store the version number as the last four-byte integer of the<a name="line.46"></a>
+<span class="sourceLineNo">047</span> * file. The version number itself is split into two portions, a major version and a minor version.<a name="line.47"></a>
+<span class="sourceLineNo">048</span> * The last three bytes of a file are the major version and a single preceding byte is the minor<a name="line.48"></a>
+<span class="sourceLineNo">049</span> * number. The major version determines which readers/writers to use to read/write a hfile while a<a name="line.49"></a>
+<span class="sourceLineNo">050</span> * minor version determines smaller changes in hfile format that do not need a new reader/writer<a name="line.50"></a>
+<span class="sourceLineNo">051</span> * type.<a name="line.51"></a>
+<span class="sourceLineNo">052</span> */<a name="line.52"></a>
+<span class="sourceLineNo">053</span>@InterfaceAudience.Private<a name="line.53"></a>
+<span class="sourceLineNo">054</span>public class FixedFileTrailer {<a name="line.54"></a>
+<span class="sourceLineNo">055</span>  private static final Logger LOG = LoggerFactory.getLogger(FixedFileTrailer.class);<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>  /**<a name="line.57"></a>
+<span class="sourceLineNo">058</span>   * We store the comparator class name as a fixed-length field in the trailer.<a name="line.58"></a>
+<span class="sourceLineNo">059</span>   */<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  private static final int MAX_COMPARATOR_NAME_LENGTH = 128;<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  /**<a name="line.62"></a>
+<span class="sourceLineNo">063</span>   * Offset to the fileinfo data, a small block of vitals. Necessary in v1 but only potentially<a name="line.63"></a>
+<span class="sourceLineNo">064</span>   * useful for pretty-printing in v2.<a name="line.64"></a>
+<span class="sourceLineNo">065</span>   */<a name="line.65"></a>
+<span class="sourceLineNo">066</span>  private long fileInfoOffset;<a name="line.66"></a>
+<span class="sourceLineNo">067</span><a name="line.67"></a>
+<span class="sourceLineNo">068</span>  /**<a name="line.68"></a>
+<span class="sourceLineNo">069</span>   * In version 1, the offset to the data block index. Starting from version 2, the meaning of this<a name="line.69"></a>
+<span class="sourceLineNo">070</span>   * field is the offset to the section of the file that should be loaded at the time the file is<a name="line.70"></a>
+<span class="sourceLineNo">071</span>   * being opened: i.e. on open we load the root index, file info, etc. See<a name="line.71"></a>
+<span class="sourceLineNo">072</span>   * http://hbase.apache.org/book.html#_hfile_format_2 in the reference guide.<a name="line.72"></a>
+<span class="sourceLineNo">073</span>   */<a name="line.73"></a>
+<span class="sourceLineNo">074</span>  private long loadOnOpenDataOffset;<a name="line.74"></a>
+<span class="sourceLineNo">075</span><a name="line.75"></a>
+<span class="sourceLineNo">076</span>  /**<a name="line.76"></a>
+<span class="sourceLineNo">077</span>   * The number of entries in the root data index.<a name="line.77"></a>
+<span class="sourceLineNo">078</span>   */<a name="line.78"></a>
+<span class="sourceLineNo">079</span>  private int dataIndexCount;<a name="line.79"></a>
+<span class="sourceLineNo">080</span><a name="line.80"></a>
+<span class="sourceLineNo">081</span>  /**<a name="line.81"></a>
+<span class="sourceLineNo">082</span>   * Total uncompressed size of all blocks of the data index<a name="line.82"></a>
+<span class="sourceLineNo">083</span>   */<a name="line.83"></a>
+<span class="sourceLineNo">084</span>  private long uncompressedDataIndexSize;<a name="line.84"></a>
+<span class="sourceLineNo">085</span><a name="line.85"></a>
+<span class="sourceLineNo">086</span>  /**<a name="line.86"></a>
+<span class="sourceLineNo">087</span>   * The number of entries in the meta index<a name="line.87"></a>
+<span class="sourceLineNo">088</span>   */<a name="line.88"></a>
+<span class="sourceLineNo">089</span>  private int metaIndexCount;<a name="line.89"></a>
+<span class="sourceLineNo">090</span><a name="line.90"></a>
+<span class="sourceLineNo">091</span>  /**<a name="line.91"></a>
+<span class="sourceLineNo">092</span>   * The total uncompressed size of keys/values stored in the file.<a name="line.92"></a>
+<span class="sourceLineNo">093</span>   */<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  private long totalUncompressedBytes;<a name="line.94"></a>
+<span class="sourceLineNo">095</span><a name="line.95"></a>
+<span class="sourceLineNo">096</span>  /**<a name="line.96"></a>
+<span class="sourceLineNo">097</span>   * The number of key/value pairs in the file. This field was int in version 1, but is now long.<a name="line.97"></a>
+<span class="sourceLineNo">098</span>   */<a name="line.98"></a>
+<span class="sourceLineNo">099</span>  private long entryCount;<a name="line.99"></a>
+<span class="sourceLineNo">100</span><a name="line.100"></a>
+<span class="sourceLineNo">101</span>  /**<a name="line.101"></a>
+<span class="sourceLineNo">102</span>   * The compression codec used for all blocks.<a name="line.102"></a>
+<span class="sourceLineNo">103</span>   */<a name="line.103"></a>
+<span class="sourceLineNo">104</span>  private Compression.Algorithm compressionCodec = Compression.Algorithm.NONE;<a name="line.104"></a>
+<span class="sourceLineNo">105</span><a name="line.105"></a>
+<span class="sourceLineNo">106</span>  /**<a name="line.106"></a>
+<span class="sourceLineNo">107</span>   * The number of levels in the potentially multi-level data index. Used from version 2 onwards.<a name="line.107"></a>
+<span class="sourceLineNo">108</span>   */<a name="line.108"></a>
+<span class="sourceLineNo">109</span>  private int numDataIndexLevels;<a name="line.109"></a>
+<span class="sourceLineNo">110</span><a name="line.110"></a>
+<span class="sourceLineNo">111</span>  /**<a name="line.111"></a>
+<span class="sourceLineNo">112</span>   * The offset of the first data block.<a name="line.112"></a>
+<span class="sourceLineNo">113</span>   */<a name="line.113"></a>
+<span class="sourceLineNo">114</span>  private long firstDataBlockOffset;<a name="line.114"></a>
+<span class="sourceLineNo">115</span><a name="line.115"></a>
+<span class="sourceLineNo">116</span>  /**<a name="line.116"></a>
+<span class="sourceLineNo">117</span>   * It is guaranteed that no key/value data blocks start after this offset in the file.<a name="line.117"></a>
+<span class="sourceLineNo">118</span>   */<a name="line.118"></a>
+<span class="sourceLineNo">119</span>  private long lastDataBlockOffset;<a name="line.119"></a>
+<span class="sourceLineNo">120</span><a name="line.120"></a>
+<span class="sourceLineNo">121</span>  /**<a name="line.121"></a>
+<span class="sourceLineNo">122</span>   * Raw key comparator class name in version 3<a name="line.122"></a>
+<span class="sourceLineNo">123</span>   */<a name="line.123"></a>
+<span class="sourceLineNo">124</span>  // We could write the actual class name from 2.0 onwards and handle BC<a name="line.124"></a>
+<span class="sourceLineNo">125</span>  private String comparatorClassName =<a name="line.125"></a>
+<span class="sourceLineNo">126</span>    InnerStoreCellComparator.INNER_STORE_COMPARATOR.getClass().getName();<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  /**<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   * The encryption key<a name="line.129"></a>
+<span class="sourceLineNo">130</span>   */<a name="line.130"></a>
+<span class="sourceLineNo">131</span>  private byte[] encryptionKey;<a name="line.131"></a>
+<span class="sourceLineNo">132</span><a name="line.132"></a>
+<span class="sourceLineNo">133</span>  /**<a name="line.133"></a>
+<span class="sourceLineNo">134</span>   * The {@link HFile} format major version.<a name="line.134"></a>
+<span class="sourceLineNo">135</span>   */<a name="line.135"></a>
+<span class="sourceLineNo">136</span>  private final int majorVersion;<a name="line.136"></a>
+<span class="sourceLineNo">137</span><a name="line.137"></a>
+<span class="sourceLineNo">138</span>  /**<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   * The {@link HFile} format minor version.<a name="line.139"></a>
+<span class="sourceLineNo">140</span>   */<a name="line.140"></a>
+<span class="sourceLineNo">141</span>  private final int minorVersion;<a name="line.141"></a>
+<span class="sourceLineNo">142</span><a name="line.142"></a>
+<span class="sourceLineNo">143</span>  FixedFileTrailer(int majorVersion, int minorVersion) {<a name="line.143"></a>
+<span class="sourceLineNo">144</span>    this.majorVersion = majorVersion;<a name="line.144"></a>
+<span class="sourceLineNo">145</span>    this.minorVersion = minorVersion;<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    HFile.checkFormatVersion(majorVersion);<a name="line.146"></a>
+<span class="sourceLineNo">147</span>  }<a name="line.147"></a>
+<span class="sourceLineNo">148</span><a name="line.148"></a>
+<span class="sourceLineNo">149</span>  private static int[] computeTrailerSizeByVersion() {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    int[] versionToSize = new int[HFile.MAX_FORMAT_VERSION + 1];<a name="line.150"></a>
+<span class="sourceLineNo">151</span>    // We support only 2 major versions now. ie. V2, V3<a name="line.151"></a>
+<span class="sourceLineNo">152</span>    versionToSize[2] = 212;<a name="line.152"></a>
+<span class="sourceLineNo">153</span>    for (int version = 3; version &lt;= HFile.MAX_FORMAT_VERSION; version++) {<a name="line.153"></a>
+<span class="sourceLineNo">154</span>      // Max FFT size for V3 and above is taken as 4KB for future enhancements<a name="line.154"></a>
+<span class="sourceLineNo">155</span>      // if any.<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      // Unless the trailer size exceeds 4K this can continue<a name="line.156"></a>
+<span class="sourceLineNo">157</span>      versionToSize[version] = 1024 * 4;<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    }<a name="line.158"></a>
+<span class="sourceLineNo">159</span>    return versionToSize;<a name="line.159"></a>
+<span class="sourceLineNo">160</span>  }<a name="line.160"></a>
+<span class="sourceLineNo">161</span><a name="line.161"></a>
+<span class="sourceLineNo">162</span>  private static int getMaxTrailerSize() {<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    int maxSize = 0;<a name="line.163"></a>
+<span class="sourceLineNo">164</span>    for (int version = HFile.MIN_FORMAT_VERSION; version &lt;= HFile.MAX_FORMAT_VERSION; ++version) {<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      maxSize = Math.max(getTrailerSize(version), maxSize);<a name="line.165"></a>
+<span class="sourceLineNo">166</span>    }<a name="line.166"></a>
+<span class="sourceLineNo">167</span>    return maxSize;<a name="line.167"></a>
+<span class="sourceLineNo">168</span>  }<a name="line.168"></a>
+<span class="sourceLineNo">169</span><a name="line.169"></a>
+<span class="sourceLineNo">170</span>  private static final int[] TRAILER_SIZE = computeTrailerSizeByVersion();<a name="line.170"></a>
+<span class="sourceLineNo">171</span>  private static final int MAX_TRAILER_SIZE = getMaxTrailerSize();<a name="line.171"></a>
 <span class="sourceLineNo">172</span><a name="line.172"></a>
-<span class="sourceLineNo">173</span>  static int getTrailerSize(int version) {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>    return TRAILER_SIZE[version];<a name="line.174"></a>
-<span class="sourceLineNo">175</span>  }<a name="line.175"></a>
-<span class="sourceLineNo">176</span><a name="line.176"></a>
-<span class="sourceLineNo">177</span>  public int getTrailerSize() {<a name="line.177"></a>
-<span class="sourceLineNo">178</span>    return getTrailerSize(majorVersion);<a name="line.178"></a>
-<span class="sourceLineNo">179</span>  }<a name="line.179"></a>
-<span class="sourceLineNo">180</span><a name="line.180"></a>
-<span class="sourceLineNo">181</span>  /**<a name="line.181"></a>
-<span class="sourceLineNo">182</span>   * Write the trailer to a data stream. We support writing version 1 for testing and for<a name="line.182"></a>
-<span class="sourceLineNo">183</span>   * determining version 1 trailer size. It is also easy to see what fields changed in version 2.<a name="line.183"></a>
-<span class="sourceLineNo">184</span>   */<a name="line.184"></a>
-<span class="sourceLineNo">185</span>  void serialize(DataOutputStream outputStream) throws IOException {<a name="line.185"></a>
-<span class="sourceLineNo">186</span>    HFile.checkFormatVersion(majorVersion);<a name="line.186"></a>
-<span class="sourceLineNo">187</span><a name="line.187"></a>
-<span class="sourceLineNo">188</span>    ByteArrayOutputStream baos = new ByteArrayOutputStream();<a name="line.188"></a>
-<span class="sourceLineNo">189</span>    DataOutputStream baosDos = new DataOutputStream(baos);<a name="line.189"></a>
-<span class="sourceLineNo">190</span><a name="line.190"></a>
-<span class="sourceLineNo">191</span>    BlockType.TRAILER.write(baosDos);<a name="line.191"></a>
-<span class="sourceLineNo">192</span>    serializeAsPB(baosDos);<a name="line.192"></a>
-<span class="sourceLineNo">193</span><a name="line.193"></a>
-<span class="sourceLineNo">194</span>    // The last 4 bytes of the file encode the major and minor version universally<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    baosDos.writeInt(materializeVersion(majorVersion, minorVersion));<a name="line.195"></a>
-<span class="sourceLineNo">196</span><a name="line.196"></a>
-<span class="sourceLineNo">197</span>    baos.writeTo(outputStream);<a name="line.197"></a>
-<span class="sourceLineNo">198</span>  }<a name="line.198"></a>
-<span class="sourceLineNo">199</span><a name="line.199"></a>
-<span class="sourceLineNo">200</span>  HFileProtos.FileTrailerProto toProtobuf() {<a name="line.200"></a>
-<span class="sourceLineNo">201</span>    HFileProtos.FileTrailerProto.Builder builder = HFileProtos.FileTrailerProto.newBuilder()<a name="line.201"></a>
-<span class="sourceLineNo">202</span>      .setFileInfoOffset(fileInfoOffset).setLoadOnOpenDataOffset(loadOnOpenDataOffset)<a name="line.202"></a>
-<span class="sourceLineNo">203</span>      .setUncompressedDataIndexSize(uncompressedDataIndexSize)<a name="line.203"></a>
-<span class="sourceLineNo">204</span>      .setTotalUncompressedBytes(totalUncompressedBytes).setDataIndexCount(dataIndexCount)<a name="line.204"></a>
-<span class="sourceLineNo">205</span>      .setMetaIndexCount(metaIndexCount).setEntryCount(entryCount)<a name="line.205"></a>
-<span class="sourceLineNo">206</span>      .setNumDataIndexLevels(numDataIndexLevels).setFirstDataBlockOffset(firstDataBlockOffset)<a name="line.206"></a>
-<span class="sourceLineNo">207</span>      .setLastDataBlockOffset(lastDataBlockOffset)<a name="line.207"></a>
-<span class="sourceLineNo">208</span>      .setComparatorClassName(getHBase1CompatibleName(comparatorClassName))<a name="line.208"></a>
-<span class="sourceLineNo">209</span>      .setCompressionCodec(compressionCodec.ordinal());<a name="line.209"></a>
-<span class="sourceLineNo">210</span>    if (encryptionKey != null) {<a name="line.210"></a>
-<span class="sourceLineNo">211</span>      builder.setEncryptionKey(UnsafeByteOperations.unsafeWrap(encryptionKey));<a name="line.211"></a>
-<span class="sourceLineNo">212</span>    }<a name="line.212"></a>
-<span class="sourceLineNo">213</span>    return builder.build();<a name="line.213"></a>
-<span class="sourceLineNo">214</span>  }<a name="line.214"></a>
-<span class="sourceLineNo">215</span><a name="line.215"></a>
-<span class="sourceLineNo">216</span>  /**<a name="line.216"></a>
-<span class="sourceLineNo">217</span>   * Write trailer data as protobuf. NOTE: we run a translation on the comparator name and will<a name="line.217"></a>
-<span class="sourceLineNo">218</span>   * serialize the old hbase-1.x where it makes sense. See {@link #getHBase1CompatibleName(String)}.<a name="line.218"></a>
-<span class="sourceLineNo">219</span>   */<a name="line.219"></a>
-<span class="sourceLineNo">220</span>  void serializeAsPB(DataOutputStream output) throws IOException {<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    ByteArrayOutputStream baos = new ByteArrayOutputStream();<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    // We need this extra copy unfortunately to determine the final size of the<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    // delimited output, see use of baos.size() below.<a name="line.223"></a>
-<span class="sourceLineNo">224</span>    toProtobuf().writeDelimitedTo(baos);<a name="line.224"></a>
-<span class="sourceLineNo">225</span>    baos.writeTo(output);<a name="line.225"></a>
-<span class="sourceLineNo">226</span>    // Pad to make up the difference between variable PB encoding length and the<a name="line.226"></a>
-<span class="sourceLineNo">227</span>    // length when encoded as writable under earlier V2 formats. Failure to pad<a name="line.227"></a>
-<span class="sourceLineNo">228</span>    // properly or if the PB encoding is too big would mean the trailer wont be read<a name="line.228"></a>
-<span class="sourceLineNo">229</span>    // in properly by HFile.<a name="line.229"></a>
-<span class="sourceLineNo">230</span>    int padding = getTrailerSize() - NOT_PB_SIZE - baos.size();<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    if (padding &lt; 0) {<a name="line.231"></a>
-<span class="sourceLineNo">232</span>      throw new IOException("Pbuf encoding size exceeded fixed trailer size limit");<a name="line.232"></a>
-<span class="sourceLineNo">233</span>    }<a name="line.233"></a>
-<span class="sourceLineNo">234</span>    for (int i = 0; i &lt; padding; i++) {<a name="line.234"></a>
-<span class="sourceLineNo">235</span>      output.write(0);<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    }<a name="line.236"></a>
-<span class="sourceLineNo">237</span>  }<a name="line.237"></a>
-<span class="sourceLineNo">238</span><a name="line.238"></a>
-<span class="sourceLineNo">239</span>  /**<a name="line.239"></a>
-<span class="sourceLineNo">240</span>   * Deserialize the fixed file trailer from the given stream. The version needs to already be<a name="line.240"></a>
-<span class="sourceLineNo">241</span>   * specified. Make sure this is consistent with {@link #serialize(DataOutputStream)}.<a name="line.241"></a>
-<span class="sourceLineNo">242</span>   */<a name="line.242"></a>
-<span class="sourceLineNo">243</span>  void deserialize(DataInputStream inputStream) throws IOException {<a name="line.243"></a>
-<span class="sourceLineNo">244</span>    HFile.checkFormatVersion(majorVersion);<a name="line.244"></a>
-<span class="sourceLineNo">245</span><a name="line.245"></a>
-<span class="sourceLineNo">246</span>    BlockType.TRAILER.readAndCheck(inputStream);<a name="line.246"></a>
+<span class="sourceLineNo">173</span>  private static final int NOT_PB_SIZE = BlockType.MAGIC_LENGTH + Bytes.SIZEOF_INT;<a name="line.173"></a>
+<span class="sourceLineNo">174</span><a name="line.174"></a>
+<span class="sourceLineNo">175</span>  static int getTrailerSize(int version) {<a name="line.175"></a>
+<span class="sourceLineNo">176</span>    return TRAILER_SIZE[version];<a name="line.176"></a>
+<span class="sourceLineNo">177</span>  }<a name="line.177"></a>
+<span class="sourceLineNo">178</span><a name="line.178"></a>
+<span class="sourceLineNo">179</span>  public int getTrailerSize() {<a name="line.179"></a>
+<span class="sourceLineNo">180</span>    return getTrailerSize(majorVersion);<a name="line.180"></a>
+<span class="sourceLineNo">181</span>  }<a name="line.181"></a>
+<span class="sourceLineNo">182</span><a name="line.182"></a>
+<span class="sourceLineNo">183</span>  /**<a name="line.183"></a>
+<span class="sourceLineNo">184</span>   * Write the trailer to a data stream. We support writing version 1 for testing and for<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   * determining version 1 trailer size. It is also easy to see what fields changed in version 2.<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   */<a name="line.186"></a>
+<span class="sourceLineNo">187</span>  void serialize(DataOutputStream outputStream) throws IOException {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    HFile.checkFormatVersion(majorVersion);<a name="line.188"></a>
+<span class="sourceLineNo">189</span><a name="line.189"></a>
+<span class="sourceLineNo">190</span>    ByteArrayOutputStream baos = new ByteArrayOutputStream();<a name="line.190"></a>
+<span class="sourceLineNo">191</span>    DataOutputStream baosDos = new DataOutputStream(baos);<a name="line.191"></a>
+<span class="sourceLineNo">192</span><a name="line.192"></a>
+<span class="sourceLineNo">193</span>    BlockType.TRAILER.write(baosDos);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>    serializeAsPB(baosDos);<a name="line.194"></a>
+<span class="sourceLineNo">195</span><a name="line.195"></a>
+<span class="sourceLineNo">196</span>    // The last 4 bytes of the file encode the major and minor version universally<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    baosDos.writeInt(materializeVersion(majorVersion, minorVersion));<a name="line.197"></a>
+<span class="sourceLineNo">198</span><a name="line.198"></a>
+<span class="sourceLineNo">199</span>    baos.writeTo(outputStream);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>  }<a name="line.200"></a>
+<span class="sourceLineNo">201</span><a name="line.201"></a>
+<span class="sourceLineNo">202</span>  HFileProtos.FileTrailerProto toProtobuf() {<a name="line.202"></a>
+<span class="sourceLineNo">203</span>    HFileProtos.FileTrailerProto.Builder builder = HFileProtos.FileTrailerProto.newBuilder()<a name="line.203"></a>
+<span class="sourceLineNo">204</span>      .setFileInfoOffset(fileInfoOffset).setLoadOnOpenDataOffset(loadOnOpenDataOffset)<a name="line.204"></a>
+<span class="sourceLineNo">205</span>      .setUncompressedDataIndexSize(uncompressedDataIndexSize)<a name="line.205"></a>
+<span class="sourceLineNo">206</span>      .setTotalUncompressedBytes(totalUncompressedBytes).setDataIndexCount(dataIndexCount)<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      .setMetaIndexCount(metaIndexCount).setEntryCount(entryCount)<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      .setNumDataIndexLevels(numDataIndexLevels).setFirstDataBlockOffset(firstDataBlockOffset)<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      .setLastDataBlockOffset(lastDataBlockOffset)<a name="line.209"></a>
+<span class="sourceLineNo">210</span>      .setComparatorClassName(getHBase1CompatibleName(comparatorClassName))<a name="line.210"></a>
+<span class="sourceLineNo">211</span>      .setCompressionCodec(compressionCodec.ordinal());<a name="line.211"></a>
+<span class="sourceLineNo">212</span>    if (encryptionKey != null) {<a name="line.212"></a>
+<span class="sourceLineNo">213</span>      builder.setEncryptionKey(UnsafeByteOperations.unsafeWrap(encryptionKey));<a name="line.213"></a>
+<span class="sourceLineNo">214</span>    }<a name="line.214"></a>
+<span class="sourceLineNo">215</span>    return builder.build();<a name="line.215"></a>
+<span class="sourceLineNo">216</span>  }<a name="line.216"></a>
+<span class="sourceLineNo">217</span><a name="line.217"></a>
+<span class="sourceLineNo">218</span>  /**<a name="line.218"></a>
+<span class="sourceLineNo">219</span>   * Write trailer data as protobuf. NOTE: we run a translation on the comparator name and will<a name="line.219"></a>
+<span class="sourceLineNo">220</span>   * serialize the old hbase-1.x where it makes sense. See {@link #getHBase1CompatibleName(String)}.<a name="line.220"></a>
+<span class="sourceLineNo">221</span>   */<a name="line.221"></a>
+<span class="sourceLineNo">222</span>  void serializeAsPB(DataOutputStream output) throws IOException {<a name="line.222"></a>
+<span class="sourceLineNo">223</span>    ByteArrayOutputStream baos = new ByteArrayOutputStream();<a name="line.223"></a>
+<span class="sourceLineNo">224</span>    // We need this extra copy unfortunately to determine the final size of the<a name="line.224"></a>
+<span class="sourceLineNo">225</span>    // delimited output, see use of baos.size() below.<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    toProtobuf().writeDelimitedTo(baos);<a name="line.226"></a>
+<span class="sourceLineNo">227</span>    baos.writeTo(output);<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    // Pad to make up the difference between variable PB encoding length and the<a name="line.228"></a>
+<span class="sourceLineNo">229</span>    // length when encoded as writable under earlier V2 formats. Failure to pad<a name="line.229"></a>
+<span class="sourceLineNo">230</span>    // properly or if the PB encoding is too big would mean the trailer wont be read<a name="line.230"></a>
+<span class="sourceLineNo">231</span>    // in properly by HFile.<a name="line.231"></a>
+<span class="sourceLineNo">232</span>    int padding = getTrailerSize() - NOT_PB_SIZE - baos.size();<a name="line.232"></a>
+<span class="sourceLineNo">233</span>    if (padding &lt; 0) {<a name="line.233"></a>
+<span class="sourceLineNo">234</span>      throw new IOException("Pbuf encoding size exceeded fixed trailer size limit");<a name="line.234"></a>
+<span class="sourceLineNo">235</span>    }<a name="line.235"></a>
+<span class="sourceLineNo">236</span>    for (int i = 0; i &lt; padding; i++) {<a name="line.236"></a>
+<span class="sourceLineNo">237</span>      output.write(0);<a name="line.237"></a>
+<span class="sourceLineNo">238</span>    }<a name="line.238"></a>
+<span class="sourceLineNo">239</span>  }<a name="line.239"></a>
+<span class="sourceLineNo">240</span><a name="line.240"></a>
+<span class="sourceLineNo">241</span>  /**<a name="line.241"></a>
+<span class="sourceLineNo">242</span>   * Deserialize the fixed file trailer from the given stream. The version needs to already be<a name="line.242"></a>
+<span class="sourceLineNo">243</span>   * specified. Make sure this is consistent with {@link #serialize(DataOutputStream)}.<a name="line.243"></a>
+<span class="sourceLineNo">244</span>   */<a name="line.244"></a>
+<span class="sourceLineNo">245</span>  void deserialize(DataInputStream inputStream) throws IOException {<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    HFile.checkFormatVersion(majorVersion);<a name="line.246"></a>
 <span class="sourceLineNo">247</span><a name="line.247"></a>
-<span class="sourceLineNo">248</span>    if (<a name="line.248"></a>
-<span class="sourceLineNo">249</span>      majorVersion &gt; 2<a name="line.249"></a>
-<span class="sourceLineNo">250</span>        || (majorVersion == 2 &amp;&amp; minorVersion &gt;= HFileReaderImpl.PBUF_TRAILER_MINOR_VERSION)<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    ) {<a name="line.251"></a>
-<span class="sourceLineNo">252</span>      deserializeFromPB(inputStream);<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    } else {<a name="line.253"></a>
-<span class="sourceLineNo">254</span>      deserializeFromWritable(inputStream);<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    }<a name="line.255"></a>
-<span class="sourceLineNo">256</span><a name="line.256"></a>
-<span class="sourceLineNo">257</span>    // The last 4 bytes of the file encode the major and minor version universally<a name="line.257"></a>
-<span class="sourceLineNo">258</span>    int version = inputStream.readInt();<a name="line.258"></a>
-<span class="sourceLineNo">259</span>    expectMajorVersion(extractMajorVersion(version));<a name="line.259"></a>
-<span class="sourceLineNo">260</span>    expectMinorVersion(extractMinorVersion(version));<a name="line.260"></a>
-<span class="sourceLineNo">261</span>  }<a name="line.261"></a>
-<span class="sourceLineNo">262</span><a name="line.262"></a>
-<span class="sourceLineNo">263</span>  /**<a name="line.263"></a>
-<span class="sourceLineNo">264</span>   * Deserialize the file trailer as protobuf<a name="line.264"></a>
-<span class="sourceLineNo">265</span>   */<a name="line.265"></a>
-<span class="sourceLineNo">266</span>  void deserializeFromPB(DataInputStream inputStream) throws IOException {<a name="line.266"></a>
-<span class="sourceLineNo">267</span>    // read PB and skip padding<a name="line.267"></a>
-<span class="sourceLineNo">268</span>    int start = inputStream.available();<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    HFileProtos.FileTrailerProto trailerProto =<a name="line.269"></a>
-<span class="sourceLineNo">270</span>      HFileProtos.FileTrailerProto.PARSER.parseDelimitedFrom(inputStream);<a name="line.270"></a>
-<span class="sourceLineNo">271</span>    int size = start - inputStream.available();<a name="line.271"></a>
-<span class="sourceLineNo">272</span>    inputStream.skip(getTrailerSize() - NOT_PB_SIZE - size);<a name="line.272"></a>
-<span class="sourceLineNo">273</span><a name="line.273"></a>
-<span class="sourceLineNo">274</span>    // process the PB<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    if (trailerProto.hasFileInfoOffset()) {<a name="line.275"></a>
-<span class="sourceLineNo">276</span>      fileInfoOffset = trailerProto.getFileInfoOffset();<a name="line.276"></a>
-<span class="sourceLineNo">277</span>    }<a name="line.277"></a>
-<span class="sourceLineNo">278</span>    if (trailerProto.hasLoadOnOpenDataOffset()) {<a name="line.278"></a>
-<span class="sourceLineNo">279</span>      loadOnOpenDataOffset = trailerProto.getLoadOnOpenDataOffset();<a name="line.279"></a>
-<span class="sourceLineNo">280</span>    }<a name="line.280"></a>
-<span class="sourceLineNo">281</span>    if (trailerProto.hasUncompressedDataIndexSize()) {<a name="line.281"></a>
-<span class="sourceLineNo">282</span>      uncompressedDataIndexSize = trailerProto.getUncompressedDataIndexSize();<a name="line.282"></a>
-<span class="sourceLineNo">283</span>    }<a name="line.283"></a>
-<span class="sourceLineNo">284</span>    if (trailerProto.hasTotalUncompressedBytes()) {<a name="line.284"></a>
-<span class="sourceLineNo">285</span>      totalUncompressedBytes = trailerProto.getTotalUncompressedBytes();<a name="line.285"></a>
-<span class="sourceLineNo">286</span>    }<a name="line.286"></a>
-<span class="sourceLineNo">287</span>    if (trailerProto.hasDataIndexCount()) {<a name="line.287"></a>
-<span class="sourceLineNo">288</span>      dataIndexCount = trailerProto.getDataIndexCount();<a name="line.288"></a>
-<span class="sourceLineNo">289</span>    }<a name="line.289"></a>
-<span class="sourceLineNo">290</span>    if (trailerProto.hasMetaIndexCount()) {<a name="line.290"></a>
-<span class="sourceLineNo">291</span>      metaIndexCount = trailerProto.getMetaIndexCount();<a name="line.291"></a>
-<span class="sourceLineNo">292</span>    }<a name="line.292"></a>
-<span class="sourceLineNo">293</span>    if (trailerProto.hasEntryCount()) {<a name="line.293"></a>
-<span class="sourceLineNo">294</span>      entryCount = trailerProto.getEntryCount();<a name="line.294"></a>
-<span class="sourceLineNo">295</span>    }<a name="line.295"></a>
-<span class="sourceLineNo">296</span>    if (trailerProto.hasNumDataIndexLevels()) {<a name="line.296"></a>
-<span class="sourceLineNo">297</span>      numDataIndexLevels = trailerProto.getNumDataIndexLevels();<a name="line.297"></a>
-<span class="sourceLineNo">298</span>    }<a name="line.298"></a>
-<span class="sourceLineNo">299</span>    if (trailerProto.hasFirstDataBlockOffset()) {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>      firstDataBlockOffset = trailerProto.getFirstDataBlockOffset();<a name="line.300"></a>
-<span class="sourceLineNo">301</span>    }<a name="line.301"></a>
-<span class="sourceLineNo">302</span>    if (trailerProto.hasLastDataBlockOffset()) {<a name="line.302"></a>
-<span class="sourceLineNo">303</span>      lastDataBlockOffset = trailerProto.getLastDataBlockOffset();<a name="line.303"></a>
-<span class="sourceLineNo">304</span>    }<a name="line.304"></a>
-<span class="sourceLineNo">305</span>    if (trailerProto.hasComparatorClassName()) {<a name="line.305"></a>
-<span class="sourceLineNo">306</span>      setComparatorClass(getComparatorClass(trailerProto.getComparatorClassName()));<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    }<a name="line.307"></a>
-<span class="sourceLineNo">308</span>    if (trailerProto.hasCompressionCodec()) {<a name="line.308"></a>
-<span class="sourceLineNo">309</span>      compressionCodec = Compression.Algorithm.values()[trailerProto.getCompressionCodec()];<a name="line.309"></a>
-<span class="sourceLineNo">310</span>    } else {<a name="line.310"></a>
-<span class="sourceLineNo">311</span>      compressionCodec = Compression.Algorithm.NONE;<a name="line.311"></a>
-<span class="sourceLineNo">312</span>    }<a name="line.312"></a>
-<span class="sourceLineNo">313</span>    if (trailerProto.hasEncryptionKey()) {<a name="line.313"></a>
-<span class="sourceLineNo">314</span>      encryptionKey = trailerProto.getEncryptionKey().toByteArray();<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    }<a name="line.315"></a>
-<span class="sourceLineNo">316</span>  }<a name="line.316"></a>
-<span class="sourceLineNo">317</span><a name="line.317"></a>
-<span class="sourceLineNo">318</span>  /**<a name="line.318"></a>
-<span class="sourceLineNo">319</span>   * Deserialize the file trailer as writable data<a name="line.319"></a>
-<span class="sourceLineNo">320</span>   */<a name="line.320"></a>
-<span class="sourceLineNo">321</span>  void deserializeFromWritable(DataInput input) throws IOException {<a name="line.321"></a>
-<span class="sourceLineNo">322</span>    fileInfoOffset = input.readLong();<a name="line.322"></a>
-<span class="sourceLineNo">323</span>    loadOnOpenDataOffset = input.readLong();<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    dataIndexCount = input.readInt();<a name="line.324"></a>
-<span class="sourceLineNo">325</span>    uncompressedDataIndexSize = input.readLong();<a name="line.325"></a>
-<span class="sourceLineNo">326</span>    metaIndexCount = input.readInt();<a name="line.326"></a>
-<span class="sourceLineNo">327</span><a name="line.327"></a>
-<span class="sourceLineNo">328</span>    totalUncompressedBytes = input.readLong();<a name="line.328"></a>
-<span class="sourceLineNo">329</span>    entryCount = input.readLong();<a name="line.329"></a>
-<span class="sourceLineNo">330</span>    compressionCodec = Compression.Algorithm.values()[input.readInt()];<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    numDataIndexLevels = input.readInt();<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    firstDataBlockOffset = input.readLong();<a name="line.332"></a>
-<span class="sourceLineNo">333</span>    lastDataBlockOffset = input.readLong();<a name="line.333"></a>
-<span class="sourceLineNo">334</span>    // TODO this is a classname encoded into an HFile's trailer. We are going to need to have<a name="line.334"></a>
-<span class="sourceLineNo">335</span>    // some compat code here.<a name="line.335"></a>
-<span class="sourceLineNo">336</span>    setComparatorClass(<a name="line.336"></a>
-<span class="sourceLineNo">337</span>      getComparatorClass(Bytes.readStringFixedSize(input, MAX_COMPARATOR_NAME_LENGTH)));<a name="line.337"></a>
-<span class="sourceLineNo">338</span>  }<a name="line.338"></a>
-<span class="sourceLineNo">339</span><a name="line.339"></a>
-<span class="sourceLineNo">340</span>  private void append(StringBuilder sb, String s) {<a name="line.340"></a>
-<span class="sourceLineNo">341</span>    if (sb.length() &gt; 0) {<a name="line.341"></a>
-<span class="sourceLineNo">342</span>      sb.append(", ");<a name="line.342"></a>
-<span class="sourceLineNo">343</span>    }<a name="line.343"></a>
-<span class="sourceLineNo">344</span>    sb.append(s);<a name="line.344"></a>
-<span class="sourceLineNo">345</span>  }<a name="line.345"></a>
-<span class="sourceLineNo">346</span><a name="line.346"></a>
-<span class="sourceLineNo">347</span>  @Override<a name="line.347"></a>
-<span class="sourceLineNo">348</span>  public String toString() {<a name="line.348"></a>
-<span class="sourceLineNo">349</span>    StringBuilder sb = new StringBuilder();<a name="line.349"></a>
-<span class="sourceLineNo">350</span>    append(sb, "fileinfoOffset=" + fileInfoOffset);<a name="line.350"></a>
-<span class="sourceLineNo">351</span>    append(sb, "loadOnOpenDataOffset=" + loadOnOpenDataOffset);<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    append(sb, "dataIndexCount=" + dataIndexCount);<a name="line.352"></a>
-<span class="sourceLineNo">353</span>    append(sb, "metaIndexCount=" + metaIndexCount);<a name="line.353"></a>
-<span class="sourceLineNo">354</span>    append(sb, "totalUncomressedBytes=" + totalUncompressedBytes);<a name="line.354"></a>
-<span class="sourceLineNo">355</span>    append(sb, "entryCount=" + entryCount);<a name="line.355"></a>
-<span class="sourceLineNo">356</span>    append(sb, "compressionCodec=" + compressionCodec);<a name="line.356"></a>
-<span class="sourceLineNo">357</span>    append(sb, "uncompressedDataIndexSize=" + uncompressedDataIndexSize);<a name="line.357"></a>
-<span class="sourceLineNo">358</span>    append(sb, "numDataIndexLevels=" + numDataIndexLevels);<a name="line.358"></a>
-<span class="sourceLineNo">359</span>    append(sb, "firstDataBlockOffset=" + firstDataBlockOffset);<a name="line.359"></a>
-<span class="sourceLineNo">360</span>    append(sb, "lastDataBlockOffset=" + lastDataBlockOffset);<a name="line.360"></a>
-<span class="sourceLineNo">361</span>    append(sb, "comparatorClassName=" + comparatorClassName);<a name="line.361"></a>
-<span class="sourceLineNo">362</span>    if (majorVersion &gt;= 3) {<a name="line.362"></a>
-<span class="sourceLineNo">363</span>      append(sb, "encryptionKey=" + (encryptionKey != null ? "PRESENT" : "NONE"));<a name="line.363"></a>
-<span class="sourceLineNo">364</span>    }<a name="line.364"></a>
-<span class="sourceLineNo">365</span>    append(sb, "majorVersion=" + majorVersion);<a name="line.365"></a>
-<span class="sourceLineNo">366</span>    append(sb, "minorVersion=" + minorVersion);<a name="line.366"></a>
-<span class="sourceLineNo">367</span><a name="line.367"></a>
-<span class="sourceLineNo">368</span>    return sb.toString();<a name="line.368"></a>
-<span class="sourceLineNo">369</span>  }<a name="line.369"></a>
-<span class="sourceLineNo">370</span><a name="line.370"></a>
-<span class="sourceLineNo">371</span>  /**<a name="line.371"></a>
-<span class="sourceLineNo">372</span>   * Reads a file trailer from the given file.<a name="line.372"></a>
-<span class="sourceLineNo">373</span>   * @param istream  the input stream with the ability to seek. Does not have to be buffered, as<a name="line.373"></a>
-<span class="sourceLineNo">374</span>   *                 only one read operation is made.<a name="line.374"></a>
-<span class="sourceLineNo">375</span>   * @param fileSize the file size. Can be obtained using<a name="line.375"></a>
-<span class="sourceLineNo">376</span>   *                 {@link org.apache.hadoop.fs.FileSystem#getFileStatus( org.apache.hadoop.fs.Path)}.<a name="line.376"></a>
-<span class="sourceLineNo">377</span>   * @return the fixed file trailer read<a name="line.377"></a>
-<span class="sourceLineNo">378</span>   * @throws IOException if failed to read from the underlying stream, or the trailer is corrupted,<a name="line.378"></a>
-<span class="sourceLineNo">379</span>   *                     or the version of the trailer is unsupported<a name="line.379"></a>
-<span class="sourceLineNo">380</span>   */<a name="line.380"></a>
-<span class="sourceLineNo">381</span>  public static FixedFileTrailer readFromStream(FSDataInputStream istream, long fileSize)<a name="line.381"></a>
-<span class="sourceLineNo">382</span>    throws IOException {<a name="line.382"></a>
-<span class="sourceLineNo">383</span>    int bufferSize = MAX_TRAILER_SIZE;<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    long seekPoint = fileSize - bufferSize;<a name="line.384"></a>
-<span class="sourceLineNo">385</span>    if (seekPoint &lt; 0) {<a name="line.385"></a>
-<span class="sourceLineNo">386</span>      // It is hard to imagine such a small HFile.<a name="line.386"></a>
-<span class="sourceLineNo">387</span>      seekPoint = 0;<a name="line.387"></a>
-<span class="sourceLineNo">388</span>      bufferSize = (int) fileSize;<a name="line.388"></a>
-<span class="sourceLineNo">389</span>    }<a name="line.389"></a>
-<span class="sourceLineNo">390</span><a name="line.390"></a>
-<span class="sourceLineNo">391</span>    istream.seek(seekPoint);<a name="line.391"></a>
+<span class="sourceLineNo">248</span>    BlockType.TRAILER.readAndCheck(inputStream);<a name="line.248"></a>
+<span class="sourceLineNo">249</span><a name="line.249"></a>
+<span class="sourceLineNo">250</span>    if (<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      majorVersion &gt; 2<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        || (majorVersion == 2 &amp;&amp; minorVersion &gt;= HFileReaderImpl.PBUF_TRAILER_MINOR_VERSION)<a name="line.252"></a>
+<span class="sourceLineNo">253</span>    ) {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>      deserializeFromPB(inputStream);<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    } else {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>      deserializeFromWritable(inputStream);<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    }<a name="line.257"></a>
+<span class="sourceLineNo">258</span><a name="line.258"></a>
+<span class="sourceLineNo">259</span>    // The last 4 bytes of the file encode the major and minor version universally<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    int version = inputStream.readInt();<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    expectMajorVersion(extractMajorVersion(version));<a name="line.261"></a>
+<span class="sourceLineNo">262</span>    expectMinorVersion(extractMinorVersion(version));<a name="line.262"></a>
+<span class="sourceLineNo">263</span>  }<a name="line.263"></a>
+<span class="sourceLineNo">264</span><a name="line.264"></a>
+<span class="sourceLineNo">265</span>  /**<a name="line.265"></a>
+<span class="sourceLineNo">266</span>   * Deserialize the file trailer as protobuf<a name="line.266"></a>
+<span class="sourceLineNo">267</span>   */<a name="line.267"></a>
+<span class="sourceLineNo">268</span>  void deserializeFromPB(DataInputStream inputStream) throws IOException {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>    // read PB and skip padding<a name="line.269"></a>
+<span class="sourceLineNo">270</span>    int start = inputStream.available();<a name="line.270"></a>
+<span class="sourceLineNo">271</span>    HFileProtos.FileTrailerProto trailerProto =<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      HFileProtos.FileTrailerProto.PARSER.parseDelimitedFrom(inputStream);<a name="line.272"></a>
+<span class="sourceLineNo">273</span>    int size = start - inputStream.available();<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    inputStream.skip(getTrailerSize() - NOT_PB_SIZE - size);<a name="line.274"></a>
+<span class="sourceLineNo">275</span><a name="line.275"></a>
+<span class="sourceLineNo">276</span>    // process the PB<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    if (trailerProto.hasFileInfoOffset()) {<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      fileInfoOffset = trailerProto.getFileInfoOffset();<a name="line.278"></a>
+<span class="sourceLineNo">279</span>    }<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    if (trailerProto.hasLoadOnOpenDataOffset()) {<a name="line.280"></a>
+<span class="sourceLineNo">281</span>      loadOnOpenDataOffset = trailerProto.getLoadOnOpenDataOffset();<a name="line.281"></a>
+<span class="sourceLineNo">282</span>    }<a name="line.282"></a>
+<span class="sourceLineNo">283</span>    if (trailerProto.hasUncompressedDataIndexSize()) {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>      uncompressedDataIndexSize = trailerProto.getUncompressedDataIndexSize();<a name="line.284"></a>
+<span class="sourceLineNo">285</span>    }<a name="line.285"></a>
+<span class="sourceLineNo">286</span>    if (trailerProto.hasTotalUncompressedBytes()) {<a name="line.286"></a>
+<span class="sourceLineNo">287</span>      totalUncompressedBytes = trailerProto.getTotalUncompressedBytes();<a name="line.287"></a>
+<span class="sourceLineNo">288</span>    }<a name="line.288"></a>
+<span class="sourceLineNo">289</span>    if (trailerProto.hasDataIndexCount()) {<a name="line.289"></a>
+<span class="sourceLineNo">290</span>      dataIndexCount = trailerProto.getDataIndexCount();<a name="line.290"></a>
+<span class="sourceLineNo">291</span>    }<a name="line.291"></a>
+<span class="sourceLineNo">292</span>    if (trailerProto.hasMetaIndexCount()) {<a name="line.292"></a>
+<span class="sourceLineNo">293</span>      metaIndexCount = trailerProto.getMetaIndexCount();<a name="line.293"></a>
+<span class="sourceLineNo">294</span>    }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>    if (trailerProto.hasEntryCount()) {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>      entryCount = trailerProto.getEntryCount();<a name="line.296"></a>
+<span class="sourceLineNo">297</span>    }<a name="line.297"></a>
+<span class="sourceLineNo">298</span>    if (trailerProto.hasNumDataIndexLevels()) {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>      numDataIndexLevels = trailerProto.getNumDataIndexLevels();<a name="line.299"></a>
+<span class="sourceLineNo">300</span>    }<a name="line.300"></a>
+<span class="sourceLineNo">301</span>    if (trailerProto.hasFirstDataBlockOffset()) {<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      firstDataBlockOffset = trailerProto.getFirstDataBlockOffset();<a name="line.302"></a>
+<span class="sourceLineNo">303</span>    }<a name="line.303"></a>
+<span class="sourceLineNo">304</span>    if (trailerProto.hasLastDataBlockOffset()) {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>      lastDataBlockOffset = trailerProto.getLastDataBlockOffset();<a name="line.305"></a>
+<span class="sourceLineNo">306</span>    }<a name="line.306"></a>
+<span class="sourceLineNo">307</span>    if (trailerProto.hasComparatorClassName()) {<a name="line.307"></a>
+<span class="sourceLineNo">308</span>      setComparatorClass(getComparatorClass(trailerProto.getComparatorClassName()));<a name="line.308"></a>
+<span class="sourceLineNo">309</span>    }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>    if (trailerProto.hasCompressionCodec()) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>      compressionCodec = Compression.Algorithm.values()[trailerProto.getCompressionCodec()];<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    } else {<a name="line.312"></a>
+<span class="sourceLineNo">313</span>      compressionCodec = Compression.Algorithm.NONE;<a name="line.313"></a>
+<span class="sourceLineNo">314</span>    }<a name="line.314"></a>
+<span class="sourceLineNo">315</span>    if (trailerProto.hasEncryptionKey()) {<a name="line.315"></a>
+<span class="sourceLineNo">316</span>      encryptionKey = trailerProto.getEncryptionKey().toByteArray();<a name="line.316"></a>
+<span class="sourceLineNo">317</span>    }<a name="line.317"></a>
+<span class="sourceLineNo">318</span>  }<a name="line.318"></a>
+<span class="sourceLineNo">319</span><a name="line.319"></a>
+<span class="sourceLineNo">320</span>  /**<a name="line.320"></a>
+<span class="sourceLineNo">321</span>   * Deserialize the file trailer as writable data<a name="line.321"></a>
+<span class="sourceLineNo">322</span>   */<a name="line.322"></a>
+<span class="sourceLineNo">323</span>  void deserializeFromWritable(DataInput input) throws IOException {<a name="line.323"></a>
+<span class="sourceLineNo">324</span>    fileInfoOffset = input.readLong();<a name="line.324"></a>
+<span class="sourceLineNo">325</span>    loadOnOpenDataOffset = input.readLong();<a name="line.325"></a>
+<span class="sourceLineNo">326</span>    dataIndexCount = input.readInt();<a name="line.326"></a>
+<span class="sourceLineNo">327</span>    uncompressedDataIndexSize = input.readLong();<a name="line.327"></a>
+<span class="sourceLineNo">328</span>    metaIndexCount = input.readInt();<a name="line.328"></a>
+<span class="sourceLineNo">329</span><a name="line.329"></a>
+<span class="sourceLineNo">330</span>    totalUncompressedBytes = input.readLong();<a name="line.330"></a>
+<span class="sourceLineNo">331</span>    entryCount = input.readLong();<a name="line.331"></a>
+<span class="sourceLineNo">332</span>    compressionCodec = Compression.Algorithm.values()[input.readInt()];<a name="line.332"></a>
+<span class="sourceLineNo">333</span>    numDataIndexLevels = input.readInt();<a name="line.333"></a>
+<span class="sourceLineNo">334</span>    firstDataBlockOffset = input.readLong();<a name="line.334"></a>
+<span class="sourceLineNo">335</span>    lastDataBlockOffset = input.readLong();<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    // TODO this is a classname encoded into an HFile's trailer. We are going to need to have<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    // some compat code here.<a name="line.337"></a>
+<span class="sourceLineNo">338</span>    setComparatorClass(<a name="line.338"></a>
+<span class="sourceLineNo">339</span>      getComparatorClass(Bytes.readStringFixedSize(input, MAX_COMPARATOR_NAME_LENGTH)));<a name="line.339"></a>
+<span class="sourceLineNo">340</span>  }<a name="line.340"></a>
+<span class="sourceLineNo">341</span><a name="line.341"></a>
+<span class="sourceLineNo">342</span>  private void append(StringBuilder sb, String s) {<a name="line.342"></a>
+<span class="sourceLineNo">343</span>    if (sb.length() &gt; 0) {<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      sb.append(", ");<a name="line.344"></a>
+<span class="sourceLineNo">345</span>    }<a name="line.345"></a>
+<span class="sourceLineNo">346</span>    sb.append(s);<a name="line.346"></a>
+<span class="sourceLineNo">347</span>  }<a name="line.347"></a>
+<span class="sourceLineNo">348</span><a name="line.348"></a>
+<span class="sourceLineNo">349</span>  @Override<a name="line.349"></a>
+<span class="sourceLineNo">350</span>  public String toString() {<a name="line.350"></a>
+<span class="sourceLineNo">351</span>    StringBuilder sb = new StringBuilder();<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    append(sb, "fileinfoOffset=" + fileInfoOffset);<a name="line.352"></a>
+<span class="sourceLineNo">353</span>    append(sb, "loadOnOpenDataOffset=" + loadOnOpenDataOffset);<a name="line.353"></a>
+<span class="sourceLineNo">354</span>    append(sb, "dataIndexCount=" + dataIndexCount);<a name="line.354"></a>
+<span class="sourceLineNo">355</span>    append(sb, "metaIndexCount=" + metaIndexCount);<a name="line.355"></a>
+<span class="sourceLineNo">356</span>    append(sb, "totalUncomressedBytes=" + totalUncompressedBytes);<a name="line.356"></a>
+<span class="sourceLineNo">357</span>    append(sb, "entryCount=" + entryCount);<a name="line.357"></a>
+<span class="sourceLineNo">358</span>    append(sb, "compressionCodec=" + compressionCodec);<a name="line.358"></a>
+<span class="sourceLineNo">359</span>    append(sb, "uncompressedDataIndexSize=" + uncompressedDataIndexSize);<a name="line.359"></a>
+<span class="sourceLineNo">360</span>    append(sb, "numDataIndexLevels=" + numDataIndexLevels);<a name="line.360"></a>
+<span class="sourceLineNo">361</span>    append(sb, "firstDataBlockOffset=" + firstDataBlockOffset);<a name="line.361"></a>
+<span class="sourceLineNo">362</span>    append(sb, "lastDataBlockOffset=" + lastDataBlockOffset);<a name="line.362"></a>
+<span class="sourceLineNo">363</span>    append(sb, "comparatorClassName=" + comparatorClassName);<a name="line.363"></a>
+<span class="sourceLineNo">364</span>    if (majorVersion &gt;= 3) {<a name="line.364"></a>
+<span class="sourceLineNo">365</span>      append(sb, "encryptionKey=" + (encryptionKey != null ? "PRESENT" : "NONE"));<a name="line.365"></a>
+<span class="sourceLineNo">366</span>    }<a name="line.366"></a>
+<span class="sourceLineNo">367</span>    append(sb, "majorVersion=" + majorVersion);<a name="line.367"></a>
+<span class="sourceLineNo">368</span>    append(sb, "minorVersion=" + minorVersion);<a name="line.368"></a>
+<span class="sourceLineNo">369</span><a name="line.369"></a>
+<span class="sourceLineNo">370</span>    return sb.toString();<a name="line.370"></a>
+<span class="sourceLineNo">371</span>  }<a name="line.371"></a>
+<span class="sourceLineNo">372</span><a name="line.372"></a>
+<span class="sourceLineNo">373</span>  /**<a name="line.373"></a>
+<span class="sourceLineNo">374</span>   * Reads a file trailer from the given file.<a name="line.374"></a>
+<span class="sourceLineNo">375</span>   * @param istream  the input stream with the ability to seek. Does not have to be buffered, as<a name="line.375"></a>
+<span class="sourceLineNo">376</span>   *                 only one read operation is made.<a name="line.376"></a>
+<span class="sourceLineNo">377</span>   * @param fileSize the file size. Can be obtained using<a name="line.377"></a>
+<span class="sourceLineNo">378</span>   *                 {@link org.apache.hadoop.fs.FileSystem#getFileStatus( org.apache.hadoop.fs.Path)}.<a name="line.378"></a>
+<span class="sourceLineNo">379</span>   * @return the fixed file trailer read<a name="line.379"></a>
+<span class="sourceLineNo">380</span>   * @throws IOException if failed to read from the underlying stream, or the trailer is corrupted,<a name="line.380"></a>
+<span class="sourceLineNo">381</span>   *                     or the version of the trailer is unsupported<a name="line.381"></a>
+<span class="sourceLineNo">382</span>   */<a name="line.382"></a>
+<span class="sourceLineNo">383</span>  public static FixedFileTrailer readFromStream(FSDataInputStream istream, long fileSize)<a name="line.383"></a>
+<span class="sourceLineNo">384</span>    throws IOException {<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    int bufferSize = MAX_TRAILER_SIZE;<a name="line.385"></a>
+<span class="sourceLineNo">386</span>    long seekPoint = fileSize - bufferSize;<a name="line.386"></a>
+<span class="sourceLineNo">387</span>    if (seekPoint &lt; 0) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>      // It is hard to imagine such a small HFile.<a name="line.388"></a>
+<span class="sourceLineNo">389</span>      seekPoint = 0;<a name="line.389"></a>
+<span class="sourceLineNo">390</span>      bufferSize = (int) fileSize;<a name="line.390"></a>
+<span class="sourceLineNo">391</span>    }<a name="line.391"></a>
 <span class="sourceLineNo">392</span><a name="line.392"></a>
-<span class="sourceLineNo">393</span>    ByteBuffer buf = ByteBuffer.allocate(bufferSize);<a name="line.393"></a>
-<span class="sourceLineNo">394</span>    istream.readFully(buf.array(), buf.arrayOffset(), buf.arrayOffset() + buf.limit());<a name="line.394"></a>
-<span class="sourceLineNo">395</span><a name="line.395"></a>
-<span class="sourceLineNo">396</span>    // Read the version from the last int of the file.<a name="line.396"></a>
-<span class="sourceLineNo">397</span>    buf.position(buf.limit() - Bytes.SIZEOF_INT);<a name="line.397"></a>
-<span class="sourceLineNo">398</span>    int version = buf.getInt();<a name="line.398"></a>
-<span class="sourceLineNo">399</span><a name="line.399"></a>
-<span class="sourceLineNo">400</span>    // Extract the major and minor versions.<a name="line.400"></a>
-<span class="sourceLineNo">401</span>    int majorVersion = extractMajorVersion(version);<a name="line.401"></a>
-<span class="sourceLineNo">402</span>    int minorVersion = extractMinorVersion(version);<a name="line.402"></a>
-<span class="sourceLineNo">403</span><a name="line.403"></a>
-<span class="sourceLineNo">404</span>    HFile.checkFormatVersion(majorVersion); // throws IAE if invalid<a name="line.404"></a>
+<span class="sourceLineNo">393</span>    istream.seek(seekPoint);<a name="line.393"></a>
+<span class="sourceLineNo">394</span><a name="line.394"></a>
+<span class="sourceLineNo">395</span>    ByteBuffer buf = ByteBuffer.allocate(bufferSize);<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    istream.readFully(buf.array(), buf.arrayOffset(), buf.arrayOffset() + buf.limit());<a name="line.396"></a>
+<span class="sourceLineNo">397</span><a name="line.397"></a>
+<span class="sourceLineNo">398</span>    // Read the version from the last int of the file.<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    buf.position(buf.limit() - Bytes.SIZEOF_INT);<a name="line.399"></a>
+<span class="sourceLineNo">400</span>    int version = buf.getInt();<a name="line.400"></a>
+<span class="sourceLineNo">401</span><a name="line.401"></a>
+<span class="sourceLineNo">402</span>    // Extract the major and minor versions.<a name="line.402"></a>
+<span class="sourceLineNo">403</span>    int majorVersion = extractMajorVersion(version);<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    int minorVersion = extractMinorVersion(version);<a name="line.404"></a>
 <span class="sourceLineNo">405</span><a name="line.405"></a>
-<span class="sourceLineNo">406</span>    int trailerSize = getTrailerSize(majorVersion);<a name="line.406"></a>
+<span class="sourceLineNo">406</span>    HFile.checkFormatVersion(majorVersion); // throws IAE if invalid<a name="line.406"></a>
 <span class="sourceLineNo">407</span><a name="line.407"></a>
-<span class="sourceLineNo">408</span>    FixedFileTrailer fft = new FixedFileTrailer(majorVersion, minorVersion);<a name="line.408"></a>
-<span class="sourceLineNo">409</span>    fft.deserialize(new DataInputStream(new ByteArrayInputStream(buf.array(),<a name="line.409"></a>
-<span class="sourceLineNo">410</span>      buf.arrayOffset() + bufferSize - trailerSize, trailerSize)));<a name="line.410"></a>
-<span class="sourceLineNo">411</span>    return fft;<a name="line.411"></a>
-<span class="sourceLineNo">412</span>  }<a name="line.412"></a>
-<span class="sourceLineNo">413</span><a name="line.413"></a>
-<span class="sourceLineNo">414</span>  public void expectMajorVersion(int expected) {<a name="line.414"></a>
-<span class="sourceLineNo">415</span>    if (majorVersion != expected) {<a name="line.415"></a>
-<span class="sourceLineNo">416</span>      throw new IllegalArgumentException(<a name="line.416"></a>
-<span class="sourceLineNo">417</span>        "Invalid HFile major version: " + majorVersion + " (expected: " + expected + ")");<a name="line.417"></a>
-<span class="sourceLineNo">418</span>    }<a name="line.418"></a>
-<span class="sourceLineNo">419</span>  }<a name="line.419"></a>
-<span class="sourceLineNo">420</span><a name="line.420"></a>
-<span class="sourceLineNo">421</span>  public void expectMinorVersion(int expected) {<a name="line.421"></a>
-<span class="sourceLineNo">422</span>    if (minorVersion != expected) {<a name="line.422"></a>
-<span class="sourceLineNo">423</span>      throw new IllegalArgumentException(<a name="line.423"></a>
-<span class="sourceLineNo">424</span>        "Invalid HFile minor version: " + minorVersion + " (expected: " + expected + ")");<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
-<span class="sourceLineNo">426</span>  }<a name="line.426"></a>
-<span class="sourceLineNo">427</span><a name="line.427"></a>
-<span class="sourceLineNo">428</span>  public void expectAtLeastMajorVersion(int lowerBound) {<a name="line.428"></a>
-<span class="sourceLineNo">429</span>    if (majorVersion &lt; lowerBound) {<a name="line.429"></a>
-<span class="sourceLineNo">430</span>      throw new IllegalArgumentException("Invalid HFile major version: " + majorVersion<a name="line.430"></a>
-<span class="sourceLineNo">431</span>        + " (expected: " + lowerBound + " or higher).");<a name="line.431"></a>
-<span class="sourceLineNo">432</span>    }<a name="line.432"></a>
-<span class="sourceLineNo">433</span>  }<a name="line.433"></a>
-<span class="sourceLineNo">434</span><a name="line.434"></a>
-<span class="sourceLineNo">435</span>  public long getFileInfoOffset() {<a name="line.435"></a>
-<span class="sourceLineNo">436</span>    return fileInfoOffset;<a name="line.436"></a>
-<span class="sourceLineNo">437</span>  }<a name="line.437"></a>
-<span class="sourceLineNo">438</span><a name="line.438"></a>
-<span class="sourceLineNo">439</span>  public void setFileInfoOffset(long fileInfoOffset) {<a name="line.439"></a>
-<span class="sourceLineNo">440</span>    this.fileInfoOffset = fileInfoOffset;<a name="line.440"></a>
-<span class="sourceLineNo">441</span>  }<a name="line.441"></a>
-<span class="sourceLineNo">442</span><a name="line.442"></a>
-<span class="sourceLineNo">443</span>  public long getLoadOnOpenDataOffset() {<a name="line.443"></a>
-<span class="sourceLineNo">444</span>    return loadOnOpenDataOffset;<a name="line.444"></a>
-<span class="sourceLineNo">445</span>  }<a name="line.445"></a>
-<span class="sourceLineNo">446</span><a name="line.446"></a>
-<span class="sourceLineNo">447</span>  public void setLoadOnOpenOffset(long loadOnOpenDataOffset) {<a name="line.447"></a>
-<span class="sourceLineNo">448</span>    this.loadOnOpenDataOffset = loadOnOpenDataOffset;<a name="line.448"></a>
-<span class="sourceLineNo">449</span>  }<a name="line.449"></a>
-<span class="sourceLineNo">450</span><a name="line.450"></a>
-<span class="sourceLineNo">451</span>  public int getDataIndexCount() {<a name="line.451"></a>
-<span class="sourceLineNo">452</span>    return dataIndexCount;<a name="line.452"></a>
-<span class="sourceLineNo">453</span>  }<a name="line.453"></a>
-<span class="sourceLineNo">454</span><a name="line.454"></a>
-<span class="sourceLineNo">455</span>  public void setDataIndexCount(int dataIndexCount) {<a name="line.455"></a>
-<span class="sourceLineNo">456</span>    this.dataIndexCount = dataIndexCount;<a name="line.456"></a>
-<span class="sourceLineNo">457</span>  }<a name="line.457"></a>
-<span class="sourceLineNo">458</span><a name="line.458"></a>
-<span class="sourceLineNo">459</span>  public int getMetaIndexCount() {<a name="line.459"></a>
-<span class="sourceLineNo">460</span>    return metaIndexCount;<a name="line.460"></a>
-<span class="sourceLineNo">461</span>  }<a name="line.461"></a>
-<span class="sourceLineNo">462</span><a name="line.462"></a>
-<span class="sourceLineNo">463</span>  public void setMetaIndexCount(int metaIndexCount) {<a name="line.463"></a>
-<span class="sourceLineNo">464</span>    this.metaIndexCount = metaIndexCount;<a name="line.464"></a>
-<span class="sourceLineNo">465</span>  }<a name="line.465"></a>
-<span class="sourceLineNo">466</span><a name="line.466"></a>
-<span class="sourceLineNo">467</span>  public long getTotalUncompressedBytes() {<a name="line.467"></a>
-<span class="sourceLineNo">468</span>    return totalUncompressedBytes;<a name="line.468"></a>
-<span class="sourceLineNo">469</span>  }<a name="line.469"></a>
-<span class="sourceLineNo">470</span><a name="line.470"></a>
-<span class="sourceLineNo">471</span>  public void setTotalUncompressedBytes(long totalUncompressedBytes) {<a name="line.471"></a>
-<span class="sourceLineNo">472</span>    this.totalUncompressedBytes = totalUncompressedBytes;<a name="line.472"></a>
-<span class="sourceLineNo">473</span>  }<a name="line.473"></a>
-<span class="sourceLineNo">474</span><a name="line.474"></a>
-<span class="sourceLineNo">475</span>  public long getEntryCount() {<a name="line.475"></a>
-<span class="sourceLineNo">476</span>    return entryCount;<a name="line.476"></a>
-<span class="sourceLineNo">477</span>  }<a name="line.477"></a>
-<span class="sourceLineNo">478</span><a name="line.478"></a>
-<span class="sourceLineNo">479</span>  public void setEntryCount(long newEntryCount) {<a name="line.479"></a>
-<span class="sourceLineNo">480</span>    entryCount = newEntryCount;<a name="line.480"></a>
-<span class="sourceLineNo">481</span>  }<a name="line.481"></a>
-<span class="sourceLineNo">482</span><a name="line.482"></a>
-<span class="sourceLineNo">483</span>  public Compression.Algorithm getCompressionCodec() {<a name="line.483"></a>
-<span class="sourceLineNo">484</span>    return compressionCodec;<a name="line.484"></a>
-<span class="sourceLineNo">485</span>  }<a name="line.485"></a>
-<span class="sourceLineNo">486</span><a name="line.486"></a>
-<span class="sourceLineNo">487</span>  public void setCompressionCodec(Compression.Algorithm compressionCodec) {<a name="line.487"></a>
-<span class="sourceLineNo">488</span>    this.compressionCodec = compressionCodec;<a name="line.488"></a>
-<span class="sourceLineNo">489</span>  }<a name="line.489"></a>
-<span class="sourceLineNo">490</span><a name="line.490"></a>
-<span class="sourceLineNo">491</span>  public int getNumDataIndexLevels() {<a name="line.491"></a>
-<span class="sourceLineNo">492</span>    expectAtLeastMajorVersion(2);<a name="line.492"></a>
-<span class="sourceLineNo">493</span>    return numDataIndexLevels;<a name="line.493"></a>
-<span class="sourceLineNo">494</span>  }<a name="line.494"></a>
-<span class="sourceLineNo">495</span><a name="line.495"></a>
-<span class="sourceLineNo">496</span>  public void setNumDataIndexLevels(int numDataIndexLevels) {<a name="line.496"></a>
-<span class="sourceLineNo">497</span>    expectAtLeastMajorVersion(2);<a name="line.497"></a>
-<span class="sourceLineNo">498</span>    this.numDataIndexLevels = numDataIndexLevels;<a name="line.498"></a>
-<span class="sourceLineNo">499</span>  }<a name="line.499"></a>
-<span class="sourceLineNo">500</span><a name="line.500"></a>
-<span class="sourceLineNo">501</span>  public long getLastDataBlockOffset() {<a name="line.501"></a>
-<span class="sourceLineNo">502</span>    expectAtLeastMajorVersion(2);<a name="line.502"></a>
-<span class="sourceLineNo">503</span>    return lastDataBlockOffset;<a name="line.503"></a>
-<span class="sourceLineNo">504</span>  }<a name="line.504"></a>
-<span class="sourceLineNo">505</span><a name="line.505"></a>
-<span class="sourceLineNo">506</span>  public void setLastDataBlockOffset(long lastDataBlockOffset) {<a name="line.506"></a>
-<span class="sourceLineNo">507</span>    expectAtLeastMajorVersion(2);<a name="line.507"></a>
-<span class="sourceLineNo">508</span>    this.lastDataBlockOffset = lastDataBlockOffset;<a name="line.508"></a>
-<span class="sourceLineNo">509</span>  }<a name="line.509"></a>
-<span class="sourceLineNo">510</span><a name="line.510"></a>
-<span class="sourceLineNo">511</span>  public long getFirstDataBlockOffset() {<a name="line.511"></a>
-<span class="sourceLineNo">512</span>    expectAtLeastMajorVersion(2);<a name="line.512"></a>
-<span class="sourceLineNo">513</span>    return firstDataBlockOffset;<a name="line.513"></a>
-<span class="sourceLineNo">514</span>  }<a name="line.514"></a>
-<span class="sourceLineNo">515</span><a name="line.515"></a>
-<span class="sourceLineNo">516</span>  public void setFirstDataBlockOffset(long firstDataBlockOffset) {<a name="line.516"></a>
-<span class="sourceLineNo">517</span>    expectAtLeastMajorVersion(2);<a name="line.517"></a>
-<span class="sourceLineNo">518</span>    this.firstDataBlockOffset = firstDataBlockOffset;<a name="line.518"></a>
-<span class="sourceLineNo">519</span>  }<a name="line.519"></a>
-<span class="sourceLineNo">520</span><a name="line.520"></a>
-<span class="sourceLineNo">521</span>  public String getComparatorClassName() {<a name="line.521"></a>
-<span class="sourceLineNo">522</span>    return comparatorClassName;<a name="line.522"></a>
-<span class="sourceLineNo">523</span>  }<a name="line.523"></a>
-<span class="sourceLineNo">524</span><a name="line.524"></a>
-<span class="sourceLineNo">525</span>  /**<a name="line.525"></a>
-<span class="sourceLineNo">526</span>   * Returns the major version of this HFile format<a name="line.526"></a>
-<span class="sourceLineNo">527</span>   */<a name="line.527"></a>
-<span class="sourceLineNo">528</span>  public int getMajorVersion() {<a name="line.528"></a>
-<span class="sourceLineNo">529</span>    return majorVersion;<a name="line.529"></a>
-<span class="sourceLineNo">530</span>  }<a name="line.530"></a>
-<span class="sourceLineNo">531</span><a name="line.531"></a>
-<span class="sourceLineNo">532</span>  /**<a name="line.532"></a>
-<span class="sourceLineNo">533</span>   * Returns the minor version of this HFile format<a name="line.533"></a>
-<span class="sourceLineNo">534</span>   */<a name="line.534"></a>
-<span class="sourceLineNo">535</span>  public int getMinorVersion() {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    return minorVersion;<a name="line.536"></a>
-<span class="sourceLineNo">537</span>  }<a name="line.537"></a>
-<span class="sourceLineNo">538</span><a name="line.538"></a>
-<span class="sourceLineNo">539</span>  public void setComparatorClass(Class&lt;? extends CellComparator&gt; klass) {<a name="line.539"></a>
-<span class="sourceLineNo">540</span>    // Is the comparator instantiable?<a name="line.540"></a>
-<span class="sourceLineNo">541</span>    try {<a name="line.541"></a>
-<span class="sourceLineNo">542</span>      // If null, it should be the Bytes.BYTES_RAWCOMPARATOR<a name="line.542"></a>
-<span class="sourceLineNo">543</span>      if (klass != null) {<a name="line.543"></a>
-<span class="sourceLineNo">544</span>        CellComparator comp = klass.getDeclaredConstructor().newInstance();<a name="line.544"></a>
-<span class="sourceLineNo">545</span>        // if the name wasn't one of the legacy names, maybe its a legit new<a name="line.545"></a>
-<span class="sourceLineNo">546</span>        // kind of comparator.<a name="line.546"></a>
-<span class="sourceLineNo">547</span>        this.comparatorClassName = klass.getName();<a name="line.547"></a>
-<span class="sourceLineNo">548</span>      }<a name="line.548"></a>
-<span class="sourceLineNo">549</span>    } catch (Exception e) {<a name="line.549"></a>
-<span class="sourceLineNo">550</span>      throw new RuntimeException("Comparator class " + klass.getName() + " is not instantiable", e);<a name="line.550"></a>
-<span class="sourceLineNo">551</span>    }<a name="line.551"></a>
-<span class="sourceLineNo">552</span>  }<a name="line.552"></a>
-<span class="sourceLineNo">553</span><a name="line.553"></a>
-<span class="sourceLineNo">554</span>  /**<a name="line.554"></a>
-<span class="sourceLineNo">555</span>   * If a 'standard' Comparator, write the old name for the Comparator when we serialize rather than<a name="line.555"></a>
-<span class="sourceLineNo">556</span>   * the new name; writing the new name will make it so newly-written hfiles are not parseable by<a name="line.556"></a>
-<span class="sourceLineNo">557</span>   * hbase-1.x, a facility we'd like to preserve across rolling upgrade and hbase-1.x clusters<a name="line.557"></a>
-<span class="sourceLineNo">558</span>   * reading hbase-2.x produce.<a name="line.558"></a>
-<span class="sourceLineNo">559</span>   * &lt;p&gt;<a name="line.559"></a>
-<span class="sourceLineNo">560</span>   * The Comparators in hbase-2.x work the same as they did in hbase-1.x; they compare KeyValues. In<a name="line.560"></a>
-<span class="sourceLineNo">561</span>   * hbase-2.x they were renamed making use of the more generic 'Cell' nomenclature to indicate that<a name="line.561"></a>
-<span class="sourceLineNo">562</span>   * we intend to move away from KeyValues post hbase-2. A naming change is not reason enough to<a name="line.562"></a>
-<span class="sourceLineNo">563</span>   * make it so hbase-1.x cannot read hbase-2.x files given the structure goes unchanged (hfile v3).<a name="line.563"></a>
-<span class="sourceLineNo">564</span>   * So, lets write the old names for Comparators into the hfile tails in hbase-2. Here is where we<a name="line.564"></a>
-<span class="sourceLineNo">565</span>   * do the translation. {@link #getComparatorClass(String)} does translation going the other way.<a name="line.565"></a>
-<span class="sourceLineNo">566</span>   * &lt;p&gt;<a name="line.566"></a>
-<span class="sourceLineNo">567</span>   * The translation is done on the serialized Protobuf only.<a name="line.567"></a>
-<span class="sourceLineNo">568</span>   * &lt;/p&gt;<a name="line.568"></a>
-<span class="sourceLineNo">569</span>   * @param comparator String class name of the Comparator used in this hfile.<a name="line.569"></a>
-<span class="sourceLineNo">570</span>   * @return What to store in the trailer as our comparator name.<a name="line.570"></a>
-<span class="sourceLineNo">571</span>   * @see #getComparatorClass(String)<a name="line.571"></a>
-<span class="sourceLineNo">572</span>   * @since hbase-2.0.0.<a name="line.572"></a>
-<span class="sourceLineNo">573</span>   * @deprecated Since hbase-2.0.0. Will be removed in hbase-3.0.0.<a name="line.573"></a>
-<span class="sourceLineNo">574</span>   */<a name="line.574"></a>
-<span class="sourceLineNo">575</span>  @Deprecated<a name="line.575"></a>
-<span class="sourceLineNo">576</span>  private String getHBase1CompatibleName(final String comparator) {<a name="line.576"></a>
-<span class="sourceLineNo">577</span>    if (comparator.equals(CellComparatorImpl.class.getName())) {<a name="line.577"></a>
-<span class="sourceLineNo">578</span>      return KeyValue.COMPARATOR.getClass().getName();<a name="line.578"></a>
-<span class="sourceLineNo">579</span>    }<a name="line.579"></a>
-<span class="sourceLineNo">580</span>    if (comparator.equals(MetaCellComparator.class.getName())) {<a name="line.580"></a>
-<span class="sourceLineNo">581</span>      return KeyValue.META_COMPARATOR.getClass().getName();<a name="line.581"></a>
-<span class="sourceLineNo">582</span>    }<a name="line.582"></a>
-<span class="sourceLineNo">583</span>    return comparator;<a name="line.583"></a>
-<span class="sourceLineNo">584</span>  }<a name="line.584"></a>
-<span class="sourceLineNo">585</span><a name="line.585"></a>
-<span class="sourceLineNo">586</span>  @SuppressWarnings("unchecked")<a name="line.586"></a>
-<span class="sourceLineNo">587</span>  private static Class&lt;? extends CellComparator&gt; getComparatorClass(String comparatorClassName)<a name="line.587"></a>
-<span class="sourceLineNo">588</span>    throws IOException {<a name="line.588"></a>
-<span class="sourceLineNo">589</span>    Class&lt;? extends CellComparator&gt; comparatorKlass;<a name="line.589"></a>
-<span class="sourceLineNo">590</span>    // for BC<a name="line.590"></a>
-<span class="sourceLineNo">591</span>    if (<a name="line.591"></a>
-<span class="sourceLineNo">592</span>      comparatorClassName.equals(KeyValue.COMPARATOR.getLegacyKeyComparatorName())<a name="line.592"></a>
-<span class="sourceLineNo">593</span>        || comparatorClassName.equals(KeyValue.COMPARATOR.getClass().getName())<a name="line.593"></a>
-<span class="sourceLineNo">594</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.CellComparator"))<a name="line.594"></a>
-<span class="sourceLineNo">595</span>    ) {<a name="line.595"></a>
-<span class="sourceLineNo">596</span>      comparatorKlass = CellComparatorImpl.class;<a name="line.596"></a>
-<span class="sourceLineNo">597</span>    } else if (<a name="line.597"></a>
-<span class="sourceLineNo">598</span>      comparatorClassName.equals(KeyValue.META_COMPARATOR.getLegacyKeyComparatorName())<a name="line.598"></a>
-<span class="sourceLineNo">599</span>        || comparatorClassName.equals(KeyValue.META_COMPARATOR.getClass().getName())<a name="line.599"></a>
-<span class="sourceLineNo">600</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.CellComparator$MetaCellComparator"))<a name="line.600"></a>
-<span class="sourceLineNo">601</span>        || (comparatorClassName<a name="line.601"></a>
-<span class="sourceLineNo">602</span>          .equals("org.apache.hadoop.hbase.CellComparatorImpl$MetaCellComparator"))<a name="line.602"></a>
-<span class="sourceLineNo">603</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.MetaCellComparator"))<a name="line.603"></a>
-<span class="sourceLineNo">604</span>    ) {<a name="line.604"></a>
-<span class="sourceLineNo">605</span>      comparatorKlass = MetaCellComparator.class;<a name="line.605"></a>
-<span class="sourceLineNo">606</span>    } else if (<a name="line.606"></a>
-<span class="sourceLineNo">607</span>      comparatorClassName.equals("org.apache.hadoop.hbase.KeyValue$RawBytesComparator")<a name="line.607"></a>
-<span class="sourceLineNo">608</span>        || comparatorClassName.equals("org.apache.hadoop.hbase.util.Bytes$ByteArrayComparator")<a name="line.608"></a>
+<span class="sourceLineNo">408</span>    int trailerSize = getTrailerSize(majorVersion);<a name="line.408"></a>
+<span class="sourceLineNo">409</span><a name="line.409"></a>
+<span class="sourceLineNo">410</span>    FixedFileTrailer fft = new FixedFileTrailer(majorVersion, minorVersion);<a name="line.410"></a>
+<span class="sourceLineNo">411</span>    fft.deserialize(new DataInputStream(new ByteArrayInputStream(buf.array(),<a name="line.411"></a>
+<span class="sourceLineNo">412</span>      buf.arrayOffset() + bufferSize - trailerSize, trailerSize)));<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    return fft;<a name="line.413"></a>
+<span class="sourceLineNo">414</span>  }<a name="line.414"></a>
+<span class="sourceLineNo">415</span><a name="line.415"></a>
+<span class="sourceLineNo">416</span>  public void expectMajorVersion(int expected) {<a name="line.416"></a>
+<span class="sourceLineNo">417</span>    if (majorVersion != expected) {<a name="line.417"></a>
+<span class="sourceLineNo">418</span>      throw new IllegalArgumentException(<a name="line.418"></a>
+<span class="sourceLineNo">419</span>        "Invalid HFile major version: " + majorVersion + " (expected: " + expected + ")");<a name="line.419"></a>
+<span class="sourceLineNo">420</span>    }<a name="line.420"></a>
+<span class="sourceLineNo">421</span>  }<a name="line.421"></a>
+<span class="sourceLineNo">422</span><a name="line.422"></a>
+<span class="sourceLineNo">423</span>  public void expectMinorVersion(int expected) {<a name="line.423"></a>
+<span class="sourceLineNo">424</span>    if (minorVersion != expected) {<a name="line.424"></a>
+<span class="sourceLineNo">425</span>      throw new IllegalArgumentException(<a name="line.425"></a>
+<span class="sourceLineNo">426</span>        "Invalid HFile minor version: " + minorVersion + " (expected: " + expected + ")");<a name="line.426"></a>
+<span class="sourceLineNo">427</span>    }<a name="line.427"></a>
+<span class="sourceLineNo">428</span>  }<a name="line.428"></a>
+<span class="sourceLineNo">429</span><a name="line.429"></a>
+<span class="sourceLineNo">430</span>  public void expectAtLeastMajorVersion(int lowerBound) {<a name="line.430"></a>
+<span class="sourceLineNo">431</span>    if (majorVersion &lt; lowerBound) {<a name="line.431"></a>
+<span class="sourceLineNo">432</span>      throw new IllegalArgumentException("Invalid HFile major version: " + majorVersion<a name="line.432"></a>
+<span class="sourceLineNo">433</span>        + " (expected: " + lowerBound + " or higher).");<a name="line.433"></a>
+<span class="sourceLineNo">434</span>    }<a name="line.434"></a>
+<span class="sourceLineNo">435</span>  }<a name="line.435"></a>
+<span class="sourceLineNo">436</span><a name="line.436"></a>
+<span class="sourceLineNo">437</span>  public long getFileInfoOffset() {<a name="line.437"></a>
+<span class="sourceLineNo">438</span>    return fileInfoOffset;<a name="line.438"></a>
+<span class="sourceLineNo">439</span>  }<a name="line.439"></a>
+<span class="sourceLineNo">440</span><a name="line.440"></a>
+<span class="sourceLineNo">441</span>  public void setFileInfoOffset(long fileInfoOffset) {<a name="line.441"></a>
+<span class="sourceLineNo">442</span>    this.fileInfoOffset = fileInfoOffset;<a name="line.442"></a>
+<span class="sourceLineNo">443</span>  }<a name="line.443"></a>
+<span class="sourceLineNo">444</span><a name="line.444"></a>
+<span class="sourceLineNo">445</span>  public long getLoadOnOpenDataOffset() {<a name="line.445"></a>
+<span class="sourceLineNo">446</span>    return loadOnOpenDataOffset;<a name="line.446"></a>
+<span class="sourceLineNo">447</span>  }<a name="line.447"></a>
+<span class="sourceLineNo">448</span><a name="line.448"></a>
+<span class="sourceLineNo">449</span>  public void setLoadOnOpenOffset(long loadOnOpenDataOffset) {<a name="line.449"></a>
+<span class="sourceLineNo">450</span>    this.loadOnOpenDataOffset = loadOnOpenDataOffset;<a name="line.450"></a>
+<span class="sourceLineNo">451</span>  }<a name="line.451"></a>
+<span class="sourceLineNo">452</span><a name="line.452"></a>
+<span class="sourceLineNo">453</span>  public int getDataIndexCount() {<a name="line.453"></a>
+<span class="sourceLineNo">454</span>    return dataIndexCount;<a name="line.454"></a>
+<span class="sourceLineNo">455</span>  }<a name="line.455"></a>
+<span class="sourceLineNo">456</span><a name="line.456"></a>
+<span class="sourceLineNo">457</span>  public void setDataIndexCount(int dataIndexCount) {<a name="line.457"></a>
+<span class="sourceLineNo">458</span>    this.dataIndexCount = dataIndexCount;<a name="line.458"></a>
+<span class="sourceLineNo">459</span>  }<a name="line.459"></a>
+<span class="sourceLineNo">460</span><a name="line.460"></a>
+<span class="sourceLineNo">461</span>  public int getMetaIndexCount() {<a name="line.461"></a>
+<span class="sourceLineNo">462</span>    return metaIndexCount;<a name="line.462"></a>
+<span class="sourceLineNo">463</span>  }<a name="line.463"></a>
+<span class="sourceLineNo">464</span><a name="line.464"></a>
+<span class="sourceLineNo">465</span>  public void setMetaIndexCount(int metaIndexCount) {<a name="line.465"></a>
+<span class="sourceLineNo">466</span>    this.metaIndexCount = metaIndexCount;<a name="line.466"></a>
+<span class="sourceLineNo">467</span>  }<a name="line.467"></a>
+<span class="sourceLineNo">468</span><a name="line.468"></a>
+<span class="sourceLineNo">469</span>  public long getTotalUncompressedBytes() {<a name="line.469"></a>
+<span class="sourceLineNo">470</span>    return totalUncompressedBytes;<a name="line.470"></a>
+<span class="sourceLineNo">471</span>  }<a name="line.471"></a>
+<span class="sourceLineNo">472</span><a name="line.472"></a>
+<span class="sourceLineNo">473</span>  public void setTotalUncompressedBytes(long totalUncompressedBytes) {<a name="line.473"></a>
+<span class="sourceLineNo">474</span>    this.totalUncompressedBytes = totalUncompressedBytes;<a name="line.474"></a>
+<span class="sourceLineNo">475</span>  }<a name="line.475"></a>
+<span class="sourceLineNo">476</span><a name="line.476"></a>
+<span class="sourceLineNo">477</span>  public long getEntryCount() {<a name="line.477"></a>
+<span class="sourceLineNo">478</span>    return entryCount;<a name="line.478"></a>
+<span class="sourceLineNo">479</span>  }<a name="line.479"></a>
+<span class="sourceLineNo">480</span><a name="line.480"></a>
+<span class="sourceLineNo">481</span>  public void setEntryCount(long newEntryCount) {<a name="line.481"></a>
+<span class="sourceLineNo">482</span>    entryCount = newEntryCount;<a name="line.482"></a>
+<span class="sourceLineNo">483</span>  }<a name="line.483"></a>
+<span class="sourceLineNo">484</span><a name="line.484"></a>
+<span class="sourceLineNo">485</span>  public Compression.Algorithm getCompressionCodec() {<a name="line.485"></a>
+<span class="sourceLineNo">486</span>    return compressionCodec;<a name="line.486"></a>
+<span class="sourceLineNo">487</span>  }<a name="line.487"></a>
+<span class="sourceLineNo">488</span><a name="line.488"></a>
+<span class="sourceLineNo">489</span>  public void setCompressionCodec(Compression.Algorithm compressionCodec) {<a name="line.489"></a>
+<span class="sourceLineNo">490</span>    this.compressionCodec = compressionCodec;<a name="line.490"></a>
+<span class="sourceLineNo">491</span>  }<a name="line.491"></a>
+<span class="sourceLineNo">492</span><a name="line.492"></a>
+<span class="sourceLineNo">493</span>  public int getNumDataIndexLevels() {<a name="line.493"></a>
+<span class="sourceLineNo">494</span>    expectAtLeastMajorVersion(2);<a name="line.494"></a>
+<span class="sourceLineNo">495</span>    return numDataIndexLevels;<a name="line.495"></a>
+<span class="sourceLineNo">496</span>  }<a name="line.496"></a>
+<span class="sourceLineNo">497</span><a name="line.497"></a>
+<span class="sourceLineNo">498</span>  public void setNumDataIndexLevels(int numDataIndexLevels) {<a name="line.498"></a>
+<span class="sourceLineNo">499</span>    expectAtLeastMajorVersion(2);<a name="line.499"></a>
+<span class="sourceLineNo">500</span>    this.numDataIndexLevels = numDataIndexLevels;<a name="line.500"></a>
+<span class="sourceLineNo">501</span>  }<a name="line.501"></a>
+<span class="sourceLineNo">502</span><a name="line.502"></a>
+<span class="sourceLineNo">503</span>  public long getLastDataBlockOffset() {<a name="line.503"></a>
+<span class="sourceLineNo">504</span>    expectAtLeastMajorVersion(2);<a name="line.504"></a>
+<span class="sourceLineNo">505</span>    return lastDataBlockOffset;<a name="line.505"></a>
+<span class="sourceLineNo">506</span>  }<a name="line.506"></a>
+<span class="sourceLineNo">507</span><a name="line.507"></a>
+<span class="sourceLineNo">508</span>  public void setLastDataBlockOffset(long lastDataBlockOffset) {<a name="line.508"></a>
+<span class="sourceLineNo">509</span>    expectAtLeastMajorVersion(2);<a name="line.509"></a>
+<span class="sourceLineNo">510</span>    this.lastDataBlockOffset = lastDataBlockOffset;<a name="line.510"></a>
+<span class="sourceLineNo">511</span>  }<a name="line.511"></a>
+<span class="sourceLineNo">512</span><a name="line.512"></a>
+<span class="sourceLineNo">513</span>  public long getFirstDataBlockOffset() {<a name="line.513"></a>
+<span class="sourceLineNo">514</span>    expectAtLeastMajorVersion(2);<a name="line.514"></a>
+<span class="sourceLineNo">515</span>    return firstDataBlockOffset;<a name="line.515"></a>
+<span class="sourceLineNo">516</span>  }<a name="line.516"></a>
+<span class="sourceLineNo">517</span><a name="line.517"></a>
+<span class="sourceLineNo">518</span>  public void setFirstDataBlockOffset(long firstDataBlockOffset) {<a name="line.518"></a>
+<span class="sourceLineNo">519</span>    expectAtLeastMajorVersion(2);<a name="line.519"></a>
+<span class="sourceLineNo">520</span>    this.firstDataBlockOffset = firstDataBlockOffset;<a name="line.520"></a>
+<span class="sourceLineNo">521</span>  }<a name="line.521"></a>
+<span class="sourceLineNo">522</span><a name="line.522"></a>
+<span class="sourceLineNo">523</span>  public String getComparatorClassName() {<a name="line.523"></a>
+<span class="sourceLineNo">524</span>    return comparatorClassName;<a name="line.524"></a>
+<span class="sourceLineNo">525</span>  }<a name="line.525"></a>
+<span class="sourceLineNo">526</span><a name="line.526"></a>
+<span class="sourceLineNo">527</span>  /**<a name="line.527"></a>
+<span class="sourceLineNo">528</span>   * Returns the major version of this HFile format<a name="line.528"></a>
+<span class="sourceLineNo">529</span>   */<a name="line.529"></a>
+<span class="sourceLineNo">530</span>  public int getMajorVersion() {<a name="line.530"></a>
+<span class="sourceLineNo">531</span>    return majorVersion;<a name="line.531"></a>
+<span class="sourceLineNo">532</span>  }<a name="line.532"></a>
+<span class="sourceLineNo">533</span><a name="line.533"></a>
+<span class="sourceLineNo">534</span>  /**<a name="line.534"></a>
+<span class="sourceLineNo">535</span>   * Returns the minor version of this HFile format<a name="line.535"></a>
+<span class="sourceLineNo">536</span>   */<a name="line.536"></a>
+<span class="sourceLineNo">537</span>  public int getMinorVersion() {<a name="line.537"></a>
+<span class="sourceLineNo">538</span>    return minorVersion;<a name="line.538"></a>
+<span class="sourceLineNo">539</span>  }<a name="line.539"></a>
+<span class="sourceLineNo">540</span><a name="line.540"></a>
+<span class="sourceLineNo">541</span>  public void setComparatorClass(Class&lt;? extends CellComparator&gt; klass) {<a name="line.541"></a>
+<span class="sourceLineNo">542</span>    // Is the comparator instantiable?<a name="line.542"></a>
+<span class="sourceLineNo">543</span>    try {<a name="line.543"></a>
+<span class="sourceLineNo">544</span>      // If null, it should be the Bytes.BYTES_RAWCOMPARATOR<a name="line.544"></a>
+<span class="sourceLineNo">545</span>      if (klass != null) {<a name="line.545"></a>
+<span class="sourceLineNo">546</span>        CellComparator comp = klass.getDeclaredConstructor().newInstance();<a name="line.546"></a>
+<span class="sourceLineNo">547</span>        // if the name wasn't one of the legacy names, maybe its a legit new<a name="line.547"></a>
+<span class="sourceLineNo">548</span>        // kind of comparator.<a name="line.548"></a>
+<span class="sourceLineNo">549</span>        this.comparatorClassName = klass.getName();<a name="line.549"></a>
+<span class="sourceLineNo">550</span>      }<a name="line.550"></a>
+<span class="sourceLineNo">551</span>    } catch (Exception e) {<a name="line.551"></a>
+<span class="sourceLineNo">552</span>      throw new RuntimeException("Comparator class " + klass.getName() + " is not instantiable", e);<a name="line.552"></a>
+<span class="sourceLineNo">553</span>    }<a name="line.553"></a>
+<span class="sourceLineNo">554</span>  }<a name="line.554"></a>
+<span class="sourceLineNo">555</span><a name="line.555"></a>
+<span class="sourceLineNo">556</span>  /**<a name="line.556"></a>
+<span class="sourceLineNo">557</span>   * If a 'standard' Comparator, write the old name for the Comparator when we serialize rather than<a name="line.557"></a>
+<span class="sourceLineNo">558</span>   * the new name; writing the new name will make it so newly-written hfiles are not parseable by<a name="line.558"></a>
+<span class="sourceLineNo">559</span>   * hbase-1.x, a facility we'd like to preserve across rolling upgrade and hbase-1.x clusters<a name="line.559"></a>
+<span class="sourceLineNo">560</span>   * reading hbase-2.x produce.<a name="line.560"></a>
+<span class="sourceLineNo">561</span>   * &lt;p&gt;<a name="line.561"></a>
+<span class="sourceLineNo">562</span>   * The Comparators in hbase-2.x work the same as they did in hbase-1.x; they compare KeyValues. In<a name="line.562"></a>
+<span class="sourceLineNo">563</span>   * hbase-2.x they were renamed making use of the more generic 'Cell' nomenclature to indicate that<a name="line.563"></a>
+<span class="sourceLineNo">564</span>   * we intend to move away from KeyValues post hbase-2. A naming change is not reason enough to<a name="line.564"></a>
+<span class="sourceLineNo">565</span>   * make it so hbase-1.x cannot read hbase-2.x files given the structure goes unchanged (hfile v3).<a name="line.565"></a>
+<span class="sourceLineNo">566</span>   * So, lets write the old names for Comparators into the hfile tails in hbase-2. Here is where we<a name="line.566"></a>
+<span class="sourceLineNo">567</span>   * do the translation. {@link #getComparatorClass(String)} does translation going the other way.<a name="line.567"></a>
+<span class="sourceLineNo">568</span>   * &lt;p&gt;<a name="line.568"></a>
+<span class="sourceLineNo">569</span>   * The translation is done on the serialized Protobuf only.<a name="line.569"></a>
+<span class="sourceLineNo">570</span>   * &lt;/p&gt;<a name="line.570"></a>
+<span class="sourceLineNo">571</span>   * @param comparator String class name of the Comparator used in this hfile.<a name="line.571"></a>
+<span class="sourceLineNo">572</span>   * @return What to store in the trailer as our comparator name.<a name="line.572"></a>
+<span class="sourceLineNo">573</span>   * @see #getComparatorClass(String)<a name="line.573"></a>
+<span class="sourceLineNo">574</span>   * @since hbase-2.0.0.<a name="line.574"></a>
+<span class="sourceLineNo">575</span>   * @deprecated Since hbase-2.0.0. Will be removed in hbase-3.0.0.<a name="line.575"></a>
+<span class="sourceLineNo">576</span>   */<a name="line.576"></a>
+<span class="sourceLineNo">577</span>  @Deprecated<a name="line.577"></a>
+<span class="sourceLineNo">578</span>  private String getHBase1CompatibleName(final String comparator) {<a name="line.578"></a>
+<span class="sourceLineNo">579</span>    if (<a name="line.579"></a>
+<span class="sourceLineNo">580</span>      comparator.equals(CellComparatorImpl.class.getName())<a name="line.580"></a>
+<span class="sourceLineNo">581</span>        || comparator.equals(InnerStoreCellComparator.class.getName())<a name="line.581"></a>
+<span class="sourceLineNo">582</span>    ) {<a name="line.582"></a>
+<span class="sourceLineNo">583</span>      return KeyValue.COMPARATOR.getClass().getName();<a name="line.583"></a>
+<span class="sourceLineNo">584</span>    }<a name="line.584"></a>
+<span class="sourceLineNo">585</span>    if (comparator.equals(MetaCellComparator.class.getName())) {<a name="line.585"></a>
+<span class="sourceLineNo">586</span>      return KeyValue.META_COMPARATOR.getClass().getName();<a name="line.586"></a>
+<span class="sourceLineNo">587</span>    }<a name="line.587"></a>
+<span class="sourceLineNo">588</span>    return comparator;<a name="line.588"></a>
+<span class="sourceLineNo">589</span>  }<a name="line.589"></a>
+<span class="sourceLineNo">590</span><a name="line.590"></a>
+<span class="sourceLineNo">591</span>  @SuppressWarnings("unchecked")<a name="line.591"></a>
+<span class="sourceLineNo">592</span>  private static Class&lt;? extends CellComparator&gt; getComparatorClass(String comparatorClassName)<a name="line.592"></a>
+<span class="sourceLineNo">593</span>    throws IOException {<a name="line.593"></a>
+<span class="sourceLineNo">594</span>    Class&lt;? extends CellComparator&gt; comparatorKlass;<a name="line.594"></a>
+<span class="sourceLineNo">595</span>    // for BC<a name="line.595"></a>
+<span class="sourceLineNo">596</span>    if (<a name="line.596"></a>
+<span class="sourceLineNo">597</span>      comparatorClassName.equals(KeyValue.COMPARATOR.getLegacyKeyComparatorName())<a name="line.597"></a>
+<span class="sourceLineNo">598</span>        || comparatorClassName.equals(KeyValue.COMPARATOR.getClass().getName())<a name="line.598"></a>
+<span class="sourceLineNo">599</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.CellComparator"))<a name="line.599"></a>
+<span class="sourceLineNo">600</span>    ) {<a name="line.600"></a>
+<span class="sourceLineNo">601</span>      comparatorKlass = InnerStoreCellComparator.class;<a name="line.601"></a>
+<span class="sourceLineNo">602</span>    } else if (<a name="line.602"></a>
+<span class="sourceLineNo">603</span>      comparatorClassName.equals(KeyValue.META_COMPARATOR.getLegacyKeyComparatorName())<a name="line.603"></a>
+<span class="sourceLineNo">604</span>        || comparatorClassName.equals(KeyValue.META_COMPARATOR.getClass().getName())<a name="line.604"></a>
+<span class="sourceLineNo">605</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.CellComparator$MetaCellComparator"))<a name="line.605"></a>
+<span class="sourceLineNo">606</span>        || (comparatorClassName<a name="line.606"></a>
+<span class="sourceLineNo">607</span>          .equals("org.apache.hadoop.hbase.CellComparatorImpl$MetaCellComparator"))<a name="line.607"></a>
+<span class="sourceLineNo">608</span>        || (comparatorClassName.equals("org.apache.hadoop.hbase.MetaCellComparator"))<a name="line.608"></a>
 <span class="sourceLineNo">609</span>    ) {<a name="line.609"></a>
-<span class="sourceLineNo">610</span>      // When the comparator to be used is Bytes.BYTES_RAWCOMPARATOR, we just return null from here<a name="line.610"></a>
-<span class="sourceLineNo">611</span>      // Bytes.BYTES_RAWCOMPARATOR is not a CellComparator<a name="line.611"></a>
-<span class="sourceLineNo">612</span>      comparatorKlass = null;<a name="line.612"></a>
-<span class="sourceLineNo">613</span>    } else {<a name="line.613"></a>
-<span class="sourceLineNo">614</span>      // if the name wasn't one of the legacy names, maybe its a legit new kind of comparator.<a name="line.614"></a>
-<span class="sourceLineNo">615</span>      try {<a name="line.615"></a>
-<span class="sourceLineNo">616</span>        comparatorKlass = (Class&lt;? extends CellComparator&gt;) Class.forName(comparatorClassName);<a name="line.616"></a>
-<span class="sourceLineNo">617</span>      } catch (ClassNotFoundException e) {<a name="line.617"></a>
-<span class="sourceLineNo">618</span>        throw new IOException(e);<a name="line.618"></a>
-<span class="sourceLineNo">619</span>      }<a name="line.619"></a>
-<span class="sourceLineNo">620</span>    }<a name="line.620"></a>
-<span class="sourceLineNo">621</span>    return comparatorKlass;<a name="line.621"></a>
-<span class="sourceLineNo">622</span>  }<a name="line.622"></a>
-<span class="sourceLineNo">623</span><a name="line.623"></a>
-<span class="sourceLineNo">624</span>  static CellComparator createComparator(String comparatorClassName) throws IOException {<a name="line.624"></a>
-<span class="sourceLineNo">625</span>    if (comparatorClassName.equals(CellComparatorImpl.COMPARATOR.getClass().getName())) {<a name="line.625"></a>
-<span class="sourceLineNo">626</span>      return CellComparatorImpl.COMPARATOR;<a name="line.626"></a>
-<span class="sourceLineNo">627</span>    } else<a name="line.627"></a>
-<span class="sourceLineNo">628</span>      if (comparatorClassName.equals(MetaCellComparator.META_COMPARATOR.getClass().getName())) {<a name="line.628"></a>
-<span class="sourceLineNo">629</span>        return MetaCellComparator.META_COMPARATOR;<a name="line.629"></a>
-<span class="sourceLineNo">630</span>      }<a name="line.630"></a>
-<span class="sourceLineNo">631</span>    try {<a name="line.631"></a>
-<span class="sourceLineNo">632</span>      Class&lt;? extends CellComparator&gt; comparatorClass = getComparatorClass(comparatorClassName);<a name="line.632"></a>
-<span class="sourceLineNo">633</span>      if (comparatorClass != null) {<a name="line.633"></a>
-<span class="sourceLineNo">634</span>        return comparatorClass.getDeclaredConstructor().newInstance();<a name="line.634"></a>
-<span class="sourceLineNo">635</span>      }<a name="line.635"></a>
-<span class="sourceLineNo">636</span>      LOG.warn("No Comparator class for " + comparatorClassName + ". Returning Null.");<a name="line.636"></a>
-<span class="sourceLineNo">637</span>      return null;<a name="line.637"></a>
-<span class="sourceLineNo">638</span>    } catch (Exception e) {<a name="line.638"></a>
-<span class="sourceLineNo">639</span>      throw new IOException("Comparator class " + comparatorClassName + " is not instantiable", e);<a name="line.639"></a>
-<span class="sourceLineNo">640</span>    }<a name="line.640"></a>
-<span class="sourceLineNo">641</span>  }<a name="line.641"></a>
-<span class="sourceLineNo">642</span><a name="line.642"></a>
-<span class="sourceLineNo">643</span>  CellComparator createComparator() throws IOException {<a name="line.643"></a>
-<span class="sourceLineNo">644</span>    expectAtLeastMajorVersion(2);<a name="line.644"></a>
-<span class="sourceLineNo">645</span>    return createComparator(comparatorClassName);<a name="line.645"></a>
-<span class="sourceLineNo">646</span>  }<a name="line.646"></a>
-<span class="sourceLineNo">647</span><a name="line.647"></a>
-<span class="sourceLineNo">648</span>  public long getUncompressedDataIndexSize() {<a name="line.648"></a>
-<span class="sourceLineNo">649</span>    return uncompressedDataIndexSize;<a name="line.649"></a>
-<span class="sourceLineNo">650</span>  }<a name="line.650"></a>
-<span class="sourceLineNo">651</span><a name="line.651"></a>
-<span class="sourceLineNo">652</span>  public void setUncompressedDataIndexSize(long uncompressedDataIndexSize) {<a name="line.652"></a>
-<span class="sourceLineNo">653</span>    expectAtLeastMajorVersion(2);<a name="line.653"></a>
-<span class="sourceLineNo">654</span>    this.uncompressedDataIndexSize = uncompressedDataIndexSize;<a name="line.654"></a>
-<span class="sourceLineNo">655</span>  }<a name="line.655"></a>
-<span class="sourceLineNo">656</span><a name="line.656"></a>
-<span class="sourceLineNo">657</span>  public byte[] getEncryptionKey() {<a name="line.657"></a>
-<span class="sourceLineNo">658</span>    // This is a v3 feature but if reading a v2 file the encryptionKey will just be null which<a name="line.658"></a>
-<span class="sourceLineNo">659</span>    // if fine for this feature.<a name="line.659"></a>
-<span class="sourceLineNo">660</span>    expectAtLeastMajorVersion(2);<a name="line.660"></a>
-<span class="sourceLineNo">661</span>    return encryptionKey;<a name="line.661"></a>
-<span class="sourceLineNo">662</span>  }<a name="line.662"></a>
-<span class="sourceLineNo">663</span><a name="line.663"></a>
-<span class="sourceLineNo">664</span>  public void setEncryptionKey(byte[] keyBytes) {<a name="line.664"></a>
-<span class="sourceLineNo">665</span>    this.encryptionKey = keyBytes;<a name="line.665"></a>
-<span class="sourceLineNo">666</span>  }<a name="line.666"></a>
-<span class="sourceLineNo">667</span><a name="line.667"></a>
-<span class="sourceLineNo">668</span>  /**<a name="line.668"></a>
-<span class="sourceLineNo">669</span>   * Extracts the major version for a 4-byte serialized version data. The major version is the 3<a name="line.669"></a>
-<span class="sourceLineNo">670</span>   * least significant bytes<a name="line.670"></a>
-<span class="sourceLineNo">671</span>   */<a name="line.671"></a>
-<span class="sourceLineNo">672</span>  private static int extractMajorVersion(int serializedVersion) {<a name="line.672"></a>
-<span class="sourceLineNo">673</span>    return (serializedVersion &amp; 0x00ffffff);<a name="line.673"></a>
+<span class="sourceLineNo">610</span>      comparatorKlass = MetaCellComparator.class;<a name="line.610"></a>
+<span class="sourceLineNo">611</span>    } else if (<a name="line.611"></a>
+<span class="sourceLineNo">612</span>      comparatorClassName.equals("org.apache.hadoop.hbase.KeyValue$RawBytesComparator")<a name="line.612"></a>
+<span class="sourceLineNo">613</span>        || comparatorClassName.equals("org.apache.hadoop.hbase.util.Bytes$ByteArrayComparator")<a name="line.613"></a>
+<span class="sourceLineNo">614</span>    ) {<a name="line.614"></a>
+<span class="sourceLineNo">615</span>      // When the comparator to be used is Bytes.BYTES_RAWCOMPARATOR, we just return null from here<a name="line.615"></a>
+<span class="sourceLineNo">616</span>      // Bytes.BYTES_RAWCOMPARATOR is not a CellComparator<a name="line.616"></a>
+<span class="sourceLineNo">617</span>      comparatorKlass = null;<a name="line.617"></a>
+<span class="sourceLineNo">618</span>    } else {<a name="line.618"></a>
+<span class="sourceLineNo">619</span>      // if the name wasn't one of the legacy names, maybe its a legit new kind of comparator.<a name="line.619"></a>
+<span class="sourceLineNo">620</span>      try {<a name="line.620"></a>
+<span class="sourceLineNo">621</span>        comparatorKlass = (Class&lt;? extends CellComparator&gt;) Class.forName(comparatorClassName);<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      } catch (ClassNotFoundException e) {<a name="line.622"></a>
+<span class="sourceLineNo">623</span>        throw new IOException(e);<a name="line.623"></a>
+<span class="sourceLineNo">624</span>      }<a name="line.624"></a>
+<span class="sourceLineNo">625</span>    }<a name="line.625"></a>
+<span class="sourceLineNo">626</span>    return comparatorKlass;<a name="line.626"></a>
+<span class="sourceLineNo">627</span>  }<a name="line.627"></a>
+<span class="sourceLineNo">628</span><a name="line.628"></a>
+<span class="sourceLineNo">629</span>  static CellComparator createComparator(String comparatorClassName) throws IOException {<a name="line.629"></a>
+<span class="sourceLineNo">630</span>    if (<a name="line.630"></a>
+<span class="sourceLineNo">631</span>      comparatorClassName<a name="line.631"></a>
+<span class="sourceLineNo">632</span>        .equals(InnerStoreCellComparator.INNER_STORE_COMPARATOR.getClass().getName())<a name="line.632"></a>
+<span class="sourceLineNo">633</span>    ) {<a name="line.633"></a>
+<span class="sourceLineNo">634</span>      return InnerStoreCellComparator.INNER_STORE_COMPARATOR;<a name="line.634"></a>
+<span class="sourceLineNo">635</span>    } else<a name="line.635"></a>
+<span class="sourceLineNo">636</span>      if (comparatorClassName.equals(MetaCellComparator.META_COMPARATOR.getClass().getName())) {<a name="line.636"></a>
+<span class="sourceLineNo">637</span>        return MetaCellComparator.META_COMPARATOR;<a name="line.637"></a>
+<span class="sourceLineNo">638</span>      }<a name="line.638"></a>
+<span class="sourceLineNo">639</span>    try {<a name="line.639"></a>
+<span class="sourceLineNo">640</span>      Class&lt;? extends CellComparator&gt; comparatorClass = getComparatorClass(comparatorClassName);<a name="line.640"></a>
+<span class="sourceLineNo">641</span>      if (comparatorClass != null) {<a name="line.641"></a>
+<span class="sourceLineNo">642</span>        return comparatorClass.getDeclaredConstructor().newInstance();<a name="line.642"></a>
+<span class="sourceLineNo">643</span>      }<a name="line.643"></a>
+<span class="sourceLineNo">644</span>      LOG.warn("No Comparator class for " + comparatorClassName + ". Returning Null.");<a name="line.644"></a>
+<span class="sourceLineNo">645</span>      return null;<a name="line.645"></a>
+<span class="sourceLineNo">646</span>    } catch (Exception e) {<a name="line.646"></a>
+<span class="sourceLineNo">647</span>      throw new IOException("Comparator class " + comparatorClassName + " is not instantiable", e);<a name="line.647"></a>
+<span class="sourceLineNo">648</span>    }<a name="line.648"></a>
+<span class="sourceLineNo">649</span>  }<a name="line.649"></a>
+<span class="sourceLineNo">650</span><a name="line.650"></a>
+<span class="sourceLineNo">651</span>  CellComparator createComparator() throws IOException {<a name="line.651"></a>
+<span class="sourceLineNo">652</span>    expectAtLeastMajorVersion(2);<a name="line.652"></a>
+<span class="sourceLineNo">653</span>    return createComparator(comparatorClassName);<a name="line.653"></a>
+<span class="sourceLineNo">654</span>  }<a name="line.654"></a>
+<span class="sourceLineNo">655</span><a name="line.655"></a>
+<span class="sourceLineNo">656</span>  public long getUncompressedDataIndexSize() {<a name="line.656"></a>
+<span class="sourceLineNo">657</span>    return uncompressedDataIndexSize;<a name="line.657"></a>
+<span class="sourceLineNo">658</span>  }<a name="line.658"></a>
+<span class="sourceLineNo">659</span><a name="line.659"></a>
+<span class="sourceLineNo">660</span>  public void setUncompressedDataIndexSize(long uncompressedDataIndexSize) {<a name="line.660"></a>
+<span class="sourceLineNo">661</span>    expectAtLeastMajorVersion(2);<a name="line.661"></a>
+<span class="sourceLineNo">662</span>    this.uncompressedDataIndexSize = uncompressedDataIndexSize;<a name="line.662"></a>
+<span class="sourceLineNo">663</span>  }<a name="line.663"></a>
+<span class="sourceLineNo">664</span><a name="line.664"></a>
+<span class="sourceLineNo">665</span>  public byte[] getEncryptionKey() {<a name="line.665"></a>
+<span class="sourceLineNo">666</span>    // This is a v3 feature but if reading a v2 file the encryptionKey will just be null which<a name="line.666"></a>
+<span class="sourceLineNo">667</span>    // if fine for this feature.<a name="line.667"></a>
+<span class="sourceLineNo">668</span>    expectAtLeastMajorVersion(2);<a name="line.668"></a>
+<span class="sourceLineNo">669</span>    return encryptionKey;<a name="line.669"></a>
+<span class="sourceLineNo">670</span>  }<a name="line.670"></a>
+<span class="sourceLineNo">671</span><a name="line.671"></a>
+<span class="sourceLineNo">672</span>  public void setEncryptionKey(byte[] keyBytes) {<a name="line.672"></a>
+<span class="sourceLineNo">673</span>    this.encryptionKey = keyBytes;<a name="line.673"></a>
 <span class="sourceLineNo">674</span>  }<a name="line.674"></a>
 <span class="sourceLineNo">675</span><a name="line.675"></a>
 <span class="sourceLineNo">676</span>  /**<a name="line.676"></a>
-<span class="sourceLineNo">677</span>   * Extracts the minor version for a 4-byte serialized version data. The major version are the 3<a name="line.677"></a>
-<span class="sourceLineNo">678</span>   * the most significant bytes<a name="line.678"></a>
+<span class="sourceLineNo">677</span>   * Extracts the major version for a 4-byte serialized version data. The major version is the 3<a name="line.677"></a>
+<span class="sourceLineNo">678</span>   * least significant bytes<a name="line.678"></a>
 <span class="sourceLineNo">679</span>   */<a name="line.679"></a>
-<span class="sourceLineNo">680</span>  private static int extractMinorVersion(int serializedVersion) {<a name="line.680"></a>
-<span class="sourceLineNo">681</span>    return (serializedVersion &gt;&gt;&gt; 24);<a name="line.681"></a>
+<span class="sourceLineNo">680</span>  private static int extractMajorVersion(int serializedVersion) {<a name="line.680"></a>
+<span class="sourceLineNo">681</span>    return (serializedVersion &amp; 0x00ffffff);<a name="line.681"></a>
 <span class="sourceLineNo">682</span>  }<a name="line.682"></a>
 <span class="sourceLineNo">683</span><a name="line.683"></a>
 <span class="sourceLineNo">684</span>  /**<a name="line.684"></a>
-<span class="sourceLineNo">685</span>   * Create a 4 byte serialized version number by combining the minor and major version numbers.<a name="line.685"></a>
-<span class="sourceLineNo">686</span>   */<a name="line.686"></a>
-<span class="sourceLineNo">687</span>  static int materializeVersion(int majorVersion, int minorVersion) {<a name="line.687"></a>
-<span class="sourceLineNo">688</span>    return ((majorVersion &amp; 0x00ffffff) | (minorVersion &lt;&lt; 24));<a name="line.688"></a>
-<span class="sourceLineNo">689</span>  }<a name="line.689"></a>
-<span class="sourceLineNo">690</span>}<a name="line.690"></a>
+<span class="sourceLineNo">685</span>   * Extracts the minor version for a 4-byte serialized version data. The major version are the 3<a name="line.685"></a>
+<span class="sourceLineNo">686</span>   * the most significant bytes<a name="line.686"></a>
+<span class="sourceLineNo">687</span>   */<a name="line.687"></a>
+<span class="sourceLineNo">688</span>  private static int extractMinorVersion(int serializedVersion) {<a name="line.688"></a>
+<span class="sourceLineNo">689</span>    return (serializedVersion &gt;&gt;&gt; 24);<a name="line.689"></a>
+<span class="sourceLineNo">690</span>  }<a name="line.690"></a>
+<span class="sourceLineNo">691</span><a name="line.691"></a>
+<span class="sourceLineNo">692</span>  /**<a name="line.692"></a>
+<span class="sourceLineNo">693</span>   * Create a 4 byte serialized version number by combining the minor and major version numbers.<a name="line.693"></a>
+<span class="sourceLineNo">694</span>   */<a name="line.694"></a>
+<span class="sourceLineNo">695</span>  static int materializeVersion(int majorVersion, int minorVersion) {<a name="line.695"></a>
+<span class="sourceLineNo">696</span>    return ((majorVersion &amp; 0x00ffffff) | (minorVersion &lt;&lt; 24));<a name="line.696"></a>
+<span class="sourceLineNo">697</span>  }<a name="line.697"></a>
+<span class="sourceLineNo">698</span>}<a name="line.698"></a>
 
 
 
