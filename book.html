@@ -34126,12 +34126,18 @@ replication peer related states, and the latter one is for storing the replicati
 states.
   HBASE-15867 is only half done, as although we have abstract these two interfaces, we still only
 have zookeeper based implementations.</p>
+<div class="literalblock">
+<div class="content">
+<pre>And in HBASE-27110, we have implemented a file system based replication peer storage, to store replication peer state on file system. Of course you can still use the zookeeper based replication peer storage.
+And in HBASE-27109, we have changed the replication queue storage from zookeeper based to hbase table based. See the below `Replication Queue State` in hbase:replication table section for more details.</pre>
+</div>
+</div>
 </dd>
 <dt class="hdlist1">Replication State in ZooKeeper</dt>
 <dd>
-<p>  By default, the state is contained in the base node <em>/hbase/replication</em>.
-  Usually this nodes contains two child nodes, the <code>peers</code> znode is for storing replication peer
-state, and the <code>rs</code> znodes is for storing replication queue state.</p>
+<p>By default, the state is contained in the base node <em>/hbase/replication</em>.
+Usually this nodes contains two child nodes, the peers znode is for storing replication peer state, and the rs znodes is for storing replication queue state. And if you choose the file system based replication peer storage, you will not see the peers znode.
+And starting from 3.0.0, we have moved the replication queue state to <a href="#hbase:replication">hbase:replication</a> table, so you will not see the rs znode.</p>
 </dd>
 <dt class="hdlist1">The <code>Peers</code> Znode</dt>
 <dd>
@@ -34147,6 +34153,16 @@ This list is divided into a set of queues organized by region server and the pee
 The rs znode has one child znode for each region server in the cluster.
 The child znode name is the region server&#8217;s hostname, client port, and start code.
 This list includes both live and dead region servers.</p>
+</dd>
+</dl>
+</div>
+<div id="hbase:replication" class="dlist">
+<dl>
+<dt class="hdlist1">The hbase:replication Table</dt>
+<dd>
+<p>After 3.0.0, the <code>Queue</code> has been stored in the hbase:replication table, where the row key is &lt;PeerId&gt;-&lt;ServerName&gt;[/&lt;SourceServerName&gt;], the WAL group will be the qualifier, and the serialized ReplicationGroupOffset will be the value.
+The ReplicationGroupOffset includes the wal file of the corresponding queue (&lt;PeerId&gt;-&lt;ServerName&gt;[/&lt;SourceServerName&gt;]) and its offset.
+Because we track replication offset per queue instead of per file, we only need to store one replication offset per queue.</p>
 </dd>
 <dt class="hdlist1">Other implementations for <code>ReplicationPeerStorage</code></dt>
 <dd>
@@ -34175,7 +34191,7 @@ When nodes are removed from the slave cluster, or if nodes go down or come back 
 </div>
 </div>
 <div class="sect3">
-<h4 id="_keeping_track_of_logs"><a class="anchor" href="#_keeping_track_of_logs"></a>165.6.4. Keeping Track of Logs</h4>
+<h4 id="_keeping_track_of_logsbased_on_zookeeper"><a class="anchor" href="#_keeping_track_of_logsbased_on_zookeeper"></a>165.6.4. Keeping Track of Logs(based on ZooKeeper)</h4>
 <div class="paragraph">
 <p>Each master cluster region server has its own znode in the replication znodes hierarchy.
 It contains one znode per peer cluster (if 5 slave clusters, 5 znodes are created), and each of these contain a queue of WALs to process.
@@ -34200,7 +34216,22 @@ Because moving a file is a NameNode operation , if the reader is currently readi
 </div>
 </div>
 <div class="sect3">
-<h4 id="_reading_filtering_and_sending_edits"><a class="anchor" href="#_reading_filtering_and_sending_edits"></a>165.6.5. Reading, Filtering and Sending Edits</h4>
+<h4 id="_keeping_track_of_logsbased_on_hbase_table"><a class="anchor" href="#_keeping_track_of_logsbased_on_hbase_table"></a>165.6.5. Keeping Track of Logs(based on hbase table)</h4>
+<div class="paragraph">
+<p>After 3.0.0, for table based implementation, we have server name in row key, which means we will have lots of rows for a given peer.</p>
+</div>
+<div class="paragraph">
+<p>For a normal replication queue, the WAL files belong to the region server that is still alive, all the WAL files are kept in memory, so we do not need to get the WAL files from replication queue storage.
+And for a recovered replication queue, we could get the WAL files of the dead region server by listing the old WAL directory on HDFS. So theoretically, we do not need to store every WAL file in replication queue storage.
+And what’s more, we store the created time(usually) in the WAL file name, so for all the WAL files in a WAL group, we can sort them(actually we will sort them in the current replication framework), which means we only need to store one replication offset per queue.
+When starting a recovered replication queue, we will skip all the files before this offset, and start replicating from this offset.</p>
+</div>
+<div class="paragraph">
+<p>For ReplicationLogCleaner, all the files before this offset can be deleted, otherwise not.</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_reading_filtering_and_sending_edits"><a class="anchor" href="#_reading_filtering_and_sending_edits"></a>165.6.6. Reading, Filtering and Sending Edits</h4>
 <div class="paragraph">
 <p>By default, a source attempts to read from a WAL and ship log entries to a sink as quickly as possible.
 Speed is limited by the filtering of log entries Only KeyValues that are scoped GLOBAL and that do not belong to catalog tables will be retained.
@@ -34217,7 +34248,7 @@ If the RPC threw an exception, the source will retry 10 times before trying to f
 </div>
 </div>
 <div class="sect3">
-<h4 id="_cleaning_logs"><a class="anchor" href="#_cleaning_logs"></a>165.6.6. Cleaning Logs</h4>
+<h4 id="_cleaning_logs"><a class="anchor" href="#_cleaning_logs"></a>165.6.7. Cleaning Logs</h4>
 <div class="paragraph">
 <p>If replication is not enabled, the master&#8217;s log-cleaning thread deletes old logs using a configured TTL.
 This TTL-based method does not work well with replication, because archived logs which have exceeded their TTL may still be in a queue.
@@ -34239,13 +34270,12 @@ WALs are saved when replication is enabled or disabled as long as peers exist.
 </div>
 </div>
 <div class="sect3">
-<h4 id="rs.failover.details"><a class="anchor" href="#rs.failover.details"></a>165.6.7. Region Server Failover</h4>
+<h4 id="rs.failover.details"><a class="anchor" href="#rs.failover.details"></a>165.6.8. Region Server Failover</h4>
 <div class="paragraph">
 <p>When no region servers are failing, keeping track of the logs in ZooKeeper adds no value.
-Unfortunately, region servers do fail, and since ZooKeeper is highly available, it is useful for managing the transfer of the queues in the event of a failure.</p>
-</div>
-<div class="paragraph">
-<p>Each of the master cluster region servers keeps a watcher on every other region server, in order to be notified when one dies (just as the master does). When a failure happens, they all race to create a znode called <code>lock</code> inside the dead region server&#8217;s znode that contains its queues.
+Unfortunately, region servers do fail, and since ZooKeeper is highly available, it is useful for managing the transfer of the queues in the event of a failure.
+Each of the master cluster region servers keeps a watcher on every other region server, in order to be notified when one dies (just as the master does).
+When a failure happens, they all race to create a znode called <code>lock</code> inside the dead region server&#8217;s znode that contains its queues.
 The region server that creates it successfully then transfers all the queues to its own znode, one at a time since ZooKeeper does not support renaming queues.
 After queues are all transferred, they are deleted from the old location.
 The znodes that were recovered are renamed with the ID of the slave cluster appended with the name of the dead server.</p>
@@ -34255,6 +34285,13 @@ The znodes that were recovered are renamed with the ID of the slave cluster appe
 The main difference is that those queues will never receive new data, since they do not belong to their new region server.
 When the reader hits the end of the last log, the queue&#8217;s znode is deleted and the master cluster region server closes that replication source.</p>
 </div>
+<div class="paragraph">
+<p>And starting from 2.5.0, the failover logic has been moved to SCP, where we add a SERVER_CRASH_CLAIM_REPLICATION_QUEUES step in SCP to claim the replication queues for a dead server.
+And starting from 3.0.0, where we changed the replication queue storage from zookeeper to table, the update to the replication queue storage is async, so we also need an extra step to add the missing replication queues before claiming.</p>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_the_replication_queue_claimingbased_on_zookeeper"><a class="anchor" href="#_the_replication_queue_claimingbased_on_zookeeper"></a>165.6.9. The replication queue claiming(based on ZooKeeper)</h4>
 <div class="paragraph">
 <p>Given a master cluster with 3 region servers replicating to a single slave with id <code>2</code>, the following hierarchy represents what the znodes layout could be at some point in time.
 The region servers' znodes all contain a <code>peers</code>          znode which contains a single queue.
@@ -34333,6 +34370,35 @@ The new layout will be:</p>
 
     <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="integer">60020</span>,<span class="integer">123456790</span>/
       <span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="float">60020.1312</span>  (Contains a position)</code></pre>
+</div>
+</div>
+</div>
+<div class="sect3">
+<h4 id="_the_replication_queue_claimingbased_on_hbase_table"><a class="anchor" href="#_the_replication_queue_claimingbased_on_hbase_table"></a>165.6.10. The replication queue claiming(based on hbase table)</h4>
+<div class="paragraph">
+<p>Given a master cluster with 3 region servers replicating to a single slave with id <code>2</code>, the following info represents what the storage layout of queue in the hbase:replication at some point in time.
+Row key is &lt;PeerId&gt;-&lt;ServerName&gt;[/&lt;SourceServerName&gt;], and value is WAL &amp;&amp; Offset.</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java">  &lt;PeerId&gt;-&lt;ServerName&gt;[/&lt;SourceServerName&gt;]                        WAL &amp;&amp; Offset
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.1</span>,<span class="integer">60020</span>,<span class="integer">123456780</span>                            <span class="float">1.1</span><span class="float">.1</span><span class="float">.1</span>,<span class="float">60020.1234</span>  (Contains a position)
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="integer">60020</span>,<span class="integer">123456790</span>                            <span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="float">60020.1214</span>  (Contains a position)
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.3</span>,<span class="integer">60020</span>,<span class="integer">123456630</span>                            <span class="float">1.1</span><span class="float">.1</span><span class="float">.3</span>,<span class="float">60020.1280</span>  (Contains a position)</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>Assume that 1.1.1.2 failed.
+The survivors will claim queue of that, and, arbitrarily, 1.1.1.3 wins.
+It will claim all the queue of 1.1.1.2, including removing the row of a replication queue, and inserting a new row(where we change the server name to the region server which claims the queue).
+Finally, the layout will look like the following:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="CodeRay highlight"><code data-lang="java">  &lt;PeerId&gt;-&lt;ServerName&gt;[/&lt;SourceServerName&gt;]                        WAL &amp;&amp; Offset
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.1</span>,<span class="integer">60020</span>,<span class="integer">123456780</span>                            <span class="float">1.1</span><span class="float">.1</span><span class="float">.1</span>,<span class="float">60020.1234</span>  (Contains a position)
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.3</span>,<span class="integer">60020</span>,<span class="integer">123456630</span>                            <span class="float">1.1</span><span class="float">.1</span><span class="float">.3</span>,<span class="float">60020.1280</span>  (Contains a position)
+  <span class="integer">2</span>-<span class="float">1.1</span><span class="float">.1</span><span class="float">.3</span>,<span class="integer">60020</span>,<span class="integer">123456630</span> <span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="integer">60020</span>,<span class="integer">123456790</span>    <span class="float">1.1</span><span class="float">.1</span><span class="float">.2</span>,<span class="float">60020.1214</span>  (Contains a position)</code></pre>
 </div>
 </div>
 </div>
@@ -34454,6 +34520,16 @@ The new layout will be:</p>
 <td class="tableblock halign-left valign-top"><p class="tableblock">The directory for storing replication peer state, when filesystem replication
                   peer storage is specified</p></td>
 <td class="tableblock halign-left valign-top"><p class="tableblock">peers</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">hbase.replication.queue.table.name</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">The table for storing replication queue state</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">hbase:replication</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">hbase.replication.queue.storage.impl</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">The replication queue storage implementation</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">TableReplicationQueueStorage</p></td>
 </tr>
 </tbody>
 </table>
@@ -48313,7 +48389,7 @@ org/apache/hadoop/hbase/security/access/AccessControlClient.revoke:(Lorg/apache/
 <div id="footer">
 <div id="footer-text">
 Version 3.0.0-alpha-4-SNAPSHOT<br>
-Last updated 2023-05-15 14:30:55 UTC
+Last updated 2023-05-16 14:30:51 UTC
 </div>
 </div>
 <script type="text/x-mathjax-config">
