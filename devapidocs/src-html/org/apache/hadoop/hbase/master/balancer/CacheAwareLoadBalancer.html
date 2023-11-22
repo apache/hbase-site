@@ -1,0 +1,551 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="en">
+<head>
+<title>Source code</title>
+<link rel="stylesheet" type="text/css" href="../../../../../../../stylesheet.css" title="Style">
+</head>
+<body>
+<div class="sourceContainer">
+<pre><span class="sourceLineNo">001</span>/*<a name="line.1"></a>
+<span class="sourceLineNo">002</span> * Licensed to the Apache Software Foundation (ASF) under one<a name="line.2"></a>
+<span class="sourceLineNo">003</span> * or more contributor license agreements.  See the NOTICE file<a name="line.3"></a>
+<span class="sourceLineNo">004</span> * distributed with this work for additional information<a name="line.4"></a>
+<span class="sourceLineNo">005</span> * regarding copyright ownership.  The ASF licenses this file<a name="line.5"></a>
+<span class="sourceLineNo">006</span> * to you under the Apache License, Version 2.0 (the<a name="line.6"></a>
+<span class="sourceLineNo">007</span> * "License"); you may not use this file except in compliance<a name="line.7"></a>
+<span class="sourceLineNo">008</span> * with the License.  You may obtain a copy of the License at<a name="line.8"></a>
+<span class="sourceLineNo">009</span> *<a name="line.9"></a>
+<span class="sourceLineNo">010</span> *     http://www.apache.org/licenses/LICENSE-2.0<a name="line.10"></a>
+<span class="sourceLineNo">011</span> *<a name="line.11"></a>
+<span class="sourceLineNo">012</span> * Unless required by applicable law or agreed to in writing, software<a name="line.12"></a>
+<span class="sourceLineNo">013</span> * distributed under the License is distributed on an "AS IS" BASIS,<a name="line.13"></a>
+<span class="sourceLineNo">014</span> * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.<a name="line.14"></a>
+<span class="sourceLineNo">015</span> * See the License for the specific language governing permissions and<a name="line.15"></a>
+<span class="sourceLineNo">016</span> * limitations under the License.<a name="line.16"></a>
+<span class="sourceLineNo">017</span> */<a name="line.17"></a>
+<span class="sourceLineNo">018</span>package org.apache.hadoop.hbase.master.balancer;<a name="line.18"></a>
+<span class="sourceLineNo">019</span><a name="line.19"></a>
+<span class="sourceLineNo">020</span>/** An implementation of the {@link org.apache.hadoop.hbase.master.LoadBalancer} that assigns regions<a name="line.20"></a>
+<span class="sourceLineNo">021</span> * based on the amount they are cached on a given server. A region can move across the region<a name="line.21"></a>
+<span class="sourceLineNo">022</span> * servers whenever a region server shuts down or crashes. The region server preserves the cache<a name="line.22"></a>
+<span class="sourceLineNo">023</span> * periodically and restores the cache when it is restarted. This balancer implements a mechanism<a name="line.23"></a>
+<span class="sourceLineNo">024</span> * where it maintains the amount by which a region is cached on a region server. During balancer<a name="line.24"></a>
+<span class="sourceLineNo">025</span> * run, a region plan is generated that takes into account this cache information and tries to<a name="line.25"></a>
+<span class="sourceLineNo">026</span> * move the regions so that the cache minimally impacted.<a name="line.26"></a>
+<span class="sourceLineNo">027</span> */<a name="line.27"></a>
+<span class="sourceLineNo">028</span><a name="line.28"></a>
+<span class="sourceLineNo">029</span>import static org.apache.hadoop.hbase.HConstants.BUCKET_CACHE_PERSISTENT_PATH_KEY;<a name="line.29"></a>
+<span class="sourceLineNo">030</span><a name="line.30"></a>
+<span class="sourceLineNo">031</span>import java.util.ArrayDeque;<a name="line.31"></a>
+<span class="sourceLineNo">032</span>import java.util.ArrayList;<a name="line.32"></a>
+<span class="sourceLineNo">033</span>import java.util.Arrays;<a name="line.33"></a>
+<span class="sourceLineNo">034</span>import java.util.Deque;<a name="line.34"></a>
+<span class="sourceLineNo">035</span>import java.util.HashMap;<a name="line.35"></a>
+<span class="sourceLineNo">036</span>import java.util.List;<a name="line.36"></a>
+<span class="sourceLineNo">037</span>import java.util.Map;<a name="line.37"></a>
+<span class="sourceLineNo">038</span>import java.util.Optional;<a name="line.38"></a>
+<span class="sourceLineNo">039</span>import org.apache.hadoop.conf.Configuration;<a name="line.39"></a>
+<span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.ClusterMetrics;<a name="line.40"></a>
+<span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.RegionMetrics;<a name="line.41"></a>
+<span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.ServerMetrics;<a name="line.42"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.ServerName;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.Size;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.client.RegionInfo;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.Pair;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.slf4j.Logger;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.slf4j.LoggerFactory;<a name="line.49"></a>
+<span class="sourceLineNo">050</span><a name="line.50"></a>
+<span class="sourceLineNo">051</span>@InterfaceAudience.Private<a name="line.51"></a>
+<span class="sourceLineNo">052</span>public class CacheAwareLoadBalancer extends StochasticLoadBalancer {<a name="line.52"></a>
+<span class="sourceLineNo">053</span>  private static final Logger LOG = LoggerFactory.getLogger(CacheAwareLoadBalancer.class);<a name="line.53"></a>
+<span class="sourceLineNo">054</span><a name="line.54"></a>
+<span class="sourceLineNo">055</span>  private Configuration configuration;<a name="line.55"></a>
+<span class="sourceLineNo">056</span><a name="line.56"></a>
+<span class="sourceLineNo">057</span>  public enum GeneratorFunctionType {<a name="line.57"></a>
+<span class="sourceLineNo">058</span>    LOAD,<a name="line.58"></a>
+<span class="sourceLineNo">059</span>    CACHE_RATIO<a name="line.59"></a>
+<span class="sourceLineNo">060</span>  }<a name="line.60"></a>
+<span class="sourceLineNo">061</span><a name="line.61"></a>
+<span class="sourceLineNo">062</span>  @Override<a name="line.62"></a>
+<span class="sourceLineNo">063</span>  public synchronized void loadConf(Configuration configuration) {<a name="line.63"></a>
+<span class="sourceLineNo">064</span>    this.configuration = configuration;<a name="line.64"></a>
+<span class="sourceLineNo">065</span>    this.costFunctions = new ArrayList&lt;&gt;();<a name="line.65"></a>
+<span class="sourceLineNo">066</span>    super.loadConf(configuration);<a name="line.66"></a>
+<span class="sourceLineNo">067</span>  }<a name="line.67"></a>
+<span class="sourceLineNo">068</span><a name="line.68"></a>
+<span class="sourceLineNo">069</span>  @Override<a name="line.69"></a>
+<span class="sourceLineNo">070</span>  protected List&lt;CandidateGenerator&gt; createCandidateGenerators() {<a name="line.70"></a>
+<span class="sourceLineNo">071</span>    List&lt;CandidateGenerator&gt; candidateGenerators = new ArrayList&lt;&gt;(2);<a name="line.71"></a>
+<span class="sourceLineNo">072</span>    candidateGenerators.add(GeneratorFunctionType.LOAD.ordinal(),<a name="line.72"></a>
+<span class="sourceLineNo">073</span>      new CacheAwareSkewnessCandidateGenerator());<a name="line.73"></a>
+<span class="sourceLineNo">074</span>    candidateGenerators.add(GeneratorFunctionType.CACHE_RATIO.ordinal(),<a name="line.74"></a>
+<span class="sourceLineNo">075</span>      new CacheAwareCandidateGenerator());<a name="line.75"></a>
+<span class="sourceLineNo">076</span>    return candidateGenerators;<a name="line.76"></a>
+<span class="sourceLineNo">077</span>  }<a name="line.77"></a>
+<span class="sourceLineNo">078</span><a name="line.78"></a>
+<span class="sourceLineNo">079</span>  @Override<a name="line.79"></a>
+<span class="sourceLineNo">080</span>  protected List&lt;CostFunction&gt; createCostFunctions(Configuration configuration) {<a name="line.80"></a>
+<span class="sourceLineNo">081</span>    List&lt;CostFunction&gt; costFunctions = new ArrayList&lt;&gt;();<a name="line.81"></a>
+<span class="sourceLineNo">082</span>    addCostFunction(costFunctions, new CacheAwareRegionSkewnessCostFunction(configuration));<a name="line.82"></a>
+<span class="sourceLineNo">083</span>    addCostFunction(costFunctions, new CacheAwareCostFunction(configuration));<a name="line.83"></a>
+<span class="sourceLineNo">084</span>    return costFunctions;<a name="line.84"></a>
+<span class="sourceLineNo">085</span>  }<a name="line.85"></a>
+<span class="sourceLineNo">086</span><a name="line.86"></a>
+<span class="sourceLineNo">087</span>  private void addCostFunction(List&lt;CostFunction&gt; costFunctions, CostFunction costFunction) {<a name="line.87"></a>
+<span class="sourceLineNo">088</span>    if (costFunction.getMultiplier() &gt; 0) {<a name="line.88"></a>
+<span class="sourceLineNo">089</span>      costFunctions.add(costFunction);<a name="line.89"></a>
+<span class="sourceLineNo">090</span>    }<a name="line.90"></a>
+<span class="sourceLineNo">091</span>  }<a name="line.91"></a>
+<span class="sourceLineNo">092</span><a name="line.92"></a>
+<span class="sourceLineNo">093</span>  @Override<a name="line.93"></a>
+<span class="sourceLineNo">094</span>  public void updateClusterMetrics(ClusterMetrics clusterMetrics) {<a name="line.94"></a>
+<span class="sourceLineNo">095</span>    this.clusterStatus = clusterMetrics;<a name="line.95"></a>
+<span class="sourceLineNo">096</span>    updateRegionLoad();<a name="line.96"></a>
+<span class="sourceLineNo">097</span>  }<a name="line.97"></a>
+<span class="sourceLineNo">098</span><a name="line.98"></a>
+<span class="sourceLineNo">099</span>  /**<a name="line.99"></a>
+<span class="sourceLineNo">100</span>   * Collect the amount of region cached for all the regions from all the active region servers.<a name="line.100"></a>
+<span class="sourceLineNo">101</span>   */<a name="line.101"></a>
+<span class="sourceLineNo">102</span>  private void updateRegionLoad() {<a name="line.102"></a>
+<span class="sourceLineNo">103</span>    loads = new HashMap&lt;&gt;();<a name="line.103"></a>
+<span class="sourceLineNo">104</span>    regionCacheRatioOnOldServerMap = new HashMap&lt;&gt;();<a name="line.104"></a>
+<span class="sourceLineNo">105</span>    Map&lt;String, Pair&lt;ServerName, Integer&gt;&gt; regionCacheRatioOnCurrentServerMap = new HashMap&lt;&gt;();<a name="line.105"></a>
+<span class="sourceLineNo">106</span><a name="line.106"></a>
+<span class="sourceLineNo">107</span>    // Build current region cache statistics<a name="line.107"></a>
+<span class="sourceLineNo">108</span>    clusterStatus.getLiveServerMetrics().forEach((ServerName sn, ServerMetrics sm) -&gt; {<a name="line.108"></a>
+<span class="sourceLineNo">109</span>      // Create a map of region and the server where it is currently hosted<a name="line.109"></a>
+<span class="sourceLineNo">110</span>      sm.getRegionMetrics().forEach((byte[] regionName, RegionMetrics rm) -&gt; {<a name="line.110"></a>
+<span class="sourceLineNo">111</span>        String regionEncodedName = RegionInfo.encodeRegionName(regionName);<a name="line.111"></a>
+<span class="sourceLineNo">112</span><a name="line.112"></a>
+<span class="sourceLineNo">113</span>        Deque&lt;BalancerRegionLoad&gt; rload = new ArrayDeque&lt;&gt;();<a name="line.113"></a>
+<span class="sourceLineNo">114</span><a name="line.114"></a>
+<span class="sourceLineNo">115</span>        // Get the total size of the hFiles in this region<a name="line.115"></a>
+<span class="sourceLineNo">116</span>        int regionSizeMB = (int) rm.getRegionSizeMB().get(Size.Unit.MEGABYTE);<a name="line.116"></a>
+<span class="sourceLineNo">117</span><a name="line.117"></a>
+<span class="sourceLineNo">118</span>        rload.add(new BalancerRegionLoad(rm));<a name="line.118"></a>
+<span class="sourceLineNo">119</span>        // Maintain a map of region and it's total size. This is needed to calculate the cache<a name="line.119"></a>
+<span class="sourceLineNo">120</span>        // ratios for the regions cached on old region servers<a name="line.120"></a>
+<span class="sourceLineNo">121</span>        regionCacheRatioOnCurrentServerMap.put(regionEncodedName, new Pair&lt;&gt;(sn, regionSizeMB));<a name="line.121"></a>
+<span class="sourceLineNo">122</span>        loads.put(regionEncodedName, rload);<a name="line.122"></a>
+<span class="sourceLineNo">123</span>      });<a name="line.123"></a>
+<span class="sourceLineNo">124</span>    });<a name="line.124"></a>
+<span class="sourceLineNo">125</span><a name="line.125"></a>
+<span class="sourceLineNo">126</span>    // Build cache statistics for the regions hosted previously on old region servers<a name="line.126"></a>
+<span class="sourceLineNo">127</span>    clusterStatus.getLiveServerMetrics().forEach((ServerName sn, ServerMetrics sm) -&gt; {<a name="line.127"></a>
+<span class="sourceLineNo">128</span>      // Find if a region was previously hosted on a server other than the one it is currently<a name="line.128"></a>
+<span class="sourceLineNo">129</span>      // hosted on.<a name="line.129"></a>
+<span class="sourceLineNo">130</span>      sm.getRegionCachedInfo().forEach((String regionEncodedName, Integer regionSizeInCache) -&gt; {<a name="line.130"></a>
+<span class="sourceLineNo">131</span>        // If the region is found in regionCacheRatioOnCurrentServerMap, it is currently hosted on<a name="line.131"></a>
+<span class="sourceLineNo">132</span>        // this server<a name="line.132"></a>
+<span class="sourceLineNo">133</span>        if (regionCacheRatioOnCurrentServerMap.containsKey(regionEncodedName)) {<a name="line.133"></a>
+<span class="sourceLineNo">134</span>          ServerName currentServer =<a name="line.134"></a>
+<span class="sourceLineNo">135</span>            regionCacheRatioOnCurrentServerMap.get(regionEncodedName).getFirst();<a name="line.135"></a>
+<span class="sourceLineNo">136</span>          if (!ServerName.isSameAddress(currentServer, sn)) {<a name="line.136"></a>
+<span class="sourceLineNo">137</span>            int regionSizeMB =<a name="line.137"></a>
+<span class="sourceLineNo">138</span>              regionCacheRatioOnCurrentServerMap.get(regionEncodedName).getSecond();<a name="line.138"></a>
+<span class="sourceLineNo">139</span>            float regionCacheRatioOnOldServer =<a name="line.139"></a>
+<span class="sourceLineNo">140</span>              regionSizeMB == 0 ? 0.0f : (float) regionSizeInCache / regionSizeMB;<a name="line.140"></a>
+<span class="sourceLineNo">141</span>            regionCacheRatioOnOldServerMap.put(regionEncodedName,<a name="line.141"></a>
+<span class="sourceLineNo">142</span>              new Pair&lt;&gt;(sn, regionCacheRatioOnOldServer));<a name="line.142"></a>
+<span class="sourceLineNo">143</span>          }<a name="line.143"></a>
+<span class="sourceLineNo">144</span>        }<a name="line.144"></a>
+<span class="sourceLineNo">145</span>      });<a name="line.145"></a>
+<span class="sourceLineNo">146</span>    });<a name="line.146"></a>
+<span class="sourceLineNo">147</span>  }<a name="line.147"></a>
+<span class="sourceLineNo">148</span><a name="line.148"></a>
+<span class="sourceLineNo">149</span>  private RegionInfo getRegionInfoByEncodedName(BalancerClusterState cluster, String regionName) {<a name="line.149"></a>
+<span class="sourceLineNo">150</span>    Optional&lt;RegionInfo&gt; regionInfoOptional =<a name="line.150"></a>
+<span class="sourceLineNo">151</span>      Arrays.stream(cluster.regions).filter((RegionInfo ri) -&gt; {<a name="line.151"></a>
+<span class="sourceLineNo">152</span>        return regionName.equals(ri.getEncodedName());<a name="line.152"></a>
+<span class="sourceLineNo">153</span>      }).findFirst();<a name="line.153"></a>
+<span class="sourceLineNo">154</span><a name="line.154"></a>
+<span class="sourceLineNo">155</span>    if (regionInfoOptional.isPresent()) {<a name="line.155"></a>
+<span class="sourceLineNo">156</span>      return regionInfoOptional.get();<a name="line.156"></a>
+<span class="sourceLineNo">157</span>    }<a name="line.157"></a>
+<span class="sourceLineNo">158</span>    return null;<a name="line.158"></a>
+<span class="sourceLineNo">159</span>  }<a name="line.159"></a>
+<span class="sourceLineNo">160</span><a name="line.160"></a>
+<span class="sourceLineNo">161</span>  private class CacheAwareCandidateGenerator extends CandidateGenerator {<a name="line.161"></a>
+<span class="sourceLineNo">162</span>    @Override<a name="line.162"></a>
+<span class="sourceLineNo">163</span>    protected BalanceAction generate(BalancerClusterState cluster) {<a name="line.163"></a>
+<span class="sourceLineNo">164</span>      // Move the regions to the servers they were previously hosted on based on the cache ratio<a name="line.164"></a>
+<span class="sourceLineNo">165</span>      if (<a name="line.165"></a>
+<span class="sourceLineNo">166</span>        !regionCacheRatioOnOldServerMap.isEmpty()<a name="line.166"></a>
+<span class="sourceLineNo">167</span>          &amp;&amp; regionCacheRatioOnOldServerMap.entrySet().iterator().hasNext()<a name="line.167"></a>
+<span class="sourceLineNo">168</span>      ) {<a name="line.168"></a>
+<span class="sourceLineNo">169</span>        Map.Entry&lt;String, Pair&lt;ServerName, Float&gt;&gt; regionCacheRatioServerMap =<a name="line.169"></a>
+<span class="sourceLineNo">170</span>          regionCacheRatioOnOldServerMap.entrySet().iterator().next();<a name="line.170"></a>
+<span class="sourceLineNo">171</span>        // Get the server where this region was previously hosted<a name="line.171"></a>
+<span class="sourceLineNo">172</span>        String regionEncodedName = regionCacheRatioServerMap.getKey();<a name="line.172"></a>
+<span class="sourceLineNo">173</span>        RegionInfo regionInfo = getRegionInfoByEncodedName(cluster, regionEncodedName);<a name="line.173"></a>
+<span class="sourceLineNo">174</span>        if (regionInfo == null) {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>          LOG.warn("Region {} not found", regionEncodedName);<a name="line.175"></a>
+<span class="sourceLineNo">176</span>          regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.176"></a>
+<span class="sourceLineNo">177</span>          return BalanceAction.NULL_ACTION;<a name="line.177"></a>
+<span class="sourceLineNo">178</span>        }<a name="line.178"></a>
+<span class="sourceLineNo">179</span>        if (regionInfo.isMetaRegion() || regionInfo.getTable().isSystemTable()) {<a name="line.179"></a>
+<span class="sourceLineNo">180</span>          regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.180"></a>
+<span class="sourceLineNo">181</span>          return BalanceAction.NULL_ACTION;<a name="line.181"></a>
+<span class="sourceLineNo">182</span>        }<a name="line.182"></a>
+<span class="sourceLineNo">183</span>        int regionIndex = cluster.regionsToIndex.get(regionInfo);<a name="line.183"></a>
+<span class="sourceLineNo">184</span>        int oldServerIndex = cluster.serversToIndex<a name="line.184"></a>
+<span class="sourceLineNo">185</span>          .get(regionCacheRatioOnOldServerMap.get(regionEncodedName).getFirst().getAddress());<a name="line.185"></a>
+<span class="sourceLineNo">186</span>        if (oldServerIndex &lt; 0) {<a name="line.186"></a>
+<span class="sourceLineNo">187</span>          LOG.warn("Server previously hosting region {} not found", regionEncodedName);<a name="line.187"></a>
+<span class="sourceLineNo">188</span>          regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.188"></a>
+<span class="sourceLineNo">189</span>          return BalanceAction.NULL_ACTION;<a name="line.189"></a>
+<span class="sourceLineNo">190</span>        }<a name="line.190"></a>
+<span class="sourceLineNo">191</span><a name="line.191"></a>
+<span class="sourceLineNo">192</span>        float oldRegionCacheRatio =<a name="line.192"></a>
+<span class="sourceLineNo">193</span>          cluster.getOrComputeRegionCacheRatio(regionIndex, oldServerIndex);<a name="line.193"></a>
+<span class="sourceLineNo">194</span>        int currentServerIndex = cluster.regionIndexToServerIndex[regionIndex];<a name="line.194"></a>
+<span class="sourceLineNo">195</span>        float currentRegionCacheRatio =<a name="line.195"></a>
+<span class="sourceLineNo">196</span>          cluster.getOrComputeRegionCacheRatio(regionIndex, currentServerIndex);<a name="line.196"></a>
+<span class="sourceLineNo">197</span><a name="line.197"></a>
+<span class="sourceLineNo">198</span>        BalanceAction action = generatePlan(cluster, regionIndex, currentServerIndex,<a name="line.198"></a>
+<span class="sourceLineNo">199</span>          currentRegionCacheRatio, oldServerIndex, oldRegionCacheRatio);<a name="line.199"></a>
+<span class="sourceLineNo">200</span>        regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.200"></a>
+<span class="sourceLineNo">201</span>        return action;<a name="line.201"></a>
+<span class="sourceLineNo">202</span>      }<a name="line.202"></a>
+<span class="sourceLineNo">203</span>      return BalanceAction.NULL_ACTION;<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    }<a name="line.204"></a>
+<span class="sourceLineNo">205</span><a name="line.205"></a>
+<span class="sourceLineNo">206</span>    private BalanceAction generatePlan(BalancerClusterState cluster, int regionIndex,<a name="line.206"></a>
+<span class="sourceLineNo">207</span>      int currentServerIndex, float cacheRatioOnCurrentServer, int oldServerIndex,<a name="line.207"></a>
+<span class="sourceLineNo">208</span>      float cacheRatioOnOldServer) {<a name="line.208"></a>
+<span class="sourceLineNo">209</span>      return moveRegionToOldServer(cluster, regionIndex, currentServerIndex,<a name="line.209"></a>
+<span class="sourceLineNo">210</span>        cacheRatioOnCurrentServer, oldServerIndex, cacheRatioOnOldServer)<a name="line.210"></a>
+<span class="sourceLineNo">211</span>          ? getAction(currentServerIndex, regionIndex, oldServerIndex, -1)<a name="line.211"></a>
+<span class="sourceLineNo">212</span>          : BalanceAction.NULL_ACTION;<a name="line.212"></a>
+<span class="sourceLineNo">213</span>    }<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>    private boolean moveRegionToOldServer(BalancerClusterState cluster, int regionIndex,<a name="line.215"></a>
+<span class="sourceLineNo">216</span>      int currentServerIndex, float cacheRatioOnCurrentServer, int oldServerIndex,<a name="line.216"></a>
+<span class="sourceLineNo">217</span>      float cacheRatioOnOldServer) {<a name="line.217"></a>
+<span class="sourceLineNo">218</span>      // Find if the region has already moved by comparing the current server index with the<a name="line.218"></a>
+<span class="sourceLineNo">219</span>      // current server index. This can happen when other candidate generator has moved the region<a name="line.219"></a>
+<span class="sourceLineNo">220</span>      if (currentServerIndex &lt; 0 || oldServerIndex &lt; 0) {<a name="line.220"></a>
+<span class="sourceLineNo">221</span>        return false;<a name="line.221"></a>
+<span class="sourceLineNo">222</span>      }<a name="line.222"></a>
+<span class="sourceLineNo">223</span><a name="line.223"></a>
+<span class="sourceLineNo">224</span>      float cacheRatioDiffThreshold = 0.6f;<a name="line.224"></a>
+<span class="sourceLineNo">225</span><a name="line.225"></a>
+<span class="sourceLineNo">226</span>      // Conditions for moving the region<a name="line.226"></a>
+<span class="sourceLineNo">227</span><a name="line.227"></a>
+<span class="sourceLineNo">228</span>      // If the region is fully cached on the old server, move the region back<a name="line.228"></a>
+<span class="sourceLineNo">229</span>      if (cacheRatioOnOldServer == 1.0f) {<a name="line.229"></a>
+<span class="sourceLineNo">230</span>        if (LOG.isDebugEnabled()) {<a name="line.230"></a>
+<span class="sourceLineNo">231</span>          LOG.debug("Region {} moved to the old server {} as it is fully cached there",<a name="line.231"></a>
+<span class="sourceLineNo">232</span>            cluster.regions[regionIndex].getEncodedName(), cluster.servers[oldServerIndex]);<a name="line.232"></a>
+<span class="sourceLineNo">233</span>        }<a name="line.233"></a>
+<span class="sourceLineNo">234</span>        return true;<a name="line.234"></a>
+<span class="sourceLineNo">235</span>      }<a name="line.235"></a>
+<span class="sourceLineNo">236</span><a name="line.236"></a>
+<span class="sourceLineNo">237</span>      // Move the region back to the old server if it is cached equally on both the servers<a name="line.237"></a>
+<span class="sourceLineNo">238</span>      if (cacheRatioOnCurrentServer == cacheRatioOnOldServer) {<a name="line.238"></a>
+<span class="sourceLineNo">239</span>        if (LOG.isDebugEnabled()) {<a name="line.239"></a>
+<span class="sourceLineNo">240</span>          LOG.debug(<a name="line.240"></a>
+<span class="sourceLineNo">241</span>            "Region {} moved from {} to {} as the region is cached {} equally on both servers",<a name="line.241"></a>
+<span class="sourceLineNo">242</span>            cluster.regions[regionIndex].getEncodedName(), cluster.servers[currentServerIndex],<a name="line.242"></a>
+<span class="sourceLineNo">243</span>            cluster.servers[oldServerIndex], cacheRatioOnCurrentServer);<a name="line.243"></a>
+<span class="sourceLineNo">244</span>        }<a name="line.244"></a>
+<span class="sourceLineNo">245</span>        return true;<a name="line.245"></a>
+<span class="sourceLineNo">246</span>      }<a name="line.246"></a>
+<span class="sourceLineNo">247</span><a name="line.247"></a>
+<span class="sourceLineNo">248</span>      // If the region is not fully cached on either of the servers, move the region back to the<a name="line.248"></a>
+<span class="sourceLineNo">249</span>      // old server if the region cache ratio on the current server is still much less than the old<a name="line.249"></a>
+<span class="sourceLineNo">250</span>      // server<a name="line.250"></a>
+<span class="sourceLineNo">251</span>      if (<a name="line.251"></a>
+<span class="sourceLineNo">252</span>        cacheRatioOnOldServer &gt; 0.0f<a name="line.252"></a>
+<span class="sourceLineNo">253</span>          &amp;&amp; cacheRatioOnCurrentServer / cacheRatioOnOldServer &lt; cacheRatioDiffThreshold<a name="line.253"></a>
+<span class="sourceLineNo">254</span>      ) {<a name="line.254"></a>
+<span class="sourceLineNo">255</span>        if (LOG.isDebugEnabled()) {<a name="line.255"></a>
+<span class="sourceLineNo">256</span>          LOG.debug(<a name="line.256"></a>
+<span class="sourceLineNo">257</span>            "Region {} moved from {} to {} as region cache ratio {} is better than the current "<a name="line.257"></a>
+<span class="sourceLineNo">258</span>              + "cache ratio {}",<a name="line.258"></a>
+<span class="sourceLineNo">259</span>            cluster.regions[regionIndex].getEncodedName(), cluster.servers[currentServerIndex],<a name="line.259"></a>
+<span class="sourceLineNo">260</span>            cluster.servers[oldServerIndex], cacheRatioOnCurrentServer, cacheRatioOnOldServer);<a name="line.260"></a>
+<span class="sourceLineNo">261</span>        }<a name="line.261"></a>
+<span class="sourceLineNo">262</span>        return true;<a name="line.262"></a>
+<span class="sourceLineNo">263</span>      }<a name="line.263"></a>
+<span class="sourceLineNo">264</span><a name="line.264"></a>
+<span class="sourceLineNo">265</span>      if (LOG.isDebugEnabled()) {<a name="line.265"></a>
+<span class="sourceLineNo">266</span>        LOG.debug(<a name="line.266"></a>
+<span class="sourceLineNo">267</span>          "Region {} not moved from {} to {} with current cache ratio {} and old cache ratio {}",<a name="line.267"></a>
+<span class="sourceLineNo">268</span>          cluster.regions[regionIndex], cluster.servers[currentServerIndex],<a name="line.268"></a>
+<span class="sourceLineNo">269</span>          cluster.servers[oldServerIndex], cacheRatioOnCurrentServer, cacheRatioOnOldServer);<a name="line.269"></a>
+<span class="sourceLineNo">270</span>      }<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      return false;<a name="line.271"></a>
+<span class="sourceLineNo">272</span>    }<a name="line.272"></a>
+<span class="sourceLineNo">273</span>  }<a name="line.273"></a>
+<span class="sourceLineNo">274</span><a name="line.274"></a>
+<span class="sourceLineNo">275</span>  private class CacheAwareSkewnessCandidateGenerator extends LoadCandidateGenerator {<a name="line.275"></a>
+<span class="sourceLineNo">276</span>    @Override<a name="line.276"></a>
+<span class="sourceLineNo">277</span>    BalanceAction pickRandomRegions(BalancerClusterState cluster, int thisServer, int otherServer) {<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      // First move all the regions which were hosted previously on some other server back to their<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      // old servers<a name="line.279"></a>
+<span class="sourceLineNo">280</span>      if (<a name="line.280"></a>
+<span class="sourceLineNo">281</span>        !regionCacheRatioOnOldServerMap.isEmpty()<a name="line.281"></a>
+<span class="sourceLineNo">282</span>          &amp;&amp; regionCacheRatioOnOldServerMap.entrySet().iterator().hasNext()<a name="line.282"></a>
+<span class="sourceLineNo">283</span>      ) {<a name="line.283"></a>
+<span class="sourceLineNo">284</span>        // Get the first region index in the historical cache ratio list<a name="line.284"></a>
+<span class="sourceLineNo">285</span>        Map.Entry&lt;String, Pair&lt;ServerName, Float&gt;&gt; regionEntry =<a name="line.285"></a>
+<span class="sourceLineNo">286</span>          regionCacheRatioOnOldServerMap.entrySet().iterator().next();<a name="line.286"></a>
+<span class="sourceLineNo">287</span>        String regionEncodedName = regionEntry.getKey();<a name="line.287"></a>
+<span class="sourceLineNo">288</span><a name="line.288"></a>
+<span class="sourceLineNo">289</span>        RegionInfo regionInfo = getRegionInfoByEncodedName(cluster, regionEncodedName);<a name="line.289"></a>
+<span class="sourceLineNo">290</span>        if (regionInfo == null) {<a name="line.290"></a>
+<span class="sourceLineNo">291</span>          LOG.warn("Region {} does not exist", regionEncodedName);<a name="line.291"></a>
+<span class="sourceLineNo">292</span>          regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.292"></a>
+<span class="sourceLineNo">293</span>          return BalanceAction.NULL_ACTION;<a name="line.293"></a>
+<span class="sourceLineNo">294</span>        }<a name="line.294"></a>
+<span class="sourceLineNo">295</span>        if (regionInfo.isMetaRegion() || regionInfo.getTable().isSystemTable()) {<a name="line.295"></a>
+<span class="sourceLineNo">296</span>          regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.296"></a>
+<span class="sourceLineNo">297</span>          return BalanceAction.NULL_ACTION;<a name="line.297"></a>
+<span class="sourceLineNo">298</span>        }<a name="line.298"></a>
+<span class="sourceLineNo">299</span><a name="line.299"></a>
+<span class="sourceLineNo">300</span>        int regionIndex = cluster.regionsToIndex.get(regionInfo);<a name="line.300"></a>
+<span class="sourceLineNo">301</span><a name="line.301"></a>
+<span class="sourceLineNo">302</span>        // Get the current host name for this region<a name="line.302"></a>
+<span class="sourceLineNo">303</span>        thisServer = cluster.regionIndexToServerIndex[regionIndex];<a name="line.303"></a>
+<span class="sourceLineNo">304</span><a name="line.304"></a>
+<span class="sourceLineNo">305</span>        // Get the old server index<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        otherServer = cluster.serversToIndex.get(regionEntry.getValue().getFirst().getAddress());<a name="line.306"></a>
+<span class="sourceLineNo">307</span><a name="line.307"></a>
+<span class="sourceLineNo">308</span>        regionCacheRatioOnOldServerMap.remove(regionEncodedName);<a name="line.308"></a>
+<span class="sourceLineNo">309</span><a name="line.309"></a>
+<span class="sourceLineNo">310</span>        if (otherServer &lt; 0) {<a name="line.310"></a>
+<span class="sourceLineNo">311</span>          // The old server has been moved to other host and hence, the region cannot be moved back<a name="line.311"></a>
+<span class="sourceLineNo">312</span>          // to the old server<a name="line.312"></a>
+<span class="sourceLineNo">313</span>          if (LOG.isDebugEnabled()) {<a name="line.313"></a>
+<span class="sourceLineNo">314</span>            LOG.debug(<a name="line.314"></a>
+<span class="sourceLineNo">315</span>              "CacheAwareSkewnessCandidateGenerator: Region {} not moved to the old "<a name="line.315"></a>
+<span class="sourceLineNo">316</span>                + "server {} as the server does not exist",<a name="line.316"></a>
+<span class="sourceLineNo">317</span>              regionEncodedName, regionEntry.getValue().getFirst().getHostname());<a name="line.317"></a>
+<span class="sourceLineNo">318</span>          }<a name="line.318"></a>
+<span class="sourceLineNo">319</span>          return BalanceAction.NULL_ACTION;<a name="line.319"></a>
+<span class="sourceLineNo">320</span>        }<a name="line.320"></a>
+<span class="sourceLineNo">321</span><a name="line.321"></a>
+<span class="sourceLineNo">322</span>        if (LOG.isDebugEnabled()) {<a name="line.322"></a>
+<span class="sourceLineNo">323</span>          LOG.debug(<a name="line.323"></a>
+<span class="sourceLineNo">324</span>            "CacheAwareSkewnessCandidateGenerator: Region {} moved from {} to {} as it "<a name="line.324"></a>
+<span class="sourceLineNo">325</span>              + "was hosted their earlier",<a name="line.325"></a>
+<span class="sourceLineNo">326</span>            regionEncodedName, cluster.servers[thisServer].getHostname(),<a name="line.326"></a>
+<span class="sourceLineNo">327</span>            cluster.servers[otherServer].getHostname());<a name="line.327"></a>
+<span class="sourceLineNo">328</span>        }<a name="line.328"></a>
+<span class="sourceLineNo">329</span><a name="line.329"></a>
+<span class="sourceLineNo">330</span>        return getAction(thisServer, regionIndex, otherServer, -1);<a name="line.330"></a>
+<span class="sourceLineNo">331</span>      }<a name="line.331"></a>
+<span class="sourceLineNo">332</span><a name="line.332"></a>
+<span class="sourceLineNo">333</span>      if (thisServer &lt; 0 || otherServer &lt; 0) {<a name="line.333"></a>
+<span class="sourceLineNo">334</span>        return BalanceAction.NULL_ACTION;<a name="line.334"></a>
+<span class="sourceLineNo">335</span>      }<a name="line.335"></a>
+<span class="sourceLineNo">336</span><a name="line.336"></a>
+<span class="sourceLineNo">337</span>      int regionIndexToMove = pickLeastCachedRegion(cluster, thisServer);<a name="line.337"></a>
+<span class="sourceLineNo">338</span>      if (regionIndexToMove &lt; 0) {<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        if (LOG.isDebugEnabled()) {<a name="line.339"></a>
+<span class="sourceLineNo">340</span>          LOG.debug("CacheAwareSkewnessCandidateGenerator: No region found for movement");<a name="line.340"></a>
+<span class="sourceLineNo">341</span>        }<a name="line.341"></a>
+<span class="sourceLineNo">342</span>        return BalanceAction.NULL_ACTION;<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      }<a name="line.343"></a>
+<span class="sourceLineNo">344</span>      if (LOG.isDebugEnabled()) {<a name="line.344"></a>
+<span class="sourceLineNo">345</span>        LOG.debug(<a name="line.345"></a>
+<span class="sourceLineNo">346</span>          "CacheAwareSkewnessCandidateGenerator: Region {} moved from {} to {} as it is "<a name="line.346"></a>
+<span class="sourceLineNo">347</span>            + "least cached on current server",<a name="line.347"></a>
+<span class="sourceLineNo">348</span>          cluster.regions[regionIndexToMove].getEncodedName(),<a name="line.348"></a>
+<span class="sourceLineNo">349</span>          cluster.servers[thisServer].getHostname(), cluster.servers[otherServer].getHostname());<a name="line.349"></a>
+<span class="sourceLineNo">350</span>      }<a name="line.350"></a>
+<span class="sourceLineNo">351</span>      return getAction(thisServer, regionIndexToMove, otherServer, -1);<a name="line.351"></a>
+<span class="sourceLineNo">352</span>    }<a name="line.352"></a>
+<span class="sourceLineNo">353</span><a name="line.353"></a>
+<span class="sourceLineNo">354</span>    private int pickLeastCachedRegion(BalancerClusterState cluster, int thisServer) {<a name="line.354"></a>
+<span class="sourceLineNo">355</span>      float minCacheRatio = Float.MAX_VALUE;<a name="line.355"></a>
+<span class="sourceLineNo">356</span>      int leastCachedRegion = -1;<a name="line.356"></a>
+<span class="sourceLineNo">357</span>      for (int i = 0; i &lt; cluster.regionsPerServer[thisServer].length; i++) {<a name="line.357"></a>
+<span class="sourceLineNo">358</span>        int regionIndex = cluster.regionsPerServer[thisServer][i];<a name="line.358"></a>
+<span class="sourceLineNo">359</span><a name="line.359"></a>
+<span class="sourceLineNo">360</span>        float cacheRatioOnCurrentServer =<a name="line.360"></a>
+<span class="sourceLineNo">361</span>          cluster.getOrComputeRegionCacheRatio(regionIndex, thisServer);<a name="line.361"></a>
+<span class="sourceLineNo">362</span>        if (cacheRatioOnCurrentServer &lt; minCacheRatio) {<a name="line.362"></a>
+<span class="sourceLineNo">363</span>          minCacheRatio = cacheRatioOnCurrentServer;<a name="line.363"></a>
+<span class="sourceLineNo">364</span>          leastCachedRegion = regionIndex;<a name="line.364"></a>
+<span class="sourceLineNo">365</span>        }<a name="line.365"></a>
+<span class="sourceLineNo">366</span>      }<a name="line.366"></a>
+<span class="sourceLineNo">367</span>      return leastCachedRegion;<a name="line.367"></a>
+<span class="sourceLineNo">368</span>    }<a name="line.368"></a>
+<span class="sourceLineNo">369</span>  }<a name="line.369"></a>
+<span class="sourceLineNo">370</span><a name="line.370"></a>
+<span class="sourceLineNo">371</span>  static class CacheAwareRegionSkewnessCostFunction extends CostFunction {<a name="line.371"></a>
+<span class="sourceLineNo">372</span>    static final String REGION_COUNT_SKEW_COST_KEY =<a name="line.372"></a>
+<span class="sourceLineNo">373</span>      "hbase.master.balancer.stochastic.regionCountCost";<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    static final float DEFAULT_REGION_COUNT_SKEW_COST = 20;<a name="line.374"></a>
+<span class="sourceLineNo">375</span>    private final DoubleArrayCost cost = new DoubleArrayCost();<a name="line.375"></a>
+<span class="sourceLineNo">376</span><a name="line.376"></a>
+<span class="sourceLineNo">377</span>    CacheAwareRegionSkewnessCostFunction(Configuration conf) {<a name="line.377"></a>
+<span class="sourceLineNo">378</span>      // Load multiplier should be the greatest as it is the most general way to balance data.<a name="line.378"></a>
+<span class="sourceLineNo">379</span>      this.setMultiplier(conf.getFloat(REGION_COUNT_SKEW_COST_KEY, DEFAULT_REGION_COUNT_SKEW_COST));<a name="line.379"></a>
+<span class="sourceLineNo">380</span>    }<a name="line.380"></a>
+<span class="sourceLineNo">381</span><a name="line.381"></a>
+<span class="sourceLineNo">382</span>    @Override<a name="line.382"></a>
+<span class="sourceLineNo">383</span>    void prepare(BalancerClusterState cluster) {<a name="line.383"></a>
+<span class="sourceLineNo">384</span>      super.prepare(cluster);<a name="line.384"></a>
+<span class="sourceLineNo">385</span>      cost.prepare(cluster.numServers);<a name="line.385"></a>
+<span class="sourceLineNo">386</span>      cost.applyCostsChange(costs -&gt; {<a name="line.386"></a>
+<span class="sourceLineNo">387</span>        for (int i = 0; i &lt; cluster.numServers; i++) {<a name="line.387"></a>
+<span class="sourceLineNo">388</span>          costs[i] = cluster.regionsPerServer[i].length;<a name="line.388"></a>
+<span class="sourceLineNo">389</span>        }<a name="line.389"></a>
+<span class="sourceLineNo">390</span>      });<a name="line.390"></a>
+<span class="sourceLineNo">391</span>    }<a name="line.391"></a>
+<span class="sourceLineNo">392</span><a name="line.392"></a>
+<span class="sourceLineNo">393</span>    @Override<a name="line.393"></a>
+<span class="sourceLineNo">394</span>    protected double cost() {<a name="line.394"></a>
+<span class="sourceLineNo">395</span>      return cost.cost();<a name="line.395"></a>
+<span class="sourceLineNo">396</span>    }<a name="line.396"></a>
+<span class="sourceLineNo">397</span><a name="line.397"></a>
+<span class="sourceLineNo">398</span>    @Override<a name="line.398"></a>
+<span class="sourceLineNo">399</span>    protected void regionMoved(int region, int oldServer, int newServer) {<a name="line.399"></a>
+<span class="sourceLineNo">400</span>      cost.applyCostsChange(costs -&gt; {<a name="line.400"></a>
+<span class="sourceLineNo">401</span>        costs[oldServer] = cluster.regionsPerServer[oldServer].length;<a name="line.401"></a>
+<span class="sourceLineNo">402</span>        costs[newServer] = cluster.regionsPerServer[newServer].length;<a name="line.402"></a>
+<span class="sourceLineNo">403</span>      });<a name="line.403"></a>
+<span class="sourceLineNo">404</span>    }<a name="line.404"></a>
+<span class="sourceLineNo">405</span><a name="line.405"></a>
+<span class="sourceLineNo">406</span>    public final void updateWeight(double[] weights) {<a name="line.406"></a>
+<span class="sourceLineNo">407</span>      weights[GeneratorFunctionType.LOAD.ordinal()] += cost();<a name="line.407"></a>
+<span class="sourceLineNo">408</span>    }<a name="line.408"></a>
+<span class="sourceLineNo">409</span>  }<a name="line.409"></a>
+<span class="sourceLineNo">410</span><a name="line.410"></a>
+<span class="sourceLineNo">411</span>  static class CacheAwareCostFunction extends CostFunction {<a name="line.411"></a>
+<span class="sourceLineNo">412</span>    private static final String CACHE_COST_KEY = "hbase.master.balancer.stochastic.cacheCost";<a name="line.412"></a>
+<span class="sourceLineNo">413</span>    private double cacheRatio;<a name="line.413"></a>
+<span class="sourceLineNo">414</span>    private double bestCacheRatio;<a name="line.414"></a>
+<span class="sourceLineNo">415</span><a name="line.415"></a>
+<span class="sourceLineNo">416</span>    private static final float DEFAULT_CACHE_COST = 20;<a name="line.416"></a>
+<span class="sourceLineNo">417</span><a name="line.417"></a>
+<span class="sourceLineNo">418</span>    CacheAwareCostFunction(Configuration conf) {<a name="line.418"></a>
+<span class="sourceLineNo">419</span>      boolean isPersistentCache = conf.get(BUCKET_CACHE_PERSISTENT_PATH_KEY) != null;<a name="line.419"></a>
+<span class="sourceLineNo">420</span>      // Disable the CacheAwareCostFunction if the cached file list persistence is not enabled<a name="line.420"></a>
+<span class="sourceLineNo">421</span>      this.setMultiplier(<a name="line.421"></a>
+<span class="sourceLineNo">422</span>        !isPersistentCache ? 0.0f : conf.getFloat(CACHE_COST_KEY, DEFAULT_CACHE_COST));<a name="line.422"></a>
+<span class="sourceLineNo">423</span>      bestCacheRatio = 0.0;<a name="line.423"></a>
+<span class="sourceLineNo">424</span>      cacheRatio = 0.0;<a name="line.424"></a>
+<span class="sourceLineNo">425</span>    }<a name="line.425"></a>
+<span class="sourceLineNo">426</span><a name="line.426"></a>
+<span class="sourceLineNo">427</span>    @Override<a name="line.427"></a>
+<span class="sourceLineNo">428</span>    void prepare(BalancerClusterState cluster) {<a name="line.428"></a>
+<span class="sourceLineNo">429</span>      super.prepare(cluster);<a name="line.429"></a>
+<span class="sourceLineNo">430</span>      cacheRatio = 0.0;<a name="line.430"></a>
+<span class="sourceLineNo">431</span>      bestCacheRatio = 0.0;<a name="line.431"></a>
+<span class="sourceLineNo">432</span><a name="line.432"></a>
+<span class="sourceLineNo">433</span>      for (int region = 0; region &lt; cluster.numRegions; region++) {<a name="line.433"></a>
+<span class="sourceLineNo">434</span>        cacheRatio += cluster.getOrComputeWeightedRegionCacheRatio(region,<a name="line.434"></a>
+<span class="sourceLineNo">435</span>          cluster.regionIndexToServerIndex[region]);<a name="line.435"></a>
+<span class="sourceLineNo">436</span>        bestCacheRatio += cluster.getOrComputeWeightedRegionCacheRatio(region,<a name="line.436"></a>
+<span class="sourceLineNo">437</span>          getServerWithBestCacheRatioForRegion(region));<a name="line.437"></a>
+<span class="sourceLineNo">438</span>      }<a name="line.438"></a>
+<span class="sourceLineNo">439</span><a name="line.439"></a>
+<span class="sourceLineNo">440</span>      cacheRatio = bestCacheRatio == 0 ? 1.0 : cacheRatio / bestCacheRatio;<a name="line.440"></a>
+<span class="sourceLineNo">441</span>      if (LOG.isDebugEnabled()) {<a name="line.441"></a>
+<span class="sourceLineNo">442</span>        LOG.debug("CacheAwareCostFunction: Cost: {}", 1 - cacheRatio);<a name="line.442"></a>
+<span class="sourceLineNo">443</span>      }<a name="line.443"></a>
+<span class="sourceLineNo">444</span>    }<a name="line.444"></a>
+<span class="sourceLineNo">445</span><a name="line.445"></a>
+<span class="sourceLineNo">446</span>    @Override<a name="line.446"></a>
+<span class="sourceLineNo">447</span>    protected double cost() {<a name="line.447"></a>
+<span class="sourceLineNo">448</span>      return scale(0, 1, 1 - cacheRatio);<a name="line.448"></a>
+<span class="sourceLineNo">449</span>    }<a name="line.449"></a>
+<span class="sourceLineNo">450</span><a name="line.450"></a>
+<span class="sourceLineNo">451</span>    @Override<a name="line.451"></a>
+<span class="sourceLineNo">452</span>    protected void regionMoved(int region, int oldServer, int newServer) {<a name="line.452"></a>
+<span class="sourceLineNo">453</span>      double regionCacheRatioOnOldServer =<a name="line.453"></a>
+<span class="sourceLineNo">454</span>        cluster.getOrComputeWeightedRegionCacheRatio(region, oldServer);<a name="line.454"></a>
+<span class="sourceLineNo">455</span>      double regionCacheRatioOnNewServer =<a name="line.455"></a>
+<span class="sourceLineNo">456</span>        cluster.getOrComputeWeightedRegionCacheRatio(region, newServer);<a name="line.456"></a>
+<span class="sourceLineNo">457</span>      double cacheRatioDiff = regionCacheRatioOnNewServer - regionCacheRatioOnOldServer;<a name="line.457"></a>
+<span class="sourceLineNo">458</span>      double normalizedDelta = bestCacheRatio == 0.0 ? 0.0 : cacheRatioDiff / bestCacheRatio;<a name="line.458"></a>
+<span class="sourceLineNo">459</span>      cacheRatio += normalizedDelta;<a name="line.459"></a>
+<span class="sourceLineNo">460</span>      if (LOG.isDebugEnabled() &amp;&amp; (cacheRatio &lt; 0.0 || cacheRatio &gt; 1.0)) {<a name="line.460"></a>
+<span class="sourceLineNo">461</span>        LOG.debug(<a name="line.461"></a>
+<span class="sourceLineNo">462</span>          "CacheAwareCostFunction:regionMoved:region:{}:from:{}:to:{}:regionCacheRatioOnOldServer:{}:"<a name="line.462"></a>
+<span class="sourceLineNo">463</span>            + "regionCacheRatioOnNewServer:{}:bestRegionCacheRatio:{}:cacheRatio:{}",<a name="line.463"></a>
+<span class="sourceLineNo">464</span>          cluster.regions[region].getEncodedName(), cluster.servers[oldServer].getHostname(),<a name="line.464"></a>
+<span class="sourceLineNo">465</span>          cluster.servers[newServer].getHostname(), regionCacheRatioOnOldServer,<a name="line.465"></a>
+<span class="sourceLineNo">466</span>          regionCacheRatioOnNewServer, bestCacheRatio, cacheRatio);<a name="line.466"></a>
+<span class="sourceLineNo">467</span>      }<a name="line.467"></a>
+<span class="sourceLineNo">468</span>    }<a name="line.468"></a>
+<span class="sourceLineNo">469</span><a name="line.469"></a>
+<span class="sourceLineNo">470</span>    private int getServerWithBestCacheRatioForRegion(int region) {<a name="line.470"></a>
+<span class="sourceLineNo">471</span>      return cluster.getOrComputeServerWithBestRegionCachedRatio()[region];<a name="line.471"></a>
+<span class="sourceLineNo">472</span>    }<a name="line.472"></a>
+<span class="sourceLineNo">473</span><a name="line.473"></a>
+<span class="sourceLineNo">474</span>    @Override<a name="line.474"></a>
+<span class="sourceLineNo">475</span>    public final void updateWeight(double[] weights) {<a name="line.475"></a>
+<span class="sourceLineNo">476</span>      weights[GeneratorFunctionType.CACHE_RATIO.ordinal()] += cost();<a name="line.476"></a>
+<span class="sourceLineNo">477</span>    }<a name="line.477"></a>
+<span class="sourceLineNo">478</span>  }<a name="line.478"></a>
+<span class="sourceLineNo">479</span>}<a name="line.479"></a>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</pre>
+</div>
+</body>
+</html>
