@@ -48,624 +48,629 @@
 <span class="sourceLineNo">040</span>import org.apache.hadoop.hbase.io.compress.Compression;<a name="line.40"></a>
 <span class="sourceLineNo">041</span>import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;<a name="line.41"></a>
 <span class="sourceLineNo">042</span>import org.apache.hadoop.hbase.io.hfile.ReaderContext.ReaderType;<a name="line.42"></a>
-<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.regionserver.CellSink;<a name="line.43"></a>
-<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.ShipperListener;<a name="line.44"></a>
-<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.util.BloomFilterWriter;<a name="line.45"></a>
-<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.46"></a>
-<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.47"></a>
-<span class="sourceLineNo">048</span>import org.apache.hadoop.io.Writable;<a name="line.48"></a>
-<span class="sourceLineNo">049</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.49"></a>
-<span class="sourceLineNo">050</span>import org.slf4j.Logger;<a name="line.50"></a>
-<span class="sourceLineNo">051</span>import org.slf4j.LoggerFactory;<a name="line.51"></a>
-<span class="sourceLineNo">052</span><a name="line.52"></a>
-<span class="sourceLineNo">053</span>import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;<a name="line.53"></a>
-<span class="sourceLineNo">054</span><a name="line.54"></a>
-<span class="sourceLineNo">055</span>/**<a name="line.55"></a>
-<span class="sourceLineNo">056</span> * File format for hbase. A file of sorted key/value pairs. Both keys and values are byte arrays.<a name="line.56"></a>
-<span class="sourceLineNo">057</span> * &lt;p&gt;<a name="line.57"></a>
-<span class="sourceLineNo">058</span> * The memory footprint of a HFile includes the following (below is taken from the &lt;a<a name="line.58"></a>
-<span class="sourceLineNo">059</span> * href=https://issues.apache.org/jira/browse/HADOOP-3315&gt;TFile&lt;/a&gt; documentation but applies also<a name="line.59"></a>
-<span class="sourceLineNo">060</span> * to HFile):<a name="line.60"></a>
-<span class="sourceLineNo">061</span> * &lt;ul&gt;<a name="line.61"></a>
-<span class="sourceLineNo">062</span> * &lt;li&gt;Some constant overhead of reading or writing a compressed block.<a name="line.62"></a>
-<span class="sourceLineNo">063</span> * &lt;ul&gt;<a name="line.63"></a>
-<span class="sourceLineNo">064</span> * &lt;li&gt;Each compressed block requires one compression/decompression codec for I/O.<a name="line.64"></a>
-<span class="sourceLineNo">065</span> * &lt;li&gt;Temporary space to buffer the key.<a name="line.65"></a>
-<span class="sourceLineNo">066</span> * &lt;li&gt;Temporary space to buffer the value.<a name="line.66"></a>
-<span class="sourceLineNo">067</span> * &lt;/ul&gt;<a name="line.67"></a>
-<span class="sourceLineNo">068</span> * &lt;li&gt;HFile index, which is proportional to the total number of Data Blocks. The total amount of<a name="line.68"></a>
-<span class="sourceLineNo">069</span> * memory needed to hold the index can be estimated as (56+AvgKeySize)*NumBlocks.<a name="line.69"></a>
-<span class="sourceLineNo">070</span> * &lt;/ul&gt;<a name="line.70"></a>
-<span class="sourceLineNo">071</span> * Suggestions on performance optimization.<a name="line.71"></a>
-<span class="sourceLineNo">072</span> * &lt;ul&gt;<a name="line.72"></a>
-<span class="sourceLineNo">073</span> * &lt;li&gt;Minimum block size. We recommend a setting of minimum block size between 8KB to 1MB for<a name="line.73"></a>
-<span class="sourceLineNo">074</span> * general usage. Larger block size is preferred if files are primarily for sequential access.<a name="line.74"></a>
-<span class="sourceLineNo">075</span> * However, it would lead to inefficient random access (because there are more data to decompress).<a name="line.75"></a>
-<span class="sourceLineNo">076</span> * Smaller blocks are good for random access, but require more memory to hold the block index, and<a name="line.76"></a>
-<span class="sourceLineNo">077</span> * may be slower to create (because we must flush the compressor stream at the conclusion of each<a name="line.77"></a>
-<span class="sourceLineNo">078</span> * data block, which leads to an FS I/O flush). Further, due to the internal caching in Compression<a name="line.78"></a>
-<span class="sourceLineNo">079</span> * codec, the smallest possible block size would be around 20KB-30KB.<a name="line.79"></a>
-<span class="sourceLineNo">080</span> * &lt;li&gt;The current implementation does not offer true multi-threading for reading. The<a name="line.80"></a>
-<span class="sourceLineNo">081</span> * implementation uses FSDataInputStream seek()+read(), which is shown to be much faster than<a name="line.81"></a>
-<span class="sourceLineNo">082</span> * positioned-read call in single thread mode. However, it also means that if multiple threads<a name="line.82"></a>
-<span class="sourceLineNo">083</span> * attempt to access the same HFile (using multiple scanners) simultaneously, the actual I/O is<a name="line.83"></a>
-<span class="sourceLineNo">084</span> * carried out sequentially even if they access different DFS blocks (Reexamine! pread seems to be<a name="line.84"></a>
-<span class="sourceLineNo">085</span> * 10% faster than seek+read in my testing -- stack).<a name="line.85"></a>
-<span class="sourceLineNo">086</span> * &lt;li&gt;Compression codec. Use "none" if the data is not very compressable (by compressable, I mean a<a name="line.86"></a>
-<span class="sourceLineNo">087</span> * compression ratio at least 2:1). Generally, use "lzo" as the starting point for experimenting.<a name="line.87"></a>
-<span class="sourceLineNo">088</span> * "gz" overs slightly better compression ratio over "lzo" but requires 4x CPU to compress and 2x<a name="line.88"></a>
-<span class="sourceLineNo">089</span> * CPU to decompress, comparing to "lzo".<a name="line.89"></a>
-<span class="sourceLineNo">090</span> * &lt;/ul&gt;<a name="line.90"></a>
-<span class="sourceLineNo">091</span> * For more on the background behind HFile, see &lt;a<a name="line.91"></a>
-<span class="sourceLineNo">092</span> * href=https://issues.apache.org/jira/browse/HBASE-61&gt;HBASE-61&lt;/a&gt;.<a name="line.92"></a>
-<span class="sourceLineNo">093</span> * &lt;p&gt;<a name="line.93"></a>
-<span class="sourceLineNo">094</span> * File is made of data blocks followed by meta data blocks (if any), a fileinfo block, data block<a name="line.94"></a>
-<span class="sourceLineNo">095</span> * index, meta data block index, and a fixed size trailer which records the offsets at which file<a name="line.95"></a>
-<span class="sourceLineNo">096</span> * changes content type.<a name="line.96"></a>
-<span class="sourceLineNo">097</span> *<a name="line.97"></a>
-<span class="sourceLineNo">098</span> * &lt;pre&gt;<a name="line.98"></a>
-<span class="sourceLineNo">099</span> * &amp;lt;data blocks&amp;gt;&amp;lt;meta blocks&amp;gt;&amp;lt;fileinfo&amp;gt;&amp;lt;<a name="line.99"></a>
-<span class="sourceLineNo">100</span> * data index&amp;gt;&amp;lt;meta index&amp;gt;&amp;lt;trailer&amp;gt;<a name="line.100"></a>
-<span class="sourceLineNo">101</span> * &lt;/pre&gt;<a name="line.101"></a>
-<span class="sourceLineNo">102</span> *<a name="line.102"></a>
-<span class="sourceLineNo">103</span> * Each block has a bit of magic at its start. Block are comprised of key/values. In data blocks,<a name="line.103"></a>
-<span class="sourceLineNo">104</span> * they are both byte arrays. Metadata blocks are a String key and a byte array value. An empty file<a name="line.104"></a>
-<span class="sourceLineNo">105</span> * looks like this:<a name="line.105"></a>
-<span class="sourceLineNo">106</span> *<a name="line.106"></a>
-<span class="sourceLineNo">107</span> * &lt;pre&gt;<a name="line.107"></a>
-<span class="sourceLineNo">108</span> * &amp;lt;fileinfo&amp;gt;&amp;lt;trailer&amp;gt;<a name="line.108"></a>
-<span class="sourceLineNo">109</span> * &lt;/pre&gt;<a name="line.109"></a>
-<span class="sourceLineNo">110</span> *<a name="line.110"></a>
-<span class="sourceLineNo">111</span> * . That is, there are not data nor meta blocks present.<a name="line.111"></a>
-<span class="sourceLineNo">112</span> * &lt;p&gt;<a name="line.112"></a>
-<span class="sourceLineNo">113</span> * TODO: Do scanners need to be able to take a start and end row? TODO: Should BlockIndex know the<a name="line.113"></a>
-<span class="sourceLineNo">114</span> * name of its file? Should it have a Path that points at its file say for the case where an index<a name="line.114"></a>
-<span class="sourceLineNo">115</span> * lives apart from an HFile instance?<a name="line.115"></a>
-<span class="sourceLineNo">116</span> */<a name="line.116"></a>
-<span class="sourceLineNo">117</span>@InterfaceAudience.Private<a name="line.117"></a>
-<span class="sourceLineNo">118</span>public final class HFile {<a name="line.118"></a>
-<span class="sourceLineNo">119</span>  // LOG is being used in HFileBlock and CheckSumUtil<a name="line.119"></a>
-<span class="sourceLineNo">120</span>  static final Logger LOG = LoggerFactory.getLogger(HFile.class);<a name="line.120"></a>
-<span class="sourceLineNo">121</span><a name="line.121"></a>
-<span class="sourceLineNo">122</span>  /**<a name="line.122"></a>
-<span class="sourceLineNo">123</span>   * Maximum length of key in HFile.<a name="line.123"></a>
-<span class="sourceLineNo">124</span>   */<a name="line.124"></a>
-<span class="sourceLineNo">125</span>  public final static int MAXIMUM_KEY_LENGTH = Integer.MAX_VALUE;<a name="line.125"></a>
-<span class="sourceLineNo">126</span><a name="line.126"></a>
-<span class="sourceLineNo">127</span>  /**<a name="line.127"></a>
-<span class="sourceLineNo">128</span>   * Default compression: none.<a name="line.128"></a>
-<span class="sourceLineNo">129</span>   */<a name="line.129"></a>
-<span class="sourceLineNo">130</span>  public final static Compression.Algorithm DEFAULT_COMPRESSION_ALGORITHM =<a name="line.130"></a>
-<span class="sourceLineNo">131</span>    Compression.Algorithm.NONE;<a name="line.131"></a>
-<span class="sourceLineNo">132</span><a name="line.132"></a>
-<span class="sourceLineNo">133</span>  /** Minimum supported HFile format version */<a name="line.133"></a>
-<span class="sourceLineNo">134</span>  public static final int MIN_FORMAT_VERSION = 2;<a name="line.134"></a>
-<span class="sourceLineNo">135</span><a name="line.135"></a>
-<span class="sourceLineNo">136</span>  /**<a name="line.136"></a>
-<span class="sourceLineNo">137</span>   * Maximum supported HFile format version<a name="line.137"></a>
-<span class="sourceLineNo">138</span>   */<a name="line.138"></a>
-<span class="sourceLineNo">139</span>  public static final int MAX_FORMAT_VERSION = 3;<a name="line.139"></a>
-<span class="sourceLineNo">140</span><a name="line.140"></a>
-<span class="sourceLineNo">141</span>  /**<a name="line.141"></a>
-<span class="sourceLineNo">142</span>   * Minimum HFile format version with support for persisting cell tags<a name="line.142"></a>
-<span class="sourceLineNo">143</span>   */<a name="line.143"></a>
-<span class="sourceLineNo">144</span>  public static final int MIN_FORMAT_VERSION_WITH_TAGS = 3;<a name="line.144"></a>
-<span class="sourceLineNo">145</span><a name="line.145"></a>
-<span class="sourceLineNo">146</span>  /** Default compression name: none. */<a name="line.146"></a>
-<span class="sourceLineNo">147</span>  public final static String DEFAULT_COMPRESSION = DEFAULT_COMPRESSION_ALGORITHM.getName();<a name="line.147"></a>
-<span class="sourceLineNo">148</span><a name="line.148"></a>
-<span class="sourceLineNo">149</span>  /** Meta data block name for bloom filter bits. */<a name="line.149"></a>
-<span class="sourceLineNo">150</span>  public static final String BLOOM_FILTER_DATA_KEY = "BLOOM_FILTER_DATA";<a name="line.150"></a>
-<span class="sourceLineNo">151</span><a name="line.151"></a>
-<span class="sourceLineNo">152</span>  /**<a name="line.152"></a>
-<span class="sourceLineNo">153</span>   * We assume that HFile path ends with ROOT_DIR/TABLE_NAME/REGION_NAME/CF_NAME/HFILE, so it has at<a name="line.153"></a>
-<span class="sourceLineNo">154</span>   * least this many levels of nesting. This is needed for identifying table and CF name from an<a name="line.154"></a>
-<span class="sourceLineNo">155</span>   * HFile path.<a name="line.155"></a>
-<span class="sourceLineNo">156</span>   */<a name="line.156"></a>
-<span class="sourceLineNo">157</span>  public final static int MIN_NUM_HFILE_PATH_LEVELS = 5;<a name="line.157"></a>
-<span class="sourceLineNo">158</span><a name="line.158"></a>
-<span class="sourceLineNo">159</span>  /**<a name="line.159"></a>
-<span class="sourceLineNo">160</span>   * The number of bytes per checksum.<a name="line.160"></a>
-<span class="sourceLineNo">161</span>   */<a name="line.161"></a>
-<span class="sourceLineNo">162</span>  public static final int DEFAULT_BYTES_PER_CHECKSUM = 16 * 1024;<a name="line.162"></a>
-<span class="sourceLineNo">163</span><a name="line.163"></a>
-<span class="sourceLineNo">164</span>  // For measuring number of checksum failures<a name="line.164"></a>
-<span class="sourceLineNo">165</span>  static final LongAdder CHECKSUM_FAILURES = new LongAdder();<a name="line.165"></a>
-<span class="sourceLineNo">166</span><a name="line.166"></a>
-<span class="sourceLineNo">167</span>  // For tests. Gets incremented when we read a block whether from HDFS or from Cache.<a name="line.167"></a>
-<span class="sourceLineNo">168</span>  public static final LongAdder DATABLOCK_READ_COUNT = new LongAdder();<a name="line.168"></a>
-<span class="sourceLineNo">169</span><a name="line.169"></a>
-<span class="sourceLineNo">170</span>  /**<a name="line.170"></a>
-<span class="sourceLineNo">171</span>   * Shutdown constructor.<a name="line.171"></a>
-<span class="sourceLineNo">172</span>   */<a name="line.172"></a>
-<span class="sourceLineNo">173</span>  private HFile() {<a name="line.173"></a>
-<span class="sourceLineNo">174</span>  }<a name="line.174"></a>
-<span class="sourceLineNo">175</span><a name="line.175"></a>
-<span class="sourceLineNo">176</span>  /**<a name="line.176"></a>
-<span class="sourceLineNo">177</span>   * Number of checksum verification failures. It also clears the counter.<a name="line.177"></a>
-<span class="sourceLineNo">178</span>   */<a name="line.178"></a>
-<span class="sourceLineNo">179</span>  public static final long getAndResetChecksumFailuresCount() {<a name="line.179"></a>
-<span class="sourceLineNo">180</span>    return CHECKSUM_FAILURES.sumThenReset();<a name="line.180"></a>
-<span class="sourceLineNo">181</span>  }<a name="line.181"></a>
-<span class="sourceLineNo">182</span><a name="line.182"></a>
-<span class="sourceLineNo">183</span>  /**<a name="line.183"></a>
-<span class="sourceLineNo">184</span>   * Number of checksum verification failures. It also clears the counter.<a name="line.184"></a>
-<span class="sourceLineNo">185</span>   */<a name="line.185"></a>
-<span class="sourceLineNo">186</span>  public static final long getChecksumFailuresCount() {<a name="line.186"></a>
-<span class="sourceLineNo">187</span>    return CHECKSUM_FAILURES.sum();<a name="line.187"></a>
-<span class="sourceLineNo">188</span>  }<a name="line.188"></a>
-<span class="sourceLineNo">189</span><a name="line.189"></a>
-<span class="sourceLineNo">190</span>  public static final void updateReadLatency(long latencyMillis, boolean pread) {<a name="line.190"></a>
-<span class="sourceLineNo">191</span>    if (pread) {<a name="line.191"></a>
-<span class="sourceLineNo">192</span>      MetricsIO.getInstance().updateFsPreadTime(latencyMillis);<a name="line.192"></a>
-<span class="sourceLineNo">193</span>    } else {<a name="line.193"></a>
-<span class="sourceLineNo">194</span>      MetricsIO.getInstance().updateFsReadTime(latencyMillis);<a name="line.194"></a>
-<span class="sourceLineNo">195</span>    }<a name="line.195"></a>
-<span class="sourceLineNo">196</span>  }<a name="line.196"></a>
-<span class="sourceLineNo">197</span><a name="line.197"></a>
-<span class="sourceLineNo">198</span>  public static final void updateWriteLatency(long latencyMillis) {<a name="line.198"></a>
-<span class="sourceLineNo">199</span>    MetricsIO.getInstance().updateFsWriteTime(latencyMillis);<a name="line.199"></a>
-<span class="sourceLineNo">200</span>  }<a name="line.200"></a>
-<span class="sourceLineNo">201</span><a name="line.201"></a>
-<span class="sourceLineNo">202</span>  /** API required to write an {@link HFile} */<a name="line.202"></a>
-<span class="sourceLineNo">203</span>  public interface Writer extends Closeable, CellSink, ShipperListener {<a name="line.203"></a>
-<span class="sourceLineNo">204</span>    /** Max memstore (mvcc) timestamp in FileInfo */<a name="line.204"></a>
-<span class="sourceLineNo">205</span>    public static final byte[] MAX_MEMSTORE_TS_KEY = Bytes.toBytes("MAX_MEMSTORE_TS_KEY");<a name="line.205"></a>
+<span class="sourceLineNo">043</span>import org.apache.hadoop.hbase.ipc.RpcServer;<a name="line.43"></a>
+<span class="sourceLineNo">044</span>import org.apache.hadoop.hbase.regionserver.CellSink;<a name="line.44"></a>
+<span class="sourceLineNo">045</span>import org.apache.hadoop.hbase.regionserver.ShipperListener;<a name="line.45"></a>
+<span class="sourceLineNo">046</span>import org.apache.hadoop.hbase.util.BloomFilterWriter;<a name="line.46"></a>
+<span class="sourceLineNo">047</span>import org.apache.hadoop.hbase.util.Bytes;<a name="line.47"></a>
+<span class="sourceLineNo">048</span>import org.apache.hadoop.hbase.util.FSUtils;<a name="line.48"></a>
+<span class="sourceLineNo">049</span>import org.apache.hadoop.io.Writable;<a name="line.49"></a>
+<span class="sourceLineNo">050</span>import org.apache.yetus.audience.InterfaceAudience;<a name="line.50"></a>
+<span class="sourceLineNo">051</span>import org.slf4j.Logger;<a name="line.51"></a>
+<span class="sourceLineNo">052</span>import org.slf4j.LoggerFactory;<a name="line.52"></a>
+<span class="sourceLineNo">053</span><a name="line.53"></a>
+<span class="sourceLineNo">054</span>import org.apache.hbase.thirdparty.com.google.common.base.Preconditions;<a name="line.54"></a>
+<span class="sourceLineNo">055</span><a name="line.55"></a>
+<span class="sourceLineNo">056</span>/**<a name="line.56"></a>
+<span class="sourceLineNo">057</span> * File format for hbase. A file of sorted key/value pairs. Both keys and values are byte arrays.<a name="line.57"></a>
+<span class="sourceLineNo">058</span> * &lt;p&gt;<a name="line.58"></a>
+<span class="sourceLineNo">059</span> * The memory footprint of a HFile includes the following (below is taken from the &lt;a<a name="line.59"></a>
+<span class="sourceLineNo">060</span> * href=https://issues.apache.org/jira/browse/HADOOP-3315&gt;TFile&lt;/a&gt; documentation but applies also<a name="line.60"></a>
+<span class="sourceLineNo">061</span> * to HFile):<a name="line.61"></a>
+<span class="sourceLineNo">062</span> * &lt;ul&gt;<a name="line.62"></a>
+<span class="sourceLineNo">063</span> * &lt;li&gt;Some constant overhead of reading or writing a compressed block.<a name="line.63"></a>
+<span class="sourceLineNo">064</span> * &lt;ul&gt;<a name="line.64"></a>
+<span class="sourceLineNo">065</span> * &lt;li&gt;Each compressed block requires one compression/decompression codec for I/O.<a name="line.65"></a>
+<span class="sourceLineNo">066</span> * &lt;li&gt;Temporary space to buffer the key.<a name="line.66"></a>
+<span class="sourceLineNo">067</span> * &lt;li&gt;Temporary space to buffer the value.<a name="line.67"></a>
+<span class="sourceLineNo">068</span> * &lt;/ul&gt;<a name="line.68"></a>
+<span class="sourceLineNo">069</span> * &lt;li&gt;HFile index, which is proportional to the total number of Data Blocks. The total amount of<a name="line.69"></a>
+<span class="sourceLineNo">070</span> * memory needed to hold the index can be estimated as (56+AvgKeySize)*NumBlocks.<a name="line.70"></a>
+<span class="sourceLineNo">071</span> * &lt;/ul&gt;<a name="line.71"></a>
+<span class="sourceLineNo">072</span> * Suggestions on performance optimization.<a name="line.72"></a>
+<span class="sourceLineNo">073</span> * &lt;ul&gt;<a name="line.73"></a>
+<span class="sourceLineNo">074</span> * &lt;li&gt;Minimum block size. We recommend a setting of minimum block size between 8KB to 1MB for<a name="line.74"></a>
+<span class="sourceLineNo">075</span> * general usage. Larger block size is preferred if files are primarily for sequential access.<a name="line.75"></a>
+<span class="sourceLineNo">076</span> * However, it would lead to inefficient random access (because there are more data to decompress).<a name="line.76"></a>
+<span class="sourceLineNo">077</span> * Smaller blocks are good for random access, but require more memory to hold the block index, and<a name="line.77"></a>
+<span class="sourceLineNo">078</span> * may be slower to create (because we must flush the compressor stream at the conclusion of each<a name="line.78"></a>
+<span class="sourceLineNo">079</span> * data block, which leads to an FS I/O flush). Further, due to the internal caching in Compression<a name="line.79"></a>
+<span class="sourceLineNo">080</span> * codec, the smallest possible block size would be around 20KB-30KB.<a name="line.80"></a>
+<span class="sourceLineNo">081</span> * &lt;li&gt;The current implementation does not offer true multi-threading for reading. The<a name="line.81"></a>
+<span class="sourceLineNo">082</span> * implementation uses FSDataInputStream seek()+read(), which is shown to be much faster than<a name="line.82"></a>
+<span class="sourceLineNo">083</span> * positioned-read call in single thread mode. However, it also means that if multiple threads<a name="line.83"></a>
+<span class="sourceLineNo">084</span> * attempt to access the same HFile (using multiple scanners) simultaneously, the actual I/O is<a name="line.84"></a>
+<span class="sourceLineNo">085</span> * carried out sequentially even if they access different DFS blocks (Reexamine! pread seems to be<a name="line.85"></a>
+<span class="sourceLineNo">086</span> * 10% faster than seek+read in my testing -- stack).<a name="line.86"></a>
+<span class="sourceLineNo">087</span> * &lt;li&gt;Compression codec. Use "none" if the data is not very compressable (by compressable, I mean a<a name="line.87"></a>
+<span class="sourceLineNo">088</span> * compression ratio at least 2:1). Generally, use "lzo" as the starting point for experimenting.<a name="line.88"></a>
+<span class="sourceLineNo">089</span> * "gz" overs slightly better compression ratio over "lzo" but requires 4x CPU to compress and 2x<a name="line.89"></a>
+<span class="sourceLineNo">090</span> * CPU to decompress, comparing to "lzo".<a name="line.90"></a>
+<span class="sourceLineNo">091</span> * &lt;/ul&gt;<a name="line.91"></a>
+<span class="sourceLineNo">092</span> * For more on the background behind HFile, see &lt;a<a name="line.92"></a>
+<span class="sourceLineNo">093</span> * href=https://issues.apache.org/jira/browse/HBASE-61&gt;HBASE-61&lt;/a&gt;.<a name="line.93"></a>
+<span class="sourceLineNo">094</span> * &lt;p&gt;<a name="line.94"></a>
+<span class="sourceLineNo">095</span> * File is made of data blocks followed by meta data blocks (if any), a fileinfo block, data block<a name="line.95"></a>
+<span class="sourceLineNo">096</span> * index, meta data block index, and a fixed size trailer which records the offsets at which file<a name="line.96"></a>
+<span class="sourceLineNo">097</span> * changes content type.<a name="line.97"></a>
+<span class="sourceLineNo">098</span> *<a name="line.98"></a>
+<span class="sourceLineNo">099</span> * &lt;pre&gt;<a name="line.99"></a>
+<span class="sourceLineNo">100</span> * &amp;lt;data blocks&amp;gt;&amp;lt;meta blocks&amp;gt;&amp;lt;fileinfo&amp;gt;&amp;lt;<a name="line.100"></a>
+<span class="sourceLineNo">101</span> * data index&amp;gt;&amp;lt;meta index&amp;gt;&amp;lt;trailer&amp;gt;<a name="line.101"></a>
+<span class="sourceLineNo">102</span> * &lt;/pre&gt;<a name="line.102"></a>
+<span class="sourceLineNo">103</span> *<a name="line.103"></a>
+<span class="sourceLineNo">104</span> * Each block has a bit of magic at its start. Block are comprised of key/values. In data blocks,<a name="line.104"></a>
+<span class="sourceLineNo">105</span> * they are both byte arrays. Metadata blocks are a String key and a byte array value. An empty file<a name="line.105"></a>
+<span class="sourceLineNo">106</span> * looks like this:<a name="line.106"></a>
+<span class="sourceLineNo">107</span> *<a name="line.107"></a>
+<span class="sourceLineNo">108</span> * &lt;pre&gt;<a name="line.108"></a>
+<span class="sourceLineNo">109</span> * &amp;lt;fileinfo&amp;gt;&amp;lt;trailer&amp;gt;<a name="line.109"></a>
+<span class="sourceLineNo">110</span> * &lt;/pre&gt;<a name="line.110"></a>
+<span class="sourceLineNo">111</span> *<a name="line.111"></a>
+<span class="sourceLineNo">112</span> * . That is, there are not data nor meta blocks present.<a name="line.112"></a>
+<span class="sourceLineNo">113</span> * &lt;p&gt;<a name="line.113"></a>
+<span class="sourceLineNo">114</span> * TODO: Do scanners need to be able to take a start and end row? TODO: Should BlockIndex know the<a name="line.114"></a>
+<span class="sourceLineNo">115</span> * name of its file? Should it have a Path that points at its file say for the case where an index<a name="line.115"></a>
+<span class="sourceLineNo">116</span> * lives apart from an HFile instance?<a name="line.116"></a>
+<span class="sourceLineNo">117</span> */<a name="line.117"></a>
+<span class="sourceLineNo">118</span>@InterfaceAudience.Private<a name="line.118"></a>
+<span class="sourceLineNo">119</span>public final class HFile {<a name="line.119"></a>
+<span class="sourceLineNo">120</span>  // LOG is being used in HFileBlock and CheckSumUtil<a name="line.120"></a>
+<span class="sourceLineNo">121</span>  static final Logger LOG = LoggerFactory.getLogger(HFile.class);<a name="line.121"></a>
+<span class="sourceLineNo">122</span><a name="line.122"></a>
+<span class="sourceLineNo">123</span>  /**<a name="line.123"></a>
+<span class="sourceLineNo">124</span>   * Maximum length of key in HFile.<a name="line.124"></a>
+<span class="sourceLineNo">125</span>   */<a name="line.125"></a>
+<span class="sourceLineNo">126</span>  public final static int MAXIMUM_KEY_LENGTH = Integer.MAX_VALUE;<a name="line.126"></a>
+<span class="sourceLineNo">127</span><a name="line.127"></a>
+<span class="sourceLineNo">128</span>  /**<a name="line.128"></a>
+<span class="sourceLineNo">129</span>   * Default compression: none.<a name="line.129"></a>
+<span class="sourceLineNo">130</span>   */<a name="line.130"></a>
+<span class="sourceLineNo">131</span>  public final static Compression.Algorithm DEFAULT_COMPRESSION_ALGORITHM =<a name="line.131"></a>
+<span class="sourceLineNo">132</span>    Compression.Algorithm.NONE;<a name="line.132"></a>
+<span class="sourceLineNo">133</span><a name="line.133"></a>
+<span class="sourceLineNo">134</span>  /** Minimum supported HFile format version */<a name="line.134"></a>
+<span class="sourceLineNo">135</span>  public static final int MIN_FORMAT_VERSION = 2;<a name="line.135"></a>
+<span class="sourceLineNo">136</span><a name="line.136"></a>
+<span class="sourceLineNo">137</span>  /**<a name="line.137"></a>
+<span class="sourceLineNo">138</span>   * Maximum supported HFile format version<a name="line.138"></a>
+<span class="sourceLineNo">139</span>   */<a name="line.139"></a>
+<span class="sourceLineNo">140</span>  public static final int MAX_FORMAT_VERSION = 3;<a name="line.140"></a>
+<span class="sourceLineNo">141</span><a name="line.141"></a>
+<span class="sourceLineNo">142</span>  /**<a name="line.142"></a>
+<span class="sourceLineNo">143</span>   * Minimum HFile format version with support for persisting cell tags<a name="line.143"></a>
+<span class="sourceLineNo">144</span>   */<a name="line.144"></a>
+<span class="sourceLineNo">145</span>  public static final int MIN_FORMAT_VERSION_WITH_TAGS = 3;<a name="line.145"></a>
+<span class="sourceLineNo">146</span><a name="line.146"></a>
+<span class="sourceLineNo">147</span>  /** Default compression name: none. */<a name="line.147"></a>
+<span class="sourceLineNo">148</span>  public final static String DEFAULT_COMPRESSION = DEFAULT_COMPRESSION_ALGORITHM.getName();<a name="line.148"></a>
+<span class="sourceLineNo">149</span><a name="line.149"></a>
+<span class="sourceLineNo">150</span>  /** Meta data block name for bloom filter bits. */<a name="line.150"></a>
+<span class="sourceLineNo">151</span>  public static final String BLOOM_FILTER_DATA_KEY = "BLOOM_FILTER_DATA";<a name="line.151"></a>
+<span class="sourceLineNo">152</span><a name="line.152"></a>
+<span class="sourceLineNo">153</span>  /**<a name="line.153"></a>
+<span class="sourceLineNo">154</span>   * We assume that HFile path ends with ROOT_DIR/TABLE_NAME/REGION_NAME/CF_NAME/HFILE, so it has at<a name="line.154"></a>
+<span class="sourceLineNo">155</span>   * least this many levels of nesting. This is needed for identifying table and CF name from an<a name="line.155"></a>
+<span class="sourceLineNo">156</span>   * HFile path.<a name="line.156"></a>
+<span class="sourceLineNo">157</span>   */<a name="line.157"></a>
+<span class="sourceLineNo">158</span>  public final static int MIN_NUM_HFILE_PATH_LEVELS = 5;<a name="line.158"></a>
+<span class="sourceLineNo">159</span><a name="line.159"></a>
+<span class="sourceLineNo">160</span>  /**<a name="line.160"></a>
+<span class="sourceLineNo">161</span>   * The number of bytes per checksum.<a name="line.161"></a>
+<span class="sourceLineNo">162</span>   */<a name="line.162"></a>
+<span class="sourceLineNo">163</span>  public static final int DEFAULT_BYTES_PER_CHECKSUM = 16 * 1024;<a name="line.163"></a>
+<span class="sourceLineNo">164</span><a name="line.164"></a>
+<span class="sourceLineNo">165</span>  // For measuring number of checksum failures<a name="line.165"></a>
+<span class="sourceLineNo">166</span>  static final LongAdder CHECKSUM_FAILURES = new LongAdder();<a name="line.166"></a>
+<span class="sourceLineNo">167</span><a name="line.167"></a>
+<span class="sourceLineNo">168</span>  // For tests. Gets incremented when we read a block whether from HDFS or from Cache.<a name="line.168"></a>
+<span class="sourceLineNo">169</span>  public static final LongAdder DATABLOCK_READ_COUNT = new LongAdder();<a name="line.169"></a>
+<span class="sourceLineNo">170</span><a name="line.170"></a>
+<span class="sourceLineNo">171</span>  /**<a name="line.171"></a>
+<span class="sourceLineNo">172</span>   * Shutdown constructor.<a name="line.172"></a>
+<span class="sourceLineNo">173</span>   */<a name="line.173"></a>
+<span class="sourceLineNo">174</span>  private HFile() {<a name="line.174"></a>
+<span class="sourceLineNo">175</span>  }<a name="line.175"></a>
+<span class="sourceLineNo">176</span><a name="line.176"></a>
+<span class="sourceLineNo">177</span>  /**<a name="line.177"></a>
+<span class="sourceLineNo">178</span>   * Number of checksum verification failures. It also clears the counter.<a name="line.178"></a>
+<span class="sourceLineNo">179</span>   */<a name="line.179"></a>
+<span class="sourceLineNo">180</span>  public static final long getAndResetChecksumFailuresCount() {<a name="line.180"></a>
+<span class="sourceLineNo">181</span>    return CHECKSUM_FAILURES.sumThenReset();<a name="line.181"></a>
+<span class="sourceLineNo">182</span>  }<a name="line.182"></a>
+<span class="sourceLineNo">183</span><a name="line.183"></a>
+<span class="sourceLineNo">184</span>  /**<a name="line.184"></a>
+<span class="sourceLineNo">185</span>   * Number of checksum verification failures. It also clears the counter.<a name="line.185"></a>
+<span class="sourceLineNo">186</span>   */<a name="line.186"></a>
+<span class="sourceLineNo">187</span>  public static final long getChecksumFailuresCount() {<a name="line.187"></a>
+<span class="sourceLineNo">188</span>    return CHECKSUM_FAILURES.sum();<a name="line.188"></a>
+<span class="sourceLineNo">189</span>  }<a name="line.189"></a>
+<span class="sourceLineNo">190</span><a name="line.190"></a>
+<span class="sourceLineNo">191</span>  public static final void updateReadLatency(long latencyMillis, boolean pread, boolean tooSlow) {<a name="line.191"></a>
+<span class="sourceLineNo">192</span>    RpcServer.getCurrentCall().ifPresent(call -&gt; call.updateFsReadTime(latencyMillis));<a name="line.192"></a>
+<span class="sourceLineNo">193</span>    if (pread) {<a name="line.193"></a>
+<span class="sourceLineNo">194</span>      MetricsIO.getInstance().updateFsPreadTime(latencyMillis);<a name="line.194"></a>
+<span class="sourceLineNo">195</span>    } else {<a name="line.195"></a>
+<span class="sourceLineNo">196</span>      MetricsIO.getInstance().updateFsReadTime(latencyMillis);<a name="line.196"></a>
+<span class="sourceLineNo">197</span>    }<a name="line.197"></a>
+<span class="sourceLineNo">198</span>    if (tooSlow) {<a name="line.198"></a>
+<span class="sourceLineNo">199</span>      MetricsIO.getInstance().incrSlowFsRead();<a name="line.199"></a>
+<span class="sourceLineNo">200</span>    }<a name="line.200"></a>
+<span class="sourceLineNo">201</span>  }<a name="line.201"></a>
+<span class="sourceLineNo">202</span><a name="line.202"></a>
+<span class="sourceLineNo">203</span>  public static final void updateWriteLatency(long latencyMillis) {<a name="line.203"></a>
+<span class="sourceLineNo">204</span>    MetricsIO.getInstance().updateFsWriteTime(latencyMillis);<a name="line.204"></a>
+<span class="sourceLineNo">205</span>  }<a name="line.205"></a>
 <span class="sourceLineNo">206</span><a name="line.206"></a>
-<span class="sourceLineNo">207</span>    /** Add an element to the file info map. */<a name="line.207"></a>
-<span class="sourceLineNo">208</span>    void appendFileInfo(byte[] key, byte[] value) throws IOException;<a name="line.208"></a>
-<span class="sourceLineNo">209</span><a name="line.209"></a>
-<span class="sourceLineNo">210</span>    /** Returns the path to this {@link HFile} */<a name="line.210"></a>
-<span class="sourceLineNo">211</span>    Path getPath();<a name="line.211"></a>
-<span class="sourceLineNo">212</span><a name="line.212"></a>
-<span class="sourceLineNo">213</span>    /**<a name="line.213"></a>
-<span class="sourceLineNo">214</span>     * Adds an inline block writer such as a multi-level block index writer or a compound Bloom<a name="line.214"></a>
-<span class="sourceLineNo">215</span>     * filter writer.<a name="line.215"></a>
-<span class="sourceLineNo">216</span>     */<a name="line.216"></a>
-<span class="sourceLineNo">217</span>    void addInlineBlockWriter(InlineBlockWriter bloomWriter);<a name="line.217"></a>
-<span class="sourceLineNo">218</span><a name="line.218"></a>
-<span class="sourceLineNo">219</span>    // The below three methods take Writables. We'd like to undo Writables but undoing the below<a name="line.219"></a>
-<span class="sourceLineNo">220</span>    // would be pretty painful. Could take a byte [] or a Message but we want to be backward<a name="line.220"></a>
-<span class="sourceLineNo">221</span>    // compatible around hfiles so would need to map between Message and Writable or byte [] and<a name="line.221"></a>
-<span class="sourceLineNo">222</span>    // current Writable serialization. This would be a bit of work to little gain. Thats my<a name="line.222"></a>
-<span class="sourceLineNo">223</span>    // thinking at moment. St.Ack 20121129<a name="line.223"></a>
-<span class="sourceLineNo">224</span><a name="line.224"></a>
-<span class="sourceLineNo">225</span>    void appendMetaBlock(String bloomFilterMetaKey, Writable metaWriter);<a name="line.225"></a>
-<span class="sourceLineNo">226</span><a name="line.226"></a>
-<span class="sourceLineNo">227</span>    /**<a name="line.227"></a>
-<span class="sourceLineNo">228</span>     * Store general Bloom filter in the file. This does not deal with Bloom filter internals but is<a name="line.228"></a>
-<span class="sourceLineNo">229</span>     * necessary, since Bloom filters are stored differently in HFile version 1 and version 2.<a name="line.229"></a>
-<span class="sourceLineNo">230</span>     */<a name="line.230"></a>
-<span class="sourceLineNo">231</span>    void addGeneralBloomFilter(BloomFilterWriter bfw);<a name="line.231"></a>
-<span class="sourceLineNo">232</span><a name="line.232"></a>
-<span class="sourceLineNo">233</span>    /**<a name="line.233"></a>
-<span class="sourceLineNo">234</span>     * Store delete family Bloom filter in the file, which is only supported in HFile V2.<a name="line.234"></a>
+<span class="sourceLineNo">207</span>  /** API required to write an {@link HFile} */<a name="line.207"></a>
+<span class="sourceLineNo">208</span>  public interface Writer extends Closeable, CellSink, ShipperListener {<a name="line.208"></a>
+<span class="sourceLineNo">209</span>    /** Max memstore (mvcc) timestamp in FileInfo */<a name="line.209"></a>
+<span class="sourceLineNo">210</span>    public static final byte[] MAX_MEMSTORE_TS_KEY = Bytes.toBytes("MAX_MEMSTORE_TS_KEY");<a name="line.210"></a>
+<span class="sourceLineNo">211</span><a name="line.211"></a>
+<span class="sourceLineNo">212</span>    /** Add an element to the file info map. */<a name="line.212"></a>
+<span class="sourceLineNo">213</span>    void appendFileInfo(byte[] key, byte[] value) throws IOException;<a name="line.213"></a>
+<span class="sourceLineNo">214</span><a name="line.214"></a>
+<span class="sourceLineNo">215</span>    /** Returns the path to this {@link HFile} */<a name="line.215"></a>
+<span class="sourceLineNo">216</span>    Path getPath();<a name="line.216"></a>
+<span class="sourceLineNo">217</span><a name="line.217"></a>
+<span class="sourceLineNo">218</span>    /**<a name="line.218"></a>
+<span class="sourceLineNo">219</span>     * Adds an inline block writer such as a multi-level block index writer or a compound Bloom<a name="line.219"></a>
+<span class="sourceLineNo">220</span>     * filter writer.<a name="line.220"></a>
+<span class="sourceLineNo">221</span>     */<a name="line.221"></a>
+<span class="sourceLineNo">222</span>    void addInlineBlockWriter(InlineBlockWriter bloomWriter);<a name="line.222"></a>
+<span class="sourceLineNo">223</span><a name="line.223"></a>
+<span class="sourceLineNo">224</span>    // The below three methods take Writables. We'd like to undo Writables but undoing the below<a name="line.224"></a>
+<span class="sourceLineNo">225</span>    // would be pretty painful. Could take a byte [] or a Message but we want to be backward<a name="line.225"></a>
+<span class="sourceLineNo">226</span>    // compatible around hfiles so would need to map between Message and Writable or byte [] and<a name="line.226"></a>
+<span class="sourceLineNo">227</span>    // current Writable serialization. This would be a bit of work to little gain. Thats my<a name="line.227"></a>
+<span class="sourceLineNo">228</span>    // thinking at moment. St.Ack 20121129<a name="line.228"></a>
+<span class="sourceLineNo">229</span><a name="line.229"></a>
+<span class="sourceLineNo">230</span>    void appendMetaBlock(String bloomFilterMetaKey, Writable metaWriter);<a name="line.230"></a>
+<span class="sourceLineNo">231</span><a name="line.231"></a>
+<span class="sourceLineNo">232</span>    /**<a name="line.232"></a>
+<span class="sourceLineNo">233</span>     * Store general Bloom filter in the file. This does not deal with Bloom filter internals but is<a name="line.233"></a>
+<span class="sourceLineNo">234</span>     * necessary, since Bloom filters are stored differently in HFile version 1 and version 2.<a name="line.234"></a>
 <span class="sourceLineNo">235</span>     */<a name="line.235"></a>
-<span class="sourceLineNo">236</span>    void addDeleteFamilyBloomFilter(BloomFilterWriter bfw) throws IOException;<a name="line.236"></a>
+<span class="sourceLineNo">236</span>    void addGeneralBloomFilter(BloomFilterWriter bfw);<a name="line.236"></a>
 <span class="sourceLineNo">237</span><a name="line.237"></a>
 <span class="sourceLineNo">238</span>    /**<a name="line.238"></a>
-<span class="sourceLineNo">239</span>     * Return the file context for the HFile this writer belongs to<a name="line.239"></a>
+<span class="sourceLineNo">239</span>     * Store delete family Bloom filter in the file, which is only supported in HFile V2.<a name="line.239"></a>
 <span class="sourceLineNo">240</span>     */<a name="line.240"></a>
-<span class="sourceLineNo">241</span>    HFileContext getFileContext();<a name="line.241"></a>
-<span class="sourceLineNo">242</span>  }<a name="line.242"></a>
-<span class="sourceLineNo">243</span><a name="line.243"></a>
-<span class="sourceLineNo">244</span>  /**<a name="line.244"></a>
-<span class="sourceLineNo">245</span>   * This variety of ways to construct writers is used throughout the code, and we want to be able<a name="line.245"></a>
-<span class="sourceLineNo">246</span>   * to swap writer implementations.<a name="line.246"></a>
-<span class="sourceLineNo">247</span>   */<a name="line.247"></a>
-<span class="sourceLineNo">248</span>  public static class WriterFactory {<a name="line.248"></a>
-<span class="sourceLineNo">249</span>    protected final Configuration conf;<a name="line.249"></a>
-<span class="sourceLineNo">250</span>    protected final CacheConfig cacheConf;<a name="line.250"></a>
-<span class="sourceLineNo">251</span>    protected FileSystem fs;<a name="line.251"></a>
-<span class="sourceLineNo">252</span>    protected Path path;<a name="line.252"></a>
-<span class="sourceLineNo">253</span>    protected FSDataOutputStream ostream;<a name="line.253"></a>
-<span class="sourceLineNo">254</span>    protected InetSocketAddress[] favoredNodes;<a name="line.254"></a>
-<span class="sourceLineNo">255</span>    private HFileContext fileContext;<a name="line.255"></a>
-<span class="sourceLineNo">256</span>    protected boolean shouldDropBehind = false;<a name="line.256"></a>
-<span class="sourceLineNo">257</span><a name="line.257"></a>
-<span class="sourceLineNo">258</span>    WriterFactory(Configuration conf, CacheConfig cacheConf) {<a name="line.258"></a>
-<span class="sourceLineNo">259</span>      this.conf = conf;<a name="line.259"></a>
-<span class="sourceLineNo">260</span>      this.cacheConf = cacheConf;<a name="line.260"></a>
-<span class="sourceLineNo">261</span>    }<a name="line.261"></a>
+<span class="sourceLineNo">241</span>    void addDeleteFamilyBloomFilter(BloomFilterWriter bfw) throws IOException;<a name="line.241"></a>
+<span class="sourceLineNo">242</span><a name="line.242"></a>
+<span class="sourceLineNo">243</span>    /**<a name="line.243"></a>
+<span class="sourceLineNo">244</span>     * Return the file context for the HFile this writer belongs to<a name="line.244"></a>
+<span class="sourceLineNo">245</span>     */<a name="line.245"></a>
+<span class="sourceLineNo">246</span>    HFileContext getFileContext();<a name="line.246"></a>
+<span class="sourceLineNo">247</span>  }<a name="line.247"></a>
+<span class="sourceLineNo">248</span><a name="line.248"></a>
+<span class="sourceLineNo">249</span>  /**<a name="line.249"></a>
+<span class="sourceLineNo">250</span>   * This variety of ways to construct writers is used throughout the code, and we want to be able<a name="line.250"></a>
+<span class="sourceLineNo">251</span>   * to swap writer implementations.<a name="line.251"></a>
+<span class="sourceLineNo">252</span>   */<a name="line.252"></a>
+<span class="sourceLineNo">253</span>  public static class WriterFactory {<a name="line.253"></a>
+<span class="sourceLineNo">254</span>    protected final Configuration conf;<a name="line.254"></a>
+<span class="sourceLineNo">255</span>    protected final CacheConfig cacheConf;<a name="line.255"></a>
+<span class="sourceLineNo">256</span>    protected FileSystem fs;<a name="line.256"></a>
+<span class="sourceLineNo">257</span>    protected Path path;<a name="line.257"></a>
+<span class="sourceLineNo">258</span>    protected FSDataOutputStream ostream;<a name="line.258"></a>
+<span class="sourceLineNo">259</span>    protected InetSocketAddress[] favoredNodes;<a name="line.259"></a>
+<span class="sourceLineNo">260</span>    private HFileContext fileContext;<a name="line.260"></a>
+<span class="sourceLineNo">261</span>    protected boolean shouldDropBehind = false;<a name="line.261"></a>
 <span class="sourceLineNo">262</span><a name="line.262"></a>
-<span class="sourceLineNo">263</span>    public WriterFactory withPath(FileSystem fs, Path path) {<a name="line.263"></a>
-<span class="sourceLineNo">264</span>      Preconditions.checkNotNull(fs);<a name="line.264"></a>
-<span class="sourceLineNo">265</span>      Preconditions.checkNotNull(path);<a name="line.265"></a>
-<span class="sourceLineNo">266</span>      this.fs = fs;<a name="line.266"></a>
-<span class="sourceLineNo">267</span>      this.path = path;<a name="line.267"></a>
-<span class="sourceLineNo">268</span>      return this;<a name="line.268"></a>
-<span class="sourceLineNo">269</span>    }<a name="line.269"></a>
-<span class="sourceLineNo">270</span><a name="line.270"></a>
-<span class="sourceLineNo">271</span>    public WriterFactory withOutputStream(FSDataOutputStream ostream) {<a name="line.271"></a>
-<span class="sourceLineNo">272</span>      Preconditions.checkNotNull(ostream);<a name="line.272"></a>
-<span class="sourceLineNo">273</span>      this.ostream = ostream;<a name="line.273"></a>
-<span class="sourceLineNo">274</span>      return this;<a name="line.274"></a>
-<span class="sourceLineNo">275</span>    }<a name="line.275"></a>
-<span class="sourceLineNo">276</span><a name="line.276"></a>
-<span class="sourceLineNo">277</span>    public WriterFactory withFavoredNodes(InetSocketAddress[] favoredNodes) {<a name="line.277"></a>
-<span class="sourceLineNo">278</span>      // Deliberately not checking for null here.<a name="line.278"></a>
-<span class="sourceLineNo">279</span>      this.favoredNodes = favoredNodes;<a name="line.279"></a>
-<span class="sourceLineNo">280</span>      return this;<a name="line.280"></a>
-<span class="sourceLineNo">281</span>    }<a name="line.281"></a>
-<span class="sourceLineNo">282</span><a name="line.282"></a>
-<span class="sourceLineNo">283</span>    public WriterFactory withFileContext(HFileContext fileContext) {<a name="line.283"></a>
-<span class="sourceLineNo">284</span>      this.fileContext = fileContext;<a name="line.284"></a>
+<span class="sourceLineNo">263</span>    WriterFactory(Configuration conf, CacheConfig cacheConf) {<a name="line.263"></a>
+<span class="sourceLineNo">264</span>      this.conf = conf;<a name="line.264"></a>
+<span class="sourceLineNo">265</span>      this.cacheConf = cacheConf;<a name="line.265"></a>
+<span class="sourceLineNo">266</span>    }<a name="line.266"></a>
+<span class="sourceLineNo">267</span><a name="line.267"></a>
+<span class="sourceLineNo">268</span>    public WriterFactory withPath(FileSystem fs, Path path) {<a name="line.268"></a>
+<span class="sourceLineNo">269</span>      Preconditions.checkNotNull(fs);<a name="line.269"></a>
+<span class="sourceLineNo">270</span>      Preconditions.checkNotNull(path);<a name="line.270"></a>
+<span class="sourceLineNo">271</span>      this.fs = fs;<a name="line.271"></a>
+<span class="sourceLineNo">272</span>      this.path = path;<a name="line.272"></a>
+<span class="sourceLineNo">273</span>      return this;<a name="line.273"></a>
+<span class="sourceLineNo">274</span>    }<a name="line.274"></a>
+<span class="sourceLineNo">275</span><a name="line.275"></a>
+<span class="sourceLineNo">276</span>    public WriterFactory withOutputStream(FSDataOutputStream ostream) {<a name="line.276"></a>
+<span class="sourceLineNo">277</span>      Preconditions.checkNotNull(ostream);<a name="line.277"></a>
+<span class="sourceLineNo">278</span>      this.ostream = ostream;<a name="line.278"></a>
+<span class="sourceLineNo">279</span>      return this;<a name="line.279"></a>
+<span class="sourceLineNo">280</span>    }<a name="line.280"></a>
+<span class="sourceLineNo">281</span><a name="line.281"></a>
+<span class="sourceLineNo">282</span>    public WriterFactory withFavoredNodes(InetSocketAddress[] favoredNodes) {<a name="line.282"></a>
+<span class="sourceLineNo">283</span>      // Deliberately not checking for null here.<a name="line.283"></a>
+<span class="sourceLineNo">284</span>      this.favoredNodes = favoredNodes;<a name="line.284"></a>
 <span class="sourceLineNo">285</span>      return this;<a name="line.285"></a>
 <span class="sourceLineNo">286</span>    }<a name="line.286"></a>
 <span class="sourceLineNo">287</span><a name="line.287"></a>
-<span class="sourceLineNo">288</span>    public WriterFactory withShouldDropCacheBehind(boolean shouldDropBehind) {<a name="line.288"></a>
-<span class="sourceLineNo">289</span>      this.shouldDropBehind = shouldDropBehind;<a name="line.289"></a>
+<span class="sourceLineNo">288</span>    public WriterFactory withFileContext(HFileContext fileContext) {<a name="line.288"></a>
+<span class="sourceLineNo">289</span>      this.fileContext = fileContext;<a name="line.289"></a>
 <span class="sourceLineNo">290</span>      return this;<a name="line.290"></a>
 <span class="sourceLineNo">291</span>    }<a name="line.291"></a>
 <span class="sourceLineNo">292</span><a name="line.292"></a>
-<span class="sourceLineNo">293</span>    public Writer create() throws IOException {<a name="line.293"></a>
-<span class="sourceLineNo">294</span>      if ((path != null ? 1 : 0) + (ostream != null ? 1 : 0) != 1) {<a name="line.294"></a>
-<span class="sourceLineNo">295</span>        throw new AssertionError("Please specify exactly one of " + "filesystem/path or path");<a name="line.295"></a>
-<span class="sourceLineNo">296</span>      }<a name="line.296"></a>
-<span class="sourceLineNo">297</span>      if (path != null) {<a name="line.297"></a>
-<span class="sourceLineNo">298</span>        ostream = HFileWriterImpl.createOutputStream(conf, fs, path, favoredNodes);<a name="line.298"></a>
-<span class="sourceLineNo">299</span>        try {<a name="line.299"></a>
-<span class="sourceLineNo">300</span>          ostream.setDropBehind(shouldDropBehind &amp;&amp; cacheConf.shouldDropBehindCompaction());<a name="line.300"></a>
-<span class="sourceLineNo">301</span>        } catch (UnsupportedOperationException uoe) {<a name="line.301"></a>
-<span class="sourceLineNo">302</span>          LOG.trace("Unable to set drop behind on {}", path, uoe);<a name="line.302"></a>
-<span class="sourceLineNo">303</span>          LOG.debug("Unable to set drop behind on {}", path.getName());<a name="line.303"></a>
-<span class="sourceLineNo">304</span>        }<a name="line.304"></a>
-<span class="sourceLineNo">305</span>      }<a name="line.305"></a>
-<span class="sourceLineNo">306</span>      return new HFileWriterImpl(conf, cacheConf, path, ostream, fileContext);<a name="line.306"></a>
-<span class="sourceLineNo">307</span>    }<a name="line.307"></a>
-<span class="sourceLineNo">308</span>  }<a name="line.308"></a>
-<span class="sourceLineNo">309</span><a name="line.309"></a>
-<span class="sourceLineNo">310</span>  /** The configuration key for HFile version to use for new files */<a name="line.310"></a>
-<span class="sourceLineNo">311</span>  public static final String FORMAT_VERSION_KEY = "hfile.format.version";<a name="line.311"></a>
-<span class="sourceLineNo">312</span><a name="line.312"></a>
-<span class="sourceLineNo">313</span>  public static int getFormatVersion(Configuration conf) {<a name="line.313"></a>
-<span class="sourceLineNo">314</span>    int version = conf.getInt(FORMAT_VERSION_KEY, MAX_FORMAT_VERSION);<a name="line.314"></a>
-<span class="sourceLineNo">315</span>    checkFormatVersion(version);<a name="line.315"></a>
-<span class="sourceLineNo">316</span>    return version;<a name="line.316"></a>
-<span class="sourceLineNo">317</span>  }<a name="line.317"></a>
-<span class="sourceLineNo">318</span><a name="line.318"></a>
-<span class="sourceLineNo">319</span>  /**<a name="line.319"></a>
-<span class="sourceLineNo">320</span>   * Returns the factory to be used to create {@link HFile} writers. Disables block cache access for<a name="line.320"></a>
-<span class="sourceLineNo">321</span>   * all writers created through the returned factory.<a name="line.321"></a>
-<span class="sourceLineNo">322</span>   */<a name="line.322"></a>
-<span class="sourceLineNo">323</span>  public static final WriterFactory getWriterFactoryNoCache(Configuration conf) {<a name="line.323"></a>
-<span class="sourceLineNo">324</span>    return HFile.getWriterFactory(conf, CacheConfig.DISABLED);<a name="line.324"></a>
-<span class="sourceLineNo">325</span>  }<a name="line.325"></a>
-<span class="sourceLineNo">326</span><a name="line.326"></a>
-<span class="sourceLineNo">327</span>  /**<a name="line.327"></a>
-<span class="sourceLineNo">328</span>   * Returns the factory to be used to create {@link HFile} writers<a name="line.328"></a>
-<span class="sourceLineNo">329</span>   */<a name="line.329"></a>
-<span class="sourceLineNo">330</span>  public static final WriterFactory getWriterFactory(Configuration conf, CacheConfig cacheConf) {<a name="line.330"></a>
-<span class="sourceLineNo">331</span>    int version = getFormatVersion(conf);<a name="line.331"></a>
-<span class="sourceLineNo">332</span>    switch (version) {<a name="line.332"></a>
-<span class="sourceLineNo">333</span>      case 2:<a name="line.333"></a>
-<span class="sourceLineNo">334</span>        throw new IllegalArgumentException("This should never happen. "<a name="line.334"></a>
-<span class="sourceLineNo">335</span>          + "Did you change hfile.format.version to read v2? This version of the software writes v3"<a name="line.335"></a>
-<span class="sourceLineNo">336</span>          + " hfiles only (but it can read v2 files without having to update hfile.format.version "<a name="line.336"></a>
-<span class="sourceLineNo">337</span>          + "in hbase-site.xml)");<a name="line.337"></a>
-<span class="sourceLineNo">338</span>      case 3:<a name="line.338"></a>
-<span class="sourceLineNo">339</span>        return new HFile.WriterFactory(conf, cacheConf);<a name="line.339"></a>
-<span class="sourceLineNo">340</span>      default:<a name="line.340"></a>
-<span class="sourceLineNo">341</span>        throw new IllegalArgumentException(<a name="line.341"></a>
-<span class="sourceLineNo">342</span>          "Cannot create writer for HFile " + "format version " + version);<a name="line.342"></a>
-<span class="sourceLineNo">343</span>    }<a name="line.343"></a>
-<span class="sourceLineNo">344</span>  }<a name="line.344"></a>
-<span class="sourceLineNo">345</span><a name="line.345"></a>
-<span class="sourceLineNo">346</span>  /**<a name="line.346"></a>
-<span class="sourceLineNo">347</span>   * An abstraction used by the block index. Implementations will check cache for any asked-for<a name="line.347"></a>
-<span class="sourceLineNo">348</span>   * block and return cached block if found. Otherwise, after reading from fs, will try and put<a name="line.348"></a>
-<span class="sourceLineNo">349</span>   * block into cache before returning.<a name="line.349"></a>
-<span class="sourceLineNo">350</span>   */<a name="line.350"></a>
-<span class="sourceLineNo">351</span>  public interface CachingBlockReader {<a name="line.351"></a>
-<span class="sourceLineNo">352</span>    /**<a name="line.352"></a>
-<span class="sourceLineNo">353</span>     * Read in a file block.<a name="line.353"></a>
-<span class="sourceLineNo">354</span>     * @param offset                    offset to read.<a name="line.354"></a>
-<span class="sourceLineNo">355</span>     * @param onDiskBlockSize           size of the block<a name="line.355"></a>
-<span class="sourceLineNo">356</span>     * @param isCompaction              is this block being read as part of a compaction<a name="line.356"></a>
-<span class="sourceLineNo">357</span>     * @param expectedBlockType         the block type we are expecting to read with this read<a name="line.357"></a>
-<span class="sourceLineNo">358</span>     *                                  operation, or null to read whatever block type is available<a name="line.358"></a>
-<span class="sourceLineNo">359</span>     *                                  and avoid checking (that might reduce caching efficiency of<a name="line.359"></a>
-<span class="sourceLineNo">360</span>     *                                  encoded data blocks)<a name="line.360"></a>
-<span class="sourceLineNo">361</span>     * @param expectedDataBlockEncoding the data block encoding the caller is expecting data blocks<a name="line.361"></a>
-<span class="sourceLineNo">362</span>     *                                  to be in, or null to not perform this check and return the<a name="line.362"></a>
-<span class="sourceLineNo">363</span>     *                                  block irrespective of the encoding. This check only applies<a name="line.363"></a>
-<span class="sourceLineNo">364</span>     *                                  to data blocks and can be set to null when the caller is<a name="line.364"></a>
-<span class="sourceLineNo">365</span>     *                                  expecting to read a non-data block and has set<a name="line.365"></a>
-<span class="sourceLineNo">366</span>     *                                  expectedBlockType accordingly.<a name="line.366"></a>
-<span class="sourceLineNo">367</span>     * @return Block wrapped in a ByteBuffer.<a name="line.367"></a>
-<span class="sourceLineNo">368</span>     */<a name="line.368"></a>
-<span class="sourceLineNo">369</span>    HFileBlock readBlock(long offset, long onDiskBlockSize, boolean cacheBlock, final boolean pread,<a name="line.369"></a>
-<span class="sourceLineNo">370</span>      final boolean isCompaction, final boolean updateCacheMetrics, BlockType expectedBlockType,<a name="line.370"></a>
-<span class="sourceLineNo">371</span>      DataBlockEncoding expectedDataBlockEncoding) throws IOException;<a name="line.371"></a>
-<span class="sourceLineNo">372</span><a name="line.372"></a>
-<span class="sourceLineNo">373</span>    HFileBlock readBlock(long offset, long onDiskBlockSize, boolean cacheBlock, final boolean pread,<a name="line.373"></a>
-<span class="sourceLineNo">374</span>      final boolean isCompaction, final boolean updateCacheMetrics, BlockType expectedBlockType,<a name="line.374"></a>
-<span class="sourceLineNo">375</span>      DataBlockEncoding expectedDataBlockEncoding, boolean cacheOnly) throws IOException;<a name="line.375"></a>
-<span class="sourceLineNo">376</span>  }<a name="line.376"></a>
+<span class="sourceLineNo">293</span>    public WriterFactory withShouldDropCacheBehind(boolean shouldDropBehind) {<a name="line.293"></a>
+<span class="sourceLineNo">294</span>      this.shouldDropBehind = shouldDropBehind;<a name="line.294"></a>
+<span class="sourceLineNo">295</span>      return this;<a name="line.295"></a>
+<span class="sourceLineNo">296</span>    }<a name="line.296"></a>
+<span class="sourceLineNo">297</span><a name="line.297"></a>
+<span class="sourceLineNo">298</span>    public Writer create() throws IOException {<a name="line.298"></a>
+<span class="sourceLineNo">299</span>      if ((path != null ? 1 : 0) + (ostream != null ? 1 : 0) != 1) {<a name="line.299"></a>
+<span class="sourceLineNo">300</span>        throw new AssertionError("Please specify exactly one of " + "filesystem/path or path");<a name="line.300"></a>
+<span class="sourceLineNo">301</span>      }<a name="line.301"></a>
+<span class="sourceLineNo">302</span>      if (path != null) {<a name="line.302"></a>
+<span class="sourceLineNo">303</span>        ostream = HFileWriterImpl.createOutputStream(conf, fs, path, favoredNodes);<a name="line.303"></a>
+<span class="sourceLineNo">304</span>        try {<a name="line.304"></a>
+<span class="sourceLineNo">305</span>          ostream.setDropBehind(shouldDropBehind &amp;&amp; cacheConf.shouldDropBehindCompaction());<a name="line.305"></a>
+<span class="sourceLineNo">306</span>        } catch (UnsupportedOperationException uoe) {<a name="line.306"></a>
+<span class="sourceLineNo">307</span>          LOG.trace("Unable to set drop behind on {}", path, uoe);<a name="line.307"></a>
+<span class="sourceLineNo">308</span>          LOG.debug("Unable to set drop behind on {}", path.getName());<a name="line.308"></a>
+<span class="sourceLineNo">309</span>        }<a name="line.309"></a>
+<span class="sourceLineNo">310</span>      }<a name="line.310"></a>
+<span class="sourceLineNo">311</span>      return new HFileWriterImpl(conf, cacheConf, path, ostream, fileContext);<a name="line.311"></a>
+<span class="sourceLineNo">312</span>    }<a name="line.312"></a>
+<span class="sourceLineNo">313</span>  }<a name="line.313"></a>
+<span class="sourceLineNo">314</span><a name="line.314"></a>
+<span class="sourceLineNo">315</span>  /** The configuration key for HFile version to use for new files */<a name="line.315"></a>
+<span class="sourceLineNo">316</span>  public static final String FORMAT_VERSION_KEY = "hfile.format.version";<a name="line.316"></a>
+<span class="sourceLineNo">317</span><a name="line.317"></a>
+<span class="sourceLineNo">318</span>  public static int getFormatVersion(Configuration conf) {<a name="line.318"></a>
+<span class="sourceLineNo">319</span>    int version = conf.getInt(FORMAT_VERSION_KEY, MAX_FORMAT_VERSION);<a name="line.319"></a>
+<span class="sourceLineNo">320</span>    checkFormatVersion(version);<a name="line.320"></a>
+<span class="sourceLineNo">321</span>    return version;<a name="line.321"></a>
+<span class="sourceLineNo">322</span>  }<a name="line.322"></a>
+<span class="sourceLineNo">323</span><a name="line.323"></a>
+<span class="sourceLineNo">324</span>  /**<a name="line.324"></a>
+<span class="sourceLineNo">325</span>   * Returns the factory to be used to create {@link HFile} writers. Disables block cache access for<a name="line.325"></a>
+<span class="sourceLineNo">326</span>   * all writers created through the returned factory.<a name="line.326"></a>
+<span class="sourceLineNo">327</span>   */<a name="line.327"></a>
+<span class="sourceLineNo">328</span>  public static final WriterFactory getWriterFactoryNoCache(Configuration conf) {<a name="line.328"></a>
+<span class="sourceLineNo">329</span>    return HFile.getWriterFactory(conf, CacheConfig.DISABLED);<a name="line.329"></a>
+<span class="sourceLineNo">330</span>  }<a name="line.330"></a>
+<span class="sourceLineNo">331</span><a name="line.331"></a>
+<span class="sourceLineNo">332</span>  /**<a name="line.332"></a>
+<span class="sourceLineNo">333</span>   * Returns the factory to be used to create {@link HFile} writers<a name="line.333"></a>
+<span class="sourceLineNo">334</span>   */<a name="line.334"></a>
+<span class="sourceLineNo">335</span>  public static final WriterFactory getWriterFactory(Configuration conf, CacheConfig cacheConf) {<a name="line.335"></a>
+<span class="sourceLineNo">336</span>    int version = getFormatVersion(conf);<a name="line.336"></a>
+<span class="sourceLineNo">337</span>    switch (version) {<a name="line.337"></a>
+<span class="sourceLineNo">338</span>      case 2:<a name="line.338"></a>
+<span class="sourceLineNo">339</span>        throw new IllegalArgumentException("This should never happen. "<a name="line.339"></a>
+<span class="sourceLineNo">340</span>          + "Did you change hfile.format.version to read v2? This version of the software writes v3"<a name="line.340"></a>
+<span class="sourceLineNo">341</span>          + " hfiles only (but it can read v2 files without having to update hfile.format.version "<a name="line.341"></a>
+<span class="sourceLineNo">342</span>          + "in hbase-site.xml)");<a name="line.342"></a>
+<span class="sourceLineNo">343</span>      case 3:<a name="line.343"></a>
+<span class="sourceLineNo">344</span>        return new HFile.WriterFactory(conf, cacheConf);<a name="line.344"></a>
+<span class="sourceLineNo">345</span>      default:<a name="line.345"></a>
+<span class="sourceLineNo">346</span>        throw new IllegalArgumentException(<a name="line.346"></a>
+<span class="sourceLineNo">347</span>          "Cannot create writer for HFile " + "format version " + version);<a name="line.347"></a>
+<span class="sourceLineNo">348</span>    }<a name="line.348"></a>
+<span class="sourceLineNo">349</span>  }<a name="line.349"></a>
+<span class="sourceLineNo">350</span><a name="line.350"></a>
+<span class="sourceLineNo">351</span>  /**<a name="line.351"></a>
+<span class="sourceLineNo">352</span>   * An abstraction used by the block index. Implementations will check cache for any asked-for<a name="line.352"></a>
+<span class="sourceLineNo">353</span>   * block and return cached block if found. Otherwise, after reading from fs, will try and put<a name="line.353"></a>
+<span class="sourceLineNo">354</span>   * block into cache before returning.<a name="line.354"></a>
+<span class="sourceLineNo">355</span>   */<a name="line.355"></a>
+<span class="sourceLineNo">356</span>  public interface CachingBlockReader {<a name="line.356"></a>
+<span class="sourceLineNo">357</span>    /**<a name="line.357"></a>
+<span class="sourceLineNo">358</span>     * Read in a file block.<a name="line.358"></a>
+<span class="sourceLineNo">359</span>     * @param offset                    offset to read.<a name="line.359"></a>
+<span class="sourceLineNo">360</span>     * @param onDiskBlockSize           size of the block<a name="line.360"></a>
+<span class="sourceLineNo">361</span>     * @param isCompaction              is this block being read as part of a compaction<a name="line.361"></a>
+<span class="sourceLineNo">362</span>     * @param expectedBlockType         the block type we are expecting to read with this read<a name="line.362"></a>
+<span class="sourceLineNo">363</span>     *                                  operation, or null to read whatever block type is available<a name="line.363"></a>
+<span class="sourceLineNo">364</span>     *                                  and avoid checking (that might reduce caching efficiency of<a name="line.364"></a>
+<span class="sourceLineNo">365</span>     *                                  encoded data blocks)<a name="line.365"></a>
+<span class="sourceLineNo">366</span>     * @param expectedDataBlockEncoding the data block encoding the caller is expecting data blocks<a name="line.366"></a>
+<span class="sourceLineNo">367</span>     *                                  to be in, or null to not perform this check and return the<a name="line.367"></a>
+<span class="sourceLineNo">368</span>     *                                  block irrespective of the encoding. This check only applies<a name="line.368"></a>
+<span class="sourceLineNo">369</span>     *                                  to data blocks and can be set to null when the caller is<a name="line.369"></a>
+<span class="sourceLineNo">370</span>     *                                  expecting to read a non-data block and has set<a name="line.370"></a>
+<span class="sourceLineNo">371</span>     *                                  expectedBlockType accordingly.<a name="line.371"></a>
+<span class="sourceLineNo">372</span>     * @return Block wrapped in a ByteBuffer.<a name="line.372"></a>
+<span class="sourceLineNo">373</span>     */<a name="line.373"></a>
+<span class="sourceLineNo">374</span>    HFileBlock readBlock(long offset, long onDiskBlockSize, boolean cacheBlock, final boolean pread,<a name="line.374"></a>
+<span class="sourceLineNo">375</span>      final boolean isCompaction, final boolean updateCacheMetrics, BlockType expectedBlockType,<a name="line.375"></a>
+<span class="sourceLineNo">376</span>      DataBlockEncoding expectedDataBlockEncoding) throws IOException;<a name="line.376"></a>
 <span class="sourceLineNo">377</span><a name="line.377"></a>
-<span class="sourceLineNo">378</span>  /** An interface used by clients to open and iterate an {@link HFile}. */<a name="line.378"></a>
-<span class="sourceLineNo">379</span>  public interface Reader extends Closeable, CachingBlockReader {<a name="line.379"></a>
-<span class="sourceLineNo">380</span>    /**<a name="line.380"></a>
-<span class="sourceLineNo">381</span>     * Returns this reader's "name". Usually the last component of the path. Needs to be constant as<a name="line.381"></a>
-<span class="sourceLineNo">382</span>     * the file is being moved to support caching on write.<a name="line.382"></a>
-<span class="sourceLineNo">383</span>     */<a name="line.383"></a>
-<span class="sourceLineNo">384</span>    String getName();<a name="line.384"></a>
-<span class="sourceLineNo">385</span><a name="line.385"></a>
-<span class="sourceLineNo">386</span>    CellComparator getComparator();<a name="line.386"></a>
-<span class="sourceLineNo">387</span><a name="line.387"></a>
-<span class="sourceLineNo">388</span>    HFileScanner getScanner(Configuration conf, boolean cacheBlocks, boolean pread,<a name="line.388"></a>
-<span class="sourceLineNo">389</span>      boolean isCompaction);<a name="line.389"></a>
+<span class="sourceLineNo">378</span>    HFileBlock readBlock(long offset, long onDiskBlockSize, boolean cacheBlock, final boolean pread,<a name="line.378"></a>
+<span class="sourceLineNo">379</span>      final boolean isCompaction, final boolean updateCacheMetrics, BlockType expectedBlockType,<a name="line.379"></a>
+<span class="sourceLineNo">380</span>      DataBlockEncoding expectedDataBlockEncoding, boolean cacheOnly) throws IOException;<a name="line.380"></a>
+<span class="sourceLineNo">381</span>  }<a name="line.381"></a>
+<span class="sourceLineNo">382</span><a name="line.382"></a>
+<span class="sourceLineNo">383</span>  /** An interface used by clients to open and iterate an {@link HFile}. */<a name="line.383"></a>
+<span class="sourceLineNo">384</span>  public interface Reader extends Closeable, CachingBlockReader {<a name="line.384"></a>
+<span class="sourceLineNo">385</span>    /**<a name="line.385"></a>
+<span class="sourceLineNo">386</span>     * Returns this reader's "name". Usually the last component of the path. Needs to be constant as<a name="line.386"></a>
+<span class="sourceLineNo">387</span>     * the file is being moved to support caching on write.<a name="line.387"></a>
+<span class="sourceLineNo">388</span>     */<a name="line.388"></a>
+<span class="sourceLineNo">389</span>    String getName();<a name="line.389"></a>
 <span class="sourceLineNo">390</span><a name="line.390"></a>
-<span class="sourceLineNo">391</span>    HFileBlock getMetaBlock(String metaBlockName, boolean cacheBlock) throws IOException;<a name="line.391"></a>
+<span class="sourceLineNo">391</span>    CellComparator getComparator();<a name="line.391"></a>
 <span class="sourceLineNo">392</span><a name="line.392"></a>
-<span class="sourceLineNo">393</span>    Optional&lt;Cell&gt; getLastKey();<a name="line.393"></a>
-<span class="sourceLineNo">394</span><a name="line.394"></a>
-<span class="sourceLineNo">395</span>    Optional&lt;Cell&gt; midKey() throws IOException;<a name="line.395"></a>
-<span class="sourceLineNo">396</span><a name="line.396"></a>
-<span class="sourceLineNo">397</span>    long length();<a name="line.397"></a>
-<span class="sourceLineNo">398</span><a name="line.398"></a>
-<span class="sourceLineNo">399</span>    long getEntries();<a name="line.399"></a>
-<span class="sourceLineNo">400</span><a name="line.400"></a>
-<span class="sourceLineNo">401</span>    Optional&lt;Cell&gt; getFirstKey();<a name="line.401"></a>
-<span class="sourceLineNo">402</span><a name="line.402"></a>
-<span class="sourceLineNo">403</span>    long indexSize();<a name="line.403"></a>
-<span class="sourceLineNo">404</span><a name="line.404"></a>
-<span class="sourceLineNo">405</span>    Optional&lt;byte[]&gt; getFirstRowKey();<a name="line.405"></a>
-<span class="sourceLineNo">406</span><a name="line.406"></a>
-<span class="sourceLineNo">407</span>    Optional&lt;byte[]&gt; getLastRowKey();<a name="line.407"></a>
-<span class="sourceLineNo">408</span><a name="line.408"></a>
-<span class="sourceLineNo">409</span>    FixedFileTrailer getTrailer();<a name="line.409"></a>
-<span class="sourceLineNo">410</span><a name="line.410"></a>
-<span class="sourceLineNo">411</span>    void setDataBlockIndexReader(HFileBlockIndex.CellBasedKeyBlockIndexReader reader);<a name="line.411"></a>
-<span class="sourceLineNo">412</span><a name="line.412"></a>
-<span class="sourceLineNo">413</span>    HFileBlockIndex.CellBasedKeyBlockIndexReader getDataBlockIndexReader();<a name="line.413"></a>
-<span class="sourceLineNo">414</span><a name="line.414"></a>
-<span class="sourceLineNo">415</span>    void setMetaBlockIndexReader(HFileBlockIndex.ByteArrayKeyBlockIndexReader reader);<a name="line.415"></a>
-<span class="sourceLineNo">416</span><a name="line.416"></a>
-<span class="sourceLineNo">417</span>    HFileBlockIndex.ByteArrayKeyBlockIndexReader getMetaBlockIndexReader();<a name="line.417"></a>
-<span class="sourceLineNo">418</span><a name="line.418"></a>
-<span class="sourceLineNo">419</span>    HFileScanner getScanner(Configuration conf, boolean cacheBlocks, boolean pread);<a name="line.419"></a>
-<span class="sourceLineNo">420</span><a name="line.420"></a>
-<span class="sourceLineNo">421</span>    /**<a name="line.421"></a>
-<span class="sourceLineNo">422</span>     * Retrieves general Bloom filter metadata as appropriate for each {@link HFile} version. Knows<a name="line.422"></a>
-<span class="sourceLineNo">423</span>     * nothing about how that metadata is structured.<a name="line.423"></a>
-<span class="sourceLineNo">424</span>     */<a name="line.424"></a>
-<span class="sourceLineNo">425</span>    DataInput getGeneralBloomFilterMetadata() throws IOException;<a name="line.425"></a>
-<span class="sourceLineNo">426</span><a name="line.426"></a>
-<span class="sourceLineNo">427</span>    /**<a name="line.427"></a>
-<span class="sourceLineNo">428</span>     * Retrieves delete family Bloom filter metadata as appropriate for each {@link HFile} version.<a name="line.428"></a>
-<span class="sourceLineNo">429</span>     * Knows nothing about how that metadata is structured.<a name="line.429"></a>
-<span class="sourceLineNo">430</span>     */<a name="line.430"></a>
-<span class="sourceLineNo">431</span>    DataInput getDeleteBloomFilterMetadata() throws IOException;<a name="line.431"></a>
-<span class="sourceLineNo">432</span><a name="line.432"></a>
-<span class="sourceLineNo">433</span>    Path getPath();<a name="line.433"></a>
-<span class="sourceLineNo">434</span><a name="line.434"></a>
-<span class="sourceLineNo">435</span>    /** Close method with optional evictOnClose */<a name="line.435"></a>
-<span class="sourceLineNo">436</span>    void close(boolean evictOnClose) throws IOException;<a name="line.436"></a>
+<span class="sourceLineNo">393</span>    HFileScanner getScanner(Configuration conf, boolean cacheBlocks, boolean pread,<a name="line.393"></a>
+<span class="sourceLineNo">394</span>      boolean isCompaction);<a name="line.394"></a>
+<span class="sourceLineNo">395</span><a name="line.395"></a>
+<span class="sourceLineNo">396</span>    HFileBlock getMetaBlock(String metaBlockName, boolean cacheBlock) throws IOException;<a name="line.396"></a>
+<span class="sourceLineNo">397</span><a name="line.397"></a>
+<span class="sourceLineNo">398</span>    Optional&lt;Cell&gt; getLastKey();<a name="line.398"></a>
+<span class="sourceLineNo">399</span><a name="line.399"></a>
+<span class="sourceLineNo">400</span>    Optional&lt;Cell&gt; midKey() throws IOException;<a name="line.400"></a>
+<span class="sourceLineNo">401</span><a name="line.401"></a>
+<span class="sourceLineNo">402</span>    long length();<a name="line.402"></a>
+<span class="sourceLineNo">403</span><a name="line.403"></a>
+<span class="sourceLineNo">404</span>    long getEntries();<a name="line.404"></a>
+<span class="sourceLineNo">405</span><a name="line.405"></a>
+<span class="sourceLineNo">406</span>    Optional&lt;Cell&gt; getFirstKey();<a name="line.406"></a>
+<span class="sourceLineNo">407</span><a name="line.407"></a>
+<span class="sourceLineNo">408</span>    long indexSize();<a name="line.408"></a>
+<span class="sourceLineNo">409</span><a name="line.409"></a>
+<span class="sourceLineNo">410</span>    Optional&lt;byte[]&gt; getFirstRowKey();<a name="line.410"></a>
+<span class="sourceLineNo">411</span><a name="line.411"></a>
+<span class="sourceLineNo">412</span>    Optional&lt;byte[]&gt; getLastRowKey();<a name="line.412"></a>
+<span class="sourceLineNo">413</span><a name="line.413"></a>
+<span class="sourceLineNo">414</span>    FixedFileTrailer getTrailer();<a name="line.414"></a>
+<span class="sourceLineNo">415</span><a name="line.415"></a>
+<span class="sourceLineNo">416</span>    void setDataBlockIndexReader(HFileBlockIndex.CellBasedKeyBlockIndexReader reader);<a name="line.416"></a>
+<span class="sourceLineNo">417</span><a name="line.417"></a>
+<span class="sourceLineNo">418</span>    HFileBlockIndex.CellBasedKeyBlockIndexReader getDataBlockIndexReader();<a name="line.418"></a>
+<span class="sourceLineNo">419</span><a name="line.419"></a>
+<span class="sourceLineNo">420</span>    void setMetaBlockIndexReader(HFileBlockIndex.ByteArrayKeyBlockIndexReader reader);<a name="line.420"></a>
+<span class="sourceLineNo">421</span><a name="line.421"></a>
+<span class="sourceLineNo">422</span>    HFileBlockIndex.ByteArrayKeyBlockIndexReader getMetaBlockIndexReader();<a name="line.422"></a>
+<span class="sourceLineNo">423</span><a name="line.423"></a>
+<span class="sourceLineNo">424</span>    HFileScanner getScanner(Configuration conf, boolean cacheBlocks, boolean pread);<a name="line.424"></a>
+<span class="sourceLineNo">425</span><a name="line.425"></a>
+<span class="sourceLineNo">426</span>    /**<a name="line.426"></a>
+<span class="sourceLineNo">427</span>     * Retrieves general Bloom filter metadata as appropriate for each {@link HFile} version. Knows<a name="line.427"></a>
+<span class="sourceLineNo">428</span>     * nothing about how that metadata is structured.<a name="line.428"></a>
+<span class="sourceLineNo">429</span>     */<a name="line.429"></a>
+<span class="sourceLineNo">430</span>    DataInput getGeneralBloomFilterMetadata() throws IOException;<a name="line.430"></a>
+<span class="sourceLineNo">431</span><a name="line.431"></a>
+<span class="sourceLineNo">432</span>    /**<a name="line.432"></a>
+<span class="sourceLineNo">433</span>     * Retrieves delete family Bloom filter metadata as appropriate for each {@link HFile} version.<a name="line.433"></a>
+<span class="sourceLineNo">434</span>     * Knows nothing about how that metadata is structured.<a name="line.434"></a>
+<span class="sourceLineNo">435</span>     */<a name="line.435"></a>
+<span class="sourceLineNo">436</span>    DataInput getDeleteBloomFilterMetadata() throws IOException;<a name="line.436"></a>
 <span class="sourceLineNo">437</span><a name="line.437"></a>
-<span class="sourceLineNo">438</span>    DataBlockEncoding getDataBlockEncoding();<a name="line.438"></a>
+<span class="sourceLineNo">438</span>    Path getPath();<a name="line.438"></a>
 <span class="sourceLineNo">439</span><a name="line.439"></a>
-<span class="sourceLineNo">440</span>    boolean hasMVCCInfo();<a name="line.440"></a>
-<span class="sourceLineNo">441</span><a name="line.441"></a>
-<span class="sourceLineNo">442</span>    /**<a name="line.442"></a>
-<span class="sourceLineNo">443</span>     * Return the file context of the HFile this reader belongs to<a name="line.443"></a>
-<span class="sourceLineNo">444</span>     */<a name="line.444"></a>
-<span class="sourceLineNo">445</span>    HFileContext getFileContext();<a name="line.445"></a>
+<span class="sourceLineNo">440</span>    /** Close method with optional evictOnClose */<a name="line.440"></a>
+<span class="sourceLineNo">441</span>    void close(boolean evictOnClose) throws IOException;<a name="line.441"></a>
+<span class="sourceLineNo">442</span><a name="line.442"></a>
+<span class="sourceLineNo">443</span>    DataBlockEncoding getDataBlockEncoding();<a name="line.443"></a>
+<span class="sourceLineNo">444</span><a name="line.444"></a>
+<span class="sourceLineNo">445</span>    boolean hasMVCCInfo();<a name="line.445"></a>
 <span class="sourceLineNo">446</span><a name="line.446"></a>
-<span class="sourceLineNo">447</span>    boolean isPrimaryReplicaReader();<a name="line.447"></a>
-<span class="sourceLineNo">448</span><a name="line.448"></a>
-<span class="sourceLineNo">449</span>    DataBlockEncoding getEffectiveEncodingInCache(boolean isCompaction);<a name="line.449"></a>
-<span class="sourceLineNo">450</span><a name="line.450"></a>
-<span class="sourceLineNo">451</span>    HFileBlock.FSReader getUncachedBlockReader();<a name="line.451"></a>
-<span class="sourceLineNo">452</span><a name="line.452"></a>
-<span class="sourceLineNo">453</span>    boolean prefetchComplete();<a name="line.453"></a>
-<span class="sourceLineNo">454</span><a name="line.454"></a>
-<span class="sourceLineNo">455</span>    /**<a name="line.455"></a>
-<span class="sourceLineNo">456</span>     * To close the stream's socket. Note: This can be concurrently called from multiple threads and<a name="line.456"></a>
-<span class="sourceLineNo">457</span>     * implementation should take care of thread safety.<a name="line.457"></a>
-<span class="sourceLineNo">458</span>     */<a name="line.458"></a>
-<span class="sourceLineNo">459</span>    void unbufferStream();<a name="line.459"></a>
-<span class="sourceLineNo">460</span><a name="line.460"></a>
-<span class="sourceLineNo">461</span>    ReaderContext getContext();<a name="line.461"></a>
-<span class="sourceLineNo">462</span><a name="line.462"></a>
-<span class="sourceLineNo">463</span>    HFileInfo getHFileInfo();<a name="line.463"></a>
-<span class="sourceLineNo">464</span><a name="line.464"></a>
-<span class="sourceLineNo">465</span>    void setDataBlockEncoder(HFileDataBlockEncoder dataBlockEncoder);<a name="line.465"></a>
-<span class="sourceLineNo">466</span>  }<a name="line.466"></a>
+<span class="sourceLineNo">447</span>    /**<a name="line.447"></a>
+<span class="sourceLineNo">448</span>     * Return the file context of the HFile this reader belongs to<a name="line.448"></a>
+<span class="sourceLineNo">449</span>     */<a name="line.449"></a>
+<span class="sourceLineNo">450</span>    HFileContext getFileContext();<a name="line.450"></a>
+<span class="sourceLineNo">451</span><a name="line.451"></a>
+<span class="sourceLineNo">452</span>    boolean isPrimaryReplicaReader();<a name="line.452"></a>
+<span class="sourceLineNo">453</span><a name="line.453"></a>
+<span class="sourceLineNo">454</span>    DataBlockEncoding getEffectiveEncodingInCache(boolean isCompaction);<a name="line.454"></a>
+<span class="sourceLineNo">455</span><a name="line.455"></a>
+<span class="sourceLineNo">456</span>    HFileBlock.FSReader getUncachedBlockReader();<a name="line.456"></a>
+<span class="sourceLineNo">457</span><a name="line.457"></a>
+<span class="sourceLineNo">458</span>    boolean prefetchComplete();<a name="line.458"></a>
+<span class="sourceLineNo">459</span><a name="line.459"></a>
+<span class="sourceLineNo">460</span>    /**<a name="line.460"></a>
+<span class="sourceLineNo">461</span>     * To close the stream's socket. Note: This can be concurrently called from multiple threads and<a name="line.461"></a>
+<span class="sourceLineNo">462</span>     * implementation should take care of thread safety.<a name="line.462"></a>
+<span class="sourceLineNo">463</span>     */<a name="line.463"></a>
+<span class="sourceLineNo">464</span>    void unbufferStream();<a name="line.464"></a>
+<span class="sourceLineNo">465</span><a name="line.465"></a>
+<span class="sourceLineNo">466</span>    ReaderContext getContext();<a name="line.466"></a>
 <span class="sourceLineNo">467</span><a name="line.467"></a>
-<span class="sourceLineNo">468</span>  /**<a name="line.468"></a>
-<span class="sourceLineNo">469</span>   * Method returns the reader given the specified arguments. TODO This is a bad abstraction. See<a name="line.469"></a>
-<span class="sourceLineNo">470</span>   * HBASE-6635.<a name="line.470"></a>
-<span class="sourceLineNo">471</span>   * @param context   Reader context info<a name="line.471"></a>
-<span class="sourceLineNo">472</span>   * @param fileInfo  HFile info<a name="line.472"></a>
-<span class="sourceLineNo">473</span>   * @param cacheConf Cache configuation values, cannot be null.<a name="line.473"></a>
-<span class="sourceLineNo">474</span>   * @param conf      Configuration<a name="line.474"></a>
-<span class="sourceLineNo">475</span>   * @return an appropriate instance of HFileReader<a name="line.475"></a>
-<span class="sourceLineNo">476</span>   * @throws IOException If file is invalid, will throw CorruptHFileException flavored IOException<a name="line.476"></a>
-<span class="sourceLineNo">477</span>   */<a name="line.477"></a>
-<span class="sourceLineNo">478</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "SF_SWITCH_FALLTHROUGH",<a name="line.478"></a>
-<span class="sourceLineNo">479</span>      justification = "Intentional")<a name="line.479"></a>
-<span class="sourceLineNo">480</span>  public static Reader createReader(ReaderContext context, HFileInfo fileInfo,<a name="line.480"></a>
-<span class="sourceLineNo">481</span>    CacheConfig cacheConf, Configuration conf) throws IOException {<a name="line.481"></a>
-<span class="sourceLineNo">482</span>    try {<a name="line.482"></a>
-<span class="sourceLineNo">483</span>      if (context.getReaderType() == ReaderType.STREAM) {<a name="line.483"></a>
-<span class="sourceLineNo">484</span>        // stream reader will share trailer with pread reader, see HFileStreamReader#copyFields<a name="line.484"></a>
-<span class="sourceLineNo">485</span>        return new HFileStreamReader(context, fileInfo, cacheConf, conf);<a name="line.485"></a>
-<span class="sourceLineNo">486</span>      }<a name="line.486"></a>
-<span class="sourceLineNo">487</span>      FixedFileTrailer trailer = fileInfo.getTrailer();<a name="line.487"></a>
-<span class="sourceLineNo">488</span>      switch (trailer.getMajorVersion()) {<a name="line.488"></a>
-<span class="sourceLineNo">489</span>        case 2:<a name="line.489"></a>
-<span class="sourceLineNo">490</span>          LOG.debug("Opening HFile v2 with v3 reader");<a name="line.490"></a>
-<span class="sourceLineNo">491</span>          // Fall through. FindBugs: SF_SWITCH_FALLTHROUGH<a name="line.491"></a>
-<span class="sourceLineNo">492</span>        case 3:<a name="line.492"></a>
-<span class="sourceLineNo">493</span>          return new HFilePreadReader(context, fileInfo, cacheConf, conf);<a name="line.493"></a>
-<span class="sourceLineNo">494</span>        default:<a name="line.494"></a>
-<span class="sourceLineNo">495</span>          throw new IllegalArgumentException("Invalid HFile version " + trailer.getMajorVersion());<a name="line.495"></a>
-<span class="sourceLineNo">496</span>      }<a name="line.496"></a>
-<span class="sourceLineNo">497</span>    } catch (Throwable t) {<a name="line.497"></a>
-<span class="sourceLineNo">498</span>      IOUtils.closeQuietly(context.getInputStreamWrapper(),<a name="line.498"></a>
-<span class="sourceLineNo">499</span>        e -&gt; LOG.warn("failed to close input stream wrapper", e));<a name="line.499"></a>
-<span class="sourceLineNo">500</span>      throw new CorruptHFileException(<a name="line.500"></a>
-<span class="sourceLineNo">501</span>        "Problem reading HFile Trailer from file " + context.getFilePath(), t);<a name="line.501"></a>
-<span class="sourceLineNo">502</span>    } finally {<a name="line.502"></a>
-<span class="sourceLineNo">503</span>      context.getInputStreamWrapper().unbuffer();<a name="line.503"></a>
-<span class="sourceLineNo">504</span>    }<a name="line.504"></a>
-<span class="sourceLineNo">505</span>  }<a name="line.505"></a>
-<span class="sourceLineNo">506</span><a name="line.506"></a>
-<span class="sourceLineNo">507</span>  /**<a name="line.507"></a>
-<span class="sourceLineNo">508</span>   * Creates reader with cache configuration disabled<a name="line.508"></a>
-<span class="sourceLineNo">509</span>   * @param fs   filesystem<a name="line.509"></a>
-<span class="sourceLineNo">510</span>   * @param path Path to file to read<a name="line.510"></a>
-<span class="sourceLineNo">511</span>   * @param conf Configuration<a name="line.511"></a>
-<span class="sourceLineNo">512</span>   * @return an active Reader instance<a name="line.512"></a>
-<span class="sourceLineNo">513</span>   * @throws IOException Will throw a CorruptHFileException (DoNotRetryIOException subtype) if hfile<a name="line.513"></a>
-<span class="sourceLineNo">514</span>   *                     is corrupt/invalid.<a name="line.514"></a>
-<span class="sourceLineNo">515</span>   */<a name="line.515"></a>
-<span class="sourceLineNo">516</span>  public static Reader createReader(FileSystem fs, Path path, Configuration conf)<a name="line.516"></a>
-<span class="sourceLineNo">517</span>    throws IOException {<a name="line.517"></a>
-<span class="sourceLineNo">518</span>    // The primaryReplicaReader is mainly used for constructing block cache key, so if we do not use<a name="line.518"></a>
-<span class="sourceLineNo">519</span>    // block cache then it is OK to set it as any value. We use true here.<a name="line.519"></a>
-<span class="sourceLineNo">520</span>    return createReader(fs, path, CacheConfig.DISABLED, true, conf);<a name="line.520"></a>
-<span class="sourceLineNo">521</span>  }<a name="line.521"></a>
-<span class="sourceLineNo">522</span><a name="line.522"></a>
-<span class="sourceLineNo">523</span>  /**<a name="line.523"></a>
-<span class="sourceLineNo">524</span>   * @param fs                   filesystem<a name="line.524"></a>
-<span class="sourceLineNo">525</span>   * @param path                 Path to file to read<a name="line.525"></a>
-<span class="sourceLineNo">526</span>   * @param cacheConf            This must not be null.<a name="line.526"></a>
-<span class="sourceLineNo">527</span>   * @param primaryReplicaReader true if this is a reader for primary replica<a name="line.527"></a>
-<span class="sourceLineNo">528</span>   * @param conf                 Configuration<a name="line.528"></a>
-<span class="sourceLineNo">529</span>   * @return an active Reader instance<a name="line.529"></a>
-<span class="sourceLineNo">530</span>   * @throws IOException Will throw a CorruptHFileException (DoNotRetryIOException subtype) if hfile<a name="line.530"></a>
-<span class="sourceLineNo">531</span>   *                     is corrupt/invalid.<a name="line.531"></a>
-<span class="sourceLineNo">532</span>   * @see CacheConfig#CacheConfig(Configuration)<a name="line.532"></a>
-<span class="sourceLineNo">533</span>   */<a name="line.533"></a>
-<span class="sourceLineNo">534</span>  public static Reader createReader(FileSystem fs, Path path, CacheConfig cacheConf,<a name="line.534"></a>
-<span class="sourceLineNo">535</span>    boolean primaryReplicaReader, Configuration conf) throws IOException {<a name="line.535"></a>
-<span class="sourceLineNo">536</span>    Preconditions.checkNotNull(cacheConf, "Cannot create Reader with null CacheConf");<a name="line.536"></a>
-<span class="sourceLineNo">537</span>    FSDataInputStreamWrapper stream = new FSDataInputStreamWrapper(fs, path);<a name="line.537"></a>
-<span class="sourceLineNo">538</span>    ReaderContext context =<a name="line.538"></a>
-<span class="sourceLineNo">539</span>      new ReaderContextBuilder().withFilePath(path).withInputStreamWrapper(stream)<a name="line.539"></a>
-<span class="sourceLineNo">540</span>        .withFileSize(fs.getFileStatus(path).getLen()).withFileSystem(stream.getHfs())<a name="line.540"></a>
-<span class="sourceLineNo">541</span>        .withPrimaryReplicaReader(primaryReplicaReader).withReaderType(ReaderType.PREAD).build();<a name="line.541"></a>
-<span class="sourceLineNo">542</span>    HFileInfo fileInfo = new HFileInfo(context, conf);<a name="line.542"></a>
-<span class="sourceLineNo">543</span>    Reader reader = createReader(context, fileInfo, cacheConf, conf);<a name="line.543"></a>
-<span class="sourceLineNo">544</span>    fileInfo.initMetaAndIndex(reader);<a name="line.544"></a>
-<span class="sourceLineNo">545</span>    return reader;<a name="line.545"></a>
-<span class="sourceLineNo">546</span>  }<a name="line.546"></a>
-<span class="sourceLineNo">547</span><a name="line.547"></a>
-<span class="sourceLineNo">548</span>  /**<a name="line.548"></a>
-<span class="sourceLineNo">549</span>   * Returns true if the specified file has a valid HFile Trailer.<a name="line.549"></a>
-<span class="sourceLineNo">550</span>   * @param fs   filesystem<a name="line.550"></a>
-<span class="sourceLineNo">551</span>   * @param path Path to file to verify<a name="line.551"></a>
-<span class="sourceLineNo">552</span>   * @return true if the file has a valid HFile Trailer, otherwise false<a name="line.552"></a>
-<span class="sourceLineNo">553</span>   * @throws IOException if failed to read from the underlying stream<a name="line.553"></a>
-<span class="sourceLineNo">554</span>   */<a name="line.554"></a>
-<span class="sourceLineNo">555</span>  public static boolean isHFileFormat(final FileSystem fs, final Path path) throws IOException {<a name="line.555"></a>
-<span class="sourceLineNo">556</span>    return isHFileFormat(fs, fs.getFileStatus(path));<a name="line.556"></a>
-<span class="sourceLineNo">557</span>  }<a name="line.557"></a>
-<span class="sourceLineNo">558</span><a name="line.558"></a>
-<span class="sourceLineNo">559</span>  /**<a name="line.559"></a>
-<span class="sourceLineNo">560</span>   * Returns true if the specified file has a valid HFile Trailer.<a name="line.560"></a>
-<span class="sourceLineNo">561</span>   * @param fs         filesystem<a name="line.561"></a>
-<span class="sourceLineNo">562</span>   * @param fileStatus the file to verify<a name="line.562"></a>
-<span class="sourceLineNo">563</span>   * @return true if the file has a valid HFile Trailer, otherwise false<a name="line.563"></a>
-<span class="sourceLineNo">564</span>   * @throws IOException if failed to read from the underlying stream<a name="line.564"></a>
-<span class="sourceLineNo">565</span>   */<a name="line.565"></a>
-<span class="sourceLineNo">566</span>  public static boolean isHFileFormat(final FileSystem fs, final FileStatus fileStatus)<a name="line.566"></a>
-<span class="sourceLineNo">567</span>    throws IOException {<a name="line.567"></a>
-<span class="sourceLineNo">568</span>    final Path path = fileStatus.getPath();<a name="line.568"></a>
-<span class="sourceLineNo">569</span>    final long size = fileStatus.getLen();<a name="line.569"></a>
-<span class="sourceLineNo">570</span>    try (FSDataInputStreamWrapper fsdis = new FSDataInputStreamWrapper(fs, path)) {<a name="line.570"></a>
-<span class="sourceLineNo">571</span>      boolean isHBaseChecksum = fsdis.shouldUseHBaseChecksum();<a name="line.571"></a>
-<span class="sourceLineNo">572</span>      assert !isHBaseChecksum; // Initially we must read with FS checksum.<a name="line.572"></a>
-<span class="sourceLineNo">573</span>      FixedFileTrailer.readFromStream(fsdis.getStream(isHBaseChecksum), size);<a name="line.573"></a>
-<span class="sourceLineNo">574</span>      return true;<a name="line.574"></a>
-<span class="sourceLineNo">575</span>    } catch (IllegalArgumentException e) {<a name="line.575"></a>
-<span class="sourceLineNo">576</span>      return false;<a name="line.576"></a>
-<span class="sourceLineNo">577</span>    }<a name="line.577"></a>
-<span class="sourceLineNo">578</span>  }<a name="line.578"></a>
-<span class="sourceLineNo">579</span><a name="line.579"></a>
-<span class="sourceLineNo">580</span>  /**<a name="line.580"></a>
-<span class="sourceLineNo">581</span>   * Get names of supported compression algorithms. The names are acceptable by HFile.Writer.<a name="line.581"></a>
-<span class="sourceLineNo">582</span>   * @return Array of strings, each represents a supported compression algorithm. Currently, the<a name="line.582"></a>
-<span class="sourceLineNo">583</span>   *         following compression algorithms are supported.<a name="line.583"></a>
-<span class="sourceLineNo">584</span>   *         &lt;ul&gt;<a name="line.584"></a>
-<span class="sourceLineNo">585</span>   *         &lt;li&gt;"none" - No compression.<a name="line.585"></a>
-<span class="sourceLineNo">586</span>   *         &lt;li&gt;"gz" - GZIP compression.<a name="line.586"></a>
-<span class="sourceLineNo">587</span>   *         &lt;/ul&gt;<a name="line.587"></a>
-<span class="sourceLineNo">588</span>   */<a name="line.588"></a>
-<span class="sourceLineNo">589</span>  public static String[] getSupportedCompressionAlgorithms() {<a name="line.589"></a>
-<span class="sourceLineNo">590</span>    return Compression.getSupportedAlgorithms();<a name="line.590"></a>
-<span class="sourceLineNo">591</span>  }<a name="line.591"></a>
-<span class="sourceLineNo">592</span><a name="line.592"></a>
-<span class="sourceLineNo">593</span>  // Utility methods.<a name="line.593"></a>
-<span class="sourceLineNo">594</span>  /*<a name="line.594"></a>
-<span class="sourceLineNo">595</span>   * @param l Long to convert to an int.<a name="line.595"></a>
-<span class="sourceLineNo">596</span>   * @return &lt;code&gt;l&lt;/code&gt; cast as an int.<a name="line.596"></a>
-<span class="sourceLineNo">597</span>   */<a name="line.597"></a>
-<span class="sourceLineNo">598</span>  static int longToInt(final long l) {<a name="line.598"></a>
-<span class="sourceLineNo">599</span>    // Expecting the size() of a block not exceeding 4GB. Assuming the<a name="line.599"></a>
-<span class="sourceLineNo">600</span>    // size() will wrap to negative integer if it exceeds 2GB (From tfile).<a name="line.600"></a>
-<span class="sourceLineNo">601</span>    return (int) (l &amp; 0x00000000ffffffffL);<a name="line.601"></a>
-<span class="sourceLineNo">602</span>  }<a name="line.602"></a>
-<span class="sourceLineNo">603</span><a name="line.603"></a>
-<span class="sourceLineNo">604</span>  /**<a name="line.604"></a>
-<span class="sourceLineNo">605</span>   * Returns all HFiles belonging to the given region directory. Could return an empty list.<a name="line.605"></a>
-<span class="sourceLineNo">606</span>   * @param fs        The file system reference.<a name="line.606"></a>
-<span class="sourceLineNo">607</span>   * @param regionDir The region directory to scan.<a name="line.607"></a>
-<span class="sourceLineNo">608</span>   * @return The list of files found.<a name="line.608"></a>
-<span class="sourceLineNo">609</span>   * @throws IOException When scanning the files fails.<a name="line.609"></a>
-<span class="sourceLineNo">610</span>   */<a name="line.610"></a>
-<span class="sourceLineNo">611</span>  public static List&lt;Path&gt; getStoreFiles(FileSystem fs, Path regionDir) throws IOException {<a name="line.611"></a>
-<span class="sourceLineNo">612</span>    List&lt;Path&gt; regionHFiles = new ArrayList&lt;&gt;();<a name="line.612"></a>
-<span class="sourceLineNo">613</span>    PathFilter dirFilter = new FSUtils.DirFilter(fs);<a name="line.613"></a>
-<span class="sourceLineNo">614</span>    FileStatus[] familyDirs = fs.listStatus(regionDir, dirFilter);<a name="line.614"></a>
-<span class="sourceLineNo">615</span>    for (FileStatus dir : familyDirs) {<a name="line.615"></a>
-<span class="sourceLineNo">616</span>      FileStatus[] files = fs.listStatus(dir.getPath());<a name="line.616"></a>
-<span class="sourceLineNo">617</span>      for (FileStatus file : files) {<a name="line.617"></a>
-<span class="sourceLineNo">618</span>        if (<a name="line.618"></a>
-<span class="sourceLineNo">619</span>          !file.isDirectory()<a name="line.619"></a>
-<span class="sourceLineNo">620</span>            &amp;&amp; (!file.getPath().toString().contains(HConstants.HREGION_OLDLOGDIR_NAME))<a name="line.620"></a>
-<span class="sourceLineNo">621</span>            &amp;&amp; (!file.getPath().toString().contains(HConstants.RECOVERED_EDITS_DIR))<a name="line.621"></a>
-<span class="sourceLineNo">622</span>        ) {<a name="line.622"></a>
-<span class="sourceLineNo">623</span>          regionHFiles.add(file.getPath());<a name="line.623"></a>
-<span class="sourceLineNo">624</span>        }<a name="line.624"></a>
-<span class="sourceLineNo">625</span>      }<a name="line.625"></a>
-<span class="sourceLineNo">626</span>    }<a name="line.626"></a>
-<span class="sourceLineNo">627</span>    return regionHFiles;<a name="line.627"></a>
-<span class="sourceLineNo">628</span>  }<a name="line.628"></a>
-<span class="sourceLineNo">629</span><a name="line.629"></a>
-<span class="sourceLineNo">630</span>  /**<a name="line.630"></a>
-<span class="sourceLineNo">631</span>   * Checks the given {@link HFile} format version, and throws an exception if invalid. Note that if<a name="line.631"></a>
-<span class="sourceLineNo">632</span>   * the version number comes from an input file and has not been verified, the caller needs to<a name="line.632"></a>
-<span class="sourceLineNo">633</span>   * re-throw an {@link IOException} to indicate that this is not a software error, but corrupted<a name="line.633"></a>
-<span class="sourceLineNo">634</span>   * input.<a name="line.634"></a>
-<span class="sourceLineNo">635</span>   * @param version an HFile version<a name="line.635"></a>
-<span class="sourceLineNo">636</span>   * @throws IllegalArgumentException if the version is invalid<a name="line.636"></a>
-<span class="sourceLineNo">637</span>   */<a name="line.637"></a>
-<span class="sourceLineNo">638</span>  public static void checkFormatVersion(int version) throws IllegalArgumentException {<a name="line.638"></a>
-<span class="sourceLineNo">639</span>    if (version &lt; MIN_FORMAT_VERSION || version &gt; MAX_FORMAT_VERSION) {<a name="line.639"></a>
-<span class="sourceLineNo">640</span>      throw new IllegalArgumentException("Invalid HFile version: " + version + " (expected to be "<a name="line.640"></a>
-<span class="sourceLineNo">641</span>        + "between " + MIN_FORMAT_VERSION + " and " + MAX_FORMAT_VERSION + ")");<a name="line.641"></a>
-<span class="sourceLineNo">642</span>    }<a name="line.642"></a>
-<span class="sourceLineNo">643</span>  }<a name="line.643"></a>
-<span class="sourceLineNo">644</span><a name="line.644"></a>
-<span class="sourceLineNo">645</span>  public static void checkHFileVersion(final Configuration c) {<a name="line.645"></a>
-<span class="sourceLineNo">646</span>    int version = c.getInt(FORMAT_VERSION_KEY, MAX_FORMAT_VERSION);<a name="line.646"></a>
-<span class="sourceLineNo">647</span>    if (version &lt; MAX_FORMAT_VERSION || version &gt; MAX_FORMAT_VERSION) {<a name="line.647"></a>
-<span class="sourceLineNo">648</span>      throw new IllegalArgumentException(<a name="line.648"></a>
-<span class="sourceLineNo">649</span>        "The setting for " + FORMAT_VERSION_KEY + " (in your hbase-*.xml files) is " + version<a name="line.649"></a>
-<span class="sourceLineNo">650</span>          + " which does not match " + MAX_FORMAT_VERSION<a name="line.650"></a>
-<span class="sourceLineNo">651</span>          + "; are you running with a configuration from an older or newer hbase install (an "<a name="line.651"></a>
-<span class="sourceLineNo">652</span>          + "incompatible hbase-default.xml or hbase-site.xml on your CLASSPATH)?");<a name="line.652"></a>
-<span class="sourceLineNo">653</span>    }<a name="line.653"></a>
-<span class="sourceLineNo">654</span>  }<a name="line.654"></a>
-<span class="sourceLineNo">655</span><a name="line.655"></a>
-<span class="sourceLineNo">656</span>  public static void main(String[] args) throws Exception {<a name="line.656"></a>
-<span class="sourceLineNo">657</span>    // delegate to preserve old behavior<a name="line.657"></a>
-<span class="sourceLineNo">658</span>    HFilePrettyPrinter.main(args);<a name="line.658"></a>
+<span class="sourceLineNo">468</span>    HFileInfo getHFileInfo();<a name="line.468"></a>
+<span class="sourceLineNo">469</span><a name="line.469"></a>
+<span class="sourceLineNo">470</span>    void setDataBlockEncoder(HFileDataBlockEncoder dataBlockEncoder);<a name="line.470"></a>
+<span class="sourceLineNo">471</span>  }<a name="line.471"></a>
+<span class="sourceLineNo">472</span><a name="line.472"></a>
+<span class="sourceLineNo">473</span>  /**<a name="line.473"></a>
+<span class="sourceLineNo">474</span>   * Method returns the reader given the specified arguments. TODO This is a bad abstraction. See<a name="line.474"></a>
+<span class="sourceLineNo">475</span>   * HBASE-6635.<a name="line.475"></a>
+<span class="sourceLineNo">476</span>   * @param context   Reader context info<a name="line.476"></a>
+<span class="sourceLineNo">477</span>   * @param fileInfo  HFile info<a name="line.477"></a>
+<span class="sourceLineNo">478</span>   * @param cacheConf Cache configuation values, cannot be null.<a name="line.478"></a>
+<span class="sourceLineNo">479</span>   * @param conf      Configuration<a name="line.479"></a>
+<span class="sourceLineNo">480</span>   * @return an appropriate instance of HFileReader<a name="line.480"></a>
+<span class="sourceLineNo">481</span>   * @throws IOException If file is invalid, will throw CorruptHFileException flavored IOException<a name="line.481"></a>
+<span class="sourceLineNo">482</span>   */<a name="line.482"></a>
+<span class="sourceLineNo">483</span>  @edu.umd.cs.findbugs.annotations.SuppressWarnings(value = "SF_SWITCH_FALLTHROUGH",<a name="line.483"></a>
+<span class="sourceLineNo">484</span>      justification = "Intentional")<a name="line.484"></a>
+<span class="sourceLineNo">485</span>  public static Reader createReader(ReaderContext context, HFileInfo fileInfo,<a name="line.485"></a>
+<span class="sourceLineNo">486</span>    CacheConfig cacheConf, Configuration conf) throws IOException {<a name="line.486"></a>
+<span class="sourceLineNo">487</span>    try {<a name="line.487"></a>
+<span class="sourceLineNo">488</span>      if (context.getReaderType() == ReaderType.STREAM) {<a name="line.488"></a>
+<span class="sourceLineNo">489</span>        // stream reader will share trailer with pread reader, see HFileStreamReader#copyFields<a name="line.489"></a>
+<span class="sourceLineNo">490</span>        return new HFileStreamReader(context, fileInfo, cacheConf, conf);<a name="line.490"></a>
+<span class="sourceLineNo">491</span>      }<a name="line.491"></a>
+<span class="sourceLineNo">492</span>      FixedFileTrailer trailer = fileInfo.getTrailer();<a name="line.492"></a>
+<span class="sourceLineNo">493</span>      switch (trailer.getMajorVersion()) {<a name="line.493"></a>
+<span class="sourceLineNo">494</span>        case 2:<a name="line.494"></a>
+<span class="sourceLineNo">495</span>          LOG.debug("Opening HFile v2 with v3 reader");<a name="line.495"></a>
+<span class="sourceLineNo">496</span>          // Fall through. FindBugs: SF_SWITCH_FALLTHROUGH<a name="line.496"></a>
+<span class="sourceLineNo">497</span>        case 3:<a name="line.497"></a>
+<span class="sourceLineNo">498</span>          return new HFilePreadReader(context, fileInfo, cacheConf, conf);<a name="line.498"></a>
+<span class="sourceLineNo">499</span>        default:<a name="line.499"></a>
+<span class="sourceLineNo">500</span>          throw new IllegalArgumentException("Invalid HFile version " + trailer.getMajorVersion());<a name="line.500"></a>
+<span class="sourceLineNo">501</span>      }<a name="line.501"></a>
+<span class="sourceLineNo">502</span>    } catch (Throwable t) {<a name="line.502"></a>
+<span class="sourceLineNo">503</span>      IOUtils.closeQuietly(context.getInputStreamWrapper(),<a name="line.503"></a>
+<span class="sourceLineNo">504</span>        e -&gt; LOG.warn("failed to close input stream wrapper", e));<a name="line.504"></a>
+<span class="sourceLineNo">505</span>      throw new CorruptHFileException(<a name="line.505"></a>
+<span class="sourceLineNo">506</span>        "Problem reading HFile Trailer from file " + context.getFilePath(), t);<a name="line.506"></a>
+<span class="sourceLineNo">507</span>    } finally {<a name="line.507"></a>
+<span class="sourceLineNo">508</span>      context.getInputStreamWrapper().unbuffer();<a name="line.508"></a>
+<span class="sourceLineNo">509</span>    }<a name="line.509"></a>
+<span class="sourceLineNo">510</span>  }<a name="line.510"></a>
+<span class="sourceLineNo">511</span><a name="line.511"></a>
+<span class="sourceLineNo">512</span>  /**<a name="line.512"></a>
+<span class="sourceLineNo">513</span>   * Creates reader with cache configuration disabled<a name="line.513"></a>
+<span class="sourceLineNo">514</span>   * @param fs   filesystem<a name="line.514"></a>
+<span class="sourceLineNo">515</span>   * @param path Path to file to read<a name="line.515"></a>
+<span class="sourceLineNo">516</span>   * @param conf Configuration<a name="line.516"></a>
+<span class="sourceLineNo">517</span>   * @return an active Reader instance<a name="line.517"></a>
+<span class="sourceLineNo">518</span>   * @throws IOException Will throw a CorruptHFileException (DoNotRetryIOException subtype) if hfile<a name="line.518"></a>
+<span class="sourceLineNo">519</span>   *                     is corrupt/invalid.<a name="line.519"></a>
+<span class="sourceLineNo">520</span>   */<a name="line.520"></a>
+<span class="sourceLineNo">521</span>  public static Reader createReader(FileSystem fs, Path path, Configuration conf)<a name="line.521"></a>
+<span class="sourceLineNo">522</span>    throws IOException {<a name="line.522"></a>
+<span class="sourceLineNo">523</span>    // The primaryReplicaReader is mainly used for constructing block cache key, so if we do not use<a name="line.523"></a>
+<span class="sourceLineNo">524</span>    // block cache then it is OK to set it as any value. We use true here.<a name="line.524"></a>
+<span class="sourceLineNo">525</span>    return createReader(fs, path, CacheConfig.DISABLED, true, conf);<a name="line.525"></a>
+<span class="sourceLineNo">526</span>  }<a name="line.526"></a>
+<span class="sourceLineNo">527</span><a name="line.527"></a>
+<span class="sourceLineNo">528</span>  /**<a name="line.528"></a>
+<span class="sourceLineNo">529</span>   * @param fs                   filesystem<a name="line.529"></a>
+<span class="sourceLineNo">530</span>   * @param path                 Path to file to read<a name="line.530"></a>
+<span class="sourceLineNo">531</span>   * @param cacheConf            This must not be null.<a name="line.531"></a>
+<span class="sourceLineNo">532</span>   * @param primaryReplicaReader true if this is a reader for primary replica<a name="line.532"></a>
+<span class="sourceLineNo">533</span>   * @param conf                 Configuration<a name="line.533"></a>
+<span class="sourceLineNo">534</span>   * @return an active Reader instance<a name="line.534"></a>
+<span class="sourceLineNo">535</span>   * @throws IOException Will throw a CorruptHFileException (DoNotRetryIOException subtype) if hfile<a name="line.535"></a>
+<span class="sourceLineNo">536</span>   *                     is corrupt/invalid.<a name="line.536"></a>
+<span class="sourceLineNo">537</span>   * @see CacheConfig#CacheConfig(Configuration)<a name="line.537"></a>
+<span class="sourceLineNo">538</span>   */<a name="line.538"></a>
+<span class="sourceLineNo">539</span>  public static Reader createReader(FileSystem fs, Path path, CacheConfig cacheConf,<a name="line.539"></a>
+<span class="sourceLineNo">540</span>    boolean primaryReplicaReader, Configuration conf) throws IOException {<a name="line.540"></a>
+<span class="sourceLineNo">541</span>    Preconditions.checkNotNull(cacheConf, "Cannot create Reader with null CacheConf");<a name="line.541"></a>
+<span class="sourceLineNo">542</span>    FSDataInputStreamWrapper stream = new FSDataInputStreamWrapper(fs, path);<a name="line.542"></a>
+<span class="sourceLineNo">543</span>    ReaderContext context =<a name="line.543"></a>
+<span class="sourceLineNo">544</span>      new ReaderContextBuilder().withFilePath(path).withInputStreamWrapper(stream)<a name="line.544"></a>
+<span class="sourceLineNo">545</span>        .withFileSize(fs.getFileStatus(path).getLen()).withFileSystem(stream.getHfs())<a name="line.545"></a>
+<span class="sourceLineNo">546</span>        .withPrimaryReplicaReader(primaryReplicaReader).withReaderType(ReaderType.PREAD).build();<a name="line.546"></a>
+<span class="sourceLineNo">547</span>    HFileInfo fileInfo = new HFileInfo(context, conf);<a name="line.547"></a>
+<span class="sourceLineNo">548</span>    Reader reader = createReader(context, fileInfo, cacheConf, conf);<a name="line.548"></a>
+<span class="sourceLineNo">549</span>    fileInfo.initMetaAndIndex(reader);<a name="line.549"></a>
+<span class="sourceLineNo">550</span>    return reader;<a name="line.550"></a>
+<span class="sourceLineNo">551</span>  }<a name="line.551"></a>
+<span class="sourceLineNo">552</span><a name="line.552"></a>
+<span class="sourceLineNo">553</span>  /**<a name="line.553"></a>
+<span class="sourceLineNo">554</span>   * Returns true if the specified file has a valid HFile Trailer.<a name="line.554"></a>
+<span class="sourceLineNo">555</span>   * @param fs   filesystem<a name="line.555"></a>
+<span class="sourceLineNo">556</span>   * @param path Path to file to verify<a name="line.556"></a>
+<span class="sourceLineNo">557</span>   * @return true if the file has a valid HFile Trailer, otherwise false<a name="line.557"></a>
+<span class="sourceLineNo">558</span>   * @throws IOException if failed to read from the underlying stream<a name="line.558"></a>
+<span class="sourceLineNo">559</span>   */<a name="line.559"></a>
+<span class="sourceLineNo">560</span>  public static boolean isHFileFormat(final FileSystem fs, final Path path) throws IOException {<a name="line.560"></a>
+<span class="sourceLineNo">561</span>    return isHFileFormat(fs, fs.getFileStatus(path));<a name="line.561"></a>
+<span class="sourceLineNo">562</span>  }<a name="line.562"></a>
+<span class="sourceLineNo">563</span><a name="line.563"></a>
+<span class="sourceLineNo">564</span>  /**<a name="line.564"></a>
+<span class="sourceLineNo">565</span>   * Returns true if the specified file has a valid HFile Trailer.<a name="line.565"></a>
+<span class="sourceLineNo">566</span>   * @param fs         filesystem<a name="line.566"></a>
+<span class="sourceLineNo">567</span>   * @param fileStatus the file to verify<a name="line.567"></a>
+<span class="sourceLineNo">568</span>   * @return true if the file has a valid HFile Trailer, otherwise false<a name="line.568"></a>
+<span class="sourceLineNo">569</span>   * @throws IOException if failed to read from the underlying stream<a name="line.569"></a>
+<span class="sourceLineNo">570</span>   */<a name="line.570"></a>
+<span class="sourceLineNo">571</span>  public static boolean isHFileFormat(final FileSystem fs, final FileStatus fileStatus)<a name="line.571"></a>
+<span class="sourceLineNo">572</span>    throws IOException {<a name="line.572"></a>
+<span class="sourceLineNo">573</span>    final Path path = fileStatus.getPath();<a name="line.573"></a>
+<span class="sourceLineNo">574</span>    final long size = fileStatus.getLen();<a name="line.574"></a>
+<span class="sourceLineNo">575</span>    try (FSDataInputStreamWrapper fsdis = new FSDataInputStreamWrapper(fs, path)) {<a name="line.575"></a>
+<span class="sourceLineNo">576</span>      boolean isHBaseChecksum = fsdis.shouldUseHBaseChecksum();<a name="line.576"></a>
+<span class="sourceLineNo">577</span>      assert !isHBaseChecksum; // Initially we must read with FS checksum.<a name="line.577"></a>
+<span class="sourceLineNo">578</span>      FixedFileTrailer.readFromStream(fsdis.getStream(isHBaseChecksum), size);<a name="line.578"></a>
+<span class="sourceLineNo">579</span>      return true;<a name="line.579"></a>
+<span class="sourceLineNo">580</span>    } catch (IllegalArgumentException e) {<a name="line.580"></a>
+<span class="sourceLineNo">581</span>      return false;<a name="line.581"></a>
+<span class="sourceLineNo">582</span>    }<a name="line.582"></a>
+<span class="sourceLineNo">583</span>  }<a name="line.583"></a>
+<span class="sourceLineNo">584</span><a name="line.584"></a>
+<span class="sourceLineNo">585</span>  /**<a name="line.585"></a>
+<span class="sourceLineNo">586</span>   * Get names of supported compression algorithms. The names are acceptable by HFile.Writer.<a name="line.586"></a>
+<span class="sourceLineNo">587</span>   * @return Array of strings, each represents a supported compression algorithm. Currently, the<a name="line.587"></a>
+<span class="sourceLineNo">588</span>   *         following compression algorithms are supported.<a name="line.588"></a>
+<span class="sourceLineNo">589</span>   *         &lt;ul&gt;<a name="line.589"></a>
+<span class="sourceLineNo">590</span>   *         &lt;li&gt;"none" - No compression.<a name="line.590"></a>
+<span class="sourceLineNo">591</span>   *         &lt;li&gt;"gz" - GZIP compression.<a name="line.591"></a>
+<span class="sourceLineNo">592</span>   *         &lt;/ul&gt;<a name="line.592"></a>
+<span class="sourceLineNo">593</span>   */<a name="line.593"></a>
+<span class="sourceLineNo">594</span>  public static String[] getSupportedCompressionAlgorithms() {<a name="line.594"></a>
+<span class="sourceLineNo">595</span>    return Compression.getSupportedAlgorithms();<a name="line.595"></a>
+<span class="sourceLineNo">596</span>  }<a name="line.596"></a>
+<span class="sourceLineNo">597</span><a name="line.597"></a>
+<span class="sourceLineNo">598</span>  // Utility methods.<a name="line.598"></a>
+<span class="sourceLineNo">599</span>  /*<a name="line.599"></a>
+<span class="sourceLineNo">600</span>   * @param l Long to convert to an int.<a name="line.600"></a>
+<span class="sourceLineNo">601</span>   * @return &lt;code&gt;l&lt;/code&gt; cast as an int.<a name="line.601"></a>
+<span class="sourceLineNo">602</span>   */<a name="line.602"></a>
+<span class="sourceLineNo">603</span>  static int longToInt(final long l) {<a name="line.603"></a>
+<span class="sourceLineNo">604</span>    // Expecting the size() of a block not exceeding 4GB. Assuming the<a name="line.604"></a>
+<span class="sourceLineNo">605</span>    // size() will wrap to negative integer if it exceeds 2GB (From tfile).<a name="line.605"></a>
+<span class="sourceLineNo">606</span>    return (int) (l &amp; 0x00000000ffffffffL);<a name="line.606"></a>
+<span class="sourceLineNo">607</span>  }<a name="line.607"></a>
+<span class="sourceLineNo">608</span><a name="line.608"></a>
+<span class="sourceLineNo">609</span>  /**<a name="line.609"></a>
+<span class="sourceLineNo">610</span>   * Returns all HFiles belonging to the given region directory. Could return an empty list.<a name="line.610"></a>
+<span class="sourceLineNo">611</span>   * @param fs        The file system reference.<a name="line.611"></a>
+<span class="sourceLineNo">612</span>   * @param regionDir The region directory to scan.<a name="line.612"></a>
+<span class="sourceLineNo">613</span>   * @return The list of files found.<a name="line.613"></a>
+<span class="sourceLineNo">614</span>   * @throws IOException When scanning the files fails.<a name="line.614"></a>
+<span class="sourceLineNo">615</span>   */<a name="line.615"></a>
+<span class="sourceLineNo">616</span>  public static List&lt;Path&gt; getStoreFiles(FileSystem fs, Path regionDir) throws IOException {<a name="line.616"></a>
+<span class="sourceLineNo">617</span>    List&lt;Path&gt; regionHFiles = new ArrayList&lt;&gt;();<a name="line.617"></a>
+<span class="sourceLineNo">618</span>    PathFilter dirFilter = new FSUtils.DirFilter(fs);<a name="line.618"></a>
+<span class="sourceLineNo">619</span>    FileStatus[] familyDirs = fs.listStatus(regionDir, dirFilter);<a name="line.619"></a>
+<span class="sourceLineNo">620</span>    for (FileStatus dir : familyDirs) {<a name="line.620"></a>
+<span class="sourceLineNo">621</span>      FileStatus[] files = fs.listStatus(dir.getPath());<a name="line.621"></a>
+<span class="sourceLineNo">622</span>      for (FileStatus file : files) {<a name="line.622"></a>
+<span class="sourceLineNo">623</span>        if (<a name="line.623"></a>
+<span class="sourceLineNo">624</span>          !file.isDirectory()<a name="line.624"></a>
+<span class="sourceLineNo">625</span>            &amp;&amp; (!file.getPath().toString().contains(HConstants.HREGION_OLDLOGDIR_NAME))<a name="line.625"></a>
+<span class="sourceLineNo">626</span>            &amp;&amp; (!file.getPath().toString().contains(HConstants.RECOVERED_EDITS_DIR))<a name="line.626"></a>
+<span class="sourceLineNo">627</span>        ) {<a name="line.627"></a>
+<span class="sourceLineNo">628</span>          regionHFiles.add(file.getPath());<a name="line.628"></a>
+<span class="sourceLineNo">629</span>        }<a name="line.629"></a>
+<span class="sourceLineNo">630</span>      }<a name="line.630"></a>
+<span class="sourceLineNo">631</span>    }<a name="line.631"></a>
+<span class="sourceLineNo">632</span>    return regionHFiles;<a name="line.632"></a>
+<span class="sourceLineNo">633</span>  }<a name="line.633"></a>
+<span class="sourceLineNo">634</span><a name="line.634"></a>
+<span class="sourceLineNo">635</span>  /**<a name="line.635"></a>
+<span class="sourceLineNo">636</span>   * Checks the given {@link HFile} format version, and throws an exception if invalid. Note that if<a name="line.636"></a>
+<span class="sourceLineNo">637</span>   * the version number comes from an input file and has not been verified, the caller needs to<a name="line.637"></a>
+<span class="sourceLineNo">638</span>   * re-throw an {@link IOException} to indicate that this is not a software error, but corrupted<a name="line.638"></a>
+<span class="sourceLineNo">639</span>   * input.<a name="line.639"></a>
+<span class="sourceLineNo">640</span>   * @param version an HFile version<a name="line.640"></a>
+<span class="sourceLineNo">641</span>   * @throws IllegalArgumentException if the version is invalid<a name="line.641"></a>
+<span class="sourceLineNo">642</span>   */<a name="line.642"></a>
+<span class="sourceLineNo">643</span>  public static void checkFormatVersion(int version) throws IllegalArgumentException {<a name="line.643"></a>
+<span class="sourceLineNo">644</span>    if (version &lt; MIN_FORMAT_VERSION || version &gt; MAX_FORMAT_VERSION) {<a name="line.644"></a>
+<span class="sourceLineNo">645</span>      throw new IllegalArgumentException("Invalid HFile version: " + version + " (expected to be "<a name="line.645"></a>
+<span class="sourceLineNo">646</span>        + "between " + MIN_FORMAT_VERSION + " and " + MAX_FORMAT_VERSION + ")");<a name="line.646"></a>
+<span class="sourceLineNo">647</span>    }<a name="line.647"></a>
+<span class="sourceLineNo">648</span>  }<a name="line.648"></a>
+<span class="sourceLineNo">649</span><a name="line.649"></a>
+<span class="sourceLineNo">650</span>  public static void checkHFileVersion(final Configuration c) {<a name="line.650"></a>
+<span class="sourceLineNo">651</span>    int version = c.getInt(FORMAT_VERSION_KEY, MAX_FORMAT_VERSION);<a name="line.651"></a>
+<span class="sourceLineNo">652</span>    if (version &lt; MAX_FORMAT_VERSION || version &gt; MAX_FORMAT_VERSION) {<a name="line.652"></a>
+<span class="sourceLineNo">653</span>      throw new IllegalArgumentException(<a name="line.653"></a>
+<span class="sourceLineNo">654</span>        "The setting for " + FORMAT_VERSION_KEY + " (in your hbase-*.xml files) is " + version<a name="line.654"></a>
+<span class="sourceLineNo">655</span>          + " which does not match " + MAX_FORMAT_VERSION<a name="line.655"></a>
+<span class="sourceLineNo">656</span>          + "; are you running with a configuration from an older or newer hbase install (an "<a name="line.656"></a>
+<span class="sourceLineNo">657</span>          + "incompatible hbase-default.xml or hbase-site.xml on your CLASSPATH)?");<a name="line.657"></a>
+<span class="sourceLineNo">658</span>    }<a name="line.658"></a>
 <span class="sourceLineNo">659</span>  }<a name="line.659"></a>
-<span class="sourceLineNo">660</span>}<a name="line.660"></a>
+<span class="sourceLineNo">660</span><a name="line.660"></a>
+<span class="sourceLineNo">661</span>  public static void main(String[] args) throws Exception {<a name="line.661"></a>
+<span class="sourceLineNo">662</span>    // delegate to preserve old behavior<a name="line.662"></a>
+<span class="sourceLineNo">663</span>    HFilePrettyPrinter.main(args);<a name="line.663"></a>
+<span class="sourceLineNo">664</span>  }<a name="line.664"></a>
+<span class="sourceLineNo">665</span>}<a name="line.665"></a>
 
 
 
