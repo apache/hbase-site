@@ -44,251 +44,252 @@
 <span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.fs.FileSystem;</span>
 <span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.fs.Path;</span>
 <span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.Cell;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.HBaseConfiguration;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.exceptions.TimeoutIOException;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.io.ByteBufferWriter;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.io.asyncfs.AsyncFSOutput;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.io.asyncfs.AsyncFSOutputHelper;</span>
-<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.io.asyncfs.monitor.StreamSlowMonitor;</span>
-<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.util.CommonFSUtils.StreamLacksCapabilityException;</span>
-<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.wal.AbstractWALRoller;</span>
-<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.wal.AsyncFSWALProvider;</span>
-<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.wal.WAL.Entry;</span>
-<span class="source-line-no">044</span><span id="line-44">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">045</span><span id="line-45">import org.slf4j.Logger;</span>
-<span class="source-line-no">046</span><span id="line-46">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">047</span><span id="line-47"></span>
-<span class="source-line-no">048</span><span id="line-48">import org.apache.hbase.thirdparty.com.google.common.base.Throwables;</span>
-<span class="source-line-no">049</span><span id="line-49">import org.apache.hbase.thirdparty.io.netty.channel.Channel;</span>
-<span class="source-line-no">050</span><span id="line-50">import org.apache.hbase.thirdparty.io.netty.channel.EventLoopGroup;</span>
-<span class="source-line-no">051</span><span id="line-51"></span>
-<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALHeader;</span>
-<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALTrailer;</span>
-<span class="source-line-no">054</span><span id="line-54"></span>
-<span class="source-line-no">055</span><span id="line-55">/**</span>
-<span class="source-line-no">056</span><span id="line-56"> * AsyncWriter for protobuf-based WAL.</span>
-<span class="source-line-no">057</span><span id="line-57"> */</span>
-<span class="source-line-no">058</span><span id="line-58">@InterfaceAudience.Private</span>
-<span class="source-line-no">059</span><span id="line-59">public class AsyncProtobufLogWriter extends AbstractProtobufLogWriter</span>
-<span class="source-line-no">060</span><span id="line-60">  implements AsyncFSWALProvider.AsyncWriter {</span>
-<span class="source-line-no">061</span><span id="line-61"></span>
-<span class="source-line-no">062</span><span id="line-62">  private static final Logger LOG = LoggerFactory.getLogger(AsyncProtobufLogWriter.class);</span>
-<span class="source-line-no">063</span><span id="line-63"></span>
-<span class="source-line-no">064</span><span id="line-64">  private final EventLoopGroup eventLoopGroup;</span>
-<span class="source-line-no">065</span><span id="line-65"></span>
-<span class="source-line-no">066</span><span id="line-66">  private final Class&lt;? extends Channel&gt; channelClass;</span>
-<span class="source-line-no">067</span><span id="line-67"></span>
-<span class="source-line-no">068</span><span id="line-68">  private volatile AsyncFSOutput output;</span>
-<span class="source-line-no">069</span><span id="line-69">  /**</span>
-<span class="source-line-no">070</span><span id="line-70">   * Save {@link AsyncFSOutput#getSyncedLength()} when {@link #output} is closed.</span>
-<span class="source-line-no">071</span><span id="line-71">   */</span>
-<span class="source-line-no">072</span><span id="line-72">  private volatile long finalSyncedLength = -1;</span>
-<span class="source-line-no">073</span><span id="line-73"></span>
-<span class="source-line-no">074</span><span id="line-74">  private static final class OutputStreamWrapper extends OutputStream implements ByteBufferWriter {</span>
-<span class="source-line-no">075</span><span id="line-75"></span>
-<span class="source-line-no">076</span><span id="line-76">    private final AsyncFSOutput out;</span>
-<span class="source-line-no">077</span><span id="line-77"></span>
-<span class="source-line-no">078</span><span id="line-78">    private final byte[] oneByteBuf = new byte[1];</span>
-<span class="source-line-no">079</span><span id="line-79"></span>
-<span class="source-line-no">080</span><span id="line-80">    @Override</span>
-<span class="source-line-no">081</span><span id="line-81">    public void write(int b) throws IOException {</span>
-<span class="source-line-no">082</span><span id="line-82">      oneByteBuf[0] = (byte) b;</span>
-<span class="source-line-no">083</span><span id="line-83">      write(oneByteBuf);</span>
-<span class="source-line-no">084</span><span id="line-84">    }</span>
-<span class="source-line-no">085</span><span id="line-85"></span>
-<span class="source-line-no">086</span><span id="line-86">    public OutputStreamWrapper(AsyncFSOutput out) {</span>
-<span class="source-line-no">087</span><span id="line-87">      this.out = out;</span>
-<span class="source-line-no">088</span><span id="line-88">    }</span>
-<span class="source-line-no">089</span><span id="line-89"></span>
-<span class="source-line-no">090</span><span id="line-90">    @Override</span>
-<span class="source-line-no">091</span><span id="line-91">    public void write(ByteBuffer b, int off, int len) throws IOException {</span>
-<span class="source-line-no">092</span><span id="line-92">      ByteBuffer bb = b.duplicate();</span>
-<span class="source-line-no">093</span><span id="line-93">      bb.position(off);</span>
-<span class="source-line-no">094</span><span id="line-94">      bb.limit(off + len);</span>
-<span class="source-line-no">095</span><span id="line-95">      out.write(bb);</span>
-<span class="source-line-no">096</span><span id="line-96">    }</span>
-<span class="source-line-no">097</span><span id="line-97"></span>
-<span class="source-line-no">098</span><span id="line-98">    @Override</span>
-<span class="source-line-no">099</span><span id="line-99">    public void writeInt(int i) throws IOException {</span>
-<span class="source-line-no">100</span><span id="line-100">      out.writeInt(i);</span>
-<span class="source-line-no">101</span><span id="line-101">    }</span>
-<span class="source-line-no">102</span><span id="line-102"></span>
-<span class="source-line-no">103</span><span id="line-103">    @Override</span>
-<span class="source-line-no">104</span><span id="line-104">    public void write(byte[] b, int off, int len) throws IOException {</span>
-<span class="source-line-no">105</span><span id="line-105">      out.write(b, off, len);</span>
-<span class="source-line-no">106</span><span id="line-106">    }</span>
-<span class="source-line-no">107</span><span id="line-107"></span>
-<span class="source-line-no">108</span><span id="line-108">    @Override</span>
-<span class="source-line-no">109</span><span id="line-109">    public void close() throws IOException {</span>
-<span class="source-line-no">110</span><span id="line-110">      out.close();</span>
-<span class="source-line-no">111</span><span id="line-111">    }</span>
-<span class="source-line-no">112</span><span id="line-112">  }</span>
-<span class="source-line-no">113</span><span id="line-113"></span>
-<span class="source-line-no">114</span><span id="line-114">  private OutputStream asyncOutputWrapper;</span>
-<span class="source-line-no">115</span><span id="line-115">  private long waitTimeout;</span>
-<span class="source-line-no">116</span><span id="line-116"></span>
-<span class="source-line-no">117</span><span id="line-117">  public AsyncProtobufLogWriter(EventLoopGroup eventLoopGroup,</span>
-<span class="source-line-no">118</span><span id="line-118">    Class&lt;? extends Channel&gt; channelClass) {</span>
-<span class="source-line-no">119</span><span id="line-119">    this.eventLoopGroup = eventLoopGroup;</span>
-<span class="source-line-no">120</span><span id="line-120">    this.channelClass = channelClass;</span>
-<span class="source-line-no">121</span><span id="line-121">    // Reuse WAL_ROLL_WAIT_TIMEOUT here to avoid an infinite wait if somehow a wait on a future</span>
-<span class="source-line-no">122</span><span id="line-122">    // never completes. The objective is the same. We want to propagate an exception to trigger</span>
-<span class="source-line-no">123</span><span id="line-123">    // an abort if we seem to be hung.</span>
-<span class="source-line-no">124</span><span id="line-124">    if (this.conf == null) {</span>
-<span class="source-line-no">125</span><span id="line-125">      this.conf = HBaseConfiguration.create();</span>
-<span class="source-line-no">126</span><span id="line-126">    }</span>
-<span class="source-line-no">127</span><span id="line-127">    this.waitTimeout = this.conf.getLong(AbstractWALRoller.WAL_ROLL_WAIT_TIMEOUT,</span>
-<span class="source-line-no">128</span><span id="line-128">      AbstractWALRoller.DEFAULT_WAL_ROLL_WAIT_TIMEOUT);</span>
-<span class="source-line-no">129</span><span id="line-129">  }</span>
-<span class="source-line-no">130</span><span id="line-130"></span>
-<span class="source-line-no">131</span><span id="line-131">  @Override</span>
-<span class="source-line-no">132</span><span id="line-132">  public void append(Entry entry) {</span>
-<span class="source-line-no">133</span><span id="line-133">    int buffered = output.buffered();</span>
-<span class="source-line-no">134</span><span id="line-134">    try {</span>
-<span class="source-line-no">135</span><span id="line-135">      entry.getKey().getBuilder(compressor).setFollowingKvCount(entry.getEdit().size()).build()</span>
-<span class="source-line-no">136</span><span id="line-136">        .writeDelimitedTo(asyncOutputWrapper);</span>
-<span class="source-line-no">137</span><span id="line-137">    } catch (IOException e) {</span>
-<span class="source-line-no">138</span><span id="line-138">      throw new AssertionError("should not happen", e);</span>
-<span class="source-line-no">139</span><span id="line-139">    }</span>
-<span class="source-line-no">140</span><span id="line-140">    try {</span>
-<span class="source-line-no">141</span><span id="line-141">      for (Cell cell : entry.getEdit().getCells()) {</span>
-<span class="source-line-no">142</span><span id="line-142">        cellEncoder.write(cell);</span>
-<span class="source-line-no">143</span><span id="line-143">      }</span>
-<span class="source-line-no">144</span><span id="line-144">    } catch (IOException e) {</span>
-<span class="source-line-no">145</span><span id="line-145">      throw new AssertionError("should not happen", e);</span>
-<span class="source-line-no">146</span><span id="line-146">    }</span>
-<span class="source-line-no">147</span><span id="line-147">    length.addAndGet(output.buffered() - buffered);</span>
-<span class="source-line-no">148</span><span id="line-148">  }</span>
-<span class="source-line-no">149</span><span id="line-149"></span>
-<span class="source-line-no">150</span><span id="line-150">  @Override</span>
-<span class="source-line-no">151</span><span id="line-151">  public CompletableFuture&lt;Long&gt; sync(boolean forceSync) {</span>
-<span class="source-line-no">152</span><span id="line-152">    return output.flush(forceSync);</span>
-<span class="source-line-no">153</span><span id="line-153">  }</span>
-<span class="source-line-no">154</span><span id="line-154"></span>
-<span class="source-line-no">155</span><span id="line-155">  @Override</span>
-<span class="source-line-no">156</span><span id="line-156">  public synchronized void close() throws IOException {</span>
-<span class="source-line-no">157</span><span id="line-157">    if (this.output == null) {</span>
-<span class="source-line-no">158</span><span id="line-158">      return;</span>
-<span class="source-line-no">159</span><span id="line-159">    }</span>
-<span class="source-line-no">160</span><span id="line-160">    try {</span>
-<span class="source-line-no">161</span><span id="line-161">      writeWALTrailer();</span>
-<span class="source-line-no">162</span><span id="line-162">      output.close();</span>
-<span class="source-line-no">163</span><span id="line-163">    } catch (Exception e) {</span>
-<span class="source-line-no">164</span><span id="line-164">      LOG.warn("normal close failed, try recover", e);</span>
-<span class="source-line-no">165</span><span id="line-165">      output.recoverAndClose(null);</span>
-<span class="source-line-no">166</span><span id="line-166">    }</span>
-<span class="source-line-no">167</span><span id="line-167">    /**</span>
-<span class="source-line-no">168</span><span id="line-168">     * We have to call {@link AsyncFSOutput#getSyncedLength()} after {@link AsyncFSOutput#close()}</span>
-<span class="source-line-no">169</span><span id="line-169">     * to get the final length synced to underlying filesystem because {@link AsyncFSOutput#close()}</span>
-<span class="source-line-no">170</span><span id="line-170">     * may also flush some data to underlying filesystem.</span>
-<span class="source-line-no">171</span><span id="line-171">     */</span>
-<span class="source-line-no">172</span><span id="line-172">    this.finalSyncedLength = this.output.getSyncedLength();</span>
-<span class="source-line-no">173</span><span id="line-173">    this.output = null;</span>
-<span class="source-line-no">174</span><span id="line-174">  }</span>
-<span class="source-line-no">175</span><span id="line-175"></span>
-<span class="source-line-no">176</span><span id="line-176">  public AsyncFSOutput getOutput() {</span>
-<span class="source-line-no">177</span><span id="line-177">    return this.output;</span>
-<span class="source-line-no">178</span><span id="line-178">  }</span>
-<span class="source-line-no">179</span><span id="line-179"></span>
-<span class="source-line-no">180</span><span id="line-180">  @Override</span>
-<span class="source-line-no">181</span><span id="line-181">  protected void initOutput(FileSystem fs, Path path, boolean overwritable, int bufferSize,</span>
-<span class="source-line-no">182</span><span id="line-182">    short replication, long blockSize, StreamSlowMonitor monitor, boolean noLocalWrite)</span>
-<span class="source-line-no">183</span><span id="line-183">    throws IOException, StreamLacksCapabilityException {</span>
-<span class="source-line-no">184</span><span id="line-184">    this.output = AsyncFSOutputHelper.createOutput(fs, path, overwritable, false, replication,</span>
-<span class="source-line-no">185</span><span id="line-185">      blockSize, eventLoopGroup, channelClass, monitor, noLocalWrite);</span>
-<span class="source-line-no">186</span><span id="line-186">    this.asyncOutputWrapper = new OutputStreamWrapper(output);</span>
-<span class="source-line-no">187</span><span id="line-187">  }</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">  @Override</span>
-<span class="source-line-no">190</span><span id="line-190">  protected void closeOutputIfNecessary() {</span>
-<span class="source-line-no">191</span><span id="line-191">    if (this.output != null) {</span>
-<span class="source-line-no">192</span><span id="line-192">      try {</span>
-<span class="source-line-no">193</span><span id="line-193">        this.output.close();</span>
-<span class="source-line-no">194</span><span id="line-194">      } catch (IOException e) {</span>
-<span class="source-line-no">195</span><span id="line-195">        LOG.warn("Close output failed", e);</span>
-<span class="source-line-no">196</span><span id="line-196">      }</span>
-<span class="source-line-no">197</span><span id="line-197">    }</span>
-<span class="source-line-no">198</span><span id="line-198">  }</span>
-<span class="source-line-no">199</span><span id="line-199"></span>
-<span class="source-line-no">200</span><span id="line-200">  private long writeWALMetadata(Consumer&lt;CompletableFuture&lt;Long&gt;&gt; action) throws IOException {</span>
-<span class="source-line-no">201</span><span id="line-201">    CompletableFuture&lt;Long&gt; future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">202</span><span id="line-202">    action.accept(future);</span>
-<span class="source-line-no">203</span><span id="line-203">    try {</span>
-<span class="source-line-no">204</span><span id="line-204">      return future.get(waitTimeout, TimeUnit.MILLISECONDS).longValue();</span>
-<span class="source-line-no">205</span><span id="line-205">    } catch (InterruptedException e) {</span>
-<span class="source-line-no">206</span><span id="line-206">      InterruptedIOException ioe = new InterruptedIOException();</span>
-<span class="source-line-no">207</span><span id="line-207">      ioe.initCause(e);</span>
-<span class="source-line-no">208</span><span id="line-208">      throw ioe;</span>
-<span class="source-line-no">209</span><span id="line-209">    } catch (ExecutionException e) {</span>
-<span class="source-line-no">210</span><span id="line-210">      Throwables.propagateIfPossible(e.getCause(), IOException.class);</span>
-<span class="source-line-no">211</span><span id="line-211">      throw new RuntimeException(e.getCause());</span>
-<span class="source-line-no">212</span><span id="line-212">    } catch (TimeoutException e) {</span>
-<span class="source-line-no">213</span><span id="line-213">      throw new TimeoutIOException(e);</span>
-<span class="source-line-no">214</span><span id="line-214">    }</span>
-<span class="source-line-no">215</span><span id="line-215">  }</span>
-<span class="source-line-no">216</span><span id="line-216"></span>
-<span class="source-line-no">217</span><span id="line-217">  @Override</span>
-<span class="source-line-no">218</span><span id="line-218">  protected long writeMagicAndWALHeader(byte[] magic, WALHeader header) throws IOException {</span>
-<span class="source-line-no">219</span><span id="line-219">    return writeWALMetadata(future -&gt; {</span>
-<span class="source-line-no">220</span><span id="line-220">      output.write(magic);</span>
-<span class="source-line-no">221</span><span id="line-221">      try {</span>
-<span class="source-line-no">222</span><span id="line-222">        header.writeDelimitedTo(asyncOutputWrapper);</span>
-<span class="source-line-no">223</span><span id="line-223">      } catch (IOException e) {</span>
-<span class="source-line-no">224</span><span id="line-224">        // should not happen</span>
-<span class="source-line-no">225</span><span id="line-225">        throw new AssertionError(e);</span>
-<span class="source-line-no">226</span><span id="line-226">      }</span>
-<span class="source-line-no">227</span><span id="line-227">      addListener(output.flush(false), (len, error) -&gt; {</span>
-<span class="source-line-no">228</span><span id="line-228">        if (error != null) {</span>
-<span class="source-line-no">229</span><span id="line-229">          future.completeExceptionally(error);</span>
-<span class="source-line-no">230</span><span id="line-230">        } else {</span>
-<span class="source-line-no">231</span><span id="line-231">          future.complete(len);</span>
-<span class="source-line-no">232</span><span id="line-232">        }</span>
-<span class="source-line-no">233</span><span id="line-233">      });</span>
-<span class="source-line-no">234</span><span id="line-234">    });</span>
-<span class="source-line-no">235</span><span id="line-235">  }</span>
-<span class="source-line-no">236</span><span id="line-236"></span>
-<span class="source-line-no">237</span><span id="line-237">  @Override</span>
-<span class="source-line-no">238</span><span id="line-238">  protected long writeWALTrailerAndMagic(WALTrailer trailer, byte[] magic) throws IOException {</span>
-<span class="source-line-no">239</span><span id="line-239">    return writeWALMetadata(future -&gt; {</span>
-<span class="source-line-no">240</span><span id="line-240">      try {</span>
-<span class="source-line-no">241</span><span id="line-241">        trailer.writeTo(asyncOutputWrapper);</span>
-<span class="source-line-no">242</span><span id="line-242">      } catch (IOException e) {</span>
-<span class="source-line-no">243</span><span id="line-243">        // should not happen</span>
-<span class="source-line-no">244</span><span id="line-244">        throw new AssertionError(e);</span>
-<span class="source-line-no">245</span><span id="line-245">      }</span>
-<span class="source-line-no">246</span><span id="line-246">      output.writeInt(trailer.getSerializedSize());</span>
-<span class="source-line-no">247</span><span id="line-247">      output.write(magic);</span>
-<span class="source-line-no">248</span><span id="line-248">      addListener(output.flush(false), (len, error) -&gt; {</span>
-<span class="source-line-no">249</span><span id="line-249">        if (error != null) {</span>
-<span class="source-line-no">250</span><span id="line-250">          future.completeExceptionally(error);</span>
-<span class="source-line-no">251</span><span id="line-251">        } else {</span>
-<span class="source-line-no">252</span><span id="line-252">          future.complete(len);</span>
-<span class="source-line-no">253</span><span id="line-253">        }</span>
-<span class="source-line-no">254</span><span id="line-254">      });</span>
-<span class="source-line-no">255</span><span id="line-255">    });</span>
-<span class="source-line-no">256</span><span id="line-256">  }</span>
-<span class="source-line-no">257</span><span id="line-257"></span>
-<span class="source-line-no">258</span><span id="line-258">  @Override</span>
-<span class="source-line-no">259</span><span id="line-259">  protected OutputStream getOutputStreamForCellEncoder() {</span>
-<span class="source-line-no">260</span><span id="line-260">    return asyncOutputWrapper;</span>
-<span class="source-line-no">261</span><span id="line-261">  }</span>
-<span class="source-line-no">262</span><span id="line-262"></span>
-<span class="source-line-no">263</span><span id="line-263">  @Override</span>
-<span class="source-line-no">264</span><span id="line-264">  public long getSyncedLength() {</span>
-<span class="source-line-no">265</span><span id="line-265">    /**</span>
-<span class="source-line-no">266</span><span id="line-266">     * The statement "this.output = null;" in {@link AsyncProtobufLogWriter#close} is a sync point,</span>
-<span class="source-line-no">267</span><span id="line-267">     * if output is null, then finalSyncedLength must set, so we can return finalSyncedLength, else</span>
-<span class="source-line-no">268</span><span id="line-268">     * we return output.getSyncedLength</span>
-<span class="source-line-no">269</span><span id="line-269">     */</span>
-<span class="source-line-no">270</span><span id="line-270">    AsyncFSOutput outputToUse = this.output;</span>
-<span class="source-line-no">271</span><span id="line-271">    if (outputToUse == null) {</span>
-<span class="source-line-no">272</span><span id="line-272">      long finalSyncedLengthToUse = this.finalSyncedLength;</span>
-<span class="source-line-no">273</span><span id="line-273">      assert finalSyncedLengthToUse &gt;= 0;</span>
-<span class="source-line-no">274</span><span id="line-274">      return finalSyncedLengthToUse;</span>
-<span class="source-line-no">275</span><span id="line-275">    }</span>
-<span class="source-line-no">276</span><span id="line-276">    return outputToUse.getSyncedLength();</span>
-<span class="source-line-no">277</span><span id="line-277">  }</span>
-<span class="source-line-no">278</span><span id="line-278">}</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.ExtendedCell;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.HBaseConfiguration;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.exceptions.TimeoutIOException;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.io.ByteBufferWriter;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.io.asyncfs.AsyncFSOutput;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.io.asyncfs.AsyncFSOutputHelper;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.io.asyncfs.monitor.StreamSlowMonitor;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.util.CommonFSUtils.StreamLacksCapabilityException;</span>
+<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.wal.AbstractWALRoller;</span>
+<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.wal.AsyncFSWALProvider;</span>
+<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.wal.WAL.Entry;</span>
+<span class="source-line-no">045</span><span id="line-45">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">046</span><span id="line-46">import org.slf4j.Logger;</span>
+<span class="source-line-no">047</span><span id="line-47">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">048</span><span id="line-48"></span>
+<span class="source-line-no">049</span><span id="line-49">import org.apache.hbase.thirdparty.com.google.common.base.Throwables;</span>
+<span class="source-line-no">050</span><span id="line-50">import org.apache.hbase.thirdparty.io.netty.channel.Channel;</span>
+<span class="source-line-no">051</span><span id="line-51">import org.apache.hbase.thirdparty.io.netty.channel.EventLoopGroup;</span>
+<span class="source-line-no">052</span><span id="line-52"></span>
+<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALHeader;</span>
+<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALTrailer;</span>
+<span class="source-line-no">055</span><span id="line-55"></span>
+<span class="source-line-no">056</span><span id="line-56">/**</span>
+<span class="source-line-no">057</span><span id="line-57"> * AsyncWriter for protobuf-based WAL.</span>
+<span class="source-line-no">058</span><span id="line-58"> */</span>
+<span class="source-line-no">059</span><span id="line-59">@InterfaceAudience.Private</span>
+<span class="source-line-no">060</span><span id="line-60">public class AsyncProtobufLogWriter extends AbstractProtobufLogWriter</span>
+<span class="source-line-no">061</span><span id="line-61">  implements AsyncFSWALProvider.AsyncWriter {</span>
+<span class="source-line-no">062</span><span id="line-62"></span>
+<span class="source-line-no">063</span><span id="line-63">  private static final Logger LOG = LoggerFactory.getLogger(AsyncProtobufLogWriter.class);</span>
+<span class="source-line-no">064</span><span id="line-64"></span>
+<span class="source-line-no">065</span><span id="line-65">  private final EventLoopGroup eventLoopGroup;</span>
+<span class="source-line-no">066</span><span id="line-66"></span>
+<span class="source-line-no">067</span><span id="line-67">  private final Class&lt;? extends Channel&gt; channelClass;</span>
+<span class="source-line-no">068</span><span id="line-68"></span>
+<span class="source-line-no">069</span><span id="line-69">  private volatile AsyncFSOutput output;</span>
+<span class="source-line-no">070</span><span id="line-70">  /**</span>
+<span class="source-line-no">071</span><span id="line-71">   * Save {@link AsyncFSOutput#getSyncedLength()} when {@link #output} is closed.</span>
+<span class="source-line-no">072</span><span id="line-72">   */</span>
+<span class="source-line-no">073</span><span id="line-73">  private volatile long finalSyncedLength = -1;</span>
+<span class="source-line-no">074</span><span id="line-74"></span>
+<span class="source-line-no">075</span><span id="line-75">  private static final class OutputStreamWrapper extends OutputStream implements ByteBufferWriter {</span>
+<span class="source-line-no">076</span><span id="line-76"></span>
+<span class="source-line-no">077</span><span id="line-77">    private final AsyncFSOutput out;</span>
+<span class="source-line-no">078</span><span id="line-78"></span>
+<span class="source-line-no">079</span><span id="line-79">    private final byte[] oneByteBuf = new byte[1];</span>
+<span class="source-line-no">080</span><span id="line-80"></span>
+<span class="source-line-no">081</span><span id="line-81">    @Override</span>
+<span class="source-line-no">082</span><span id="line-82">    public void write(int b) throws IOException {</span>
+<span class="source-line-no">083</span><span id="line-83">      oneByteBuf[0] = (byte) b;</span>
+<span class="source-line-no">084</span><span id="line-84">      write(oneByteBuf);</span>
+<span class="source-line-no">085</span><span id="line-85">    }</span>
+<span class="source-line-no">086</span><span id="line-86"></span>
+<span class="source-line-no">087</span><span id="line-87">    public OutputStreamWrapper(AsyncFSOutput out) {</span>
+<span class="source-line-no">088</span><span id="line-88">      this.out = out;</span>
+<span class="source-line-no">089</span><span id="line-89">    }</span>
+<span class="source-line-no">090</span><span id="line-90"></span>
+<span class="source-line-no">091</span><span id="line-91">    @Override</span>
+<span class="source-line-no">092</span><span id="line-92">    public void write(ByteBuffer b, int off, int len) throws IOException {</span>
+<span class="source-line-no">093</span><span id="line-93">      ByteBuffer bb = b.duplicate();</span>
+<span class="source-line-no">094</span><span id="line-94">      bb.position(off);</span>
+<span class="source-line-no">095</span><span id="line-95">      bb.limit(off + len);</span>
+<span class="source-line-no">096</span><span id="line-96">      out.write(bb);</span>
+<span class="source-line-no">097</span><span id="line-97">    }</span>
+<span class="source-line-no">098</span><span id="line-98"></span>
+<span class="source-line-no">099</span><span id="line-99">    @Override</span>
+<span class="source-line-no">100</span><span id="line-100">    public void writeInt(int i) throws IOException {</span>
+<span class="source-line-no">101</span><span id="line-101">      out.writeInt(i);</span>
+<span class="source-line-no">102</span><span id="line-102">    }</span>
+<span class="source-line-no">103</span><span id="line-103"></span>
+<span class="source-line-no">104</span><span id="line-104">    @Override</span>
+<span class="source-line-no">105</span><span id="line-105">    public void write(byte[] b, int off, int len) throws IOException {</span>
+<span class="source-line-no">106</span><span id="line-106">      out.write(b, off, len);</span>
+<span class="source-line-no">107</span><span id="line-107">    }</span>
+<span class="source-line-no">108</span><span id="line-108"></span>
+<span class="source-line-no">109</span><span id="line-109">    @Override</span>
+<span class="source-line-no">110</span><span id="line-110">    public void close() throws IOException {</span>
+<span class="source-line-no">111</span><span id="line-111">      out.close();</span>
+<span class="source-line-no">112</span><span id="line-112">    }</span>
+<span class="source-line-no">113</span><span id="line-113">  }</span>
+<span class="source-line-no">114</span><span id="line-114"></span>
+<span class="source-line-no">115</span><span id="line-115">  private OutputStream asyncOutputWrapper;</span>
+<span class="source-line-no">116</span><span id="line-116">  private long waitTimeout;</span>
+<span class="source-line-no">117</span><span id="line-117"></span>
+<span class="source-line-no">118</span><span id="line-118">  public AsyncProtobufLogWriter(EventLoopGroup eventLoopGroup,</span>
+<span class="source-line-no">119</span><span id="line-119">    Class&lt;? extends Channel&gt; channelClass) {</span>
+<span class="source-line-no">120</span><span id="line-120">    this.eventLoopGroup = eventLoopGroup;</span>
+<span class="source-line-no">121</span><span id="line-121">    this.channelClass = channelClass;</span>
+<span class="source-line-no">122</span><span id="line-122">    // Reuse WAL_ROLL_WAIT_TIMEOUT here to avoid an infinite wait if somehow a wait on a future</span>
+<span class="source-line-no">123</span><span id="line-123">    // never completes. The objective is the same. We want to propagate an exception to trigger</span>
+<span class="source-line-no">124</span><span id="line-124">    // an abort if we seem to be hung.</span>
+<span class="source-line-no">125</span><span id="line-125">    if (this.conf == null) {</span>
+<span class="source-line-no">126</span><span id="line-126">      this.conf = HBaseConfiguration.create();</span>
+<span class="source-line-no">127</span><span id="line-127">    }</span>
+<span class="source-line-no">128</span><span id="line-128">    this.waitTimeout = this.conf.getLong(AbstractWALRoller.WAL_ROLL_WAIT_TIMEOUT,</span>
+<span class="source-line-no">129</span><span id="line-129">      AbstractWALRoller.DEFAULT_WAL_ROLL_WAIT_TIMEOUT);</span>
+<span class="source-line-no">130</span><span id="line-130">  }</span>
+<span class="source-line-no">131</span><span id="line-131"></span>
+<span class="source-line-no">132</span><span id="line-132">  @Override</span>
+<span class="source-line-no">133</span><span id="line-133">  public void append(Entry entry) {</span>
+<span class="source-line-no">134</span><span id="line-134">    int buffered = output.buffered();</span>
+<span class="source-line-no">135</span><span id="line-135">    try {</span>
+<span class="source-line-no">136</span><span id="line-136">      entry.getKey().getBuilder(compressor).setFollowingKvCount(entry.getEdit().size()).build()</span>
+<span class="source-line-no">137</span><span id="line-137">        .writeDelimitedTo(asyncOutputWrapper);</span>
+<span class="source-line-no">138</span><span id="line-138">    } catch (IOException e) {</span>
+<span class="source-line-no">139</span><span id="line-139">      throw new AssertionError("should not happen", e);</span>
+<span class="source-line-no">140</span><span id="line-140">    }</span>
+<span class="source-line-no">141</span><span id="line-141">    try {</span>
+<span class="source-line-no">142</span><span id="line-142">      for (Cell cell : entry.getEdit().getCells()) {</span>
+<span class="source-line-no">143</span><span id="line-143">        cellEncoder.write((ExtendedCell) cell);</span>
+<span class="source-line-no">144</span><span id="line-144">      }</span>
+<span class="source-line-no">145</span><span id="line-145">    } catch (IOException e) {</span>
+<span class="source-line-no">146</span><span id="line-146">      throw new AssertionError("should not happen", e);</span>
+<span class="source-line-no">147</span><span id="line-147">    }</span>
+<span class="source-line-no">148</span><span id="line-148">    length.addAndGet(output.buffered() - buffered);</span>
+<span class="source-line-no">149</span><span id="line-149">  }</span>
+<span class="source-line-no">150</span><span id="line-150"></span>
+<span class="source-line-no">151</span><span id="line-151">  @Override</span>
+<span class="source-line-no">152</span><span id="line-152">  public CompletableFuture&lt;Long&gt; sync(boolean forceSync) {</span>
+<span class="source-line-no">153</span><span id="line-153">    return output.flush(forceSync);</span>
+<span class="source-line-no">154</span><span id="line-154">  }</span>
+<span class="source-line-no">155</span><span id="line-155"></span>
+<span class="source-line-no">156</span><span id="line-156">  @Override</span>
+<span class="source-line-no">157</span><span id="line-157">  public synchronized void close() throws IOException {</span>
+<span class="source-line-no">158</span><span id="line-158">    if (this.output == null) {</span>
+<span class="source-line-no">159</span><span id="line-159">      return;</span>
+<span class="source-line-no">160</span><span id="line-160">    }</span>
+<span class="source-line-no">161</span><span id="line-161">    try {</span>
+<span class="source-line-no">162</span><span id="line-162">      writeWALTrailer();</span>
+<span class="source-line-no">163</span><span id="line-163">      output.close();</span>
+<span class="source-line-no">164</span><span id="line-164">    } catch (Exception e) {</span>
+<span class="source-line-no">165</span><span id="line-165">      LOG.warn("normal close failed, try recover", e);</span>
+<span class="source-line-no">166</span><span id="line-166">      output.recoverAndClose(null);</span>
+<span class="source-line-no">167</span><span id="line-167">    }</span>
+<span class="source-line-no">168</span><span id="line-168">    /**</span>
+<span class="source-line-no">169</span><span id="line-169">     * We have to call {@link AsyncFSOutput#getSyncedLength()} after {@link AsyncFSOutput#close()}</span>
+<span class="source-line-no">170</span><span id="line-170">     * to get the final length synced to underlying filesystem because {@link AsyncFSOutput#close()}</span>
+<span class="source-line-no">171</span><span id="line-171">     * may also flush some data to underlying filesystem.</span>
+<span class="source-line-no">172</span><span id="line-172">     */</span>
+<span class="source-line-no">173</span><span id="line-173">    this.finalSyncedLength = this.output.getSyncedLength();</span>
+<span class="source-line-no">174</span><span id="line-174">    this.output = null;</span>
+<span class="source-line-no">175</span><span id="line-175">  }</span>
+<span class="source-line-no">176</span><span id="line-176"></span>
+<span class="source-line-no">177</span><span id="line-177">  public AsyncFSOutput getOutput() {</span>
+<span class="source-line-no">178</span><span id="line-178">    return this.output;</span>
+<span class="source-line-no">179</span><span id="line-179">  }</span>
+<span class="source-line-no">180</span><span id="line-180"></span>
+<span class="source-line-no">181</span><span id="line-181">  @Override</span>
+<span class="source-line-no">182</span><span id="line-182">  protected void initOutput(FileSystem fs, Path path, boolean overwritable, int bufferSize,</span>
+<span class="source-line-no">183</span><span id="line-183">    short replication, long blockSize, StreamSlowMonitor monitor, boolean noLocalWrite)</span>
+<span class="source-line-no">184</span><span id="line-184">    throws IOException, StreamLacksCapabilityException {</span>
+<span class="source-line-no">185</span><span id="line-185">    this.output = AsyncFSOutputHelper.createOutput(fs, path, overwritable, false, replication,</span>
+<span class="source-line-no">186</span><span id="line-186">      blockSize, eventLoopGroup, channelClass, monitor, noLocalWrite);</span>
+<span class="source-line-no">187</span><span id="line-187">    this.asyncOutputWrapper = new OutputStreamWrapper(output);</span>
+<span class="source-line-no">188</span><span id="line-188">  }</span>
+<span class="source-line-no">189</span><span id="line-189"></span>
+<span class="source-line-no">190</span><span id="line-190">  @Override</span>
+<span class="source-line-no">191</span><span id="line-191">  protected void closeOutputIfNecessary() {</span>
+<span class="source-line-no">192</span><span id="line-192">    if (this.output != null) {</span>
+<span class="source-line-no">193</span><span id="line-193">      try {</span>
+<span class="source-line-no">194</span><span id="line-194">        this.output.close();</span>
+<span class="source-line-no">195</span><span id="line-195">      } catch (IOException e) {</span>
+<span class="source-line-no">196</span><span id="line-196">        LOG.warn("Close output failed", e);</span>
+<span class="source-line-no">197</span><span id="line-197">      }</span>
+<span class="source-line-no">198</span><span id="line-198">    }</span>
+<span class="source-line-no">199</span><span id="line-199">  }</span>
+<span class="source-line-no">200</span><span id="line-200"></span>
+<span class="source-line-no">201</span><span id="line-201">  private long writeWALMetadata(Consumer&lt;CompletableFuture&lt;Long&gt;&gt; action) throws IOException {</span>
+<span class="source-line-no">202</span><span id="line-202">    CompletableFuture&lt;Long&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">203</span><span id="line-203">    action.accept(future);</span>
+<span class="source-line-no">204</span><span id="line-204">    try {</span>
+<span class="source-line-no">205</span><span id="line-205">      return future.get(waitTimeout, TimeUnit.MILLISECONDS).longValue();</span>
+<span class="source-line-no">206</span><span id="line-206">    } catch (InterruptedException e) {</span>
+<span class="source-line-no">207</span><span id="line-207">      InterruptedIOException ioe = new InterruptedIOException();</span>
+<span class="source-line-no">208</span><span id="line-208">      ioe.initCause(e);</span>
+<span class="source-line-no">209</span><span id="line-209">      throw ioe;</span>
+<span class="source-line-no">210</span><span id="line-210">    } catch (ExecutionException e) {</span>
+<span class="source-line-no">211</span><span id="line-211">      Throwables.propagateIfPossible(e.getCause(), IOException.class);</span>
+<span class="source-line-no">212</span><span id="line-212">      throw new RuntimeException(e.getCause());</span>
+<span class="source-line-no">213</span><span id="line-213">    } catch (TimeoutException e) {</span>
+<span class="source-line-no">214</span><span id="line-214">      throw new TimeoutIOException(e);</span>
+<span class="source-line-no">215</span><span id="line-215">    }</span>
+<span class="source-line-no">216</span><span id="line-216">  }</span>
+<span class="source-line-no">217</span><span id="line-217"></span>
+<span class="source-line-no">218</span><span id="line-218">  @Override</span>
+<span class="source-line-no">219</span><span id="line-219">  protected long writeMagicAndWALHeader(byte[] magic, WALHeader header) throws IOException {</span>
+<span class="source-line-no">220</span><span id="line-220">    return writeWALMetadata(future -&gt; {</span>
+<span class="source-line-no">221</span><span id="line-221">      output.write(magic);</span>
+<span class="source-line-no">222</span><span id="line-222">      try {</span>
+<span class="source-line-no">223</span><span id="line-223">        header.writeDelimitedTo(asyncOutputWrapper);</span>
+<span class="source-line-no">224</span><span id="line-224">      } catch (IOException e) {</span>
+<span class="source-line-no">225</span><span id="line-225">        // should not happen</span>
+<span class="source-line-no">226</span><span id="line-226">        throw new AssertionError(e);</span>
+<span class="source-line-no">227</span><span id="line-227">      }</span>
+<span class="source-line-no">228</span><span id="line-228">      addListener(output.flush(false), (len, error) -&gt; {</span>
+<span class="source-line-no">229</span><span id="line-229">        if (error != null) {</span>
+<span class="source-line-no">230</span><span id="line-230">          future.completeExceptionally(error);</span>
+<span class="source-line-no">231</span><span id="line-231">        } else {</span>
+<span class="source-line-no">232</span><span id="line-232">          future.complete(len);</span>
+<span class="source-line-no">233</span><span id="line-233">        }</span>
+<span class="source-line-no">234</span><span id="line-234">      });</span>
+<span class="source-line-no">235</span><span id="line-235">    });</span>
+<span class="source-line-no">236</span><span id="line-236">  }</span>
+<span class="source-line-no">237</span><span id="line-237"></span>
+<span class="source-line-no">238</span><span id="line-238">  @Override</span>
+<span class="source-line-no">239</span><span id="line-239">  protected long writeWALTrailerAndMagic(WALTrailer trailer, byte[] magic) throws IOException {</span>
+<span class="source-line-no">240</span><span id="line-240">    return writeWALMetadata(future -&gt; {</span>
+<span class="source-line-no">241</span><span id="line-241">      try {</span>
+<span class="source-line-no">242</span><span id="line-242">        trailer.writeTo(asyncOutputWrapper);</span>
+<span class="source-line-no">243</span><span id="line-243">      } catch (IOException e) {</span>
+<span class="source-line-no">244</span><span id="line-244">        // should not happen</span>
+<span class="source-line-no">245</span><span id="line-245">        throw new AssertionError(e);</span>
+<span class="source-line-no">246</span><span id="line-246">      }</span>
+<span class="source-line-no">247</span><span id="line-247">      output.writeInt(trailer.getSerializedSize());</span>
+<span class="source-line-no">248</span><span id="line-248">      output.write(magic);</span>
+<span class="source-line-no">249</span><span id="line-249">      addListener(output.flush(false), (len, error) -&gt; {</span>
+<span class="source-line-no">250</span><span id="line-250">        if (error != null) {</span>
+<span class="source-line-no">251</span><span id="line-251">          future.completeExceptionally(error);</span>
+<span class="source-line-no">252</span><span id="line-252">        } else {</span>
+<span class="source-line-no">253</span><span id="line-253">          future.complete(len);</span>
+<span class="source-line-no">254</span><span id="line-254">        }</span>
+<span class="source-line-no">255</span><span id="line-255">      });</span>
+<span class="source-line-no">256</span><span id="line-256">    });</span>
+<span class="source-line-no">257</span><span id="line-257">  }</span>
+<span class="source-line-no">258</span><span id="line-258"></span>
+<span class="source-line-no">259</span><span id="line-259">  @Override</span>
+<span class="source-line-no">260</span><span id="line-260">  protected OutputStream getOutputStreamForCellEncoder() {</span>
+<span class="source-line-no">261</span><span id="line-261">    return asyncOutputWrapper;</span>
+<span class="source-line-no">262</span><span id="line-262">  }</span>
+<span class="source-line-no">263</span><span id="line-263"></span>
+<span class="source-line-no">264</span><span id="line-264">  @Override</span>
+<span class="source-line-no">265</span><span id="line-265">  public long getSyncedLength() {</span>
+<span class="source-line-no">266</span><span id="line-266">    /**</span>
+<span class="source-line-no">267</span><span id="line-267">     * The statement "this.output = null;" in {@link AsyncProtobufLogWriter#close} is a sync point,</span>
+<span class="source-line-no">268</span><span id="line-268">     * if output is null, then finalSyncedLength must set, so we can return finalSyncedLength, else</span>
+<span class="source-line-no">269</span><span id="line-269">     * we return output.getSyncedLength</span>
+<span class="source-line-no">270</span><span id="line-270">     */</span>
+<span class="source-line-no">271</span><span id="line-271">    AsyncFSOutput outputToUse = this.output;</span>
+<span class="source-line-no">272</span><span id="line-272">    if (outputToUse == null) {</span>
+<span class="source-line-no">273</span><span id="line-273">      long finalSyncedLengthToUse = this.finalSyncedLength;</span>
+<span class="source-line-no">274</span><span id="line-274">      assert finalSyncedLengthToUse &gt;= 0;</span>
+<span class="source-line-no">275</span><span id="line-275">      return finalSyncedLengthToUse;</span>
+<span class="source-line-no">276</span><span id="line-276">    }</span>
+<span class="source-line-no">277</span><span id="line-277">    return outputToUse.getSyncedLength();</span>
+<span class="source-line-no">278</span><span id="line-278">  }</span>
+<span class="source-line-no">279</span><span id="line-279">}</span>
 
 
 
