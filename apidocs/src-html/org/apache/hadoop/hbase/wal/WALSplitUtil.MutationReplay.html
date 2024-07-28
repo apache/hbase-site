@@ -49,563 +49,565 @@
 <span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.fs.Path;</span>
 <span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.fs.PathFilter;</span>
 <span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.Cell;</span>
-<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.CellScanner;</span>
-<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.CellUtil;</span>
-<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.HConstants;</span>
-<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.client.Delete;</span>
-<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.client.Durability;</span>
-<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.client.Mutation;</span>
-<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.client.Put;</span>
-<span class="source-line-no">047</span><span id="line-47">import org.apache.hadoop.hbase.client.RegionInfo;</span>
-<span class="source-line-no">048</span><span id="line-48">import org.apache.hadoop.hbase.client.Row;</span>
-<span class="source-line-no">049</span><span id="line-49">import org.apache.hadoop.hbase.regionserver.HRegion;</span>
-<span class="source-line-no">050</span><span id="line-50">import org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL;</span>
-<span class="source-line-no">051</span><span id="line-51">import org.apache.hadoop.hbase.util.Bytes;</span>
-<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.util.CommonFSUtils;</span>
-<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
-<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.util.FSUtils;</span>
-<span class="source-line-no">055</span><span id="line-55">import org.apache.hadoop.hbase.util.IOExceptionSupplier;</span>
-<span class="source-line-no">056</span><span id="line-56">import org.apache.hadoop.hbase.util.Pair;</span>
-<span class="source-line-no">057</span><span id="line-57">import org.apache.hadoop.hbase.zookeeper.ZKSplitLog;</span>
-<span class="source-line-no">058</span><span id="line-58">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">059</span><span id="line-59">import org.slf4j.Logger;</span>
-<span class="source-line-no">060</span><span id="line-60">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">061</span><span id="line-61"></span>
-<span class="source-line-no">062</span><span id="line-62">import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;</span>
-<span class="source-line-no">063</span><span id="line-63">import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos;</span>
-<span class="source-line-no">064</span><span id="line-64">import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;</span>
-<span class="source-line-no">065</span><span id="line-65"></span>
-<span class="source-line-no">066</span><span id="line-66">/**</span>
-<span class="source-line-no">067</span><span id="line-67"> * This class provides static methods to support WAL splitting related works</span>
-<span class="source-line-no">068</span><span id="line-68"> */</span>
-<span class="source-line-no">069</span><span id="line-69">@InterfaceAudience.Private</span>
-<span class="source-line-no">070</span><span id="line-70">public final class WALSplitUtil {</span>
-<span class="source-line-no">071</span><span id="line-71">  private static final Logger LOG = LoggerFactory.getLogger(WALSplitUtil.class);</span>
-<span class="source-line-no">072</span><span id="line-72"></span>
-<span class="source-line-no">073</span><span id="line-73">  private static final Pattern EDITFILES_NAME_PATTERN = Pattern.compile("-?[0-9]+");</span>
-<span class="source-line-no">074</span><span id="line-74">  private static final String RECOVERED_LOG_TMPFILE_SUFFIX = ".temp";</span>
-<span class="source-line-no">075</span><span id="line-75">  private static final String SEQUENCE_ID_FILE_SUFFIX = ".seqid";</span>
-<span class="source-line-no">076</span><span id="line-76">  private static final String OLD_SEQUENCE_ID_FILE_SUFFIX = "_seqid";</span>
-<span class="source-line-no">077</span><span id="line-77">  private static final int SEQUENCE_ID_FILE_SUFFIX_LENGTH = SEQUENCE_ID_FILE_SUFFIX.length();</span>
-<span class="source-line-no">078</span><span id="line-78"></span>
-<span class="source-line-no">079</span><span id="line-79">  private WALSplitUtil() {</span>
-<span class="source-line-no">080</span><span id="line-80">  }</span>
-<span class="source-line-no">081</span><span id="line-81"></span>
-<span class="source-line-no">082</span><span id="line-82">  /**</span>
-<span class="source-line-no">083</span><span id="line-83">   * Completes the work done by splitLogFile by archiving logs</span>
-<span class="source-line-no">084</span><span id="line-84">   * &lt;p&gt;</span>
-<span class="source-line-no">085</span><span id="line-85">   * It is invoked by SplitLogManager once it knows that one of the SplitLogWorkers have completed</span>
-<span class="source-line-no">086</span><span id="line-86">   * the splitLogFile() part. If the master crashes then this function might get called multiple</span>
-<span class="source-line-no">087</span><span id="line-87">   * times.</span>
-<span class="source-line-no">088</span><span id="line-88">   * &lt;p&gt;</span>
-<span class="source-line-no">089</span><span id="line-89">   */</span>
-<span class="source-line-no">090</span><span id="line-90">  public static void finishSplitLogFile(String logfile, Configuration conf) throws IOException {</span>
-<span class="source-line-no">091</span><span id="line-91">    Path walDir = CommonFSUtils.getWALRootDir(conf);</span>
-<span class="source-line-no">092</span><span id="line-92">    Path oldLogDir = new Path(walDir, HConstants.HREGION_OLDLOGDIR_NAME);</span>
-<span class="source-line-no">093</span><span id="line-93">    Path walPath;</span>
-<span class="source-line-no">094</span><span id="line-94">    if (CommonFSUtils.isStartingWithPath(walDir, logfile)) {</span>
-<span class="source-line-no">095</span><span id="line-95">      walPath = new Path(logfile);</span>
-<span class="source-line-no">096</span><span id="line-96">    } else {</span>
-<span class="source-line-no">097</span><span id="line-97">      walPath = new Path(walDir, logfile);</span>
-<span class="source-line-no">098</span><span id="line-98">    }</span>
-<span class="source-line-no">099</span><span id="line-99">    FileSystem walFS = walDir.getFileSystem(conf);</span>
-<span class="source-line-no">100</span><span id="line-100">    boolean corrupt = ZKSplitLog.isCorrupted(walDir, walPath.getName(), walFS);</span>
-<span class="source-line-no">101</span><span id="line-101">    archive(walPath, corrupt, oldLogDir, walFS, conf);</span>
-<span class="source-line-no">102</span><span id="line-102">    Path stagingDir = ZKSplitLog.getSplitLogDir(walDir, walPath.getName());</span>
-<span class="source-line-no">103</span><span id="line-103">    walFS.delete(stagingDir, true);</span>
-<span class="source-line-no">104</span><span id="line-104">  }</span>
-<span class="source-line-no">105</span><span id="line-105"></span>
-<span class="source-line-no">106</span><span id="line-106">  /**</span>
-<span class="source-line-no">107</span><span id="line-107">   * Moves processed logs to a oldLogDir after successful processing Moves corrupted logs (any log</span>
-<span class="source-line-no">108</span><span id="line-108">   * that couldn't be successfully parsed to corruptDir (.corrupt) for later investigation</span>
-<span class="source-line-no">109</span><span id="line-109">   */</span>
-<span class="source-line-no">110</span><span id="line-110">  static void archive(final Path wal, final boolean corrupt, final Path oldWALDir,</span>
-<span class="source-line-no">111</span><span id="line-111">    final FileSystem walFS, final Configuration conf) throws IOException {</span>
-<span class="source-line-no">112</span><span id="line-112">    Path dir;</span>
-<span class="source-line-no">113</span><span id="line-113">    Path target;</span>
-<span class="source-line-no">114</span><span id="line-114">    if (corrupt) {</span>
-<span class="source-line-no">115</span><span id="line-115">      dir = new Path(CommonFSUtils.getWALRootDir(conf), HConstants.CORRUPT_DIR_NAME);</span>
-<span class="source-line-no">116</span><span id="line-116">      if (conf.get("hbase.regionserver.hlog.splitlog.corrupt.dir") != null) {</span>
-<span class="source-line-no">117</span><span id="line-117">        LOG.warn("hbase.regionserver.hlog.splitlog.corrupt.dir is deprecated. Default to {}", dir);</span>
-<span class="source-line-no">118</span><span id="line-118">      }</span>
-<span class="source-line-no">119</span><span id="line-119">      target = new Path(dir, wal.getName());</span>
-<span class="source-line-no">120</span><span id="line-120">    } else {</span>
-<span class="source-line-no">121</span><span id="line-121">      dir = oldWALDir;</span>
-<span class="source-line-no">122</span><span id="line-122">      target = AbstractFSWAL.getWALArchivePath(oldWALDir, wal);</span>
-<span class="source-line-no">123</span><span id="line-123">    }</span>
-<span class="source-line-no">124</span><span id="line-124">    mkdir(walFS, dir);</span>
-<span class="source-line-no">125</span><span id="line-125">    moveWAL(walFS, wal, target);</span>
-<span class="source-line-no">126</span><span id="line-126">  }</span>
-<span class="source-line-no">127</span><span id="line-127"></span>
-<span class="source-line-no">128</span><span id="line-128">  private static void mkdir(FileSystem fs, Path dir) throws IOException {</span>
-<span class="source-line-no">129</span><span id="line-129">    if (!fs.mkdirs(dir)) {</span>
-<span class="source-line-no">130</span><span id="line-130">      LOG.warn("Failed mkdir {}", dir);</span>
-<span class="source-line-no">131</span><span id="line-131">    }</span>
-<span class="source-line-no">132</span><span id="line-132">  }</span>
-<span class="source-line-no">133</span><span id="line-133"></span>
-<span class="source-line-no">134</span><span id="line-134">  /**</span>
-<span class="source-line-no">135</span><span id="line-135">   * Move WAL. Used to move processed WALs to archive or bad WALs to corrupt WAL dir. WAL may have</span>
-<span class="source-line-no">136</span><span id="line-136">   * already been moved; makes allowance.</span>
-<span class="source-line-no">137</span><span id="line-137">   */</span>
-<span class="source-line-no">138</span><span id="line-138">  public static void moveWAL(FileSystem fs, Path p, Path targetDir) throws IOException {</span>
-<span class="source-line-no">139</span><span id="line-139">    if (fs.exists(p)) {</span>
-<span class="source-line-no">140</span><span id="line-140">      if (!CommonFSUtils.renameAndSetModifyTime(fs, p, targetDir)) {</span>
-<span class="source-line-no">141</span><span id="line-141">        LOG.warn("Failed move of {} to {}", p, targetDir);</span>
-<span class="source-line-no">142</span><span id="line-142">      } else {</span>
-<span class="source-line-no">143</span><span id="line-143">        LOG.info("Moved {} to {}", p, targetDir);</span>
-<span class="source-line-no">144</span><span id="line-144">      }</span>
-<span class="source-line-no">145</span><span id="line-145">    }</span>
-<span class="source-line-no">146</span><span id="line-146">  }</span>
-<span class="source-line-no">147</span><span id="line-147"></span>
-<span class="source-line-no">148</span><span id="line-148">  /**</span>
-<span class="source-line-no">149</span><span id="line-149">   * Path to a file under RECOVERED_EDITS_DIR directory of the region found in &lt;code&gt;logEntry&lt;/code&gt;</span>
-<span class="source-line-no">150</span><span id="line-150">   * named for the sequenceid in the passed &lt;code&gt;logEntry&lt;/code&gt;: e.g.</span>
-<span class="source-line-no">151</span><span id="line-151">   * /hbase/some_table/2323432434/recovered.edits/2332. This method also ensures existence of</span>
-<span class="source-line-no">152</span><span id="line-152">   * RECOVERED_EDITS_DIR under the region creating it if necessary. And also set storage policy for</span>
-<span class="source-line-no">153</span><span id="line-153">   * RECOVERED_EDITS_DIR if WAL_STORAGE_POLICY is configured.</span>
-<span class="source-line-no">154</span><span id="line-154">   * @param tableName          the table name</span>
-<span class="source-line-no">155</span><span id="line-155">   * @param encodedRegionName  the encoded region name</span>
-<span class="source-line-no">156</span><span id="line-156">   * @param seqId              the sequence id which used to generate file name</span>
-<span class="source-line-no">157</span><span id="line-157">   * @param fileNameBeingSplit the file being split currently. Used to generate tmp file name.</span>
-<span class="source-line-no">158</span><span id="line-158">   * @param tmpDirName         of the directory used to sideline old recovered edits file</span>
-<span class="source-line-no">159</span><span id="line-159">   * @param conf               configuration</span>
-<span class="source-line-no">160</span><span id="line-160">   * @return Path to file into which to dump split log edits.</span>
-<span class="source-line-no">161</span><span id="line-161">   */</span>
-<span class="source-line-no">162</span><span id="line-162">  @SuppressWarnings("deprecation")</span>
-<span class="source-line-no">163</span><span id="line-163">  static Path getRegionSplitEditsPath(TableName tableName, byte[] encodedRegionName, long seqId,</span>
-<span class="source-line-no">164</span><span id="line-164">    String fileNameBeingSplit, String tmpDirName, Configuration conf) throws IOException {</span>
-<span class="source-line-no">165</span><span id="line-165">    FileSystem walFS = CommonFSUtils.getWALFileSystem(conf);</span>
-<span class="source-line-no">166</span><span id="line-166">    Path tableDir = CommonFSUtils.getWALTableDir(conf, tableName);</span>
-<span class="source-line-no">167</span><span id="line-167">    String encodedRegionNameStr = Bytes.toString(encodedRegionName);</span>
-<span class="source-line-no">168</span><span id="line-168">    Path regionDir = HRegion.getRegionDir(tableDir, encodedRegionNameStr);</span>
-<span class="source-line-no">169</span><span id="line-169">    Path dir = getRegionDirRecoveredEditsDir(regionDir);</span>
-<span class="source-line-no">170</span><span id="line-170"></span>
-<span class="source-line-no">171</span><span id="line-171">    if (walFS.exists(dir) &amp;&amp; walFS.isFile(dir)) {</span>
-<span class="source-line-no">172</span><span id="line-172">      Path tmp = new Path(tmpDirName);</span>
-<span class="source-line-no">173</span><span id="line-173">      if (!walFS.exists(tmp)) {</span>
-<span class="source-line-no">174</span><span id="line-174">        walFS.mkdirs(tmp);</span>
-<span class="source-line-no">175</span><span id="line-175">      }</span>
-<span class="source-line-no">176</span><span id="line-176">      tmp = new Path(tmp, HConstants.RECOVERED_EDITS_DIR + "_" + encodedRegionNameStr);</span>
-<span class="source-line-no">177</span><span id="line-177">      LOG.warn("Found existing old file: {}. It could be some "</span>
-<span class="source-line-no">178</span><span id="line-178">        + "leftover of an old installation. It should be a folder instead. " + "So moving it to {}",</span>
-<span class="source-line-no">179</span><span id="line-179">        dir, tmp);</span>
-<span class="source-line-no">180</span><span id="line-180">      if (!walFS.rename(dir, tmp)) {</span>
-<span class="source-line-no">181</span><span id="line-181">        LOG.warn("Failed to sideline old file {}", dir);</span>
-<span class="source-line-no">182</span><span id="line-182">      }</span>
-<span class="source-line-no">183</span><span id="line-183">    }</span>
-<span class="source-line-no">184</span><span id="line-184"></span>
-<span class="source-line-no">185</span><span id="line-185">    if (!walFS.exists(dir) &amp;&amp; !walFS.mkdirs(dir)) {</span>
-<span class="source-line-no">186</span><span id="line-186">      LOG.warn("mkdir failed on {}", dir);</span>
-<span class="source-line-no">187</span><span id="line-187">    } else {</span>
-<span class="source-line-no">188</span><span id="line-188">      String storagePolicy =</span>
-<span class="source-line-no">189</span><span id="line-189">        conf.get(HConstants.WAL_STORAGE_POLICY, HConstants.DEFAULT_WAL_STORAGE_POLICY);</span>
-<span class="source-line-no">190</span><span id="line-190">      CommonFSUtils.setStoragePolicy(walFS, dir, storagePolicy);</span>
-<span class="source-line-no">191</span><span id="line-191">    }</span>
-<span class="source-line-no">192</span><span id="line-192">    // Append fileBeingSplit to prevent name conflict since we may have duplicate wal entries now.</span>
-<span class="source-line-no">193</span><span id="line-193">    // Append file name ends with RECOVERED_LOG_TMPFILE_SUFFIX to ensure</span>
-<span class="source-line-no">194</span><span id="line-194">    // region's replayRecoveredEdits will not delete it</span>
-<span class="source-line-no">195</span><span id="line-195">    String fileName = formatRecoveredEditsFileName(seqId);</span>
-<span class="source-line-no">196</span><span id="line-196">    fileName = getTmpRecoveredEditsFileName(fileName + "-" + fileNameBeingSplit);</span>
-<span class="source-line-no">197</span><span id="line-197">    return new Path(dir, fileName);</span>
-<span class="source-line-no">198</span><span id="line-198">  }</span>
-<span class="source-line-no">199</span><span id="line-199"></span>
-<span class="source-line-no">200</span><span id="line-200">  private static String getTmpRecoveredEditsFileName(String fileName) {</span>
-<span class="source-line-no">201</span><span id="line-201">    return fileName + RECOVERED_LOG_TMPFILE_SUFFIX;</span>
-<span class="source-line-no">202</span><span id="line-202">  }</span>
-<span class="source-line-no">203</span><span id="line-203"></span>
-<span class="source-line-no">204</span><span id="line-204">  /**</span>
-<span class="source-line-no">205</span><span id="line-205">   * Get the completed recovered edits file path, renaming it to be by last edit in the file from</span>
-<span class="source-line-no">206</span><span id="line-206">   * its first edit. Then we could use the name to skip recovered edits when doing</span>
-<span class="source-line-no">207</span><span id="line-207">   * HRegion#replayRecoveredEditsIfAny(Map, CancelableProgressable, MonitoredTask).</span>
-<span class="source-line-no">208</span><span id="line-208">   * @return dstPath take file's last edit log seq num as the name</span>
-<span class="source-line-no">209</span><span id="line-209">   */</span>
-<span class="source-line-no">210</span><span id="line-210">  static Path getCompletedRecoveredEditsFilePath(Path srcPath, long maximumEditWALSeqNum) {</span>
-<span class="source-line-no">211</span><span id="line-211">    String fileName = formatRecoveredEditsFileName(maximumEditWALSeqNum);</span>
-<span class="source-line-no">212</span><span id="line-212">    return new Path(srcPath.getParent(), fileName);</span>
-<span class="source-line-no">213</span><span id="line-213">  }</span>
-<span class="source-line-no">214</span><span id="line-214"></span>
-<span class="source-line-no">215</span><span id="line-215">  static String formatRecoveredEditsFileName(final long seqid) {</span>
-<span class="source-line-no">216</span><span id="line-216">    return String.format("%019d", seqid);</span>
-<span class="source-line-no">217</span><span id="line-217">  }</span>
-<span class="source-line-no">218</span><span id="line-218"></span>
-<span class="source-line-no">219</span><span id="line-219">  /**</span>
-<span class="source-line-no">220</span><span id="line-220">   * @param regionDir This regions directory in the filesystem.</span>
-<span class="source-line-no">221</span><span id="line-221">   * @return The directory that holds recovered edits files for the region &lt;code&gt;regionDir&lt;/code&gt;</span>
-<span class="source-line-no">222</span><span id="line-222">   */</span>
-<span class="source-line-no">223</span><span id="line-223">  public static Path getRegionDirRecoveredEditsDir(final Path regionDir) {</span>
-<span class="source-line-no">224</span><span id="line-224">    return new Path(regionDir, HConstants.RECOVERED_EDITS_DIR);</span>
-<span class="source-line-no">225</span><span id="line-225">  }</span>
-<span class="source-line-no">226</span><span id="line-226"></span>
-<span class="source-line-no">227</span><span id="line-227">  /**</span>
-<span class="source-line-no">228</span><span id="line-228">   * Check whether there is recovered.edits in the region dir</span>
-<span class="source-line-no">229</span><span id="line-229">   * @param conf       conf</span>
-<span class="source-line-no">230</span><span id="line-230">   * @param regionInfo the region to check</span>
-<span class="source-line-no">231</span><span id="line-231">   * @return true if recovered.edits exist in the region dir</span>
-<span class="source-line-no">232</span><span id="line-232">   */</span>
-<span class="source-line-no">233</span><span id="line-233">  public static boolean hasRecoveredEdits(final Configuration conf, final RegionInfo regionInfo)</span>
-<span class="source-line-no">234</span><span id="line-234">    throws IOException {</span>
-<span class="source-line-no">235</span><span id="line-235">    // No recovered.edits for non default replica regions</span>
-<span class="source-line-no">236</span><span id="line-236">    if (regionInfo.getReplicaId() != RegionInfo.DEFAULT_REPLICA_ID) {</span>
-<span class="source-line-no">237</span><span id="line-237">      return false;</span>
-<span class="source-line-no">238</span><span id="line-238">    }</span>
-<span class="source-line-no">239</span><span id="line-239">    // Only default replica region can reach here, so we can use regioninfo</span>
-<span class="source-line-no">240</span><span id="line-240">    // directly without converting it to default replica's regioninfo.</span>
-<span class="source-line-no">241</span><span id="line-241">    Path regionWALDir =</span>
-<span class="source-line-no">242</span><span id="line-242">      CommonFSUtils.getWALRegionDir(conf, regionInfo.getTable(), regionInfo.getEncodedName());</span>
-<span class="source-line-no">243</span><span id="line-243">    Path regionDir = FSUtils.getRegionDirFromRootDir(CommonFSUtils.getRootDir(conf), regionInfo);</span>
-<span class="source-line-no">244</span><span id="line-244">    Path wrongRegionWALDir =</span>
-<span class="source-line-no">245</span><span id="line-245">      CommonFSUtils.getWrongWALRegionDir(conf, regionInfo.getTable(), regionInfo.getEncodedName());</span>
-<span class="source-line-no">246</span><span id="line-246">    FileSystem walFs = CommonFSUtils.getWALFileSystem(conf);</span>
-<span class="source-line-no">247</span><span id="line-247">    FileSystem rootFs = CommonFSUtils.getRootDirFileSystem(conf);</span>
-<span class="source-line-no">248</span><span id="line-248">    NavigableSet&lt;Path&gt; files = getSplitEditFilesSorted(walFs, regionWALDir);</span>
-<span class="source-line-no">249</span><span id="line-249">    if (!files.isEmpty()) {</span>
-<span class="source-line-no">250</span><span id="line-250">      return true;</span>
-<span class="source-line-no">251</span><span id="line-251">    }</span>
-<span class="source-line-no">252</span><span id="line-252">    files = getSplitEditFilesSorted(rootFs, regionDir);</span>
-<span class="source-line-no">253</span><span id="line-253">    if (!files.isEmpty()) {</span>
-<span class="source-line-no">254</span><span id="line-254">      return true;</span>
-<span class="source-line-no">255</span><span id="line-255">    }</span>
-<span class="source-line-no">256</span><span id="line-256">    files = getSplitEditFilesSorted(walFs, wrongRegionWALDir);</span>
-<span class="source-line-no">257</span><span id="line-257">    return !files.isEmpty();</span>
-<span class="source-line-no">258</span><span id="line-258">  }</span>
-<span class="source-line-no">259</span><span id="line-259"></span>
-<span class="source-line-no">260</span><span id="line-260">  /**</span>
-<span class="source-line-no">261</span><span id="line-261">   * This method will check 3 places for finding the max sequence id file. One is the expected</span>
-<span class="source-line-no">262</span><span id="line-262">   * place, another is the old place under the region directory, and the last one is the wrong one</span>
-<span class="source-line-no">263</span><span id="line-263">   * we introduced in HBASE-20734. See HBASE-22617 for more details.</span>
-<span class="source-line-no">264</span><span id="line-264">   * &lt;p/&gt;</span>
-<span class="source-line-no">265</span><span id="line-265">   * Notice that, you should always call this method instead of</span>
-<span class="source-line-no">266</span><span id="line-266">   * {@link #getMaxRegionSequenceId(FileSystem, Path)} until 4.0.0 release.</span>
-<span class="source-line-no">267</span><span id="line-267">   * @deprecated Only for compatibility, will be removed in 4.0.0.</span>
-<span class="source-line-no">268</span><span id="line-268">   */</span>
-<span class="source-line-no">269</span><span id="line-269">  @Deprecated</span>
-<span class="source-line-no">270</span><span id="line-270">  public static long getMaxRegionSequenceId(Configuration conf, RegionInfo region,</span>
-<span class="source-line-no">271</span><span id="line-271">    IOExceptionSupplier&lt;FileSystem&gt; rootFsSupplier, IOExceptionSupplier&lt;FileSystem&gt; walFsSupplier)</span>
-<span class="source-line-no">272</span><span id="line-272">    throws IOException {</span>
-<span class="source-line-no">273</span><span id="line-273">    FileSystem rootFs = rootFsSupplier.get();</span>
-<span class="source-line-no">274</span><span id="line-274">    FileSystem walFs = walFsSupplier.get();</span>
-<span class="source-line-no">275</span><span id="line-275">    Path regionWALDir =</span>
-<span class="source-line-no">276</span><span id="line-276">      CommonFSUtils.getWALRegionDir(conf, region.getTable(), region.getEncodedName());</span>
-<span class="source-line-no">277</span><span id="line-277">    // This is the old place where we store max sequence id file</span>
-<span class="source-line-no">278</span><span id="line-278">    Path regionDir = FSUtils.getRegionDirFromRootDir(CommonFSUtils.getRootDir(conf), region);</span>
-<span class="source-line-no">279</span><span id="line-279">    // This is for HBASE-20734, where we use a wrong directory, see HBASE-22617 for more details.</span>
-<span class="source-line-no">280</span><span id="line-280">    Path wrongRegionWALDir =</span>
-<span class="source-line-no">281</span><span id="line-281">      CommonFSUtils.getWrongWALRegionDir(conf, region.getTable(), region.getEncodedName());</span>
-<span class="source-line-no">282</span><span id="line-282">    long maxSeqId = getMaxRegionSequenceId(walFs, regionWALDir);</span>
-<span class="source-line-no">283</span><span id="line-283">    maxSeqId = Math.max(maxSeqId, getMaxRegionSequenceId(rootFs, regionDir));</span>
-<span class="source-line-no">284</span><span id="line-284">    maxSeqId = Math.max(maxSeqId, getMaxRegionSequenceId(walFs, wrongRegionWALDir));</span>
-<span class="source-line-no">285</span><span id="line-285">    return maxSeqId;</span>
-<span class="source-line-no">286</span><span id="line-286">  }</span>
-<span class="source-line-no">287</span><span id="line-287"></span>
-<span class="source-line-no">288</span><span id="line-288">  /**</span>
-<span class="source-line-no">289</span><span id="line-289">   * Returns sorted set of edit files made by splitter, excluding files with '.temp' suffix.</span>
-<span class="source-line-no">290</span><span id="line-290">   * @param walFS     WAL FileSystem used to retrieving split edits files.</span>
-<span class="source-line-no">291</span><span id="line-291">   * @param regionDir WAL region dir to look for recovered edits files under.</span>
-<span class="source-line-no">292</span><span id="line-292">   * @return Files in passed &lt;code&gt;regionDir&lt;/code&gt; as a sorted set.</span>
-<span class="source-line-no">293</span><span id="line-293">   */</span>
-<span class="source-line-no">294</span><span id="line-294">  public static NavigableSet&lt;Path&gt; getSplitEditFilesSorted(final FileSystem walFS,</span>
-<span class="source-line-no">295</span><span id="line-295">    final Path regionDir) throws IOException {</span>
-<span class="source-line-no">296</span><span id="line-296">    NavigableSet&lt;Path&gt; filesSorted = new TreeSet&lt;&gt;();</span>
-<span class="source-line-no">297</span><span id="line-297">    Path editsdir = getRegionDirRecoveredEditsDir(regionDir);</span>
-<span class="source-line-no">298</span><span id="line-298">    if (!walFS.exists(editsdir)) {</span>
-<span class="source-line-no">299</span><span id="line-299">      return filesSorted;</span>
-<span class="source-line-no">300</span><span id="line-300">    }</span>
-<span class="source-line-no">301</span><span id="line-301">    FileStatus[] files = CommonFSUtils.listStatus(walFS, editsdir, new PathFilter() {</span>
-<span class="source-line-no">302</span><span id="line-302">      @Override</span>
-<span class="source-line-no">303</span><span id="line-303">      public boolean accept(Path p) {</span>
-<span class="source-line-no">304</span><span id="line-304">        boolean result = false;</span>
-<span class="source-line-no">305</span><span id="line-305">        try {</span>
-<span class="source-line-no">306</span><span id="line-306">          // Return files and only files that match the editfile names pattern.</span>
-<span class="source-line-no">307</span><span id="line-307">          // There can be other files in this directory other than edit files.</span>
-<span class="source-line-no">308</span><span id="line-308">          // In particular, on error, we'll move aside the bad edit file giving</span>
-<span class="source-line-no">309</span><span id="line-309">          // it a timestamp suffix. See moveAsideBadEditsFile.</span>
-<span class="source-line-no">310</span><span id="line-310">          Matcher m = EDITFILES_NAME_PATTERN.matcher(p.getName());</span>
-<span class="source-line-no">311</span><span id="line-311">          result = walFS.isFile(p) &amp;&amp; m.matches();</span>
-<span class="source-line-no">312</span><span id="line-312">          // Skip the file whose name ends with RECOVERED_LOG_TMPFILE_SUFFIX,</span>
-<span class="source-line-no">313</span><span id="line-313">          // because it means splitwal thread is writting this file.</span>
-<span class="source-line-no">314</span><span id="line-314">          if (p.getName().endsWith(RECOVERED_LOG_TMPFILE_SUFFIX)) {</span>
-<span class="source-line-no">315</span><span id="line-315">            result = false;</span>
-<span class="source-line-no">316</span><span id="line-316">          }</span>
-<span class="source-line-no">317</span><span id="line-317">          // Skip SeqId Files</span>
-<span class="source-line-no">318</span><span id="line-318">          if (isSequenceIdFile(p)) {</span>
-<span class="source-line-no">319</span><span id="line-319">            result = false;</span>
-<span class="source-line-no">320</span><span id="line-320">          }</span>
-<span class="source-line-no">321</span><span id="line-321">        } catch (IOException e) {</span>
-<span class="source-line-no">322</span><span id="line-322">          LOG.warn("Failed isFile check on {}", p, e);</span>
-<span class="source-line-no">323</span><span id="line-323">        }</span>
-<span class="source-line-no">324</span><span id="line-324">        return result;</span>
-<span class="source-line-no">325</span><span id="line-325">      }</span>
-<span class="source-line-no">326</span><span id="line-326">    });</span>
-<span class="source-line-no">327</span><span id="line-327">    if (ArrayUtils.isNotEmpty(files)) {</span>
-<span class="source-line-no">328</span><span id="line-328">      Arrays.asList(files).forEach(status -&gt; filesSorted.add(status.getPath()));</span>
-<span class="source-line-no">329</span><span id="line-329">    }</span>
-<span class="source-line-no">330</span><span id="line-330">    return filesSorted;</span>
-<span class="source-line-no">331</span><span id="line-331">  }</span>
-<span class="source-line-no">332</span><span id="line-332"></span>
-<span class="source-line-no">333</span><span id="line-333">  /**</span>
-<span class="source-line-no">334</span><span id="line-334">   * Move aside a bad edits file.</span>
-<span class="source-line-no">335</span><span id="line-335">   * @param fs    the file system used to rename bad edits file.</span>
-<span class="source-line-no">336</span><span id="line-336">   * @param edits Edits file to move aside.</span>
-<span class="source-line-no">337</span><span id="line-337">   * @return The name of the moved aside file.</span>
-<span class="source-line-no">338</span><span id="line-338">   */</span>
-<span class="source-line-no">339</span><span id="line-339">  public static Path moveAsideBadEditsFile(final FileSystem fs, final Path edits)</span>
-<span class="source-line-no">340</span><span id="line-340">    throws IOException {</span>
-<span class="source-line-no">341</span><span id="line-341">    Path moveAsideName =</span>
-<span class="source-line-no">342</span><span id="line-342">      new Path(edits.getParent(), edits.getName() + "." + EnvironmentEdgeManager.currentTime());</span>
-<span class="source-line-no">343</span><span id="line-343">    if (!fs.rename(edits, moveAsideName)) {</span>
-<span class="source-line-no">344</span><span id="line-344">      LOG.warn("Rename failed from {} to {}", edits, moveAsideName);</span>
-<span class="source-line-no">345</span><span id="line-345">    }</span>
-<span class="source-line-no">346</span><span id="line-346">    return moveAsideName;</span>
-<span class="source-line-no">347</span><span id="line-347">  }</span>
-<span class="source-line-no">348</span><span id="line-348"></span>
-<span class="source-line-no">349</span><span id="line-349">  /**</span>
-<span class="source-line-no">350</span><span id="line-350">   * Is the given file a region open sequence id file.</span>
-<span class="source-line-no">351</span><span id="line-351">   */</span>
-<span class="source-line-no">352</span><span id="line-352">  public static boolean isSequenceIdFile(final Path file) {</span>
-<span class="source-line-no">353</span><span id="line-353">    return file.getName().endsWith(SEQUENCE_ID_FILE_SUFFIX)</span>
-<span class="source-line-no">354</span><span id="line-354">      || file.getName().endsWith(OLD_SEQUENCE_ID_FILE_SUFFIX);</span>
-<span class="source-line-no">355</span><span id="line-355">  }</span>
-<span class="source-line-no">356</span><span id="line-356"></span>
-<span class="source-line-no">357</span><span id="line-357">  private static FileStatus[] getSequenceIdFiles(FileSystem walFS, Path regionDir)</span>
-<span class="source-line-no">358</span><span id="line-358">    throws IOException {</span>
-<span class="source-line-no">359</span><span id="line-359">    // TODO: Why are we using a method in here as part of our normal region open where</span>
-<span class="source-line-no">360</span><span id="line-360">    // there is no splitting involved? Fix. St.Ack 01/20/2017.</span>
-<span class="source-line-no">361</span><span id="line-361">    Path editsDir = getRegionDirRecoveredEditsDir(regionDir);</span>
-<span class="source-line-no">362</span><span id="line-362">    try {</span>
-<span class="source-line-no">363</span><span id="line-363">      FileStatus[] files = walFS.listStatus(editsDir, WALSplitUtil::isSequenceIdFile);</span>
-<span class="source-line-no">364</span><span id="line-364">      return files != null ? files : new FileStatus[0];</span>
-<span class="source-line-no">365</span><span id="line-365">    } catch (FileNotFoundException e) {</span>
-<span class="source-line-no">366</span><span id="line-366">      return new FileStatus[0];</span>
-<span class="source-line-no">367</span><span id="line-367">    }</span>
-<span class="source-line-no">368</span><span id="line-368">  }</span>
-<span class="source-line-no">369</span><span id="line-369"></span>
-<span class="source-line-no">370</span><span id="line-370">  private static long getMaxSequenceId(FileStatus[] files) {</span>
-<span class="source-line-no">371</span><span id="line-371">    long maxSeqId = -1L;</span>
-<span class="source-line-no">372</span><span id="line-372">    for (FileStatus file : files) {</span>
-<span class="source-line-no">373</span><span id="line-373">      String fileName = file.getPath().getName();</span>
-<span class="source-line-no">374</span><span id="line-374">      try {</span>
-<span class="source-line-no">375</span><span id="line-375">        maxSeqId = Math.max(maxSeqId, Long</span>
-<span class="source-line-no">376</span><span id="line-376">          .parseLong(fileName.substring(0, fileName.length() - SEQUENCE_ID_FILE_SUFFIX_LENGTH)));</span>
-<span class="source-line-no">377</span><span id="line-377">      } catch (NumberFormatException ex) {</span>
-<span class="source-line-no">378</span><span id="line-378">        LOG.warn("Invalid SeqId File Name={}", fileName);</span>
-<span class="source-line-no">379</span><span id="line-379">      }</span>
-<span class="source-line-no">380</span><span id="line-380">    }</span>
-<span class="source-line-no">381</span><span id="line-381">    return maxSeqId;</span>
-<span class="source-line-no">382</span><span id="line-382">  }</span>
-<span class="source-line-no">383</span><span id="line-383"></span>
-<span class="source-line-no">384</span><span id="line-384">  /**</span>
-<span class="source-line-no">385</span><span id="line-385">   * Get the max sequence id which is stored in the region directory. -1 if none.</span>
-<span class="source-line-no">386</span><span id="line-386">   */</span>
-<span class="source-line-no">387</span><span id="line-387">  public static long getMaxRegionSequenceId(FileSystem walFS, Path regionDir) throws IOException {</span>
-<span class="source-line-no">388</span><span id="line-388">    return getMaxSequenceId(getSequenceIdFiles(walFS, regionDir));</span>
-<span class="source-line-no">389</span><span id="line-389">  }</span>
-<span class="source-line-no">390</span><span id="line-390"></span>
-<span class="source-line-no">391</span><span id="line-391">  /**</span>
-<span class="source-line-no">392</span><span id="line-392">   * Create a file with name as region's max sequence id</span>
-<span class="source-line-no">393</span><span id="line-393">   */</span>
-<span class="source-line-no">394</span><span id="line-394">  public static void writeRegionSequenceIdFile(FileSystem walFS, Path regionDir, long newMaxSeqId)</span>
-<span class="source-line-no">395</span><span id="line-395">    throws IOException {</span>
-<span class="source-line-no">396</span><span id="line-396">    FileStatus[] files = getSequenceIdFiles(walFS, regionDir);</span>
-<span class="source-line-no">397</span><span id="line-397">    long maxSeqId = getMaxSequenceId(files);</span>
-<span class="source-line-no">398</span><span id="line-398">    if (maxSeqId &gt; newMaxSeqId) {</span>
-<span class="source-line-no">399</span><span id="line-399">      throw new IOException("The new max sequence id " + newMaxSeqId</span>
-<span class="source-line-no">400</span><span id="line-400">        + " is less than the old max sequence id " + maxSeqId);</span>
-<span class="source-line-no">401</span><span id="line-401">    }</span>
-<span class="source-line-no">402</span><span id="line-402">    // write a new seqId file</span>
-<span class="source-line-no">403</span><span id="line-403">    Path newSeqIdFile =</span>
-<span class="source-line-no">404</span><span id="line-404">      new Path(getRegionDirRecoveredEditsDir(regionDir), newMaxSeqId + SEQUENCE_ID_FILE_SUFFIX);</span>
-<span class="source-line-no">405</span><span id="line-405">    if (newMaxSeqId != maxSeqId) {</span>
-<span class="source-line-no">406</span><span id="line-406">      try {</span>
-<span class="source-line-no">407</span><span id="line-407">        if (!walFS.createNewFile(newSeqIdFile) &amp;&amp; !walFS.exists(newSeqIdFile)) {</span>
-<span class="source-line-no">408</span><span id="line-408">          throw new IOException("Failed to create SeqId file:" + newSeqIdFile);</span>
-<span class="source-line-no">409</span><span id="line-409">        }</span>
-<span class="source-line-no">410</span><span id="line-410">        LOG.debug("Wrote file={}, newMaxSeqId={}, maxSeqId={}", newSeqIdFile, newMaxSeqId,</span>
-<span class="source-line-no">411</span><span id="line-411">          maxSeqId);</span>
-<span class="source-line-no">412</span><span id="line-412">      } catch (FileAlreadyExistsException ignored) {</span>
-<span class="source-line-no">413</span><span id="line-413">        // latest hdfs throws this exception. it's all right if newSeqIdFile already exists</span>
-<span class="source-line-no">414</span><span id="line-414">      }</span>
-<span class="source-line-no">415</span><span id="line-415">    }</span>
-<span class="source-line-no">416</span><span id="line-416">    // remove old ones</span>
-<span class="source-line-no">417</span><span id="line-417">    for (FileStatus status : files) {</span>
-<span class="source-line-no">418</span><span id="line-418">      if (!newSeqIdFile.equals(status.getPath())) {</span>
-<span class="source-line-no">419</span><span id="line-419">        walFS.delete(status.getPath(), false);</span>
-<span class="source-line-no">420</span><span id="line-420">      }</span>
-<span class="source-line-no">421</span><span id="line-421">    }</span>
-<span class="source-line-no">422</span><span id="line-422">  }</span>
-<span class="source-line-no">423</span><span id="line-423"></span>
-<span class="source-line-no">424</span><span id="line-424">  /** A struct used by getMutationsFromWALEntry */</span>
-<span class="source-line-no">425</span><span id="line-425">  public static class MutationReplay implements Comparable&lt;MutationReplay&gt; {</span>
-<span class="source-line-no">426</span><span id="line-426">    public MutationReplay(ClientProtos.MutationProto.MutationType type, Mutation mutation,</span>
-<span class="source-line-no">427</span><span id="line-427">      long nonceGroup, long nonce) {</span>
-<span class="source-line-no">428</span><span id="line-428">      this.type = type;</span>
-<span class="source-line-no">429</span><span id="line-429">      this.mutation = mutation;</span>
-<span class="source-line-no">430</span><span id="line-430">      if (this.mutation.getDurability() != Durability.SKIP_WAL) {</span>
-<span class="source-line-no">431</span><span id="line-431">        // using ASYNC_WAL for relay</span>
-<span class="source-line-no">432</span><span id="line-432">        this.mutation.setDurability(Durability.ASYNC_WAL);</span>
-<span class="source-line-no">433</span><span id="line-433">      }</span>
-<span class="source-line-no">434</span><span id="line-434">      this.nonceGroup = nonceGroup;</span>
-<span class="source-line-no">435</span><span id="line-435">      this.nonce = nonce;</span>
-<span class="source-line-no">436</span><span id="line-436">    }</span>
-<span class="source-line-no">437</span><span id="line-437"></span>
-<span class="source-line-no">438</span><span id="line-438">    private final ClientProtos.MutationProto.MutationType type;</span>
-<span class="source-line-no">439</span><span id="line-439">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
-<span class="source-line-no">440</span><span id="line-440">    public final Mutation mutation;</span>
-<span class="source-line-no">441</span><span id="line-441">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
-<span class="source-line-no">442</span><span id="line-442">    public final long nonceGroup;</span>
-<span class="source-line-no">443</span><span id="line-443">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
-<span class="source-line-no">444</span><span id="line-444">    public final long nonce;</span>
-<span class="source-line-no">445</span><span id="line-445"></span>
-<span class="source-line-no">446</span><span id="line-446">    @Override</span>
-<span class="source-line-no">447</span><span id="line-447">    public int compareTo(final MutationReplay d) {</span>
-<span class="source-line-no">448</span><span id="line-448">      return Row.COMPARATOR.compare(mutation, d.mutation);</span>
-<span class="source-line-no">449</span><span id="line-449">    }</span>
-<span class="source-line-no">450</span><span id="line-450"></span>
-<span class="source-line-no">451</span><span id="line-451">    @Override</span>
-<span class="source-line-no">452</span><span id="line-452">    public boolean equals(Object obj) {</span>
-<span class="source-line-no">453</span><span id="line-453">      if (!(obj instanceof MutationReplay)) {</span>
-<span class="source-line-no">454</span><span id="line-454">        return false;</span>
-<span class="source-line-no">455</span><span id="line-455">      } else {</span>
-<span class="source-line-no">456</span><span id="line-456">        return this.compareTo((MutationReplay) obj) == 0;</span>
-<span class="source-line-no">457</span><span id="line-457">      }</span>
-<span class="source-line-no">458</span><span id="line-458">    }</span>
-<span class="source-line-no">459</span><span id="line-459"></span>
-<span class="source-line-no">460</span><span id="line-460">    @Override</span>
-<span class="source-line-no">461</span><span id="line-461">    public int hashCode() {</span>
-<span class="source-line-no">462</span><span id="line-462">      return this.mutation.hashCode();</span>
-<span class="source-line-no">463</span><span id="line-463">    }</span>
-<span class="source-line-no">464</span><span id="line-464"></span>
-<span class="source-line-no">465</span><span id="line-465">    public ClientProtos.MutationProto.MutationType getType() {</span>
-<span class="source-line-no">466</span><span id="line-466">      return type;</span>
-<span class="source-line-no">467</span><span id="line-467">    }</span>
-<span class="source-line-no">468</span><span id="line-468">  }</span>
-<span class="source-line-no">469</span><span id="line-469"></span>
-<span class="source-line-no">470</span><span id="line-470">  /**</span>
-<span class="source-line-no">471</span><span id="line-471">   * This function is used to construct mutations from a WALEntry. It also reconstructs WALKey &amp;amp;</span>
-<span class="source-line-no">472</span><span id="line-472">   * WALEdit from the passed in WALEntry</span>
-<span class="source-line-no">473</span><span id="line-473">   * @param logEntry pair of WALKey and WALEdit instance stores WALKey and WALEdit instances</span>
-<span class="source-line-no">474</span><span id="line-474">   *                 extracted from the passed in WALEntry.</span>
-<span class="source-line-no">475</span><span id="line-475">   * @return list of Pair&amp;lt;MutationType, Mutation&amp;gt; to be replayed</span>
-<span class="source-line-no">476</span><span id="line-476">   * @deprecated Since 3.0.0, will be removed in 4.0.0.</span>
-<span class="source-line-no">477</span><span id="line-477">   */</span>
-<span class="source-line-no">478</span><span id="line-478">  @Deprecated</span>
-<span class="source-line-no">479</span><span id="line-479">  public static List&lt;MutationReplay&gt; getMutationsFromWALEntry(AdminProtos.WALEntry entry,</span>
-<span class="source-line-no">480</span><span id="line-480">    CellScanner cells, Pair&lt;WALKey, WALEdit&gt; logEntry, Durability durability) throws IOException {</span>
-<span class="source-line-no">481</span><span id="line-481">    if (entry == null) {</span>
-<span class="source-line-no">482</span><span id="line-482">      // return an empty array</span>
-<span class="source-line-no">483</span><span id="line-483">      return Collections.emptyList();</span>
-<span class="source-line-no">484</span><span id="line-484">    }</span>
-<span class="source-line-no">485</span><span id="line-485"></span>
-<span class="source-line-no">486</span><span id="line-486">    long replaySeqId = (entry.getKey().hasOrigSequenceNumber())</span>
-<span class="source-line-no">487</span><span id="line-487">      ? entry.getKey().getOrigSequenceNumber()</span>
-<span class="source-line-no">488</span><span id="line-488">      : entry.getKey().getLogSequenceNumber();</span>
-<span class="source-line-no">489</span><span id="line-489">    int count = entry.getAssociatedCellCount();</span>
-<span class="source-line-no">490</span><span id="line-490">    List&lt;MutationReplay&gt; mutations = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">491</span><span id="line-491">    Cell previousCell = null;</span>
-<span class="source-line-no">492</span><span id="line-492">    Mutation m = null;</span>
-<span class="source-line-no">493</span><span id="line-493">    WALKeyImpl key = null;</span>
-<span class="source-line-no">494</span><span id="line-494">    WALEdit val = null;</span>
-<span class="source-line-no">495</span><span id="line-495">    if (logEntry != null) {</span>
-<span class="source-line-no">496</span><span id="line-496">      val = new WALEdit();</span>
-<span class="source-line-no">497</span><span id="line-497">    }</span>
-<span class="source-line-no">498</span><span id="line-498"></span>
-<span class="source-line-no">499</span><span id="line-499">    for (int i = 0; i &lt; count; i++) {</span>
-<span class="source-line-no">500</span><span id="line-500">      // Throw index out of bounds if our cell count is off</span>
-<span class="source-line-no">501</span><span id="line-501">      if (!cells.advance()) {</span>
-<span class="source-line-no">502</span><span id="line-502">        throw new ArrayIndexOutOfBoundsException("Expected=" + count + ", index=" + i);</span>
-<span class="source-line-no">503</span><span id="line-503">      }</span>
-<span class="source-line-no">504</span><span id="line-504">      Cell cell = cells.current();</span>
-<span class="source-line-no">505</span><span id="line-505">      if (val != null) {</span>
-<span class="source-line-no">506</span><span id="line-506">        val.add(cell);</span>
-<span class="source-line-no">507</span><span id="line-507">      }</span>
-<span class="source-line-no">508</span><span id="line-508"></span>
-<span class="source-line-no">509</span><span id="line-509">      boolean isNewRowOrType =</span>
-<span class="source-line-no">510</span><span id="line-510">        previousCell == null || previousCell.getTypeByte() != cell.getTypeByte()</span>
-<span class="source-line-no">511</span><span id="line-511">          || !CellUtil.matchingRows(previousCell, cell);</span>
-<span class="source-line-no">512</span><span id="line-512">      if (isNewRowOrType) {</span>
-<span class="source-line-no">513</span><span id="line-513">        // Create new mutation</span>
-<span class="source-line-no">514</span><span id="line-514">        if (CellUtil.isDelete(cell)) {</span>
-<span class="source-line-no">515</span><span id="line-515">          m = new Delete(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());</span>
-<span class="source-line-no">516</span><span id="line-516">          // Deletes don't have nonces.</span>
-<span class="source-line-no">517</span><span id="line-517">          mutations.add(new MutationReplay(ClientProtos.MutationProto.MutationType.DELETE, m,</span>
-<span class="source-line-no">518</span><span id="line-518">            HConstants.NO_NONCE, HConstants.NO_NONCE));</span>
-<span class="source-line-no">519</span><span id="line-519">        } else {</span>
-<span class="source-line-no">520</span><span id="line-520">          m = new Put(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());</span>
-<span class="source-line-no">521</span><span id="line-521">          // Puts might come from increment or append, thus we need nonces.</span>
-<span class="source-line-no">522</span><span id="line-522">          long nonceGroup =</span>
-<span class="source-line-no">523</span><span id="line-523">            entry.getKey().hasNonceGroup() ? entry.getKey().getNonceGroup() : HConstants.NO_NONCE;</span>
-<span class="source-line-no">524</span><span id="line-524">          long nonce = entry.getKey().hasNonce() ? entry.getKey().getNonce() : HConstants.NO_NONCE;</span>
-<span class="source-line-no">525</span><span id="line-525">          mutations.add(</span>
-<span class="source-line-no">526</span><span id="line-526">            new MutationReplay(ClientProtos.MutationProto.MutationType.PUT, m, nonceGroup, nonce));</span>
-<span class="source-line-no">527</span><span id="line-527">        }</span>
-<span class="source-line-no">528</span><span id="line-528">      }</span>
-<span class="source-line-no">529</span><span id="line-529">      if (CellUtil.isDelete(cell)) {</span>
-<span class="source-line-no">530</span><span id="line-530">        ((Delete) m).add(cell);</span>
-<span class="source-line-no">531</span><span id="line-531">      } else {</span>
-<span class="source-line-no">532</span><span id="line-532">        ((Put) m).add(cell);</span>
-<span class="source-line-no">533</span><span id="line-533">      }</span>
-<span class="source-line-no">534</span><span id="line-534">      m.setDurability(durability);</span>
-<span class="source-line-no">535</span><span id="line-535">      previousCell = cell;</span>
-<span class="source-line-no">536</span><span id="line-536">    }</span>
-<span class="source-line-no">537</span><span id="line-537"></span>
-<span class="source-line-no">538</span><span id="line-538">    // reconstruct WALKey</span>
-<span class="source-line-no">539</span><span id="line-539">    if (logEntry != null) {</span>
-<span class="source-line-no">540</span><span id="line-540">      org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALKey walKeyProto =</span>
-<span class="source-line-no">541</span><span id="line-541">        entry.getKey();</span>
-<span class="source-line-no">542</span><span id="line-542">      List&lt;UUID&gt; clusterIds = new ArrayList&lt;&gt;(walKeyProto.getClusterIdsCount());</span>
-<span class="source-line-no">543</span><span id="line-543">      for (HBaseProtos.UUID uuid : entry.getKey().getClusterIdsList()) {</span>
-<span class="source-line-no">544</span><span id="line-544">        clusterIds.add(new UUID(uuid.getMostSigBits(), uuid.getLeastSigBits()));</span>
-<span class="source-line-no">545</span><span id="line-545">      }</span>
-<span class="source-line-no">546</span><span id="line-546">      key = new WALKeyImpl(walKeyProto.getEncodedRegionName().toByteArray(),</span>
-<span class="source-line-no">547</span><span id="line-547">        TableName.valueOf(walKeyProto.getTableName().toByteArray()), replaySeqId,</span>
-<span class="source-line-no">548</span><span id="line-548">        walKeyProto.getWriteTime(), clusterIds, walKeyProto.getNonceGroup(), walKeyProto.getNonce(),</span>
-<span class="source-line-no">549</span><span id="line-549">        null);</span>
-<span class="source-line-no">550</span><span id="line-550">      logEntry.setFirst(key);</span>
-<span class="source-line-no">551</span><span id="line-551">      logEntry.setSecond(val);</span>
-<span class="source-line-no">552</span><span id="line-552">    }</span>
-<span class="source-line-no">553</span><span id="line-553"></span>
-<span class="source-line-no">554</span><span id="line-554">    return mutations;</span>
-<span class="source-line-no">555</span><span id="line-555">  }</span>
-<span class="source-line-no">556</span><span id="line-556"></span>
-<span class="source-line-no">557</span><span id="line-557">  /**</span>
-<span class="source-line-no">558</span><span id="line-558">   * Return path to recovered.hfiles directory of the region's column family: e.g.</span>
-<span class="source-line-no">559</span><span id="line-559">   * /hbase/some_table/2323432434/cf/recovered.hfiles/. This method also ensures existence of</span>
-<span class="source-line-no">560</span><span id="line-560">   * recovered.hfiles directory under the region's column family, creating it if necessary.</span>
-<span class="source-line-no">561</span><span id="line-561">   * @param rootFS            the root file system</span>
-<span class="source-line-no">562</span><span id="line-562">   * @param conf              configuration</span>
-<span class="source-line-no">563</span><span id="line-563">   * @param tableName         the table name</span>
-<span class="source-line-no">564</span><span id="line-564">   * @param encodedRegionName the encoded region name</span>
-<span class="source-line-no">565</span><span id="line-565">   * @param familyName        the column family name</span>
-<span class="source-line-no">566</span><span id="line-566">   * @return Path to recovered.hfiles directory of the region's column family.</span>
-<span class="source-line-no">567</span><span id="line-567">   */</span>
-<span class="source-line-no">568</span><span id="line-568">  static Path tryCreateRecoveredHFilesDir(FileSystem rootFS, Configuration conf,</span>
-<span class="source-line-no">569</span><span id="line-569">    TableName tableName, String encodedRegionName, String familyName) throws IOException {</span>
-<span class="source-line-no">570</span><span id="line-570">    Path rootDir = CommonFSUtils.getRootDir(conf);</span>
-<span class="source-line-no">571</span><span id="line-571">    Path regionDir = FSUtils.getRegionDirFromTableDir(CommonFSUtils.getTableDir(rootDir, tableName),</span>
-<span class="source-line-no">572</span><span id="line-572">      encodedRegionName);</span>
-<span class="source-line-no">573</span><span id="line-573">    Path dir = getRecoveredHFilesDir(regionDir, familyName);</span>
-<span class="source-line-no">574</span><span id="line-574">    if (!rootFS.exists(dir) &amp;&amp; !rootFS.mkdirs(dir)) {</span>
-<span class="source-line-no">575</span><span id="line-575">      LOG.warn("mkdir failed on {}, region {}, column family {}", dir, encodedRegionName,</span>
-<span class="source-line-no">576</span><span id="line-576">        familyName);</span>
-<span class="source-line-no">577</span><span id="line-577">    }</span>
-<span class="source-line-no">578</span><span id="line-578">    return dir;</span>
-<span class="source-line-no">579</span><span id="line-579">  }</span>
-<span class="source-line-no">580</span><span id="line-580"></span>
-<span class="source-line-no">581</span><span id="line-581">  /**</span>
-<span class="source-line-no">582</span><span id="line-582">   * @param regionDir  This regions directory in the filesystem</span>
-<span class="source-line-no">583</span><span id="line-583">   * @param familyName The column family name</span>
-<span class="source-line-no">584</span><span id="line-584">   * @return The directory that holds recovered hfiles for the region's column family</span>
-<span class="source-line-no">585</span><span id="line-585">   */</span>
-<span class="source-line-no">586</span><span id="line-586">  private static Path getRecoveredHFilesDir(final Path regionDir, String familyName) {</span>
-<span class="source-line-no">587</span><span id="line-587">    return new Path(new Path(regionDir, familyName), HConstants.RECOVERED_HFILES_DIR);</span>
-<span class="source-line-no">588</span><span id="line-588">  }</span>
-<span class="source-line-no">589</span><span id="line-589"></span>
-<span class="source-line-no">590</span><span id="line-590">  public static FileStatus[] getRecoveredHFiles(final FileSystem rootFS, final Path regionDir,</span>
-<span class="source-line-no">591</span><span id="line-591">    String familyName) throws IOException {</span>
-<span class="source-line-no">592</span><span id="line-592">    Path dir = getRecoveredHFilesDir(regionDir, familyName);</span>
-<span class="source-line-no">593</span><span id="line-593">    return CommonFSUtils.listStatus(rootFS, dir);</span>
-<span class="source-line-no">594</span><span id="line-594">  }</span>
-<span class="source-line-no">595</span><span id="line-595">}</span>
+<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.CellUtil;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.ExtendedCell;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.ExtendedCellScanner;</span>
+<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.HConstants;</span>
+<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.client.Delete;</span>
+<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.client.Durability;</span>
+<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.client.Mutation;</span>
+<span class="source-line-no">047</span><span id="line-47">import org.apache.hadoop.hbase.client.Put;</span>
+<span class="source-line-no">048</span><span id="line-48">import org.apache.hadoop.hbase.client.RegionInfo;</span>
+<span class="source-line-no">049</span><span id="line-49">import org.apache.hadoop.hbase.client.Row;</span>
+<span class="source-line-no">050</span><span id="line-50">import org.apache.hadoop.hbase.regionserver.HRegion;</span>
+<span class="source-line-no">051</span><span id="line-51">import org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL;</span>
+<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.util.Bytes;</span>
+<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.util.CommonFSUtils;</span>
+<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
+<span class="source-line-no">055</span><span id="line-55">import org.apache.hadoop.hbase.util.FSUtils;</span>
+<span class="source-line-no">056</span><span id="line-56">import org.apache.hadoop.hbase.util.IOExceptionSupplier;</span>
+<span class="source-line-no">057</span><span id="line-57">import org.apache.hadoop.hbase.util.Pair;</span>
+<span class="source-line-no">058</span><span id="line-58">import org.apache.hadoop.hbase.zookeeper.ZKSplitLog;</span>
+<span class="source-line-no">059</span><span id="line-59">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">060</span><span id="line-60">import org.slf4j.Logger;</span>
+<span class="source-line-no">061</span><span id="line-61">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">062</span><span id="line-62"></span>
+<span class="source-line-no">063</span><span id="line-63">import org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos;</span>
+<span class="source-line-no">064</span><span id="line-64">import org.apache.hadoop.hbase.shaded.protobuf.generated.ClientProtos;</span>
+<span class="source-line-no">065</span><span id="line-65">import org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos;</span>
+<span class="source-line-no">066</span><span id="line-66"></span>
+<span class="source-line-no">067</span><span id="line-67">/**</span>
+<span class="source-line-no">068</span><span id="line-68"> * This class provides static methods to support WAL splitting related works</span>
+<span class="source-line-no">069</span><span id="line-69"> */</span>
+<span class="source-line-no">070</span><span id="line-70">@InterfaceAudience.Private</span>
+<span class="source-line-no">071</span><span id="line-71">public final class WALSplitUtil {</span>
+<span class="source-line-no">072</span><span id="line-72">  private static final Logger LOG = LoggerFactory.getLogger(WALSplitUtil.class);</span>
+<span class="source-line-no">073</span><span id="line-73"></span>
+<span class="source-line-no">074</span><span id="line-74">  private static final Pattern EDITFILES_NAME_PATTERN = Pattern.compile("-?[0-9]+");</span>
+<span class="source-line-no">075</span><span id="line-75">  private static final String RECOVERED_LOG_TMPFILE_SUFFIX = ".temp";</span>
+<span class="source-line-no">076</span><span id="line-76">  private static final String SEQUENCE_ID_FILE_SUFFIX = ".seqid";</span>
+<span class="source-line-no">077</span><span id="line-77">  private static final String OLD_SEQUENCE_ID_FILE_SUFFIX = "_seqid";</span>
+<span class="source-line-no">078</span><span id="line-78">  private static final int SEQUENCE_ID_FILE_SUFFIX_LENGTH = SEQUENCE_ID_FILE_SUFFIX.length();</span>
+<span class="source-line-no">079</span><span id="line-79"></span>
+<span class="source-line-no">080</span><span id="line-80">  private WALSplitUtil() {</span>
+<span class="source-line-no">081</span><span id="line-81">  }</span>
+<span class="source-line-no">082</span><span id="line-82"></span>
+<span class="source-line-no">083</span><span id="line-83">  /**</span>
+<span class="source-line-no">084</span><span id="line-84">   * Completes the work done by splitLogFile by archiving logs</span>
+<span class="source-line-no">085</span><span id="line-85">   * &lt;p&gt;</span>
+<span class="source-line-no">086</span><span id="line-86">   * It is invoked by SplitLogManager once it knows that one of the SplitLogWorkers have completed</span>
+<span class="source-line-no">087</span><span id="line-87">   * the splitLogFile() part. If the master crashes then this function might get called multiple</span>
+<span class="source-line-no">088</span><span id="line-88">   * times.</span>
+<span class="source-line-no">089</span><span id="line-89">   * &lt;p&gt;</span>
+<span class="source-line-no">090</span><span id="line-90">   */</span>
+<span class="source-line-no">091</span><span id="line-91">  public static void finishSplitLogFile(String logfile, Configuration conf) throws IOException {</span>
+<span class="source-line-no">092</span><span id="line-92">    Path walDir = CommonFSUtils.getWALRootDir(conf);</span>
+<span class="source-line-no">093</span><span id="line-93">    Path oldLogDir = new Path(walDir, HConstants.HREGION_OLDLOGDIR_NAME);</span>
+<span class="source-line-no">094</span><span id="line-94">    Path walPath;</span>
+<span class="source-line-no">095</span><span id="line-95">    if (CommonFSUtils.isStartingWithPath(walDir, logfile)) {</span>
+<span class="source-line-no">096</span><span id="line-96">      walPath = new Path(logfile);</span>
+<span class="source-line-no">097</span><span id="line-97">    } else {</span>
+<span class="source-line-no">098</span><span id="line-98">      walPath = new Path(walDir, logfile);</span>
+<span class="source-line-no">099</span><span id="line-99">    }</span>
+<span class="source-line-no">100</span><span id="line-100">    FileSystem walFS = walDir.getFileSystem(conf);</span>
+<span class="source-line-no">101</span><span id="line-101">    boolean corrupt = ZKSplitLog.isCorrupted(walDir, walPath.getName(), walFS);</span>
+<span class="source-line-no">102</span><span id="line-102">    archive(walPath, corrupt, oldLogDir, walFS, conf);</span>
+<span class="source-line-no">103</span><span id="line-103">    Path stagingDir = ZKSplitLog.getSplitLogDir(walDir, walPath.getName());</span>
+<span class="source-line-no">104</span><span id="line-104">    walFS.delete(stagingDir, true);</span>
+<span class="source-line-no">105</span><span id="line-105">  }</span>
+<span class="source-line-no">106</span><span id="line-106"></span>
+<span class="source-line-no">107</span><span id="line-107">  /**</span>
+<span class="source-line-no">108</span><span id="line-108">   * Moves processed logs to a oldLogDir after successful processing Moves corrupted logs (any log</span>
+<span class="source-line-no">109</span><span id="line-109">   * that couldn't be successfully parsed to corruptDir (.corrupt) for later investigation</span>
+<span class="source-line-no">110</span><span id="line-110">   */</span>
+<span class="source-line-no">111</span><span id="line-111">  static void archive(final Path wal, final boolean corrupt, final Path oldWALDir,</span>
+<span class="source-line-no">112</span><span id="line-112">    final FileSystem walFS, final Configuration conf) throws IOException {</span>
+<span class="source-line-no">113</span><span id="line-113">    Path dir;</span>
+<span class="source-line-no">114</span><span id="line-114">    Path target;</span>
+<span class="source-line-no">115</span><span id="line-115">    if (corrupt) {</span>
+<span class="source-line-no">116</span><span id="line-116">      dir = new Path(CommonFSUtils.getWALRootDir(conf), HConstants.CORRUPT_DIR_NAME);</span>
+<span class="source-line-no">117</span><span id="line-117">      if (conf.get("hbase.regionserver.hlog.splitlog.corrupt.dir") != null) {</span>
+<span class="source-line-no">118</span><span id="line-118">        LOG.warn("hbase.regionserver.hlog.splitlog.corrupt.dir is deprecated. Default to {}", dir);</span>
+<span class="source-line-no">119</span><span id="line-119">      }</span>
+<span class="source-line-no">120</span><span id="line-120">      target = new Path(dir, wal.getName());</span>
+<span class="source-line-no">121</span><span id="line-121">    } else {</span>
+<span class="source-line-no">122</span><span id="line-122">      dir = oldWALDir;</span>
+<span class="source-line-no">123</span><span id="line-123">      target = AbstractFSWAL.getWALArchivePath(oldWALDir, wal);</span>
+<span class="source-line-no">124</span><span id="line-124">    }</span>
+<span class="source-line-no">125</span><span id="line-125">    mkdir(walFS, dir);</span>
+<span class="source-line-no">126</span><span id="line-126">    moveWAL(walFS, wal, target);</span>
+<span class="source-line-no">127</span><span id="line-127">  }</span>
+<span class="source-line-no">128</span><span id="line-128"></span>
+<span class="source-line-no">129</span><span id="line-129">  private static void mkdir(FileSystem fs, Path dir) throws IOException {</span>
+<span class="source-line-no">130</span><span id="line-130">    if (!fs.mkdirs(dir)) {</span>
+<span class="source-line-no">131</span><span id="line-131">      LOG.warn("Failed mkdir {}", dir);</span>
+<span class="source-line-no">132</span><span id="line-132">    }</span>
+<span class="source-line-no">133</span><span id="line-133">  }</span>
+<span class="source-line-no">134</span><span id="line-134"></span>
+<span class="source-line-no">135</span><span id="line-135">  /**</span>
+<span class="source-line-no">136</span><span id="line-136">   * Move WAL. Used to move processed WALs to archive or bad WALs to corrupt WAL dir. WAL may have</span>
+<span class="source-line-no">137</span><span id="line-137">   * already been moved; makes allowance.</span>
+<span class="source-line-no">138</span><span id="line-138">   */</span>
+<span class="source-line-no">139</span><span id="line-139">  public static void moveWAL(FileSystem fs, Path p, Path targetDir) throws IOException {</span>
+<span class="source-line-no">140</span><span id="line-140">    if (fs.exists(p)) {</span>
+<span class="source-line-no">141</span><span id="line-141">      if (!CommonFSUtils.renameAndSetModifyTime(fs, p, targetDir)) {</span>
+<span class="source-line-no">142</span><span id="line-142">        LOG.warn("Failed move of {} to {}", p, targetDir);</span>
+<span class="source-line-no">143</span><span id="line-143">      } else {</span>
+<span class="source-line-no">144</span><span id="line-144">        LOG.info("Moved {} to {}", p, targetDir);</span>
+<span class="source-line-no">145</span><span id="line-145">      }</span>
+<span class="source-line-no">146</span><span id="line-146">    }</span>
+<span class="source-line-no">147</span><span id="line-147">  }</span>
+<span class="source-line-no">148</span><span id="line-148"></span>
+<span class="source-line-no">149</span><span id="line-149">  /**</span>
+<span class="source-line-no">150</span><span id="line-150">   * Path to a file under RECOVERED_EDITS_DIR directory of the region found in &lt;code&gt;logEntry&lt;/code&gt;</span>
+<span class="source-line-no">151</span><span id="line-151">   * named for the sequenceid in the passed &lt;code&gt;logEntry&lt;/code&gt;: e.g.</span>
+<span class="source-line-no">152</span><span id="line-152">   * /hbase/some_table/2323432434/recovered.edits/2332. This method also ensures existence of</span>
+<span class="source-line-no">153</span><span id="line-153">   * RECOVERED_EDITS_DIR under the region creating it if necessary. And also set storage policy for</span>
+<span class="source-line-no">154</span><span id="line-154">   * RECOVERED_EDITS_DIR if WAL_STORAGE_POLICY is configured.</span>
+<span class="source-line-no">155</span><span id="line-155">   * @param tableName          the table name</span>
+<span class="source-line-no">156</span><span id="line-156">   * @param encodedRegionName  the encoded region name</span>
+<span class="source-line-no">157</span><span id="line-157">   * @param seqId              the sequence id which used to generate file name</span>
+<span class="source-line-no">158</span><span id="line-158">   * @param fileNameBeingSplit the file being split currently. Used to generate tmp file name.</span>
+<span class="source-line-no">159</span><span id="line-159">   * @param tmpDirName         of the directory used to sideline old recovered edits file</span>
+<span class="source-line-no">160</span><span id="line-160">   * @param conf               configuration</span>
+<span class="source-line-no">161</span><span id="line-161">   * @return Path to file into which to dump split log edits.</span>
+<span class="source-line-no">162</span><span id="line-162">   */</span>
+<span class="source-line-no">163</span><span id="line-163">  @SuppressWarnings("deprecation")</span>
+<span class="source-line-no">164</span><span id="line-164">  static Path getRegionSplitEditsPath(TableName tableName, byte[] encodedRegionName, long seqId,</span>
+<span class="source-line-no">165</span><span id="line-165">    String fileNameBeingSplit, String tmpDirName, Configuration conf) throws IOException {</span>
+<span class="source-line-no">166</span><span id="line-166">    FileSystem walFS = CommonFSUtils.getWALFileSystem(conf);</span>
+<span class="source-line-no">167</span><span id="line-167">    Path tableDir = CommonFSUtils.getWALTableDir(conf, tableName);</span>
+<span class="source-line-no">168</span><span id="line-168">    String encodedRegionNameStr = Bytes.toString(encodedRegionName);</span>
+<span class="source-line-no">169</span><span id="line-169">    Path regionDir = HRegion.getRegionDir(tableDir, encodedRegionNameStr);</span>
+<span class="source-line-no">170</span><span id="line-170">    Path dir = getRegionDirRecoveredEditsDir(regionDir);</span>
+<span class="source-line-no">171</span><span id="line-171"></span>
+<span class="source-line-no">172</span><span id="line-172">    if (walFS.exists(dir) &amp;&amp; walFS.isFile(dir)) {</span>
+<span class="source-line-no">173</span><span id="line-173">      Path tmp = new Path(tmpDirName);</span>
+<span class="source-line-no">174</span><span id="line-174">      if (!walFS.exists(tmp)) {</span>
+<span class="source-line-no">175</span><span id="line-175">        walFS.mkdirs(tmp);</span>
+<span class="source-line-no">176</span><span id="line-176">      }</span>
+<span class="source-line-no">177</span><span id="line-177">      tmp = new Path(tmp, HConstants.RECOVERED_EDITS_DIR + "_" + encodedRegionNameStr);</span>
+<span class="source-line-no">178</span><span id="line-178">      LOG.warn("Found existing old file: {}. It could be some "</span>
+<span class="source-line-no">179</span><span id="line-179">        + "leftover of an old installation. It should be a folder instead. " + "So moving it to {}",</span>
+<span class="source-line-no">180</span><span id="line-180">        dir, tmp);</span>
+<span class="source-line-no">181</span><span id="line-181">      if (!walFS.rename(dir, tmp)) {</span>
+<span class="source-line-no">182</span><span id="line-182">        LOG.warn("Failed to sideline old file {}", dir);</span>
+<span class="source-line-no">183</span><span id="line-183">      }</span>
+<span class="source-line-no">184</span><span id="line-184">    }</span>
+<span class="source-line-no">185</span><span id="line-185"></span>
+<span class="source-line-no">186</span><span id="line-186">    if (!walFS.exists(dir) &amp;&amp; !walFS.mkdirs(dir)) {</span>
+<span class="source-line-no">187</span><span id="line-187">      LOG.warn("mkdir failed on {}", dir);</span>
+<span class="source-line-no">188</span><span id="line-188">    } else {</span>
+<span class="source-line-no">189</span><span id="line-189">      String storagePolicy =</span>
+<span class="source-line-no">190</span><span id="line-190">        conf.get(HConstants.WAL_STORAGE_POLICY, HConstants.DEFAULT_WAL_STORAGE_POLICY);</span>
+<span class="source-line-no">191</span><span id="line-191">      CommonFSUtils.setStoragePolicy(walFS, dir, storagePolicy);</span>
+<span class="source-line-no">192</span><span id="line-192">    }</span>
+<span class="source-line-no">193</span><span id="line-193">    // Append fileBeingSplit to prevent name conflict since we may have duplicate wal entries now.</span>
+<span class="source-line-no">194</span><span id="line-194">    // Append file name ends with RECOVERED_LOG_TMPFILE_SUFFIX to ensure</span>
+<span class="source-line-no">195</span><span id="line-195">    // region's replayRecoveredEdits will not delete it</span>
+<span class="source-line-no">196</span><span id="line-196">    String fileName = formatRecoveredEditsFileName(seqId);</span>
+<span class="source-line-no">197</span><span id="line-197">    fileName = getTmpRecoveredEditsFileName(fileName + "-" + fileNameBeingSplit);</span>
+<span class="source-line-no">198</span><span id="line-198">    return new Path(dir, fileName);</span>
+<span class="source-line-no">199</span><span id="line-199">  }</span>
+<span class="source-line-no">200</span><span id="line-200"></span>
+<span class="source-line-no">201</span><span id="line-201">  private static String getTmpRecoveredEditsFileName(String fileName) {</span>
+<span class="source-line-no">202</span><span id="line-202">    return fileName + RECOVERED_LOG_TMPFILE_SUFFIX;</span>
+<span class="source-line-no">203</span><span id="line-203">  }</span>
+<span class="source-line-no">204</span><span id="line-204"></span>
+<span class="source-line-no">205</span><span id="line-205">  /**</span>
+<span class="source-line-no">206</span><span id="line-206">   * Get the completed recovered edits file path, renaming it to be by last edit in the file from</span>
+<span class="source-line-no">207</span><span id="line-207">   * its first edit. Then we could use the name to skip recovered edits when doing</span>
+<span class="source-line-no">208</span><span id="line-208">   * HRegion#replayRecoveredEditsIfAny(Map, CancelableProgressable, MonitoredTask).</span>
+<span class="source-line-no">209</span><span id="line-209">   * @return dstPath take file's last edit log seq num as the name</span>
+<span class="source-line-no">210</span><span id="line-210">   */</span>
+<span class="source-line-no">211</span><span id="line-211">  static Path getCompletedRecoveredEditsFilePath(Path srcPath, long maximumEditWALSeqNum) {</span>
+<span class="source-line-no">212</span><span id="line-212">    String fileName = formatRecoveredEditsFileName(maximumEditWALSeqNum);</span>
+<span class="source-line-no">213</span><span id="line-213">    return new Path(srcPath.getParent(), fileName);</span>
+<span class="source-line-no">214</span><span id="line-214">  }</span>
+<span class="source-line-no">215</span><span id="line-215"></span>
+<span class="source-line-no">216</span><span id="line-216">  static String formatRecoveredEditsFileName(final long seqid) {</span>
+<span class="source-line-no">217</span><span id="line-217">    return String.format("%019d", seqid);</span>
+<span class="source-line-no">218</span><span id="line-218">  }</span>
+<span class="source-line-no">219</span><span id="line-219"></span>
+<span class="source-line-no">220</span><span id="line-220">  /**</span>
+<span class="source-line-no">221</span><span id="line-221">   * @param regionDir This regions directory in the filesystem.</span>
+<span class="source-line-no">222</span><span id="line-222">   * @return The directory that holds recovered edits files for the region &lt;code&gt;regionDir&lt;/code&gt;</span>
+<span class="source-line-no">223</span><span id="line-223">   */</span>
+<span class="source-line-no">224</span><span id="line-224">  public static Path getRegionDirRecoveredEditsDir(final Path regionDir) {</span>
+<span class="source-line-no">225</span><span id="line-225">    return new Path(regionDir, HConstants.RECOVERED_EDITS_DIR);</span>
+<span class="source-line-no">226</span><span id="line-226">  }</span>
+<span class="source-line-no">227</span><span id="line-227"></span>
+<span class="source-line-no">228</span><span id="line-228">  /**</span>
+<span class="source-line-no">229</span><span id="line-229">   * Check whether there is recovered.edits in the region dir</span>
+<span class="source-line-no">230</span><span id="line-230">   * @param conf       conf</span>
+<span class="source-line-no">231</span><span id="line-231">   * @param regionInfo the region to check</span>
+<span class="source-line-no">232</span><span id="line-232">   * @return true if recovered.edits exist in the region dir</span>
+<span class="source-line-no">233</span><span id="line-233">   */</span>
+<span class="source-line-no">234</span><span id="line-234">  public static boolean hasRecoveredEdits(final Configuration conf, final RegionInfo regionInfo)</span>
+<span class="source-line-no">235</span><span id="line-235">    throws IOException {</span>
+<span class="source-line-no">236</span><span id="line-236">    // No recovered.edits for non default replica regions</span>
+<span class="source-line-no">237</span><span id="line-237">    if (regionInfo.getReplicaId() != RegionInfo.DEFAULT_REPLICA_ID) {</span>
+<span class="source-line-no">238</span><span id="line-238">      return false;</span>
+<span class="source-line-no">239</span><span id="line-239">    }</span>
+<span class="source-line-no">240</span><span id="line-240">    // Only default replica region can reach here, so we can use regioninfo</span>
+<span class="source-line-no">241</span><span id="line-241">    // directly without converting it to default replica's regioninfo.</span>
+<span class="source-line-no">242</span><span id="line-242">    Path regionWALDir =</span>
+<span class="source-line-no">243</span><span id="line-243">      CommonFSUtils.getWALRegionDir(conf, regionInfo.getTable(), regionInfo.getEncodedName());</span>
+<span class="source-line-no">244</span><span id="line-244">    Path regionDir = FSUtils.getRegionDirFromRootDir(CommonFSUtils.getRootDir(conf), regionInfo);</span>
+<span class="source-line-no">245</span><span id="line-245">    Path wrongRegionWALDir =</span>
+<span class="source-line-no">246</span><span id="line-246">      CommonFSUtils.getWrongWALRegionDir(conf, regionInfo.getTable(), regionInfo.getEncodedName());</span>
+<span class="source-line-no">247</span><span id="line-247">    FileSystem walFs = CommonFSUtils.getWALFileSystem(conf);</span>
+<span class="source-line-no">248</span><span id="line-248">    FileSystem rootFs = CommonFSUtils.getRootDirFileSystem(conf);</span>
+<span class="source-line-no">249</span><span id="line-249">    NavigableSet&lt;Path&gt; files = getSplitEditFilesSorted(walFs, regionWALDir);</span>
+<span class="source-line-no">250</span><span id="line-250">    if (!files.isEmpty()) {</span>
+<span class="source-line-no">251</span><span id="line-251">      return true;</span>
+<span class="source-line-no">252</span><span id="line-252">    }</span>
+<span class="source-line-no">253</span><span id="line-253">    files = getSplitEditFilesSorted(rootFs, regionDir);</span>
+<span class="source-line-no">254</span><span id="line-254">    if (!files.isEmpty()) {</span>
+<span class="source-line-no">255</span><span id="line-255">      return true;</span>
+<span class="source-line-no">256</span><span id="line-256">    }</span>
+<span class="source-line-no">257</span><span id="line-257">    files = getSplitEditFilesSorted(walFs, wrongRegionWALDir);</span>
+<span class="source-line-no">258</span><span id="line-258">    return !files.isEmpty();</span>
+<span class="source-line-no">259</span><span id="line-259">  }</span>
+<span class="source-line-no">260</span><span id="line-260"></span>
+<span class="source-line-no">261</span><span id="line-261">  /**</span>
+<span class="source-line-no">262</span><span id="line-262">   * This method will check 3 places for finding the max sequence id file. One is the expected</span>
+<span class="source-line-no">263</span><span id="line-263">   * place, another is the old place under the region directory, and the last one is the wrong one</span>
+<span class="source-line-no">264</span><span id="line-264">   * we introduced in HBASE-20734. See HBASE-22617 for more details.</span>
+<span class="source-line-no">265</span><span id="line-265">   * &lt;p/&gt;</span>
+<span class="source-line-no">266</span><span id="line-266">   * Notice that, you should always call this method instead of</span>
+<span class="source-line-no">267</span><span id="line-267">   * {@link #getMaxRegionSequenceId(FileSystem, Path)} until 4.0.0 release.</span>
+<span class="source-line-no">268</span><span id="line-268">   * @deprecated Only for compatibility, will be removed in 4.0.0.</span>
+<span class="source-line-no">269</span><span id="line-269">   */</span>
+<span class="source-line-no">270</span><span id="line-270">  @Deprecated</span>
+<span class="source-line-no">271</span><span id="line-271">  public static long getMaxRegionSequenceId(Configuration conf, RegionInfo region,</span>
+<span class="source-line-no">272</span><span id="line-272">    IOExceptionSupplier&lt;FileSystem&gt; rootFsSupplier, IOExceptionSupplier&lt;FileSystem&gt; walFsSupplier)</span>
+<span class="source-line-no">273</span><span id="line-273">    throws IOException {</span>
+<span class="source-line-no">274</span><span id="line-274">    FileSystem rootFs = rootFsSupplier.get();</span>
+<span class="source-line-no">275</span><span id="line-275">    FileSystem walFs = walFsSupplier.get();</span>
+<span class="source-line-no">276</span><span id="line-276">    Path regionWALDir =</span>
+<span class="source-line-no">277</span><span id="line-277">      CommonFSUtils.getWALRegionDir(conf, region.getTable(), region.getEncodedName());</span>
+<span class="source-line-no">278</span><span id="line-278">    // This is the old place where we store max sequence id file</span>
+<span class="source-line-no">279</span><span id="line-279">    Path regionDir = FSUtils.getRegionDirFromRootDir(CommonFSUtils.getRootDir(conf), region);</span>
+<span class="source-line-no">280</span><span id="line-280">    // This is for HBASE-20734, where we use a wrong directory, see HBASE-22617 for more details.</span>
+<span class="source-line-no">281</span><span id="line-281">    Path wrongRegionWALDir =</span>
+<span class="source-line-no">282</span><span id="line-282">      CommonFSUtils.getWrongWALRegionDir(conf, region.getTable(), region.getEncodedName());</span>
+<span class="source-line-no">283</span><span id="line-283">    long maxSeqId = getMaxRegionSequenceId(walFs, regionWALDir);</span>
+<span class="source-line-no">284</span><span id="line-284">    maxSeqId = Math.max(maxSeqId, getMaxRegionSequenceId(rootFs, regionDir));</span>
+<span class="source-line-no">285</span><span id="line-285">    maxSeqId = Math.max(maxSeqId, getMaxRegionSequenceId(walFs, wrongRegionWALDir));</span>
+<span class="source-line-no">286</span><span id="line-286">    return maxSeqId;</span>
+<span class="source-line-no">287</span><span id="line-287">  }</span>
+<span class="source-line-no">288</span><span id="line-288"></span>
+<span class="source-line-no">289</span><span id="line-289">  /**</span>
+<span class="source-line-no">290</span><span id="line-290">   * Returns sorted set of edit files made by splitter, excluding files with '.temp' suffix.</span>
+<span class="source-line-no">291</span><span id="line-291">   * @param walFS     WAL FileSystem used to retrieving split edits files.</span>
+<span class="source-line-no">292</span><span id="line-292">   * @param regionDir WAL region dir to look for recovered edits files under.</span>
+<span class="source-line-no">293</span><span id="line-293">   * @return Files in passed &lt;code&gt;regionDir&lt;/code&gt; as a sorted set.</span>
+<span class="source-line-no">294</span><span id="line-294">   */</span>
+<span class="source-line-no">295</span><span id="line-295">  public static NavigableSet&lt;Path&gt; getSplitEditFilesSorted(final FileSystem walFS,</span>
+<span class="source-line-no">296</span><span id="line-296">    final Path regionDir) throws IOException {</span>
+<span class="source-line-no">297</span><span id="line-297">    NavigableSet&lt;Path&gt; filesSorted = new TreeSet&lt;&gt;();</span>
+<span class="source-line-no">298</span><span id="line-298">    Path editsdir = getRegionDirRecoveredEditsDir(regionDir);</span>
+<span class="source-line-no">299</span><span id="line-299">    if (!walFS.exists(editsdir)) {</span>
+<span class="source-line-no">300</span><span id="line-300">      return filesSorted;</span>
+<span class="source-line-no">301</span><span id="line-301">    }</span>
+<span class="source-line-no">302</span><span id="line-302">    FileStatus[] files = CommonFSUtils.listStatus(walFS, editsdir, new PathFilter() {</span>
+<span class="source-line-no">303</span><span id="line-303">      @Override</span>
+<span class="source-line-no">304</span><span id="line-304">      public boolean accept(Path p) {</span>
+<span class="source-line-no">305</span><span id="line-305">        boolean result = false;</span>
+<span class="source-line-no">306</span><span id="line-306">        try {</span>
+<span class="source-line-no">307</span><span id="line-307">          // Return files and only files that match the editfile names pattern.</span>
+<span class="source-line-no">308</span><span id="line-308">          // There can be other files in this directory other than edit files.</span>
+<span class="source-line-no">309</span><span id="line-309">          // In particular, on error, we'll move aside the bad edit file giving</span>
+<span class="source-line-no">310</span><span id="line-310">          // it a timestamp suffix. See moveAsideBadEditsFile.</span>
+<span class="source-line-no">311</span><span id="line-311">          Matcher m = EDITFILES_NAME_PATTERN.matcher(p.getName());</span>
+<span class="source-line-no">312</span><span id="line-312">          result = walFS.isFile(p) &amp;&amp; m.matches();</span>
+<span class="source-line-no">313</span><span id="line-313">          // Skip the file whose name ends with RECOVERED_LOG_TMPFILE_SUFFIX,</span>
+<span class="source-line-no">314</span><span id="line-314">          // because it means splitwal thread is writting this file.</span>
+<span class="source-line-no">315</span><span id="line-315">          if (p.getName().endsWith(RECOVERED_LOG_TMPFILE_SUFFIX)) {</span>
+<span class="source-line-no">316</span><span id="line-316">            result = false;</span>
+<span class="source-line-no">317</span><span id="line-317">          }</span>
+<span class="source-line-no">318</span><span id="line-318">          // Skip SeqId Files</span>
+<span class="source-line-no">319</span><span id="line-319">          if (isSequenceIdFile(p)) {</span>
+<span class="source-line-no">320</span><span id="line-320">            result = false;</span>
+<span class="source-line-no">321</span><span id="line-321">          }</span>
+<span class="source-line-no">322</span><span id="line-322">        } catch (IOException e) {</span>
+<span class="source-line-no">323</span><span id="line-323">          LOG.warn("Failed isFile check on {}", p, e);</span>
+<span class="source-line-no">324</span><span id="line-324">        }</span>
+<span class="source-line-no">325</span><span id="line-325">        return result;</span>
+<span class="source-line-no">326</span><span id="line-326">      }</span>
+<span class="source-line-no">327</span><span id="line-327">    });</span>
+<span class="source-line-no">328</span><span id="line-328">    if (ArrayUtils.isNotEmpty(files)) {</span>
+<span class="source-line-no">329</span><span id="line-329">      Arrays.asList(files).forEach(status -&gt; filesSorted.add(status.getPath()));</span>
+<span class="source-line-no">330</span><span id="line-330">    }</span>
+<span class="source-line-no">331</span><span id="line-331">    return filesSorted;</span>
+<span class="source-line-no">332</span><span id="line-332">  }</span>
+<span class="source-line-no">333</span><span id="line-333"></span>
+<span class="source-line-no">334</span><span id="line-334">  /**</span>
+<span class="source-line-no">335</span><span id="line-335">   * Move aside a bad edits file.</span>
+<span class="source-line-no">336</span><span id="line-336">   * @param fs    the file system used to rename bad edits file.</span>
+<span class="source-line-no">337</span><span id="line-337">   * @param edits Edits file to move aside.</span>
+<span class="source-line-no">338</span><span id="line-338">   * @return The name of the moved aside file.</span>
+<span class="source-line-no">339</span><span id="line-339">   */</span>
+<span class="source-line-no">340</span><span id="line-340">  public static Path moveAsideBadEditsFile(final FileSystem fs, final Path edits)</span>
+<span class="source-line-no">341</span><span id="line-341">    throws IOException {</span>
+<span class="source-line-no">342</span><span id="line-342">    Path moveAsideName =</span>
+<span class="source-line-no">343</span><span id="line-343">      new Path(edits.getParent(), edits.getName() + "." + EnvironmentEdgeManager.currentTime());</span>
+<span class="source-line-no">344</span><span id="line-344">    if (!fs.rename(edits, moveAsideName)) {</span>
+<span class="source-line-no">345</span><span id="line-345">      LOG.warn("Rename failed from {} to {}", edits, moveAsideName);</span>
+<span class="source-line-no">346</span><span id="line-346">    }</span>
+<span class="source-line-no">347</span><span id="line-347">    return moveAsideName;</span>
+<span class="source-line-no">348</span><span id="line-348">  }</span>
+<span class="source-line-no">349</span><span id="line-349"></span>
+<span class="source-line-no">350</span><span id="line-350">  /**</span>
+<span class="source-line-no">351</span><span id="line-351">   * Is the given file a region open sequence id file.</span>
+<span class="source-line-no">352</span><span id="line-352">   */</span>
+<span class="source-line-no">353</span><span id="line-353">  public static boolean isSequenceIdFile(final Path file) {</span>
+<span class="source-line-no">354</span><span id="line-354">    return file.getName().endsWith(SEQUENCE_ID_FILE_SUFFIX)</span>
+<span class="source-line-no">355</span><span id="line-355">      || file.getName().endsWith(OLD_SEQUENCE_ID_FILE_SUFFIX);</span>
+<span class="source-line-no">356</span><span id="line-356">  }</span>
+<span class="source-line-no">357</span><span id="line-357"></span>
+<span class="source-line-no">358</span><span id="line-358">  private static FileStatus[] getSequenceIdFiles(FileSystem walFS, Path regionDir)</span>
+<span class="source-line-no">359</span><span id="line-359">    throws IOException {</span>
+<span class="source-line-no">360</span><span id="line-360">    // TODO: Why are we using a method in here as part of our normal region open where</span>
+<span class="source-line-no">361</span><span id="line-361">    // there is no splitting involved? Fix. St.Ack 01/20/2017.</span>
+<span class="source-line-no">362</span><span id="line-362">    Path editsDir = getRegionDirRecoveredEditsDir(regionDir);</span>
+<span class="source-line-no">363</span><span id="line-363">    try {</span>
+<span class="source-line-no">364</span><span id="line-364">      FileStatus[] files = walFS.listStatus(editsDir, WALSplitUtil::isSequenceIdFile);</span>
+<span class="source-line-no">365</span><span id="line-365">      return files != null ? files : new FileStatus[0];</span>
+<span class="source-line-no">366</span><span id="line-366">    } catch (FileNotFoundException e) {</span>
+<span class="source-line-no">367</span><span id="line-367">      return new FileStatus[0];</span>
+<span class="source-line-no">368</span><span id="line-368">    }</span>
+<span class="source-line-no">369</span><span id="line-369">  }</span>
+<span class="source-line-no">370</span><span id="line-370"></span>
+<span class="source-line-no">371</span><span id="line-371">  private static long getMaxSequenceId(FileStatus[] files) {</span>
+<span class="source-line-no">372</span><span id="line-372">    long maxSeqId = -1L;</span>
+<span class="source-line-no">373</span><span id="line-373">    for (FileStatus file : files) {</span>
+<span class="source-line-no">374</span><span id="line-374">      String fileName = file.getPath().getName();</span>
+<span class="source-line-no">375</span><span id="line-375">      try {</span>
+<span class="source-line-no">376</span><span id="line-376">        maxSeqId = Math.max(maxSeqId, Long</span>
+<span class="source-line-no">377</span><span id="line-377">          .parseLong(fileName.substring(0, fileName.length() - SEQUENCE_ID_FILE_SUFFIX_LENGTH)));</span>
+<span class="source-line-no">378</span><span id="line-378">      } catch (NumberFormatException ex) {</span>
+<span class="source-line-no">379</span><span id="line-379">        LOG.warn("Invalid SeqId File Name={}", fileName);</span>
+<span class="source-line-no">380</span><span id="line-380">      }</span>
+<span class="source-line-no">381</span><span id="line-381">    }</span>
+<span class="source-line-no">382</span><span id="line-382">    return maxSeqId;</span>
+<span class="source-line-no">383</span><span id="line-383">  }</span>
+<span class="source-line-no">384</span><span id="line-384"></span>
+<span class="source-line-no">385</span><span id="line-385">  /**</span>
+<span class="source-line-no">386</span><span id="line-386">   * Get the max sequence id which is stored in the region directory. -1 if none.</span>
+<span class="source-line-no">387</span><span id="line-387">   */</span>
+<span class="source-line-no">388</span><span id="line-388">  public static long getMaxRegionSequenceId(FileSystem walFS, Path regionDir) throws IOException {</span>
+<span class="source-line-no">389</span><span id="line-389">    return getMaxSequenceId(getSequenceIdFiles(walFS, regionDir));</span>
+<span class="source-line-no">390</span><span id="line-390">  }</span>
+<span class="source-line-no">391</span><span id="line-391"></span>
+<span class="source-line-no">392</span><span id="line-392">  /**</span>
+<span class="source-line-no">393</span><span id="line-393">   * Create a file with name as region's max sequence id</span>
+<span class="source-line-no">394</span><span id="line-394">   */</span>
+<span class="source-line-no">395</span><span id="line-395">  public static void writeRegionSequenceIdFile(FileSystem walFS, Path regionDir, long newMaxSeqId)</span>
+<span class="source-line-no">396</span><span id="line-396">    throws IOException {</span>
+<span class="source-line-no">397</span><span id="line-397">    FileStatus[] files = getSequenceIdFiles(walFS, regionDir);</span>
+<span class="source-line-no">398</span><span id="line-398">    long maxSeqId = getMaxSequenceId(files);</span>
+<span class="source-line-no">399</span><span id="line-399">    if (maxSeqId &gt; newMaxSeqId) {</span>
+<span class="source-line-no">400</span><span id="line-400">      throw new IOException("The new max sequence id " + newMaxSeqId</span>
+<span class="source-line-no">401</span><span id="line-401">        + " is less than the old max sequence id " + maxSeqId);</span>
+<span class="source-line-no">402</span><span id="line-402">    }</span>
+<span class="source-line-no">403</span><span id="line-403">    // write a new seqId file</span>
+<span class="source-line-no">404</span><span id="line-404">    Path newSeqIdFile =</span>
+<span class="source-line-no">405</span><span id="line-405">      new Path(getRegionDirRecoveredEditsDir(regionDir), newMaxSeqId + SEQUENCE_ID_FILE_SUFFIX);</span>
+<span class="source-line-no">406</span><span id="line-406">    if (newMaxSeqId != maxSeqId) {</span>
+<span class="source-line-no">407</span><span id="line-407">      try {</span>
+<span class="source-line-no">408</span><span id="line-408">        if (!walFS.createNewFile(newSeqIdFile) &amp;&amp; !walFS.exists(newSeqIdFile)) {</span>
+<span class="source-line-no">409</span><span id="line-409">          throw new IOException("Failed to create SeqId file:" + newSeqIdFile);</span>
+<span class="source-line-no">410</span><span id="line-410">        }</span>
+<span class="source-line-no">411</span><span id="line-411">        LOG.debug("Wrote file={}, newMaxSeqId={}, maxSeqId={}", newSeqIdFile, newMaxSeqId,</span>
+<span class="source-line-no">412</span><span id="line-412">          maxSeqId);</span>
+<span class="source-line-no">413</span><span id="line-413">      } catch (FileAlreadyExistsException ignored) {</span>
+<span class="source-line-no">414</span><span id="line-414">        // latest hdfs throws this exception. it's all right if newSeqIdFile already exists</span>
+<span class="source-line-no">415</span><span id="line-415">      }</span>
+<span class="source-line-no">416</span><span id="line-416">    }</span>
+<span class="source-line-no">417</span><span id="line-417">    // remove old ones</span>
+<span class="source-line-no">418</span><span id="line-418">    for (FileStatus status : files) {</span>
+<span class="source-line-no">419</span><span id="line-419">      if (!newSeqIdFile.equals(status.getPath())) {</span>
+<span class="source-line-no">420</span><span id="line-420">        walFS.delete(status.getPath(), false);</span>
+<span class="source-line-no">421</span><span id="line-421">      }</span>
+<span class="source-line-no">422</span><span id="line-422">    }</span>
+<span class="source-line-no">423</span><span id="line-423">  }</span>
+<span class="source-line-no">424</span><span id="line-424"></span>
+<span class="source-line-no">425</span><span id="line-425">  /** A struct used by getMutationsFromWALEntry */</span>
+<span class="source-line-no">426</span><span id="line-426">  public static class MutationReplay implements Comparable&lt;MutationReplay&gt; {</span>
+<span class="source-line-no">427</span><span id="line-427">    public MutationReplay(ClientProtos.MutationProto.MutationType type, Mutation mutation,</span>
+<span class="source-line-no">428</span><span id="line-428">      long nonceGroup, long nonce) {</span>
+<span class="source-line-no">429</span><span id="line-429">      this.type = type;</span>
+<span class="source-line-no">430</span><span id="line-430">      this.mutation = mutation;</span>
+<span class="source-line-no">431</span><span id="line-431">      if (this.mutation.getDurability() != Durability.SKIP_WAL) {</span>
+<span class="source-line-no">432</span><span id="line-432">        // using ASYNC_WAL for relay</span>
+<span class="source-line-no">433</span><span id="line-433">        this.mutation.setDurability(Durability.ASYNC_WAL);</span>
+<span class="source-line-no">434</span><span id="line-434">      }</span>
+<span class="source-line-no">435</span><span id="line-435">      this.nonceGroup = nonceGroup;</span>
+<span class="source-line-no">436</span><span id="line-436">      this.nonce = nonce;</span>
+<span class="source-line-no">437</span><span id="line-437">    }</span>
+<span class="source-line-no">438</span><span id="line-438"></span>
+<span class="source-line-no">439</span><span id="line-439">    private final ClientProtos.MutationProto.MutationType type;</span>
+<span class="source-line-no">440</span><span id="line-440">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
+<span class="source-line-no">441</span><span id="line-441">    public final Mutation mutation;</span>
+<span class="source-line-no">442</span><span id="line-442">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
+<span class="source-line-no">443</span><span id="line-443">    public final long nonceGroup;</span>
+<span class="source-line-no">444</span><span id="line-444">    @SuppressWarnings("checkstyle:VisibilityModifier")</span>
+<span class="source-line-no">445</span><span id="line-445">    public final long nonce;</span>
+<span class="source-line-no">446</span><span id="line-446"></span>
+<span class="source-line-no">447</span><span id="line-447">    @Override</span>
+<span class="source-line-no">448</span><span id="line-448">    public int compareTo(final MutationReplay d) {</span>
+<span class="source-line-no">449</span><span id="line-449">      return Row.COMPARATOR.compare(mutation, d.mutation);</span>
+<span class="source-line-no">450</span><span id="line-450">    }</span>
+<span class="source-line-no">451</span><span id="line-451"></span>
+<span class="source-line-no">452</span><span id="line-452">    @Override</span>
+<span class="source-line-no">453</span><span id="line-453">    public boolean equals(Object obj) {</span>
+<span class="source-line-no">454</span><span id="line-454">      if (!(obj instanceof MutationReplay)) {</span>
+<span class="source-line-no">455</span><span id="line-455">        return false;</span>
+<span class="source-line-no">456</span><span id="line-456">      } else {</span>
+<span class="source-line-no">457</span><span id="line-457">        return this.compareTo((MutationReplay) obj) == 0;</span>
+<span class="source-line-no">458</span><span id="line-458">      }</span>
+<span class="source-line-no">459</span><span id="line-459">    }</span>
+<span class="source-line-no">460</span><span id="line-460"></span>
+<span class="source-line-no">461</span><span id="line-461">    @Override</span>
+<span class="source-line-no">462</span><span id="line-462">    public int hashCode() {</span>
+<span class="source-line-no">463</span><span id="line-463">      return this.mutation.hashCode();</span>
+<span class="source-line-no">464</span><span id="line-464">    }</span>
+<span class="source-line-no">465</span><span id="line-465"></span>
+<span class="source-line-no">466</span><span id="line-466">    public ClientProtos.MutationProto.MutationType getType() {</span>
+<span class="source-line-no">467</span><span id="line-467">      return type;</span>
+<span class="source-line-no">468</span><span id="line-468">    }</span>
+<span class="source-line-no">469</span><span id="line-469">  }</span>
+<span class="source-line-no">470</span><span id="line-470"></span>
+<span class="source-line-no">471</span><span id="line-471">  /**</span>
+<span class="source-line-no">472</span><span id="line-472">   * This function is used to construct mutations from a WALEntry. It also reconstructs WALKey &amp;amp;</span>
+<span class="source-line-no">473</span><span id="line-473">   * WALEdit from the passed in WALEntry</span>
+<span class="source-line-no">474</span><span id="line-474">   * @param logEntry pair of WALKey and WALEdit instance stores WALKey and WALEdit instances</span>
+<span class="source-line-no">475</span><span id="line-475">   *                 extracted from the passed in WALEntry.</span>
+<span class="source-line-no">476</span><span id="line-476">   * @return list of Pair&amp;lt;MutationType, Mutation&amp;gt; to be replayed</span>
+<span class="source-line-no">477</span><span id="line-477">   * @deprecated Since 3.0.0, will be removed in 4.0.0.</span>
+<span class="source-line-no">478</span><span id="line-478">   */</span>
+<span class="source-line-no">479</span><span id="line-479">  @Deprecated</span>
+<span class="source-line-no">480</span><span id="line-480">  public static List&lt;MutationReplay&gt; getMutationsFromWALEntry(AdminProtos.WALEntry entry,</span>
+<span class="source-line-no">481</span><span id="line-481">    ExtendedCellScanner cells, Pair&lt;WALKey, WALEdit&gt; logEntry, Durability durability)</span>
+<span class="source-line-no">482</span><span id="line-482">    throws IOException {</span>
+<span class="source-line-no">483</span><span id="line-483">    if (entry == null) {</span>
+<span class="source-line-no">484</span><span id="line-484">      // return an empty array</span>
+<span class="source-line-no">485</span><span id="line-485">      return Collections.emptyList();</span>
+<span class="source-line-no">486</span><span id="line-486">    }</span>
+<span class="source-line-no">487</span><span id="line-487"></span>
+<span class="source-line-no">488</span><span id="line-488">    long replaySeqId = (entry.getKey().hasOrigSequenceNumber())</span>
+<span class="source-line-no">489</span><span id="line-489">      ? entry.getKey().getOrigSequenceNumber()</span>
+<span class="source-line-no">490</span><span id="line-490">      : entry.getKey().getLogSequenceNumber();</span>
+<span class="source-line-no">491</span><span id="line-491">    int count = entry.getAssociatedCellCount();</span>
+<span class="source-line-no">492</span><span id="line-492">    List&lt;MutationReplay&gt; mutations = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">493</span><span id="line-493">    Cell previousCell = null;</span>
+<span class="source-line-no">494</span><span id="line-494">    Mutation m = null;</span>
+<span class="source-line-no">495</span><span id="line-495">    WALKeyImpl key = null;</span>
+<span class="source-line-no">496</span><span id="line-496">    WALEdit val = null;</span>
+<span class="source-line-no">497</span><span id="line-497">    if (logEntry != null) {</span>
+<span class="source-line-no">498</span><span id="line-498">      val = new WALEdit();</span>
+<span class="source-line-no">499</span><span id="line-499">    }</span>
+<span class="source-line-no">500</span><span id="line-500"></span>
+<span class="source-line-no">501</span><span id="line-501">    for (int i = 0; i &lt; count; i++) {</span>
+<span class="source-line-no">502</span><span id="line-502">      // Throw index out of bounds if our cell count is off</span>
+<span class="source-line-no">503</span><span id="line-503">      if (!cells.advance()) {</span>
+<span class="source-line-no">504</span><span id="line-504">        throw new ArrayIndexOutOfBoundsException("Expected=" + count + ", index=" + i);</span>
+<span class="source-line-no">505</span><span id="line-505">      }</span>
+<span class="source-line-no">506</span><span id="line-506">      ExtendedCell cell = cells.current();</span>
+<span class="source-line-no">507</span><span id="line-507">      if (val != null) {</span>
+<span class="source-line-no">508</span><span id="line-508">        WALEditInternalHelper.addExtendedCell(val, cell);</span>
+<span class="source-line-no">509</span><span id="line-509">      }</span>
+<span class="source-line-no">510</span><span id="line-510"></span>
+<span class="source-line-no">511</span><span id="line-511">      boolean isNewRowOrType =</span>
+<span class="source-line-no">512</span><span id="line-512">        previousCell == null || previousCell.getTypeByte() != cell.getTypeByte()</span>
+<span class="source-line-no">513</span><span id="line-513">          || !CellUtil.matchingRows(previousCell, cell);</span>
+<span class="source-line-no">514</span><span id="line-514">      if (isNewRowOrType) {</span>
+<span class="source-line-no">515</span><span id="line-515">        // Create new mutation</span>
+<span class="source-line-no">516</span><span id="line-516">        if (CellUtil.isDelete(cell)) {</span>
+<span class="source-line-no">517</span><span id="line-517">          m = new Delete(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());</span>
+<span class="source-line-no">518</span><span id="line-518">          // Deletes don't have nonces.</span>
+<span class="source-line-no">519</span><span id="line-519">          mutations.add(new MutationReplay(ClientProtos.MutationProto.MutationType.DELETE, m,</span>
+<span class="source-line-no">520</span><span id="line-520">            HConstants.NO_NONCE, HConstants.NO_NONCE));</span>
+<span class="source-line-no">521</span><span id="line-521">        } else {</span>
+<span class="source-line-no">522</span><span id="line-522">          m = new Put(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength());</span>
+<span class="source-line-no">523</span><span id="line-523">          // Puts might come from increment or append, thus we need nonces.</span>
+<span class="source-line-no">524</span><span id="line-524">          long nonceGroup =</span>
+<span class="source-line-no">525</span><span id="line-525">            entry.getKey().hasNonceGroup() ? entry.getKey().getNonceGroup() : HConstants.NO_NONCE;</span>
+<span class="source-line-no">526</span><span id="line-526">          long nonce = entry.getKey().hasNonce() ? entry.getKey().getNonce() : HConstants.NO_NONCE;</span>
+<span class="source-line-no">527</span><span id="line-527">          mutations.add(</span>
+<span class="source-line-no">528</span><span id="line-528">            new MutationReplay(ClientProtos.MutationProto.MutationType.PUT, m, nonceGroup, nonce));</span>
+<span class="source-line-no">529</span><span id="line-529">        }</span>
+<span class="source-line-no">530</span><span id="line-530">      }</span>
+<span class="source-line-no">531</span><span id="line-531">      if (CellUtil.isDelete(cell)) {</span>
+<span class="source-line-no">532</span><span id="line-532">        ((Delete) m).add(cell);</span>
+<span class="source-line-no">533</span><span id="line-533">      } else {</span>
+<span class="source-line-no">534</span><span id="line-534">        ((Put) m).add(cell);</span>
+<span class="source-line-no">535</span><span id="line-535">      }</span>
+<span class="source-line-no">536</span><span id="line-536">      m.setDurability(durability);</span>
+<span class="source-line-no">537</span><span id="line-537">      previousCell = cell;</span>
+<span class="source-line-no">538</span><span id="line-538">    }</span>
+<span class="source-line-no">539</span><span id="line-539"></span>
+<span class="source-line-no">540</span><span id="line-540">    // reconstruct WALKey</span>
+<span class="source-line-no">541</span><span id="line-541">    if (logEntry != null) {</span>
+<span class="source-line-no">542</span><span id="line-542">      org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos.WALKey walKeyProto =</span>
+<span class="source-line-no">543</span><span id="line-543">        entry.getKey();</span>
+<span class="source-line-no">544</span><span id="line-544">      List&lt;UUID&gt; clusterIds = new ArrayList&lt;&gt;(walKeyProto.getClusterIdsCount());</span>
+<span class="source-line-no">545</span><span id="line-545">      for (HBaseProtos.UUID uuid : entry.getKey().getClusterIdsList()) {</span>
+<span class="source-line-no">546</span><span id="line-546">        clusterIds.add(new UUID(uuid.getMostSigBits(), uuid.getLeastSigBits()));</span>
+<span class="source-line-no">547</span><span id="line-547">      }</span>
+<span class="source-line-no">548</span><span id="line-548">      key = new WALKeyImpl(walKeyProto.getEncodedRegionName().toByteArray(),</span>
+<span class="source-line-no">549</span><span id="line-549">        TableName.valueOf(walKeyProto.getTableName().toByteArray()), replaySeqId,</span>
+<span class="source-line-no">550</span><span id="line-550">        walKeyProto.getWriteTime(), clusterIds, walKeyProto.getNonceGroup(), walKeyProto.getNonce(),</span>
+<span class="source-line-no">551</span><span id="line-551">        null);</span>
+<span class="source-line-no">552</span><span id="line-552">      logEntry.setFirst(key);</span>
+<span class="source-line-no">553</span><span id="line-553">      logEntry.setSecond(val);</span>
+<span class="source-line-no">554</span><span id="line-554">    }</span>
+<span class="source-line-no">555</span><span id="line-555"></span>
+<span class="source-line-no">556</span><span id="line-556">    return mutations;</span>
+<span class="source-line-no">557</span><span id="line-557">  }</span>
+<span class="source-line-no">558</span><span id="line-558"></span>
+<span class="source-line-no">559</span><span id="line-559">  /**</span>
+<span class="source-line-no">560</span><span id="line-560">   * Return path to recovered.hfiles directory of the region's column family: e.g.</span>
+<span class="source-line-no">561</span><span id="line-561">   * /hbase/some_table/2323432434/cf/recovered.hfiles/. This method also ensures existence of</span>
+<span class="source-line-no">562</span><span id="line-562">   * recovered.hfiles directory under the region's column family, creating it if necessary.</span>
+<span class="source-line-no">563</span><span id="line-563">   * @param rootFS            the root file system</span>
+<span class="source-line-no">564</span><span id="line-564">   * @param conf              configuration</span>
+<span class="source-line-no">565</span><span id="line-565">   * @param tableName         the table name</span>
+<span class="source-line-no">566</span><span id="line-566">   * @param encodedRegionName the encoded region name</span>
+<span class="source-line-no">567</span><span id="line-567">   * @param familyName        the column family name</span>
+<span class="source-line-no">568</span><span id="line-568">   * @return Path to recovered.hfiles directory of the region's column family.</span>
+<span class="source-line-no">569</span><span id="line-569">   */</span>
+<span class="source-line-no">570</span><span id="line-570">  static Path tryCreateRecoveredHFilesDir(FileSystem rootFS, Configuration conf,</span>
+<span class="source-line-no">571</span><span id="line-571">    TableName tableName, String encodedRegionName, String familyName) throws IOException {</span>
+<span class="source-line-no">572</span><span id="line-572">    Path rootDir = CommonFSUtils.getRootDir(conf);</span>
+<span class="source-line-no">573</span><span id="line-573">    Path regionDir = FSUtils.getRegionDirFromTableDir(CommonFSUtils.getTableDir(rootDir, tableName),</span>
+<span class="source-line-no">574</span><span id="line-574">      encodedRegionName);</span>
+<span class="source-line-no">575</span><span id="line-575">    Path dir = getRecoveredHFilesDir(regionDir, familyName);</span>
+<span class="source-line-no">576</span><span id="line-576">    if (!rootFS.exists(dir) &amp;&amp; !rootFS.mkdirs(dir)) {</span>
+<span class="source-line-no">577</span><span id="line-577">      LOG.warn("mkdir failed on {}, region {}, column family {}", dir, encodedRegionName,</span>
+<span class="source-line-no">578</span><span id="line-578">        familyName);</span>
+<span class="source-line-no">579</span><span id="line-579">    }</span>
+<span class="source-line-no">580</span><span id="line-580">    return dir;</span>
+<span class="source-line-no">581</span><span id="line-581">  }</span>
+<span class="source-line-no">582</span><span id="line-582"></span>
+<span class="source-line-no">583</span><span id="line-583">  /**</span>
+<span class="source-line-no">584</span><span id="line-584">   * @param regionDir  This regions directory in the filesystem</span>
+<span class="source-line-no">585</span><span id="line-585">   * @param familyName The column family name</span>
+<span class="source-line-no">586</span><span id="line-586">   * @return The directory that holds recovered hfiles for the region's column family</span>
+<span class="source-line-no">587</span><span id="line-587">   */</span>
+<span class="source-line-no">588</span><span id="line-588">  private static Path getRecoveredHFilesDir(final Path regionDir, String familyName) {</span>
+<span class="source-line-no">589</span><span id="line-589">    return new Path(new Path(regionDir, familyName), HConstants.RECOVERED_HFILES_DIR);</span>
+<span class="source-line-no">590</span><span id="line-590">  }</span>
+<span class="source-line-no">591</span><span id="line-591"></span>
+<span class="source-line-no">592</span><span id="line-592">  public static FileStatus[] getRecoveredHFiles(final FileSystem rootFS, final Path regionDir,</span>
+<span class="source-line-no">593</span><span id="line-593">    String familyName) throws IOException {</span>
+<span class="source-line-no">594</span><span id="line-594">    Path dir = getRecoveredHFilesDir(regionDir, familyName);</span>
+<span class="source-line-no">595</span><span id="line-595">    return CommonFSUtils.listStatus(rootFS, dir);</span>
+<span class="source-line-no">596</span><span id="line-596">  }</span>
+<span class="source-line-no">597</span><span id="line-597">}</span>
 
 
 
