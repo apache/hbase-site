@@ -505,54 +505,71 @@
 <span class="source-line-no">492</span><span id="line-492">      }</span>
 <span class="source-line-no">493</span><span id="line-493">      futures.addAll(batchRows.stream().map(table::batchAll).collect(Collectors.toList()));</span>
 <span class="source-line-no">494</span><span id="line-494">    }</span>
-<span class="source-line-no">495</span><span id="line-495">    for (Future&lt;?&gt; future : futures) {</span>
-<span class="source-line-no">496</span><span id="line-496">      try {</span>
-<span class="source-line-no">497</span><span id="line-497">        FutureUtils.get(future);</span>
-<span class="source-line-no">498</span><span id="line-498">      } catch (RetriesExhaustedException e) {</span>
-<span class="source-line-no">499</span><span id="line-499">        if (e.getCause() instanceof TableNotFoundException) {</span>
-<span class="source-line-no">500</span><span id="line-500">          throw new TableNotFoundException("'" + tableName + "'");</span>
-<span class="source-line-no">501</span><span id="line-501">        }</span>
-<span class="source-line-no">502</span><span id="line-502">        throw e;</span>
-<span class="source-line-no">503</span><span id="line-503">      }</span>
-<span class="source-line-no">504</span><span id="line-504">    }</span>
-<span class="source-line-no">505</span><span id="line-505">  }</span>
-<span class="source-line-no">506</span><span id="line-506"></span>
-<span class="source-line-no">507</span><span id="line-507">  private AsyncClusterConnection getConnection() throws IOException {</span>
-<span class="source-line-no">508</span><span id="line-508">    // See https://en.wikipedia.org/wiki/Double-checked_locking</span>
-<span class="source-line-no">509</span><span id="line-509">    AsyncClusterConnection connection = sharedConn;</span>
-<span class="source-line-no">510</span><span id="line-510">    if (connection == null) {</span>
-<span class="source-line-no">511</span><span id="line-511">      synchronized (sharedConnLock) {</span>
-<span class="source-line-no">512</span><span id="line-512">        connection = sharedConn;</span>
-<span class="source-line-no">513</span><span id="line-513">        if (connection == null) {</span>
-<span class="source-line-no">514</span><span id="line-514">          connection = ClusterConnectionFactory.createAsyncClusterConnection(conf, null,</span>
-<span class="source-line-no">515</span><span id="line-515">            UserProvider.instantiate(conf).getCurrent());</span>
-<span class="source-line-no">516</span><span id="line-516">          sharedConn = connection;</span>
-<span class="source-line-no">517</span><span id="line-517">        }</span>
-<span class="source-line-no">518</span><span id="line-518">      }</span>
-<span class="source-line-no">519</span><span id="line-519">    }</span>
-<span class="source-line-no">520</span><span id="line-520">    return connection;</span>
-<span class="source-line-no">521</span><span id="line-521">  }</span>
-<span class="source-line-no">522</span><span id="line-522"></span>
-<span class="source-line-no">523</span><span id="line-523">  /**</span>
-<span class="source-line-no">524</span><span id="line-524">   * Get a string representation of this sink's metrics</span>
-<span class="source-line-no">525</span><span id="line-525">   * @return string with the total replicated edits count and the date of the last edit that was</span>
-<span class="source-line-no">526</span><span id="line-526">   *         applied</span>
-<span class="source-line-no">527</span><span id="line-527">   */</span>
-<span class="source-line-no">528</span><span id="line-528">  public String getStats() {</span>
-<span class="source-line-no">529</span><span id="line-529">    long total = this.totalReplicatedEdits.get();</span>
-<span class="source-line-no">530</span><span id="line-530">    return total == 0</span>
-<span class="source-line-no">531</span><span id="line-531">      ? ""</span>
-<span class="source-line-no">532</span><span id="line-532">      : "Sink: " + "age in ms of last applied edit: " + this.metrics.refreshAgeOfLastAppliedOp()</span>
-<span class="source-line-no">533</span><span id="line-533">        + ", total replicated edits: " + total;</span>
-<span class="source-line-no">534</span><span id="line-534">  }</span>
-<span class="source-line-no">535</span><span id="line-535"></span>
-<span class="source-line-no">536</span><span id="line-536">  /**</span>
-<span class="source-line-no">537</span><span id="line-537">   * Get replication Sink Metrics</span>
-<span class="source-line-no">538</span><span id="line-538">   */</span>
-<span class="source-line-no">539</span><span id="line-539">  public MetricsSink getSinkMetrics() {</span>
-<span class="source-line-no">540</span><span id="line-540">    return this.metrics;</span>
-<span class="source-line-no">541</span><span id="line-541">  }</span>
-<span class="source-line-no">542</span><span id="line-542">}</span>
+<span class="source-line-no">495</span><span id="line-495">    // Here we will always wait until all futures are finished, even if there are failures when</span>
+<span class="source-line-no">496</span><span id="line-496">    // getting from a future in the middle. This is because this method may be called in a rpc call,</span>
+<span class="source-line-no">497</span><span id="line-497">    // so the batch operations may reference some off heap cells(through CellScanner). If we return</span>
+<span class="source-line-no">498</span><span id="line-498">    // earlier here, the rpc call may be finished and they will release the off heap cells before</span>
+<span class="source-line-no">499</span><span id="line-499">    // some of the batch operations finish, and then cause corrupt data or even crash the region</span>
+<span class="source-line-no">500</span><span id="line-500">    // server. See HBASE-28584 and HBASE-28850 for more details.</span>
+<span class="source-line-no">501</span><span id="line-501">    IOException error = null;</span>
+<span class="source-line-no">502</span><span id="line-502">    for (Future&lt;?&gt; future : futures) {</span>
+<span class="source-line-no">503</span><span id="line-503">      try {</span>
+<span class="source-line-no">504</span><span id="line-504">        FutureUtils.get(future);</span>
+<span class="source-line-no">505</span><span id="line-505">      } catch (RetriesExhaustedException e) {</span>
+<span class="source-line-no">506</span><span id="line-506">        IOException ioe;</span>
+<span class="source-line-no">507</span><span id="line-507">        if (e.getCause() instanceof TableNotFoundException) {</span>
+<span class="source-line-no">508</span><span id="line-508">          ioe = new TableNotFoundException("'" + tableName + "'");</span>
+<span class="source-line-no">509</span><span id="line-509">        } else {</span>
+<span class="source-line-no">510</span><span id="line-510">          ioe = e;</span>
+<span class="source-line-no">511</span><span id="line-511">        }</span>
+<span class="source-line-no">512</span><span id="line-512">        if (error == null) {</span>
+<span class="source-line-no">513</span><span id="line-513">          error = ioe;</span>
+<span class="source-line-no">514</span><span id="line-514">        } else {</span>
+<span class="source-line-no">515</span><span id="line-515">          error.addSuppressed(ioe);</span>
+<span class="source-line-no">516</span><span id="line-516">        }</span>
+<span class="source-line-no">517</span><span id="line-517">      }</span>
+<span class="source-line-no">518</span><span id="line-518">    }</span>
+<span class="source-line-no">519</span><span id="line-519">    if (error != null) {</span>
+<span class="source-line-no">520</span><span id="line-520">      throw error;</span>
+<span class="source-line-no">521</span><span id="line-521">    }</span>
+<span class="source-line-no">522</span><span id="line-522">  }</span>
+<span class="source-line-no">523</span><span id="line-523"></span>
+<span class="source-line-no">524</span><span id="line-524">  private AsyncClusterConnection getConnection() throws IOException {</span>
+<span class="source-line-no">525</span><span id="line-525">    // See https://en.wikipedia.org/wiki/Double-checked_locking</span>
+<span class="source-line-no">526</span><span id="line-526">    AsyncClusterConnection connection = sharedConn;</span>
+<span class="source-line-no">527</span><span id="line-527">    if (connection == null) {</span>
+<span class="source-line-no">528</span><span id="line-528">      synchronized (sharedConnLock) {</span>
+<span class="source-line-no">529</span><span id="line-529">        connection = sharedConn;</span>
+<span class="source-line-no">530</span><span id="line-530">        if (connection == null) {</span>
+<span class="source-line-no">531</span><span id="line-531">          connection = ClusterConnectionFactory.createAsyncClusterConnection(conf, null,</span>
+<span class="source-line-no">532</span><span id="line-532">            UserProvider.instantiate(conf).getCurrent());</span>
+<span class="source-line-no">533</span><span id="line-533">          sharedConn = connection;</span>
+<span class="source-line-no">534</span><span id="line-534">        }</span>
+<span class="source-line-no">535</span><span id="line-535">      }</span>
+<span class="source-line-no">536</span><span id="line-536">    }</span>
+<span class="source-line-no">537</span><span id="line-537">    return connection;</span>
+<span class="source-line-no">538</span><span id="line-538">  }</span>
+<span class="source-line-no">539</span><span id="line-539"></span>
+<span class="source-line-no">540</span><span id="line-540">  /**</span>
+<span class="source-line-no">541</span><span id="line-541">   * Get a string representation of this sink's metrics</span>
+<span class="source-line-no">542</span><span id="line-542">   * @return string with the total replicated edits count and the date of the last edit that was</span>
+<span class="source-line-no">543</span><span id="line-543">   *         applied</span>
+<span class="source-line-no">544</span><span id="line-544">   */</span>
+<span class="source-line-no">545</span><span id="line-545">  public String getStats() {</span>
+<span class="source-line-no">546</span><span id="line-546">    long total = this.totalReplicatedEdits.get();</span>
+<span class="source-line-no">547</span><span id="line-547">    return total == 0</span>
+<span class="source-line-no">548</span><span id="line-548">      ? ""</span>
+<span class="source-line-no">549</span><span id="line-549">      : "Sink: " + "age in ms of last applied edit: " + this.metrics.refreshAgeOfLastAppliedOp()</span>
+<span class="source-line-no">550</span><span id="line-550">        + ", total replicated edits: " + total;</span>
+<span class="source-line-no">551</span><span id="line-551">  }</span>
+<span class="source-line-no">552</span><span id="line-552"></span>
+<span class="source-line-no">553</span><span id="line-553">  /**</span>
+<span class="source-line-no">554</span><span id="line-554">   * Get replication Sink Metrics</span>
+<span class="source-line-no">555</span><span id="line-555">   */</span>
+<span class="source-line-no">556</span><span id="line-556">  public MetricsSink getSinkMetrics() {</span>
+<span class="source-line-no">557</span><span id="line-557">    return this.metrics;</span>
+<span class="source-line-no">558</span><span id="line-558">  }</span>
+<span class="source-line-no">559</span><span id="line-559">}</span>
 
 
 
