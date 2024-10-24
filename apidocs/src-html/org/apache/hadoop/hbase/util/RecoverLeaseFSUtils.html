@@ -33,205 +33,256 @@
 <span class="source-line-no">020</span><span id="line-20">import java.io.FileNotFoundException;</span>
 <span class="source-line-no">021</span><span id="line-21">import java.io.IOException;</span>
 <span class="source-line-no">022</span><span id="line-22">import java.io.InterruptedIOException;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.lang.reflect.Method;</span>
-<span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.conf.Configuration;</span>
-<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.fs.FileSystem;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.fs.FilterFileSystem;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.fs.Path;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hdfs.DistributedFileSystem;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.slf4j.Logger;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">033</span><span id="line-33"></span>
-<span class="source-line-no">034</span><span id="line-34">/**</span>
-<span class="source-line-no">035</span><span id="line-35"> * Utility methods for recovering file lease for hdfs.</span>
-<span class="source-line-no">036</span><span id="line-36"> */</span>
-<span class="source-line-no">037</span><span id="line-37">@InterfaceAudience.Private</span>
-<span class="source-line-no">038</span><span id="line-38">public final class RecoverLeaseFSUtils {</span>
-<span class="source-line-no">039</span><span id="line-39"></span>
-<span class="source-line-no">040</span><span id="line-40">  private static final Logger LOG = LoggerFactory.getLogger(RecoverLeaseFSUtils.class);</span>
-<span class="source-line-no">041</span><span id="line-41"></span>
-<span class="source-line-no">042</span><span id="line-42">  private RecoverLeaseFSUtils() {</span>
-<span class="source-line-no">043</span><span id="line-43">  }</span>
-<span class="source-line-no">044</span><span id="line-44"></span>
-<span class="source-line-no">045</span><span id="line-45">  public static void recoverFileLease(FileSystem fs, Path p, Configuration conf)</span>
-<span class="source-line-no">046</span><span id="line-46">    throws IOException {</span>
-<span class="source-line-no">047</span><span id="line-47">    recoverFileLease(fs, p, conf, null);</span>
-<span class="source-line-no">048</span><span id="line-48">  }</span>
-<span class="source-line-no">049</span><span id="line-49"></span>
-<span class="source-line-no">050</span><span id="line-50">  /**</span>
-<span class="source-line-no">051</span><span id="line-51">   * Recover the lease from HDFS, retrying multiple times.</span>
-<span class="source-line-no">052</span><span id="line-52">   */</span>
-<span class="source-line-no">053</span><span id="line-53">  public static void recoverFileLease(FileSystem fs, Path p, Configuration conf,</span>
-<span class="source-line-no">054</span><span id="line-54">    CancelableProgressable reporter) throws IOException {</span>
-<span class="source-line-no">055</span><span id="line-55">    if (fs instanceof FilterFileSystem) {</span>
-<span class="source-line-no">056</span><span id="line-56">      fs = ((FilterFileSystem) fs).getRawFileSystem();</span>
-<span class="source-line-no">057</span><span id="line-57">    }</span>
-<span class="source-line-no">058</span><span id="line-58">    // lease recovery not needed for local file system case.</span>
-<span class="source-line-no">059</span><span id="line-59">    if (!(fs instanceof DistributedFileSystem)) {</span>
-<span class="source-line-no">060</span><span id="line-60">      return;</span>
-<span class="source-line-no">061</span><span id="line-61">    }</span>
-<span class="source-line-no">062</span><span id="line-62">    recoverDFSFileLease((DistributedFileSystem) fs, p, conf, reporter);</span>
-<span class="source-line-no">063</span><span id="line-63">  }</span>
-<span class="source-line-no">064</span><span id="line-64"></span>
-<span class="source-line-no">065</span><span id="line-65">  /*</span>
-<span class="source-line-no">066</span><span id="line-66">   * Run the dfs recover lease. recoverLease is asynchronous. It returns: -false when it starts the</span>
-<span class="source-line-no">067</span><span id="line-67">   * lease recovery (i.e. lease recovery not *yet* done) - true when the lease recovery has</span>
-<span class="source-line-no">068</span><span id="line-68">   * succeeded or the file is closed. But, we have to be careful. Each time we call recoverLease, it</span>
-<span class="source-line-no">069</span><span id="line-69">   * starts the recover lease process over from the beginning. We could put ourselves in a situation</span>
-<span class="source-line-no">070</span><span id="line-70">   * where we are doing nothing but starting a recovery, interrupting it to start again, and so on.</span>
-<span class="source-line-no">071</span><span id="line-71">   * The findings over in HBASE-8354 have it that the namenode will try to recover the lease on the</span>
-<span class="source-line-no">072</span><span id="line-72">   * file's primary node. If all is well, it should return near immediately. But, as is common, it</span>
-<span class="source-line-no">073</span><span id="line-73">   * is the very primary node that has crashed and so the namenode will be stuck waiting on a socket</span>
-<span class="source-line-no">074</span><span id="line-74">   * timeout before it will ask another datanode to start the recovery. It does not help if we call</span>
-<span class="source-line-no">075</span><span id="line-75">   * recoverLease in the meantime and in particular, after the socket timeout, a recoverLease</span>
-<span class="source-line-no">076</span><span id="line-76">   * invocation will cause us to start over from square one (possibly waiting on socket timeout</span>
-<span class="source-line-no">077</span><span id="line-77">   * against primary node). So, in the below, we do the following: 1. Call recoverLease. 2. If it</span>
-<span class="source-line-no">078</span><span id="line-78">   * returns true, break. 3. If it returns false, wait a few seconds and then call it again. 4. If</span>
-<span class="source-line-no">079</span><span id="line-79">   * it returns true, break. 5. If it returns false, wait for what we think the datanode socket</span>
-<span class="source-line-no">080</span><span id="line-80">   * timeout is (configurable) and then try again. 6. If it returns true, break. 7. If it returns</span>
-<span class="source-line-no">081</span><span id="line-81">   * false, repeat starting at step 5. above. If HDFS-4525 is available, call it every second, and</span>
-<span class="source-line-no">082</span><span id="line-82">   * we might be able to exit early.</span>
-<span class="source-line-no">083</span><span id="line-83">   */</span>
-<span class="source-line-no">084</span><span id="line-84">  private static boolean recoverDFSFileLease(final DistributedFileSystem dfs, final Path p,</span>
-<span class="source-line-no">085</span><span id="line-85">    final Configuration conf, final CancelableProgressable reporter) throws IOException {</span>
-<span class="source-line-no">086</span><span id="line-86">    LOG.info("Recover lease on dfs file " + p);</span>
-<span class="source-line-no">087</span><span id="line-87">    long startWaiting = EnvironmentEdgeManager.currentTime();</span>
-<span class="source-line-no">088</span><span id="line-88">    // Default is 15 minutes. It's huge, but the idea is that if we have a major issue, HDFS</span>
-<span class="source-line-no">089</span><span id="line-89">    // usually needs 10 minutes before marking the nodes as dead. So we're putting ourselves</span>
-<span class="source-line-no">090</span><span id="line-90">    // beyond that limit 'to be safe'.</span>
-<span class="source-line-no">091</span><span id="line-91">    long recoveryTimeout = conf.getInt("hbase.lease.recovery.timeout", 900000) + startWaiting;</span>
-<span class="source-line-no">092</span><span id="line-92">    // This setting should be a little above what the cluster dfs heartbeat is set to.</span>
-<span class="source-line-no">093</span><span id="line-93">    long firstPause = conf.getInt("hbase.lease.recovery.first.pause", 4000);</span>
-<span class="source-line-no">094</span><span id="line-94">    // This should be set to how long it'll take for us to timeout against primary datanode if it</span>
-<span class="source-line-no">095</span><span id="line-95">    // is dead. We set it to 64 seconds, 4 seconds than the default READ_TIMEOUT in HDFS, the</span>
-<span class="source-line-no">096</span><span id="line-96">    // default value for DFS_CLIENT_SOCKET_TIMEOUT_KEY. If recovery is still failing after this</span>
-<span class="source-line-no">097</span><span id="line-97">    // timeout, then further recovery will take liner backoff with this base, to avoid endless</span>
-<span class="source-line-no">098</span><span id="line-98">    // preemptions when this value is not properly configured.</span>
-<span class="source-line-no">099</span><span id="line-99">    long subsequentPauseBase = conf.getLong("hbase.lease.recovery.dfs.timeout", 64 * 1000);</span>
-<span class="source-line-no">100</span><span id="line-100"></span>
-<span class="source-line-no">101</span><span id="line-101">    Method isFileClosedMeth = null;</span>
-<span class="source-line-no">102</span><span id="line-102">    // whether we need to look for isFileClosed method</span>
-<span class="source-line-no">103</span><span id="line-103">    boolean findIsFileClosedMeth = true;</span>
-<span class="source-line-no">104</span><span id="line-104">    boolean recovered = false;</span>
-<span class="source-line-no">105</span><span id="line-105">    // We break the loop if we succeed the lease recovery, timeout, or we throw an exception.</span>
-<span class="source-line-no">106</span><span id="line-106">    for (int nbAttempt = 0; !recovered; nbAttempt++) {</span>
-<span class="source-line-no">107</span><span id="line-107">      recovered = recoverLease(dfs, nbAttempt, p, startWaiting);</span>
-<span class="source-line-no">108</span><span id="line-108">      if (recovered) {</span>
-<span class="source-line-no">109</span><span id="line-109">        break;</span>
-<span class="source-line-no">110</span><span id="line-110">      }</span>
-<span class="source-line-no">111</span><span id="line-111">      checkIfCancelled(reporter);</span>
-<span class="source-line-no">112</span><span id="line-112">      if (checkIfTimedout(conf, recoveryTimeout, nbAttempt, p, startWaiting)) {</span>
-<span class="source-line-no">113</span><span id="line-113">        break;</span>
-<span class="source-line-no">114</span><span id="line-114">      }</span>
-<span class="source-line-no">115</span><span id="line-115">      try {</span>
-<span class="source-line-no">116</span><span id="line-116">        // On the first time through wait the short 'firstPause'.</span>
-<span class="source-line-no">117</span><span id="line-117">        if (nbAttempt == 0) {</span>
-<span class="source-line-no">118</span><span id="line-118">          Thread.sleep(firstPause);</span>
-<span class="source-line-no">119</span><span id="line-119">        } else {</span>
-<span class="source-line-no">120</span><span id="line-120">          // Cycle here until (subsequentPause * nbAttempt) elapses. While spinning, check</span>
-<span class="source-line-no">121</span><span id="line-121">          // isFileClosed if available (should be in hadoop 2.0.5... not in hadoop 1 though).</span>
-<span class="source-line-no">122</span><span id="line-122">          long localStartWaiting = EnvironmentEdgeManager.currentTime();</span>
-<span class="source-line-no">123</span><span id="line-123">          while (</span>
-<span class="source-line-no">124</span><span id="line-124">            (EnvironmentEdgeManager.currentTime() - localStartWaiting)</span>
-<span class="source-line-no">125</span><span id="line-125">                &lt; subsequentPauseBase * nbAttempt</span>
-<span class="source-line-no">126</span><span id="line-126">          ) {</span>
-<span class="source-line-no">127</span><span id="line-127">            Thread.sleep(conf.getInt("hbase.lease.recovery.pause", 1000));</span>
-<span class="source-line-no">128</span><span id="line-128">            if (findIsFileClosedMeth) {</span>
-<span class="source-line-no">129</span><span id="line-129">              try {</span>
-<span class="source-line-no">130</span><span id="line-130">                isFileClosedMeth =</span>
-<span class="source-line-no">131</span><span id="line-131">                  dfs.getClass().getMethod("isFileClosed", new Class[] { Path.class });</span>
-<span class="source-line-no">132</span><span id="line-132">              } catch (NoSuchMethodException nsme) {</span>
-<span class="source-line-no">133</span><span id="line-133">                LOG.debug("isFileClosed not available");</span>
-<span class="source-line-no">134</span><span id="line-134">              } finally {</span>
-<span class="source-line-no">135</span><span id="line-135">                findIsFileClosedMeth = false;</span>
-<span class="source-line-no">136</span><span id="line-136">              }</span>
-<span class="source-line-no">137</span><span id="line-137">            }</span>
-<span class="source-line-no">138</span><span id="line-138">            if (isFileClosedMeth != null &amp;&amp; isFileClosed(dfs, isFileClosedMeth, p)) {</span>
-<span class="source-line-no">139</span><span id="line-139">              recovered = true;</span>
-<span class="source-line-no">140</span><span id="line-140">              break;</span>
-<span class="source-line-no">141</span><span id="line-141">            }</span>
-<span class="source-line-no">142</span><span id="line-142">            checkIfCancelled(reporter);</span>
-<span class="source-line-no">143</span><span id="line-143">          }</span>
-<span class="source-line-no">144</span><span id="line-144">        }</span>
-<span class="source-line-no">145</span><span id="line-145">      } catch (InterruptedException ie) {</span>
-<span class="source-line-no">146</span><span id="line-146">        InterruptedIOException iioe = new InterruptedIOException();</span>
-<span class="source-line-no">147</span><span id="line-147">        iioe.initCause(ie);</span>
-<span class="source-line-no">148</span><span id="line-148">        throw iioe;</span>
-<span class="source-line-no">149</span><span id="line-149">      }</span>
-<span class="source-line-no">150</span><span id="line-150">    }</span>
-<span class="source-line-no">151</span><span id="line-151">    return recovered;</span>
-<span class="source-line-no">152</span><span id="line-152">  }</span>
-<span class="source-line-no">153</span><span id="line-153"></span>
-<span class="source-line-no">154</span><span id="line-154">  private static boolean checkIfTimedout(final Configuration conf, final long recoveryTimeout,</span>
-<span class="source-line-no">155</span><span id="line-155">    final int nbAttempt, final Path p, final long startWaiting) {</span>
-<span class="source-line-no">156</span><span id="line-156">    if (recoveryTimeout &lt; EnvironmentEdgeManager.currentTime()) {</span>
-<span class="source-line-no">157</span><span id="line-157">      LOG.warn("Cannot recoverLease after trying for "</span>
-<span class="source-line-no">158</span><span id="line-158">        + conf.getInt("hbase.lease.recovery.timeout", 900000)</span>
-<span class="source-line-no">159</span><span id="line-159">        + "ms (hbase.lease.recovery.timeout); continuing, but may be DATALOSS!!!; "</span>
-<span class="source-line-no">160</span><span id="line-160">        + getLogMessageDetail(nbAttempt, p, startWaiting));</span>
-<span class="source-line-no">161</span><span id="line-161">      return true;</span>
-<span class="source-line-no">162</span><span id="line-162">    }</span>
-<span class="source-line-no">163</span><span id="line-163">    return false;</span>
-<span class="source-line-no">164</span><span id="line-164">  }</span>
-<span class="source-line-no">165</span><span id="line-165"></span>
-<span class="source-line-no">166</span><span id="line-166">  /**</span>
-<span class="source-line-no">167</span><span id="line-167">   * Try to recover the lease.</span>
-<span class="source-line-no">168</span><span id="line-168">   * @return True if dfs#recoverLease came by true.</span>
-<span class="source-line-no">169</span><span id="line-169">   */</span>
-<span class="source-line-no">170</span><span id="line-170">  private static boolean recoverLease(final DistributedFileSystem dfs, final int nbAttempt,</span>
-<span class="source-line-no">171</span><span id="line-171">    final Path p, final long startWaiting) throws FileNotFoundException {</span>
-<span class="source-line-no">172</span><span id="line-172">    boolean recovered = false;</span>
-<span class="source-line-no">173</span><span id="line-173">    try {</span>
-<span class="source-line-no">174</span><span id="line-174">      recovered = dfs.recoverLease(p);</span>
-<span class="source-line-no">175</span><span id="line-175">      LOG.info((recovered ? "Recovered lease, " : "Failed to recover lease, ")</span>
-<span class="source-line-no">176</span><span id="line-176">        + getLogMessageDetail(nbAttempt, p, startWaiting));</span>
-<span class="source-line-no">177</span><span id="line-177">    } catch (IOException e) {</span>
-<span class="source-line-no">178</span><span id="line-178">      if (e instanceof LeaseExpiredException &amp;&amp; e.getMessage().contains("File does not exist")) {</span>
-<span class="source-line-no">179</span><span id="line-179">        // This exception comes out instead of FNFE, fix it</span>
-<span class="source-line-no">180</span><span id="line-180">        throw new FileNotFoundException("The given WAL wasn't found at " + p);</span>
-<span class="source-line-no">181</span><span id="line-181">      } else if (e instanceof FileNotFoundException) {</span>
-<span class="source-line-no">182</span><span id="line-182">        throw (FileNotFoundException) e;</span>
-<span class="source-line-no">183</span><span id="line-183">      }</span>
-<span class="source-line-no">184</span><span id="line-184">      LOG.warn(getLogMessageDetail(nbAttempt, p, startWaiting), e);</span>
-<span class="source-line-no">185</span><span id="line-185">    }</span>
-<span class="source-line-no">186</span><span id="line-186">    return recovered;</span>
-<span class="source-line-no">187</span><span id="line-187">  }</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">  /** Returns Detail to append to any log message around lease recovering. */</span>
-<span class="source-line-no">190</span><span id="line-190">  private static String getLogMessageDetail(final int nbAttempt, final Path p,</span>
-<span class="source-line-no">191</span><span id="line-191">    final long startWaiting) {</span>
-<span class="source-line-no">192</span><span id="line-192">    return "attempt=" + nbAttempt + " on file=" + p + " after "</span>
-<span class="source-line-no">193</span><span id="line-193">      + (EnvironmentEdgeManager.currentTime() - startWaiting) + "ms";</span>
-<span class="source-line-no">194</span><span id="line-194">  }</span>
-<span class="source-line-no">195</span><span id="line-195"></span>
-<span class="source-line-no">196</span><span id="line-196">  /**</span>
-<span class="source-line-no">197</span><span id="line-197">   * Call HDFS-4525 isFileClosed if it is available.</span>
-<span class="source-line-no">198</span><span id="line-198">   * @return True if file is closed.</span>
-<span class="source-line-no">199</span><span id="line-199">   */</span>
-<span class="source-line-no">200</span><span id="line-200">  private static boolean isFileClosed(final DistributedFileSystem dfs, final Method m,</span>
-<span class="source-line-no">201</span><span id="line-201">    final Path p) {</span>
-<span class="source-line-no">202</span><span id="line-202">    try {</span>
-<span class="source-line-no">203</span><span id="line-203">      return (Boolean) m.invoke(dfs, p);</span>
-<span class="source-line-no">204</span><span id="line-204">    } catch (SecurityException e) {</span>
-<span class="source-line-no">205</span><span id="line-205">      LOG.warn("No access", e);</span>
-<span class="source-line-no">206</span><span id="line-206">    } catch (Exception e) {</span>
-<span class="source-line-no">207</span><span id="line-207">      LOG.warn("Failed invocation for " + p.toString(), e);</span>
-<span class="source-line-no">208</span><span id="line-208">    }</span>
-<span class="source-line-no">209</span><span id="line-209">    return false;</span>
-<span class="source-line-no">210</span><span id="line-210">  }</span>
-<span class="source-line-no">211</span><span id="line-211"></span>
-<span class="source-line-no">212</span><span id="line-212">  private static void checkIfCancelled(final CancelableProgressable reporter)</span>
-<span class="source-line-no">213</span><span id="line-213">    throws InterruptedIOException {</span>
-<span class="source-line-no">214</span><span id="line-214">    if (reporter == null) {</span>
-<span class="source-line-no">215</span><span id="line-215">      return;</span>
-<span class="source-line-no">216</span><span id="line-216">    }</span>
-<span class="source-line-no">217</span><span id="line-217">    if (!reporter.progress()) {</span>
-<span class="source-line-no">218</span><span id="line-218">      throw new InterruptedIOException("Operation cancelled");</span>
-<span class="source-line-no">219</span><span id="line-219">    }</span>
-<span class="source-line-no">220</span><span id="line-220">  }</span>
-<span class="source-line-no">221</span><span id="line-221">}</span>
+<span class="source-line-no">023</span><span id="line-23">import java.lang.reflect.InvocationTargetException;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.lang.reflect.Method;</span>
+<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.conf.Configuration;</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.fs.FileSystem;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.fs.FilterFileSystem;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.fs.Path;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hdfs.DistributedFileSystem;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.slf4j.Logger;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">034</span><span id="line-34"></span>
+<span class="source-line-no">035</span><span id="line-35">/**</span>
+<span class="source-line-no">036</span><span id="line-36"> * Utility methods for recovering file lease for hdfs.</span>
+<span class="source-line-no">037</span><span id="line-37"> */</span>
+<span class="source-line-no">038</span><span id="line-38">@InterfaceAudience.Private</span>
+<span class="source-line-no">039</span><span id="line-39">public final class RecoverLeaseFSUtils {</span>
+<span class="source-line-no">040</span><span id="line-40"></span>
+<span class="source-line-no">041</span><span id="line-41">  private static final Logger LOG = LoggerFactory.getLogger(RecoverLeaseFSUtils.class);</span>
+<span class="source-line-no">042</span><span id="line-42"></span>
+<span class="source-line-no">043</span><span id="line-43">  private static Class&lt;?&gt; leaseRecoverableClazz = null;</span>
+<span class="source-line-no">044</span><span id="line-44">  private static Method recoverLeaseMethod = null;</span>
+<span class="source-line-no">045</span><span id="line-45">  public static final String LEASE_RECOVERABLE_CLASS_NAME = "org.apache.hadoop.fs.LeaseRecoverable";</span>
+<span class="source-line-no">046</span><span id="line-46">  static {</span>
+<span class="source-line-no">047</span><span id="line-47">    LOG.debug("Initialize RecoverLeaseFSUtils");</span>
+<span class="source-line-no">048</span><span id="line-48">    initializeRecoverLeaseMethod(LEASE_RECOVERABLE_CLASS_NAME);</span>
+<span class="source-line-no">049</span><span id="line-49">  }</span>
+<span class="source-line-no">050</span><span id="line-50"></span>
+<span class="source-line-no">051</span><span id="line-51">  /**</span>
+<span class="source-line-no">052</span><span id="line-52">   * Initialize reflection classes and methods. If LeaseRecoverable class is not found, look for</span>
+<span class="source-line-no">053</span><span id="line-53">   * DistributedFilSystem#recoverLease method.</span>
+<span class="source-line-no">054</span><span id="line-54">   */</span>
+<span class="source-line-no">055</span><span id="line-55">  static void initializeRecoverLeaseMethod(String className) {</span>
+<span class="source-line-no">056</span><span id="line-56">    try {</span>
+<span class="source-line-no">057</span><span id="line-57">      leaseRecoverableClazz = Class.forName(className);</span>
+<span class="source-line-no">058</span><span id="line-58">      recoverLeaseMethod = leaseRecoverableClazz.getMethod("recoverLease", Path.class);</span>
+<span class="source-line-no">059</span><span id="line-59">      LOG.debug("set recoverLeaseMethod to " + className + ".recoverLease()");</span>
+<span class="source-line-no">060</span><span id="line-60">    } catch (ClassNotFoundException e) {</span>
+<span class="source-line-no">061</span><span id="line-61">      LOG.debug(</span>
+<span class="source-line-no">062</span><span id="line-62">        "LeaseRecoverable interface not in the classpath, this means Hadoop 3.3.5 or below.");</span>
+<span class="source-line-no">063</span><span id="line-63">      try {</span>
+<span class="source-line-no">064</span><span id="line-64">        recoverLeaseMethod = DistributedFileSystem.class.getMethod("recoverLease", Path.class);</span>
+<span class="source-line-no">065</span><span id="line-65">      } catch (NoSuchMethodException ex) {</span>
+<span class="source-line-no">066</span><span id="line-66">        LOG.error("Cannot find recoverLease method in DistributedFileSystem class. "</span>
+<span class="source-line-no">067</span><span id="line-67">          + "It should never happen. Abort.", ex);</span>
+<span class="source-line-no">068</span><span id="line-68">        throw new RuntimeException(ex);</span>
+<span class="source-line-no">069</span><span id="line-69">      }</span>
+<span class="source-line-no">070</span><span id="line-70">    } catch (NoSuchMethodException e) {</span>
+<span class="source-line-no">071</span><span id="line-71">      LOG.error("Cannot find recoverLease method in LeaseRecoverable class. "</span>
+<span class="source-line-no">072</span><span id="line-72">        + "It should never happen. Abort.", e);</span>
+<span class="source-line-no">073</span><span id="line-73">      throw new RuntimeException(e);</span>
+<span class="source-line-no">074</span><span id="line-74">    }</span>
+<span class="source-line-no">075</span><span id="line-75">  }</span>
+<span class="source-line-no">076</span><span id="line-76"></span>
+<span class="source-line-no">077</span><span id="line-77">  private RecoverLeaseFSUtils() {</span>
+<span class="source-line-no">078</span><span id="line-78">  }</span>
+<span class="source-line-no">079</span><span id="line-79"></span>
+<span class="source-line-no">080</span><span id="line-80">  public static void recoverFileLease(FileSystem fs, Path p, Configuration conf)</span>
+<span class="source-line-no">081</span><span id="line-81">    throws IOException {</span>
+<span class="source-line-no">082</span><span id="line-82">    recoverFileLease(fs, p, conf, null);</span>
+<span class="source-line-no">083</span><span id="line-83">  }</span>
+<span class="source-line-no">084</span><span id="line-84"></span>
+<span class="source-line-no">085</span><span id="line-85">  /**</span>
+<span class="source-line-no">086</span><span id="line-86">   * Recover the lease from Hadoop file system, retrying multiple times.</span>
+<span class="source-line-no">087</span><span id="line-87">   */</span>
+<span class="source-line-no">088</span><span id="line-88">  public static void recoverFileLease(FileSystem fs, Path p, Configuration conf,</span>
+<span class="source-line-no">089</span><span id="line-89">    CancelableProgressable reporter) throws IOException {</span>
+<span class="source-line-no">090</span><span id="line-90">    if (fs instanceof FilterFileSystem) {</span>
+<span class="source-line-no">091</span><span id="line-91">      fs = ((FilterFileSystem) fs).getRawFileSystem();</span>
+<span class="source-line-no">092</span><span id="line-92">    }</span>
+<span class="source-line-no">093</span><span id="line-93"></span>
+<span class="source-line-no">094</span><span id="line-94">    // lease recovery not needed for local file system case.</span>
+<span class="source-line-no">095</span><span id="line-95">    if (isLeaseRecoverable(fs)) {</span>
+<span class="source-line-no">096</span><span id="line-96">      recoverDFSFileLease(fs, p, conf, reporter);</span>
+<span class="source-line-no">097</span><span id="line-97">    }</span>
+<span class="source-line-no">098</span><span id="line-98">  }</span>
+<span class="source-line-no">099</span><span id="line-99"></span>
+<span class="source-line-no">100</span><span id="line-100">  public static boolean isLeaseRecoverable(FileSystem fs) {</span>
+<span class="source-line-no">101</span><span id="line-101">    // return true if HDFS.</span>
+<span class="source-line-no">102</span><span id="line-102">    if (fs instanceof DistributedFileSystem) {</span>
+<span class="source-line-no">103</span><span id="line-103">      return true;</span>
+<span class="source-line-no">104</span><span id="line-104">    }</span>
+<span class="source-line-no">105</span><span id="line-105">    // return true if the file system implements LeaseRecoverable interface.</span>
+<span class="source-line-no">106</span><span id="line-106">    if (leaseRecoverableClazz != null) {</span>
+<span class="source-line-no">107</span><span id="line-107">      return leaseRecoverableClazz.isAssignableFrom(fs.getClass());</span>
+<span class="source-line-no">108</span><span id="line-108">    }</span>
+<span class="source-line-no">109</span><span id="line-109">    // return false if the file system is not HDFS and does not implement LeaseRecoverable.</span>
+<span class="source-line-no">110</span><span id="line-110">    return false;</span>
+<span class="source-line-no">111</span><span id="line-111">  }</span>
+<span class="source-line-no">112</span><span id="line-112"></span>
+<span class="source-line-no">113</span><span id="line-113">  /*</span>
+<span class="source-line-no">114</span><span id="line-114">   * Run the dfs recover lease. recoverLease is asynchronous. It returns: -false when it starts the</span>
+<span class="source-line-no">115</span><span id="line-115">   * lease recovery (i.e. lease recovery not *yet* done) - true when the lease recovery has</span>
+<span class="source-line-no">116</span><span id="line-116">   * succeeded or the file is closed. But, we have to be careful. Each time we call recoverLease, it</span>
+<span class="source-line-no">117</span><span id="line-117">   * starts the recover lease process over from the beginning. We could put ourselves in a situation</span>
+<span class="source-line-no">118</span><span id="line-118">   * where we are doing nothing but starting a recovery, interrupting it to start again, and so on.</span>
+<span class="source-line-no">119</span><span id="line-119">   * The findings over in HBASE-8354 have it that the namenode will try to recover the lease on the</span>
+<span class="source-line-no">120</span><span id="line-120">   * file's primary node. If all is well, it should return near immediately. But, as is common, it</span>
+<span class="source-line-no">121</span><span id="line-121">   * is the very primary node that has crashed and so the namenode will be stuck waiting on a socket</span>
+<span class="source-line-no">122</span><span id="line-122">   * timeout before it will ask another datanode to start the recovery. It does not help if we call</span>
+<span class="source-line-no">123</span><span id="line-123">   * recoverLease in the meantime and in particular, after the socket timeout, a recoverLease</span>
+<span class="source-line-no">124</span><span id="line-124">   * invocation will cause us to start over from square one (possibly waiting on socket timeout</span>
+<span class="source-line-no">125</span><span id="line-125">   * against primary node). So, in the below, we do the following: 1. Call recoverLease. 2. If it</span>
+<span class="source-line-no">126</span><span id="line-126">   * returns true, break. 3. If it returns false, wait a few seconds and then call it again. 4. If</span>
+<span class="source-line-no">127</span><span id="line-127">   * it returns true, break. 5. If it returns false, wait for what we think the datanode socket</span>
+<span class="source-line-no">128</span><span id="line-128">   * timeout is (configurable) and then try again. 6. If it returns true, break. 7. If it returns</span>
+<span class="source-line-no">129</span><span id="line-129">   * false, repeat starting at step 5. above. If HDFS-4525 is available, call it every second, and</span>
+<span class="source-line-no">130</span><span id="line-130">   * we might be able to exit early.</span>
+<span class="source-line-no">131</span><span id="line-131">   */</span>
+<span class="source-line-no">132</span><span id="line-132">  private static boolean recoverDFSFileLease(final FileSystem dfs, final Path p,</span>
+<span class="source-line-no">133</span><span id="line-133">    final Configuration conf, final CancelableProgressable reporter) throws IOException {</span>
+<span class="source-line-no">134</span><span id="line-134">    LOG.info("Recover lease on dfs file " + p);</span>
+<span class="source-line-no">135</span><span id="line-135">    long startWaiting = EnvironmentEdgeManager.currentTime();</span>
+<span class="source-line-no">136</span><span id="line-136">    // Default is 15 minutes. It's huge, but the idea is that if we have a major issue, HDFS</span>
+<span class="source-line-no">137</span><span id="line-137">    // usually needs 10 minutes before marking the nodes as dead. So we're putting ourselves</span>
+<span class="source-line-no">138</span><span id="line-138">    // beyond that limit 'to be safe'.</span>
+<span class="source-line-no">139</span><span id="line-139">    long recoveryTimeout = conf.getInt("hbase.lease.recovery.timeout", 900000) + startWaiting;</span>
+<span class="source-line-no">140</span><span id="line-140">    // This setting should be a little above what the cluster dfs heartbeat is set to.</span>
+<span class="source-line-no">141</span><span id="line-141">    long firstPause = conf.getInt("hbase.lease.recovery.first.pause", 4000);</span>
+<span class="source-line-no">142</span><span id="line-142">    // This should be set to how long it'll take for us to timeout against primary datanode if it</span>
+<span class="source-line-no">143</span><span id="line-143">    // is dead. We set it to 64 seconds, 4 seconds than the default READ_TIMEOUT in HDFS, the</span>
+<span class="source-line-no">144</span><span id="line-144">    // default value for DFS_CLIENT_SOCKET_TIMEOUT_KEY. If recovery is still failing after this</span>
+<span class="source-line-no">145</span><span id="line-145">    // timeout, then further recovery will take liner backoff with this base, to avoid endless</span>
+<span class="source-line-no">146</span><span id="line-146">    // preemptions when this value is not properly configured.</span>
+<span class="source-line-no">147</span><span id="line-147">    long subsequentPauseBase = conf.getLong("hbase.lease.recovery.dfs.timeout", 64 * 1000);</span>
+<span class="source-line-no">148</span><span id="line-148"></span>
+<span class="source-line-no">149</span><span id="line-149">    Method isFileClosedMeth = null;</span>
+<span class="source-line-no">150</span><span id="line-150">    // whether we need to look for isFileClosed method</span>
+<span class="source-line-no">151</span><span id="line-151">    boolean findIsFileClosedMeth = true;</span>
+<span class="source-line-no">152</span><span id="line-152">    boolean recovered = false;</span>
+<span class="source-line-no">153</span><span id="line-153">    // We break the loop if we succeed the lease recovery, timeout, or we throw an exception.</span>
+<span class="source-line-no">154</span><span id="line-154">    for (int nbAttempt = 0; !recovered; nbAttempt++) {</span>
+<span class="source-line-no">155</span><span id="line-155">      recovered = recoverLease(dfs, nbAttempt, p, startWaiting);</span>
+<span class="source-line-no">156</span><span id="line-156">      if (recovered) {</span>
+<span class="source-line-no">157</span><span id="line-157">        break;</span>
+<span class="source-line-no">158</span><span id="line-158">      }</span>
+<span class="source-line-no">159</span><span id="line-159">      checkIfCancelled(reporter);</span>
+<span class="source-line-no">160</span><span id="line-160">      if (checkIfTimedout(conf, recoveryTimeout, nbAttempt, p, startWaiting)) {</span>
+<span class="source-line-no">161</span><span id="line-161">        break;</span>
+<span class="source-line-no">162</span><span id="line-162">      }</span>
+<span class="source-line-no">163</span><span id="line-163">      try {</span>
+<span class="source-line-no">164</span><span id="line-164">        // On the first time through wait the short 'firstPause'.</span>
+<span class="source-line-no">165</span><span id="line-165">        if (nbAttempt == 0) {</span>
+<span class="source-line-no">166</span><span id="line-166">          Thread.sleep(firstPause);</span>
+<span class="source-line-no">167</span><span id="line-167">        } else {</span>
+<span class="source-line-no">168</span><span id="line-168">          // Cycle here until (subsequentPause * nbAttempt) elapses. While spinning, check</span>
+<span class="source-line-no">169</span><span id="line-169">          // isFileClosed if available (should be in hadoop 2.0.5... not in hadoop 1 though).</span>
+<span class="source-line-no">170</span><span id="line-170">          long localStartWaiting = EnvironmentEdgeManager.currentTime();</span>
+<span class="source-line-no">171</span><span id="line-171">          while (</span>
+<span class="source-line-no">172</span><span id="line-172">            (EnvironmentEdgeManager.currentTime() - localStartWaiting)</span>
+<span class="source-line-no">173</span><span id="line-173">                &lt; subsequentPauseBase * nbAttempt</span>
+<span class="source-line-no">174</span><span id="line-174">          ) {</span>
+<span class="source-line-no">175</span><span id="line-175">            Thread.sleep(conf.getInt("hbase.lease.recovery.pause", 1000));</span>
+<span class="source-line-no">176</span><span id="line-176">            if (findIsFileClosedMeth) {</span>
+<span class="source-line-no">177</span><span id="line-177">              try {</span>
+<span class="source-line-no">178</span><span id="line-178">                isFileClosedMeth =</span>
+<span class="source-line-no">179</span><span id="line-179">                  dfs.getClass().getMethod("isFileClosed", new Class[] { Path.class });</span>
+<span class="source-line-no">180</span><span id="line-180">              } catch (NoSuchMethodException nsme) {</span>
+<span class="source-line-no">181</span><span id="line-181">                LOG.debug("isFileClosed not available");</span>
+<span class="source-line-no">182</span><span id="line-182">              } finally {</span>
+<span class="source-line-no">183</span><span id="line-183">                findIsFileClosedMeth = false;</span>
+<span class="source-line-no">184</span><span id="line-184">              }</span>
+<span class="source-line-no">185</span><span id="line-185">            }</span>
+<span class="source-line-no">186</span><span id="line-186">            if (isFileClosedMeth != null &amp;&amp; isFileClosed(dfs, isFileClosedMeth, p)) {</span>
+<span class="source-line-no">187</span><span id="line-187">              recovered = true;</span>
+<span class="source-line-no">188</span><span id="line-188">              break;</span>
+<span class="source-line-no">189</span><span id="line-189">            }</span>
+<span class="source-line-no">190</span><span id="line-190">            checkIfCancelled(reporter);</span>
+<span class="source-line-no">191</span><span id="line-191">          }</span>
+<span class="source-line-no">192</span><span id="line-192">        }</span>
+<span class="source-line-no">193</span><span id="line-193">      } catch (InterruptedException ie) {</span>
+<span class="source-line-no">194</span><span id="line-194">        InterruptedIOException iioe = new InterruptedIOException();</span>
+<span class="source-line-no">195</span><span id="line-195">        iioe.initCause(ie);</span>
+<span class="source-line-no">196</span><span id="line-196">        throw iioe;</span>
+<span class="source-line-no">197</span><span id="line-197">      }</span>
+<span class="source-line-no">198</span><span id="line-198">    }</span>
+<span class="source-line-no">199</span><span id="line-199">    return recovered;</span>
+<span class="source-line-no">200</span><span id="line-200">  }</span>
+<span class="source-line-no">201</span><span id="line-201"></span>
+<span class="source-line-no">202</span><span id="line-202">  private static boolean checkIfTimedout(final Configuration conf, final long recoveryTimeout,</span>
+<span class="source-line-no">203</span><span id="line-203">    final int nbAttempt, final Path p, final long startWaiting) {</span>
+<span class="source-line-no">204</span><span id="line-204">    if (recoveryTimeout &lt; EnvironmentEdgeManager.currentTime()) {</span>
+<span class="source-line-no">205</span><span id="line-205">      LOG.warn("Cannot recoverLease after trying for "</span>
+<span class="source-line-no">206</span><span id="line-206">        + conf.getInt("hbase.lease.recovery.timeout", 900000)</span>
+<span class="source-line-no">207</span><span id="line-207">        + "ms (hbase.lease.recovery.timeout); continuing, but may be DATALOSS!!!; "</span>
+<span class="source-line-no">208</span><span id="line-208">        + getLogMessageDetail(nbAttempt, p, startWaiting));</span>
+<span class="source-line-no">209</span><span id="line-209">      return true;</span>
+<span class="source-line-no">210</span><span id="line-210">    }</span>
+<span class="source-line-no">211</span><span id="line-211">    return false;</span>
+<span class="source-line-no">212</span><span id="line-212">  }</span>
+<span class="source-line-no">213</span><span id="line-213"></span>
+<span class="source-line-no">214</span><span id="line-214">  /**</span>
+<span class="source-line-no">215</span><span id="line-215">   * Try to recover the lease.</span>
+<span class="source-line-no">216</span><span id="line-216">   * @return True if dfs#recoverLease came by true.</span>
+<span class="source-line-no">217</span><span id="line-217">   */</span>
+<span class="source-line-no">218</span><span id="line-218">  private static boolean recoverLease(final FileSystem dfs, final int nbAttempt, final Path p,</span>
+<span class="source-line-no">219</span><span id="line-219">    final long startWaiting) throws FileNotFoundException {</span>
+<span class="source-line-no">220</span><span id="line-220">    boolean recovered = false;</span>
+<span class="source-line-no">221</span><span id="line-221">    try {</span>
+<span class="source-line-no">222</span><span id="line-222">      recovered = (Boolean) recoverLeaseMethod.invoke(dfs, p);</span>
+<span class="source-line-no">223</span><span id="line-223">      LOG.info((recovered ? "Recovered lease, " : "Failed to recover lease, ")</span>
+<span class="source-line-no">224</span><span id="line-224">        + getLogMessageDetail(nbAttempt, p, startWaiting));</span>
+<span class="source-line-no">225</span><span id="line-225">    } catch (InvocationTargetException ite) {</span>
+<span class="source-line-no">226</span><span id="line-226">      final Throwable e = ite.getCause();</span>
+<span class="source-line-no">227</span><span id="line-227">      if (e instanceof LeaseExpiredException &amp;&amp; e.getMessage().contains("File does not exist")) {</span>
+<span class="source-line-no">228</span><span id="line-228">        // This exception comes out instead of FNFE, fix it</span>
+<span class="source-line-no">229</span><span id="line-229">        throw new FileNotFoundException("The given WAL wasn't found at " + p);</span>
+<span class="source-line-no">230</span><span id="line-230">      } else if (e instanceof FileNotFoundException) {</span>
+<span class="source-line-no">231</span><span id="line-231">        throw (FileNotFoundException) e;</span>
+<span class="source-line-no">232</span><span id="line-232">      }</span>
+<span class="source-line-no">233</span><span id="line-233">      LOG.warn(getLogMessageDetail(nbAttempt, p, startWaiting), e);</span>
+<span class="source-line-no">234</span><span id="line-234">    } catch (IllegalAccessException e) {</span>
+<span class="source-line-no">235</span><span id="line-235">      LOG.error("Failed to call recoverLease on {}. Abort.", dfs, e);</span>
+<span class="source-line-no">236</span><span id="line-236">      throw new RuntimeException(e);</span>
+<span class="source-line-no">237</span><span id="line-237">    }</span>
+<span class="source-line-no">238</span><span id="line-238">    return recovered;</span>
+<span class="source-line-no">239</span><span id="line-239">  }</span>
+<span class="source-line-no">240</span><span id="line-240"></span>
+<span class="source-line-no">241</span><span id="line-241">  /** Returns Detail to append to any log message around lease recovering. */</span>
+<span class="source-line-no">242</span><span id="line-242">  private static String getLogMessageDetail(final int nbAttempt, final Path p,</span>
+<span class="source-line-no">243</span><span id="line-243">    final long startWaiting) {</span>
+<span class="source-line-no">244</span><span id="line-244">    return "attempt=" + nbAttempt + " on file=" + p + " after "</span>
+<span class="source-line-no">245</span><span id="line-245">      + (EnvironmentEdgeManager.currentTime() - startWaiting) + "ms";</span>
+<span class="source-line-no">246</span><span id="line-246">  }</span>
+<span class="source-line-no">247</span><span id="line-247"></span>
+<span class="source-line-no">248</span><span id="line-248">  /**</span>
+<span class="source-line-no">249</span><span id="line-249">   * Call HDFS-4525 isFileClosed if it is available.</span>
+<span class="source-line-no">250</span><span id="line-250">   * @return True if file is closed.</span>
+<span class="source-line-no">251</span><span id="line-251">   */</span>
+<span class="source-line-no">252</span><span id="line-252">  private static boolean isFileClosed(final FileSystem dfs, final Method m, final Path p) {</span>
+<span class="source-line-no">253</span><span id="line-253">    try {</span>
+<span class="source-line-no">254</span><span id="line-254">      return (Boolean) m.invoke(dfs, p);</span>
+<span class="source-line-no">255</span><span id="line-255">    } catch (SecurityException e) {</span>
+<span class="source-line-no">256</span><span id="line-256">      LOG.warn("No access", e);</span>
+<span class="source-line-no">257</span><span id="line-257">    } catch (Exception e) {</span>
+<span class="source-line-no">258</span><span id="line-258">      LOG.warn("Failed invocation for " + p.toString(), e);</span>
+<span class="source-line-no">259</span><span id="line-259">    }</span>
+<span class="source-line-no">260</span><span id="line-260">    return false;</span>
+<span class="source-line-no">261</span><span id="line-261">  }</span>
+<span class="source-line-no">262</span><span id="line-262"></span>
+<span class="source-line-no">263</span><span id="line-263">  private static void checkIfCancelled(final CancelableProgressable reporter)</span>
+<span class="source-line-no">264</span><span id="line-264">    throws InterruptedIOException {</span>
+<span class="source-line-no">265</span><span id="line-265">    if (reporter == null) {</span>
+<span class="source-line-no">266</span><span id="line-266">      return;</span>
+<span class="source-line-no">267</span><span id="line-267">    }</span>
+<span class="source-line-no">268</span><span id="line-268">    if (!reporter.progress()) {</span>
+<span class="source-line-no">269</span><span id="line-269">      throw new InterruptedIOException("Operation cancelled");</span>
+<span class="source-line-no">270</span><span id="line-270">    }</span>
+<span class="source-line-no">271</span><span id="line-271">  }</span>
+<span class="source-line-no">272</span><span id="line-272">}</span>
 
 
 
