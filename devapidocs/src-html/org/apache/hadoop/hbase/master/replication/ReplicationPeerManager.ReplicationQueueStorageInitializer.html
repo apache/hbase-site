@@ -89,764 +89,776 @@
 <span class="source-line-no">076</span><span id="line-76">import org.apache.hadoop.hbase.replication.ZKReplicationQueueStorageForMigration.ZkReplicationQueueData;</span>
 <span class="source-line-no">077</span><span id="line-77">import org.apache.hadoop.hbase.util.FutureUtils;</span>
 <span class="source-line-no">078</span><span id="line-78">import org.apache.hadoop.hbase.util.Pair;</span>
-<span class="source-line-no">079</span><span id="line-79">import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;</span>
-<span class="source-line-no">080</span><span id="line-80">import org.apache.hadoop.hbase.zookeeper.ZKClusterId;</span>
-<span class="source-line-no">081</span><span id="line-81">import org.apache.hadoop.hbase.zookeeper.ZKConfig;</span>
-<span class="source-line-no">082</span><span id="line-82">import org.apache.hadoop.hbase.zookeeper.ZKWatcher;</span>
-<span class="source-line-no">083</span><span id="line-83">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">084</span><span id="line-84">import org.apache.zookeeper.KeeperException;</span>
-<span class="source-line-no">085</span><span id="line-85">import org.slf4j.Logger;</span>
-<span class="source-line-no">086</span><span id="line-86">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">087</span><span id="line-87"></span>
-<span class="source-line-no">088</span><span id="line-88">import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableMap;</span>
-<span class="source-line-no">089</span><span id="line-89">import org.apache.hbase.thirdparty.com.google.common.collect.Maps;</span>
-<span class="source-line-no">090</span><span id="line-90"></span>
-<span class="source-line-no">091</span><span id="line-91">/**</span>
-<span class="source-line-no">092</span><span id="line-92"> * Manages and performs all replication admin operations.</span>
-<span class="source-line-no">093</span><span id="line-93"> * &lt;p&gt;</span>
-<span class="source-line-no">094</span><span id="line-94"> * Used to add/remove a replication peer.</span>
-<span class="source-line-no">095</span><span id="line-95"> * &lt;p&gt;</span>
-<span class="source-line-no">096</span><span id="line-96"> * Implement {@link ConfigurationObserver} mainly for recreating {@link ReplicationPeerStorage}, for</span>
-<span class="source-line-no">097</span><span id="line-97"> * supporting migrating across different replication peer storages without restarting master.</span>
-<span class="source-line-no">098</span><span id="line-98"> */</span>
-<span class="source-line-no">099</span><span id="line-99">@InterfaceAudience.Private</span>
-<span class="source-line-no">100</span><span id="line-100">public class ReplicationPeerManager implements ConfigurationObserver {</span>
-<span class="source-line-no">101</span><span id="line-101"></span>
-<span class="source-line-no">102</span><span id="line-102">  private static final Logger LOG = LoggerFactory.getLogger(ReplicationPeerManager.class);</span>
-<span class="source-line-no">103</span><span id="line-103"></span>
-<span class="source-line-no">104</span><span id="line-104">  private volatile ReplicationPeerStorage peerStorage;</span>
-<span class="source-line-no">105</span><span id="line-105"></span>
-<span class="source-line-no">106</span><span id="line-106">  private final ReplicationQueueStorage queueStorage;</span>
-<span class="source-line-no">107</span><span id="line-107"></span>
-<span class="source-line-no">108</span><span id="line-108">  private final ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers;</span>
-<span class="source-line-no">109</span><span id="line-109"></span>
-<span class="source-line-no">110</span><span id="line-110">  private final ImmutableMap&lt;SyncReplicationState,</span>
-<span class="source-line-no">111</span><span id="line-111">    EnumSet&lt;SyncReplicationState&gt;&gt; allowedTransition =</span>
-<span class="source-line-no">112</span><span id="line-112">      Maps.immutableEnumMap(ImmutableMap.of(SyncReplicationState.ACTIVE,</span>
-<span class="source-line-no">113</span><span id="line-113">        EnumSet.of(SyncReplicationState.DOWNGRADE_ACTIVE, SyncReplicationState.STANDBY),</span>
-<span class="source-line-no">114</span><span id="line-114">        SyncReplicationState.STANDBY, EnumSet.of(SyncReplicationState.DOWNGRADE_ACTIVE),</span>
-<span class="source-line-no">115</span><span id="line-115">        SyncReplicationState.DOWNGRADE_ACTIVE,</span>
-<span class="source-line-no">116</span><span id="line-116">        EnumSet.of(SyncReplicationState.STANDBY, SyncReplicationState.ACTIVE)));</span>
-<span class="source-line-no">117</span><span id="line-117"></span>
-<span class="source-line-no">118</span><span id="line-118">  private final String clusterId;</span>
-<span class="source-line-no">119</span><span id="line-119"></span>
-<span class="source-line-no">120</span><span id="line-120">  private volatile Configuration conf;</span>
-<span class="source-line-no">121</span><span id="line-121"></span>
-<span class="source-line-no">122</span><span id="line-122">  // for dynamic recreating ReplicationPeerStorage.</span>
-<span class="source-line-no">123</span><span id="line-123">  private final FileSystem fs;</span>
-<span class="source-line-no">124</span><span id="line-124"></span>
-<span class="source-line-no">125</span><span id="line-125">  private final ZKWatcher zk;</span>
-<span class="source-line-no">126</span><span id="line-126"></span>
-<span class="source-line-no">127</span><span id="line-127">  @FunctionalInterface</span>
-<span class="source-line-no">128</span><span id="line-128">  interface ReplicationQueueStorageInitializer {</span>
-<span class="source-line-no">129</span><span id="line-129"></span>
-<span class="source-line-no">130</span><span id="line-130">    void initialize() throws IOException;</span>
-<span class="source-line-no">131</span><span id="line-131">  }</span>
-<span class="source-line-no">132</span><span id="line-132"></span>
-<span class="source-line-no">133</span><span id="line-133">  private final ReplicationQueueStorageInitializer queueStorageInitializer;</span>
-<span class="source-line-no">134</span><span id="line-134"></span>
-<span class="source-line-no">135</span><span id="line-135">  // we will mock this class in UT so leave the constructor as package private and not mark the</span>
-<span class="source-line-no">136</span><span id="line-136">  // class as final, since mockito can not mock a final class</span>
-<span class="source-line-no">137</span><span id="line-137">  ReplicationPeerManager(FileSystem fs, ZKWatcher zk, ReplicationPeerStorage peerStorage,</span>
-<span class="source-line-no">138</span><span id="line-138">    ReplicationQueueStorage queueStorage, ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers,</span>
-<span class="source-line-no">139</span><span id="line-139">    Configuration conf, String clusterId,</span>
-<span class="source-line-no">140</span><span id="line-140">    ReplicationQueueStorageInitializer queueStorageInitializer) {</span>
-<span class="source-line-no">141</span><span id="line-141">    this.fs = fs;</span>
-<span class="source-line-no">142</span><span id="line-142">    this.zk = zk;</span>
-<span class="source-line-no">143</span><span id="line-143">    this.peerStorage = peerStorage;</span>
-<span class="source-line-no">144</span><span id="line-144">    this.queueStorage = queueStorage;</span>
-<span class="source-line-no">145</span><span id="line-145">    this.peers = peers;</span>
-<span class="source-line-no">146</span><span id="line-146">    this.conf = conf;</span>
-<span class="source-line-no">147</span><span id="line-147">    this.clusterId = clusterId;</span>
-<span class="source-line-no">148</span><span id="line-148">    this.queueStorageInitializer = queueStorageInitializer;</span>
-<span class="source-line-no">149</span><span id="line-149">  }</span>
-<span class="source-line-no">150</span><span id="line-150"></span>
-<span class="source-line-no">151</span><span id="line-151">  private void checkQueuesDeleted(String peerId)</span>
-<span class="source-line-no">152</span><span id="line-152">    throws ReplicationException, DoNotRetryIOException {</span>
-<span class="source-line-no">153</span><span id="line-153">    List&lt;ReplicationQueueId&gt; queueIds = queueStorage.listAllQueueIds(peerId);</span>
-<span class="source-line-no">154</span><span id="line-154">    if (!queueIds.isEmpty()) {</span>
-<span class="source-line-no">155</span><span id="line-155">      throw new DoNotRetryIOException("There are still " + queueIds.size()</span>
-<span class="source-line-no">156</span><span id="line-156">        + " undeleted queue(s) for peerId: " + peerId + ", first is " + queueIds.get(0));</span>
-<span class="source-line-no">157</span><span id="line-157">    }</span>
-<span class="source-line-no">158</span><span id="line-158">    if (queueStorage.getAllPeersFromHFileRefsQueue().contains(peerId)) {</span>
-<span class="source-line-no">159</span><span id="line-159">      throw new DoNotRetryIOException("Undeleted queue for peer " + peerId + " in hfile-refs");</span>
-<span class="source-line-no">160</span><span id="line-160">    }</span>
-<span class="source-line-no">161</span><span id="line-161">  }</span>
-<span class="source-line-no">162</span><span id="line-162"></span>
-<span class="source-line-no">163</span><span id="line-163">  private void initializeQueueStorage() throws IOException {</span>
-<span class="source-line-no">164</span><span id="line-164">    queueStorageInitializer.initialize();</span>
-<span class="source-line-no">165</span><span id="line-165">  }</span>
-<span class="source-line-no">166</span><span id="line-166"></span>
-<span class="source-line-no">167</span><span id="line-167">  void preAddPeer(String peerId, ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">168</span><span id="line-168">    throws ReplicationException, IOException {</span>
-<span class="source-line-no">169</span><span id="line-169">    if (peerId.contains("-")) {</span>
-<span class="source-line-no">170</span><span id="line-170">      throw new DoNotRetryIOException("Found invalid peer name: " + peerId);</span>
-<span class="source-line-no">171</span><span id="line-171">    }</span>
-<span class="source-line-no">172</span><span id="line-172">    checkPeerConfig(peerConfig);</span>
-<span class="source-line-no">173</span><span id="line-173">    if (peerConfig.isSyncReplication()) {</span>
-<span class="source-line-no">174</span><span id="line-174">      checkSyncReplicationPeerConfigConflict(peerConfig);</span>
-<span class="source-line-no">175</span><span id="line-175">    }</span>
-<span class="source-line-no">176</span><span id="line-176">    if (peers.containsKey(peerId)) {</span>
-<span class="source-line-no">177</span><span id="line-177">      throw new DoNotRetryIOException("Replication peer " + peerId + " already exists");</span>
-<span class="source-line-no">178</span><span id="line-178">    }</span>
-<span class="source-line-no">179</span><span id="line-179"></span>
-<span class="source-line-no">180</span><span id="line-180">    // lazy create table</span>
-<span class="source-line-no">181</span><span id="line-181">    initializeQueueStorage();</span>
-<span class="source-line-no">182</span><span id="line-182">    // make sure that there is no queues with the same peer id. This may happen when we create a</span>
-<span class="source-line-no">183</span><span id="line-183">    // peer with the same id with a old deleted peer. If the replication queues for the old peer</span>
-<span class="source-line-no">184</span><span id="line-184">    // have not been cleaned up yet then we should not create the new peer, otherwise the old wal</span>
-<span class="source-line-no">185</span><span id="line-185">    // file may also be replicated.</span>
-<span class="source-line-no">186</span><span id="line-186">    checkQueuesDeleted(peerId);</span>
-<span class="source-line-no">187</span><span id="line-187">  }</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">  private ReplicationPeerDescription checkPeerExists(String peerId) throws DoNotRetryIOException {</span>
-<span class="source-line-no">190</span><span id="line-190">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">191</span><span id="line-191">    if (desc == null) {</span>
-<span class="source-line-no">192</span><span id="line-192">      throw new ReplicationPeerNotFoundException(peerId);</span>
-<span class="source-line-no">193</span><span id="line-193">    }</span>
-<span class="source-line-no">194</span><span id="line-194">    return desc;</span>
-<span class="source-line-no">195</span><span id="line-195">  }</span>
-<span class="source-line-no">196</span><span id="line-196"></span>
-<span class="source-line-no">197</span><span id="line-197">  private void checkPeerInDAStateIfSyncReplication(String peerId) throws DoNotRetryIOException {</span>
-<span class="source-line-no">198</span><span id="line-198">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">199</span><span id="line-199">    if (</span>
-<span class="source-line-no">200</span><span id="line-200">      desc != null &amp;&amp; desc.getPeerConfig().isSyncReplication()</span>
-<span class="source-line-no">201</span><span id="line-201">        &amp;&amp; !SyncReplicationState.DOWNGRADE_ACTIVE.equals(desc.getSyncReplicationState())</span>
-<span class="source-line-no">202</span><span id="line-202">    ) {</span>
-<span class="source-line-no">203</span><span id="line-203">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">204</span><span id="line-204">        "Couldn't remove synchronous replication peer with state=" + desc.getSyncReplicationState()</span>
-<span class="source-line-no">205</span><span id="line-205">          + ", Transit the synchronous replication state to be DOWNGRADE_ACTIVE firstly.");</span>
-<span class="source-line-no">206</span><span id="line-206">    }</span>
-<span class="source-line-no">207</span><span id="line-207">  }</span>
-<span class="source-line-no">208</span><span id="line-208"></span>
-<span class="source-line-no">209</span><span id="line-209">  ReplicationPeerConfig preRemovePeer(String peerId) throws DoNotRetryIOException {</span>
-<span class="source-line-no">210</span><span id="line-210">    ReplicationPeerDescription pd = checkPeerExists(peerId);</span>
-<span class="source-line-no">211</span><span id="line-211">    checkPeerInDAStateIfSyncReplication(peerId);</span>
-<span class="source-line-no">212</span><span id="line-212">    return pd.getPeerConfig();</span>
-<span class="source-line-no">213</span><span id="line-213">  }</span>
-<span class="source-line-no">214</span><span id="line-214"></span>
-<span class="source-line-no">215</span><span id="line-215">  void preEnablePeer(String peerId) throws DoNotRetryIOException {</span>
-<span class="source-line-no">216</span><span id="line-216">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
-<span class="source-line-no">217</span><span id="line-217">    if (desc.isEnabled()) {</span>
-<span class="source-line-no">218</span><span id="line-218">      throw new DoNotRetryIOException("Replication peer " + peerId + " has already been enabled");</span>
-<span class="source-line-no">219</span><span id="line-219">    }</span>
-<span class="source-line-no">220</span><span id="line-220">  }</span>
-<span class="source-line-no">221</span><span id="line-221"></span>
-<span class="source-line-no">222</span><span id="line-222">  void preDisablePeer(String peerId) throws DoNotRetryIOException {</span>
-<span class="source-line-no">223</span><span id="line-223">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
-<span class="source-line-no">224</span><span id="line-224">    if (!desc.isEnabled()) {</span>
-<span class="source-line-no">225</span><span id="line-225">      throw new DoNotRetryIOException("Replication peer " + peerId + " has already been disabled");</span>
-<span class="source-line-no">226</span><span id="line-226">    }</span>
-<span class="source-line-no">227</span><span id="line-227">  }</span>
-<span class="source-line-no">228</span><span id="line-228"></span>
-<span class="source-line-no">229</span><span id="line-229">  /**</span>
-<span class="source-line-no">230</span><span id="line-230">   * Return the old peer description. Can never be null.</span>
-<span class="source-line-no">231</span><span id="line-231">   */</span>
-<span class="source-line-no">232</span><span id="line-232">  ReplicationPeerDescription preUpdatePeerConfig(String peerId, ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">233</span><span id="line-233">    throws DoNotRetryIOException {</span>
-<span class="source-line-no">234</span><span id="line-234">    checkPeerConfig(peerConfig);</span>
-<span class="source-line-no">235</span><span id="line-235">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
-<span class="source-line-no">236</span><span id="line-236">    ReplicationPeerConfig oldPeerConfig = desc.getPeerConfig();</span>
-<span class="source-line-no">237</span><span id="line-237">    if (!isStringEquals(peerConfig.getClusterKey(), oldPeerConfig.getClusterKey())) {</span>
-<span class="source-line-no">238</span><span id="line-238">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">239</span><span id="line-239">        "Changing the cluster key on an existing peer is not allowed. Existing key '"</span>
-<span class="source-line-no">240</span><span id="line-240">          + oldPeerConfig.getClusterKey() + "' for peer " + peerId + " does not match new key '"</span>
-<span class="source-line-no">241</span><span id="line-241">          + peerConfig.getClusterKey() + "'");</span>
-<span class="source-line-no">242</span><span id="line-242">    }</span>
-<span class="source-line-no">243</span><span id="line-243"></span>
-<span class="source-line-no">244</span><span id="line-244">    if (</span>
-<span class="source-line-no">245</span><span id="line-245">      !isStringEquals(peerConfig.getReplicationEndpointImpl(),</span>
-<span class="source-line-no">246</span><span id="line-246">        oldPeerConfig.getReplicationEndpointImpl())</span>
-<span class="source-line-no">247</span><span id="line-247">    ) {</span>
-<span class="source-line-no">248</span><span id="line-248">      throw new DoNotRetryIOException("Changing the replication endpoint implementation class "</span>
-<span class="source-line-no">249</span><span id="line-249">        + "on an existing peer is not allowed. Existing class '"</span>
-<span class="source-line-no">250</span><span id="line-250">        + oldPeerConfig.getReplicationEndpointImpl() + "' for peer " + peerId</span>
-<span class="source-line-no">251</span><span id="line-251">        + " does not match new class '" + peerConfig.getReplicationEndpointImpl() + "'");</span>
-<span class="source-line-no">252</span><span id="line-252">    }</span>
-<span class="source-line-no">253</span><span id="line-253"></span>
-<span class="source-line-no">254</span><span id="line-254">    if (!isStringEquals(peerConfig.getRemoteWALDir(), oldPeerConfig.getRemoteWALDir())) {</span>
-<span class="source-line-no">255</span><span id="line-255">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">256</span><span id="line-256">        "Changing the remote wal dir on an existing peer is not allowed. Existing remote wal "</span>
-<span class="source-line-no">257</span><span id="line-257">          + "dir '" + oldPeerConfig.getRemoteWALDir() + "' for peer " + peerId</span>
-<span class="source-line-no">258</span><span id="line-258">          + " does not match new remote wal dir '" + peerConfig.getRemoteWALDir() + "'");</span>
-<span class="source-line-no">259</span><span id="line-259">    }</span>
-<span class="source-line-no">260</span><span id="line-260"></span>
-<span class="source-line-no">261</span><span id="line-261">    if (oldPeerConfig.isSyncReplication()) {</span>
-<span class="source-line-no">262</span><span id="line-262">      if (!ReplicationUtils.isNamespacesAndTableCFsEqual(oldPeerConfig, peerConfig)) {</span>
-<span class="source-line-no">263</span><span id="line-263">        throw new DoNotRetryIOException(</span>
-<span class="source-line-no">264</span><span id="line-264">          "Changing the replicated namespace/table config on a synchronous replication "</span>
-<span class="source-line-no">265</span><span id="line-265">            + "peer(peerId: " + peerId + ") is not allowed.");</span>
-<span class="source-line-no">266</span><span id="line-266">      }</span>
-<span class="source-line-no">267</span><span id="line-267">    }</span>
-<span class="source-line-no">268</span><span id="line-268">    return desc;</span>
-<span class="source-line-no">269</span><span id="line-269">  }</span>
-<span class="source-line-no">270</span><span id="line-270"></span>
-<span class="source-line-no">271</span><span id="line-271">  /** Returns the old desciption of the peer */</span>
-<span class="source-line-no">272</span><span id="line-272">  ReplicationPeerDescription preTransitPeerSyncReplicationState(String peerId,</span>
-<span class="source-line-no">273</span><span id="line-273">    SyncReplicationState state) throws DoNotRetryIOException {</span>
-<span class="source-line-no">274</span><span id="line-274">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
-<span class="source-line-no">275</span><span id="line-275">    SyncReplicationState fromState = desc.getSyncReplicationState();</span>
-<span class="source-line-no">276</span><span id="line-276">    EnumSet&lt;SyncReplicationState&gt; allowedToStates = allowedTransition.get(fromState);</span>
-<span class="source-line-no">277</span><span id="line-277">    if (allowedToStates == null || !allowedToStates.contains(state)) {</span>
-<span class="source-line-no">278</span><span id="line-278">      throw new DoNotRetryIOException("Can not transit current cluster state from " + fromState</span>
-<span class="source-line-no">279</span><span id="line-279">        + " to " + state + " for peer id=" + peerId);</span>
-<span class="source-line-no">280</span><span id="line-280">    }</span>
-<span class="source-line-no">281</span><span id="line-281">    return desc;</span>
-<span class="source-line-no">282</span><span id="line-282">  }</span>
-<span class="source-line-no">283</span><span id="line-283"></span>
-<span class="source-line-no">284</span><span id="line-284">  public void addPeer(String peerId, ReplicationPeerConfig peerConfig, boolean enabled)</span>
-<span class="source-line-no">285</span><span id="line-285">    throws ReplicationException {</span>
-<span class="source-line-no">286</span><span id="line-286">    if (peers.containsKey(peerId)) {</span>
-<span class="source-line-no">287</span><span id="line-287">      // this should be a retry, just return</span>
-<span class="source-line-no">288</span><span id="line-288">      return;</span>
-<span class="source-line-no">289</span><span id="line-289">    }</span>
-<span class="source-line-no">290</span><span id="line-290">    peerConfig = ReplicationPeerConfigUtil.updateReplicationBasePeerConfigs(conf, peerConfig);</span>
-<span class="source-line-no">291</span><span id="line-291">    ReplicationPeerConfig copiedPeerConfig = ReplicationPeerConfig.newBuilder(peerConfig).build();</span>
-<span class="source-line-no">292</span><span id="line-292">    SyncReplicationState syncReplicationState = copiedPeerConfig.isSyncReplication()</span>
-<span class="source-line-no">293</span><span id="line-293">      ? SyncReplicationState.DOWNGRADE_ACTIVE</span>
-<span class="source-line-no">294</span><span id="line-294">      : SyncReplicationState.NONE;</span>
-<span class="source-line-no">295</span><span id="line-295">    peerStorage.addPeer(peerId, copiedPeerConfig, enabled, syncReplicationState);</span>
-<span class="source-line-no">296</span><span id="line-296">    peers.put(peerId,</span>
-<span class="source-line-no">297</span><span id="line-297">      new ReplicationPeerDescription(peerId, enabled, copiedPeerConfig, syncReplicationState));</span>
-<span class="source-line-no">298</span><span id="line-298">  }</span>
-<span class="source-line-no">299</span><span id="line-299"></span>
-<span class="source-line-no">300</span><span id="line-300">  public void removePeer(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">301</span><span id="line-301">    if (!peers.containsKey(peerId)) {</span>
-<span class="source-line-no">302</span><span id="line-302">      // this should be a retry, just return</span>
-<span class="source-line-no">303</span><span id="line-303">      return;</span>
-<span class="source-line-no">304</span><span id="line-304">    }</span>
-<span class="source-line-no">305</span><span id="line-305">    peerStorage.removePeer(peerId);</span>
-<span class="source-line-no">306</span><span id="line-306">    peers.remove(peerId);</span>
-<span class="source-line-no">307</span><span id="line-307">  }</span>
-<span class="source-line-no">308</span><span id="line-308"></span>
-<span class="source-line-no">309</span><span id="line-309">  private void setPeerState(String peerId, boolean enabled) throws ReplicationException {</span>
-<span class="source-line-no">310</span><span id="line-310">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">311</span><span id="line-311">    if (desc.isEnabled() == enabled) {</span>
-<span class="source-line-no">312</span><span id="line-312">      // this should be a retry, just return</span>
-<span class="source-line-no">313</span><span id="line-313">      return;</span>
-<span class="source-line-no">314</span><span id="line-314">    }</span>
-<span class="source-line-no">315</span><span id="line-315">    peerStorage.setPeerState(peerId, enabled);</span>
-<span class="source-line-no">316</span><span id="line-316">    peers.put(peerId, new ReplicationPeerDescription(peerId, enabled, desc.getPeerConfig(),</span>
-<span class="source-line-no">317</span><span id="line-317">      desc.getSyncReplicationState()));</span>
-<span class="source-line-no">318</span><span id="line-318">  }</span>
-<span class="source-line-no">319</span><span id="line-319"></span>
-<span class="source-line-no">320</span><span id="line-320">  public boolean getPeerState(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">321</span><span id="line-321">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">322</span><span id="line-322">    if (desc != null) {</span>
-<span class="source-line-no">323</span><span id="line-323">      return desc.isEnabled();</span>
-<span class="source-line-no">324</span><span id="line-324">    } else {</span>
-<span class="source-line-no">325</span><span id="line-325">      throw new ReplicationException("Replication Peer of " + peerId + " does not exist.");</span>
-<span class="source-line-no">326</span><span id="line-326">    }</span>
-<span class="source-line-no">327</span><span id="line-327">  }</span>
-<span class="source-line-no">328</span><span id="line-328"></span>
-<span class="source-line-no">329</span><span id="line-329">  public void enablePeer(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">330</span><span id="line-330">    setPeerState(peerId, true);</span>
-<span class="source-line-no">331</span><span id="line-331">  }</span>
-<span class="source-line-no">332</span><span id="line-332"></span>
-<span class="source-line-no">333</span><span id="line-333">  public void disablePeer(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">334</span><span id="line-334">    setPeerState(peerId, false);</span>
-<span class="source-line-no">335</span><span id="line-335">  }</span>
-<span class="source-line-no">336</span><span id="line-336"></span>
-<span class="source-line-no">337</span><span id="line-337">  public void updatePeerConfig(String peerId, ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">338</span><span id="line-338">    throws ReplicationException {</span>
-<span class="source-line-no">339</span><span id="line-339">    // the checking rules are too complicated here so we give up checking whether this is a retry.</span>
-<span class="source-line-no">340</span><span id="line-340">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">341</span><span id="line-341">    ReplicationPeerConfig oldPeerConfig = desc.getPeerConfig();</span>
-<span class="source-line-no">342</span><span id="line-342">    ReplicationPeerConfigBuilder newPeerConfigBuilder =</span>
-<span class="source-line-no">343</span><span id="line-343">      ReplicationPeerConfig.newBuilder(peerConfig);</span>
-<span class="source-line-no">344</span><span id="line-344">    // we need to use the new conf to overwrite the old one.</span>
-<span class="source-line-no">345</span><span id="line-345">    newPeerConfigBuilder.putAllConfiguration(oldPeerConfig.getConfiguration());</span>
-<span class="source-line-no">346</span><span id="line-346">    newPeerConfigBuilder.putAllConfiguration(peerConfig.getConfiguration());</span>
-<span class="source-line-no">347</span><span id="line-347">    ReplicationPeerConfig newPeerConfig = newPeerConfigBuilder.build();</span>
-<span class="source-line-no">348</span><span id="line-348">    peerStorage.updatePeerConfig(peerId, newPeerConfig);</span>
-<span class="source-line-no">349</span><span id="line-349">    peers.put(peerId, new ReplicationPeerDescription(peerId, desc.isEnabled(), newPeerConfig,</span>
-<span class="source-line-no">350</span><span id="line-350">      desc.getSyncReplicationState()));</span>
-<span class="source-line-no">351</span><span id="line-351">  }</span>
-<span class="source-line-no">352</span><span id="line-352"></span>
-<span class="source-line-no">353</span><span id="line-353">  public List&lt;ReplicationPeerDescription&gt; listPeers(Pattern pattern) {</span>
-<span class="source-line-no">354</span><span id="line-354">    if (pattern == null) {</span>
-<span class="source-line-no">355</span><span id="line-355">      return new ArrayList&lt;&gt;(peers.values());</span>
-<span class="source-line-no">356</span><span id="line-356">    }</span>
-<span class="source-line-no">357</span><span id="line-357">    return peers.values().stream().filter(r -&gt; pattern.matcher(r.getPeerId()).matches())</span>
-<span class="source-line-no">358</span><span id="line-358">      .collect(Collectors.toList());</span>
-<span class="source-line-no">359</span><span id="line-359">  }</span>
-<span class="source-line-no">360</span><span id="line-360"></span>
-<span class="source-line-no">361</span><span id="line-361">  public Optional&lt;ReplicationPeerConfig&gt; getPeerConfig(String peerId) {</span>
-<span class="source-line-no">362</span><span id="line-362">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">363</span><span id="line-363">    return desc != null ? Optional.of(desc.getPeerConfig()) : Optional.empty();</span>
-<span class="source-line-no">364</span><span id="line-364">  }</span>
-<span class="source-line-no">365</span><span id="line-365"></span>
-<span class="source-line-no">366</span><span id="line-366">  void removeAllLastPushedSeqIds(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">367</span><span id="line-367">    queueStorage.removeLastSequenceIds(peerId);</span>
-<span class="source-line-no">368</span><span id="line-368">  }</span>
-<span class="source-line-no">369</span><span id="line-369"></span>
-<span class="source-line-no">370</span><span id="line-370">  public void setPeerNewSyncReplicationState(String peerId, SyncReplicationState state)</span>
-<span class="source-line-no">371</span><span id="line-371">    throws ReplicationException {</span>
-<span class="source-line-no">372</span><span id="line-372">    peerStorage.setPeerNewSyncReplicationState(peerId, state);</span>
-<span class="source-line-no">373</span><span id="line-373">  }</span>
-<span class="source-line-no">374</span><span id="line-374"></span>
-<span class="source-line-no">375</span><span id="line-375">  public void transitPeerSyncReplicationState(String peerId, SyncReplicationState newState)</span>
-<span class="source-line-no">376</span><span id="line-376">    throws ReplicationException {</span>
-<span class="source-line-no">377</span><span id="line-377">    if (peerStorage.getPeerNewSyncReplicationState(peerId) != SyncReplicationState.NONE) {</span>
-<span class="source-line-no">378</span><span id="line-378">      // Only transit if this is not a retry</span>
-<span class="source-line-no">379</span><span id="line-379">      peerStorage.transitPeerSyncReplicationState(peerId);</span>
-<span class="source-line-no">380</span><span id="line-380">    }</span>
-<span class="source-line-no">381</span><span id="line-381">    ReplicationPeerDescription desc = peers.get(peerId);</span>
-<span class="source-line-no">382</span><span id="line-382">    if (desc.getSyncReplicationState() != newState) {</span>
-<span class="source-line-no">383</span><span id="line-383">      // Only recreate the desc if this is not a retry</span>
-<span class="source-line-no">384</span><span id="line-384">      peers.put(peerId,</span>
-<span class="source-line-no">385</span><span id="line-385">        new ReplicationPeerDescription(peerId, desc.isEnabled(), desc.getPeerConfig(), newState));</span>
-<span class="source-line-no">386</span><span id="line-386">    }</span>
-<span class="source-line-no">387</span><span id="line-387">  }</span>
-<span class="source-line-no">388</span><span id="line-388"></span>
-<span class="source-line-no">389</span><span id="line-389">  public void removeAllQueues(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">390</span><span id="line-390">    // Here we need two passes to address the problem of claimQueue. Maybe a claimQueue is still</span>
-<span class="source-line-no">391</span><span id="line-391">    // on-going when the refresh peer config procedure is done, if a RS which has already been</span>
-<span class="source-line-no">392</span><span id="line-392">    // scanned claims the queue of a RS which has not been scanned yet, we will miss that queue in</span>
-<span class="source-line-no">393</span><span id="line-393">    // the scan here, and if the RS who has claimed the queue crashed before creating recovered</span>
-<span class="source-line-no">394</span><span id="line-394">    // source, then the queue will leave there until the another RS detects the crash and helps</span>
-<span class="source-line-no">395</span><span id="line-395">    // removing the queue.</span>
-<span class="source-line-no">396</span><span id="line-396">    // A two pass scan can solve the problem. Anyway, the queue will not disappear during the</span>
-<span class="source-line-no">397</span><span id="line-397">    // claiming, it will either under the old RS or under the new RS, and a queue can only be</span>
-<span class="source-line-no">398</span><span id="line-398">    // claimed once after the refresh peer procedure done(as the next claim queue will just delete</span>
-<span class="source-line-no">399</span><span id="line-399">    // it), so we can make sure that a two pass scan will finally find the queue and remove it,</span>
-<span class="source-line-no">400</span><span id="line-400">    // unless it has already been removed by others.</span>
-<span class="source-line-no">401</span><span id="line-401">    queueStorage.removeAllQueues(peerId);</span>
+<span class="source-line-no">079</span><span id="line-79">import org.apache.hadoop.hbase.util.ServerRegionReplicaUtil;</span>
+<span class="source-line-no">080</span><span id="line-80">import org.apache.hadoop.hbase.wal.AbstractFSWALProvider;</span>
+<span class="source-line-no">081</span><span id="line-81">import org.apache.hadoop.hbase.zookeeper.ZKClusterId;</span>
+<span class="source-line-no">082</span><span id="line-82">import org.apache.hadoop.hbase.zookeeper.ZKConfig;</span>
+<span class="source-line-no">083</span><span id="line-83">import org.apache.hadoop.hbase.zookeeper.ZKWatcher;</span>
+<span class="source-line-no">084</span><span id="line-84">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">085</span><span id="line-85">import org.apache.zookeeper.KeeperException;</span>
+<span class="source-line-no">086</span><span id="line-86">import org.slf4j.Logger;</span>
+<span class="source-line-no">087</span><span id="line-87">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">088</span><span id="line-88"></span>
+<span class="source-line-no">089</span><span id="line-89">import org.apache.hbase.thirdparty.com.google.common.collect.ImmutableMap;</span>
+<span class="source-line-no">090</span><span id="line-90">import org.apache.hbase.thirdparty.com.google.common.collect.Maps;</span>
+<span class="source-line-no">091</span><span id="line-91"></span>
+<span class="source-line-no">092</span><span id="line-92">/**</span>
+<span class="source-line-no">093</span><span id="line-93"> * Manages and performs all replication admin operations.</span>
+<span class="source-line-no">094</span><span id="line-94"> * &lt;p&gt;</span>
+<span class="source-line-no">095</span><span id="line-95"> * Used to add/remove a replication peer.</span>
+<span class="source-line-no">096</span><span id="line-96"> * &lt;p&gt;</span>
+<span class="source-line-no">097</span><span id="line-97"> * Implement {@link ConfigurationObserver} mainly for recreating {@link ReplicationPeerStorage}, for</span>
+<span class="source-line-no">098</span><span id="line-98"> * supporting migrating across different replication peer storages without restarting master.</span>
+<span class="source-line-no">099</span><span id="line-99"> */</span>
+<span class="source-line-no">100</span><span id="line-100">@InterfaceAudience.Private</span>
+<span class="source-line-no">101</span><span id="line-101">public class ReplicationPeerManager implements ConfigurationObserver {</span>
+<span class="source-line-no">102</span><span id="line-102"></span>
+<span class="source-line-no">103</span><span id="line-103">  private static final Logger LOG = LoggerFactory.getLogger(ReplicationPeerManager.class);</span>
+<span class="source-line-no">104</span><span id="line-104"></span>
+<span class="source-line-no">105</span><span id="line-105">  private volatile ReplicationPeerStorage peerStorage;</span>
+<span class="source-line-no">106</span><span id="line-106"></span>
+<span class="source-line-no">107</span><span id="line-107">  private final ReplicationQueueStorage queueStorage;</span>
+<span class="source-line-no">108</span><span id="line-108"></span>
+<span class="source-line-no">109</span><span id="line-109">  private final ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers;</span>
+<span class="source-line-no">110</span><span id="line-110"></span>
+<span class="source-line-no">111</span><span id="line-111">  private final ImmutableMap&lt;SyncReplicationState,</span>
+<span class="source-line-no">112</span><span id="line-112">    EnumSet&lt;SyncReplicationState&gt;&gt; allowedTransition =</span>
+<span class="source-line-no">113</span><span id="line-113">      Maps.immutableEnumMap(ImmutableMap.of(SyncReplicationState.ACTIVE,</span>
+<span class="source-line-no">114</span><span id="line-114">        EnumSet.of(SyncReplicationState.DOWNGRADE_ACTIVE, SyncReplicationState.STANDBY),</span>
+<span class="source-line-no">115</span><span id="line-115">        SyncReplicationState.STANDBY, EnumSet.of(SyncReplicationState.DOWNGRADE_ACTIVE),</span>
+<span class="source-line-no">116</span><span id="line-116">        SyncReplicationState.DOWNGRADE_ACTIVE,</span>
+<span class="source-line-no">117</span><span id="line-117">        EnumSet.of(SyncReplicationState.STANDBY, SyncReplicationState.ACTIVE)));</span>
+<span class="source-line-no">118</span><span id="line-118"></span>
+<span class="source-line-no">119</span><span id="line-119">  private final String clusterId;</span>
+<span class="source-line-no">120</span><span id="line-120"></span>
+<span class="source-line-no">121</span><span id="line-121">  private volatile Configuration conf;</span>
+<span class="source-line-no">122</span><span id="line-122"></span>
+<span class="source-line-no">123</span><span id="line-123">  // for dynamic recreating ReplicationPeerStorage.</span>
+<span class="source-line-no">124</span><span id="line-124">  private final FileSystem fs;</span>
+<span class="source-line-no">125</span><span id="line-125"></span>
+<span class="source-line-no">126</span><span id="line-126">  private final ZKWatcher zk;</span>
+<span class="source-line-no">127</span><span id="line-127"></span>
+<span class="source-line-no">128</span><span id="line-128">  @FunctionalInterface</span>
+<span class="source-line-no">129</span><span id="line-129">  interface ReplicationQueueStorageInitializer {</span>
+<span class="source-line-no">130</span><span id="line-130"></span>
+<span class="source-line-no">131</span><span id="line-131">    void initialize() throws IOException;</span>
+<span class="source-line-no">132</span><span id="line-132">  }</span>
+<span class="source-line-no">133</span><span id="line-133"></span>
+<span class="source-line-no">134</span><span id="line-134">  private final ReplicationQueueStorageInitializer queueStorageInitializer;</span>
+<span class="source-line-no">135</span><span id="line-135"></span>
+<span class="source-line-no">136</span><span id="line-136">  // we will mock this class in UT so leave the constructor as package private and not mark the</span>
+<span class="source-line-no">137</span><span id="line-137">  // class as final, since mockito can not mock a final class</span>
+<span class="source-line-no">138</span><span id="line-138">  ReplicationPeerManager(FileSystem fs, ZKWatcher zk, ReplicationPeerStorage peerStorage,</span>
+<span class="source-line-no">139</span><span id="line-139">    ReplicationQueueStorage queueStorage, ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers,</span>
+<span class="source-line-no">140</span><span id="line-140">    Configuration conf, String clusterId,</span>
+<span class="source-line-no">141</span><span id="line-141">    ReplicationQueueStorageInitializer queueStorageInitializer) {</span>
+<span class="source-line-no">142</span><span id="line-142">    this.fs = fs;</span>
+<span class="source-line-no">143</span><span id="line-143">    this.zk = zk;</span>
+<span class="source-line-no">144</span><span id="line-144">    this.peerStorage = peerStorage;</span>
+<span class="source-line-no">145</span><span id="line-145">    this.queueStorage = queueStorage;</span>
+<span class="source-line-no">146</span><span id="line-146">    this.peers = peers;</span>
+<span class="source-line-no">147</span><span id="line-147">    this.conf = conf;</span>
+<span class="source-line-no">148</span><span id="line-148">    this.clusterId = clusterId;</span>
+<span class="source-line-no">149</span><span id="line-149">    this.queueStorageInitializer = queueStorageInitializer;</span>
+<span class="source-line-no">150</span><span id="line-150">  }</span>
+<span class="source-line-no">151</span><span id="line-151"></span>
+<span class="source-line-no">152</span><span id="line-152">  private void checkQueuesDeleted(String peerId)</span>
+<span class="source-line-no">153</span><span id="line-153">    throws ReplicationException, DoNotRetryIOException {</span>
+<span class="source-line-no">154</span><span id="line-154">    List&lt;ReplicationQueueId&gt; queueIds = queueStorage.listAllQueueIds(peerId);</span>
+<span class="source-line-no">155</span><span id="line-155">    if (!queueIds.isEmpty()) {</span>
+<span class="source-line-no">156</span><span id="line-156">      throw new DoNotRetryIOException("There are still " + queueIds.size()</span>
+<span class="source-line-no">157</span><span id="line-157">        + " undeleted queue(s) for peerId: " + peerId + ", first is " + queueIds.get(0));</span>
+<span class="source-line-no">158</span><span id="line-158">    }</span>
+<span class="source-line-no">159</span><span id="line-159">    if (queueStorage.getAllPeersFromHFileRefsQueue().contains(peerId)) {</span>
+<span class="source-line-no">160</span><span id="line-160">      throw new DoNotRetryIOException("Undeleted queue for peer " + peerId + " in hfile-refs");</span>
+<span class="source-line-no">161</span><span id="line-161">    }</span>
+<span class="source-line-no">162</span><span id="line-162">  }</span>
+<span class="source-line-no">163</span><span id="line-163"></span>
+<span class="source-line-no">164</span><span id="line-164">  private void initializeQueueStorage() throws IOException {</span>
+<span class="source-line-no">165</span><span id="line-165">    queueStorageInitializer.initialize();</span>
+<span class="source-line-no">166</span><span id="line-166">  }</span>
+<span class="source-line-no">167</span><span id="line-167"></span>
+<span class="source-line-no">168</span><span id="line-168">  void preAddPeer(String peerId, ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">169</span><span id="line-169">    throws ReplicationException, IOException {</span>
+<span class="source-line-no">170</span><span id="line-170">    if (peerId.contains("-")) {</span>
+<span class="source-line-no">171</span><span id="line-171">      throw new DoNotRetryIOException("Found invalid peer name: " + peerId);</span>
+<span class="source-line-no">172</span><span id="line-172">    }</span>
+<span class="source-line-no">173</span><span id="line-173">    checkPeerConfig(peerConfig);</span>
+<span class="source-line-no">174</span><span id="line-174">    if (peerConfig.isSyncReplication()) {</span>
+<span class="source-line-no">175</span><span id="line-175">      checkSyncReplicationPeerConfigConflict(peerConfig);</span>
+<span class="source-line-no">176</span><span id="line-176">    }</span>
+<span class="source-line-no">177</span><span id="line-177">    if (peers.containsKey(peerId)) {</span>
+<span class="source-line-no">178</span><span id="line-178">      throw new DoNotRetryIOException("Replication peer " + peerId + " already exists");</span>
+<span class="source-line-no">179</span><span id="line-179">    }</span>
+<span class="source-line-no">180</span><span id="line-180"></span>
+<span class="source-line-no">181</span><span id="line-181">    // lazy create table</span>
+<span class="source-line-no">182</span><span id="line-182">    initializeQueueStorage();</span>
+<span class="source-line-no">183</span><span id="line-183">    // make sure that there is no queues with the same peer id. This may happen when we create a</span>
+<span class="source-line-no">184</span><span id="line-184">    // peer with the same id with a old deleted peer. If the replication queues for the old peer</span>
+<span class="source-line-no">185</span><span id="line-185">    // have not been cleaned up yet then we should not create the new peer, otherwise the old wal</span>
+<span class="source-line-no">186</span><span id="line-186">    // file may also be replicated.</span>
+<span class="source-line-no">187</span><span id="line-187">    checkQueuesDeleted(peerId);</span>
+<span class="source-line-no">188</span><span id="line-188">  }</span>
+<span class="source-line-no">189</span><span id="line-189"></span>
+<span class="source-line-no">190</span><span id="line-190">  private ReplicationPeerDescription checkPeerExists(String peerId) throws DoNotRetryIOException {</span>
+<span class="source-line-no">191</span><span id="line-191">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">192</span><span id="line-192">    if (desc == null) {</span>
+<span class="source-line-no">193</span><span id="line-193">      throw new ReplicationPeerNotFoundException(peerId);</span>
+<span class="source-line-no">194</span><span id="line-194">    }</span>
+<span class="source-line-no">195</span><span id="line-195">    return desc;</span>
+<span class="source-line-no">196</span><span id="line-196">  }</span>
+<span class="source-line-no">197</span><span id="line-197"></span>
+<span class="source-line-no">198</span><span id="line-198">  private void checkPeerInDAStateIfSyncReplication(String peerId) throws DoNotRetryIOException {</span>
+<span class="source-line-no">199</span><span id="line-199">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">200</span><span id="line-200">    if (</span>
+<span class="source-line-no">201</span><span id="line-201">      desc != null &amp;&amp; desc.getPeerConfig().isSyncReplication()</span>
+<span class="source-line-no">202</span><span id="line-202">        &amp;&amp; !SyncReplicationState.DOWNGRADE_ACTIVE.equals(desc.getSyncReplicationState())</span>
+<span class="source-line-no">203</span><span id="line-203">    ) {</span>
+<span class="source-line-no">204</span><span id="line-204">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">205</span><span id="line-205">        "Couldn't remove synchronous replication peer with state=" + desc.getSyncReplicationState()</span>
+<span class="source-line-no">206</span><span id="line-206">          + ", Transit the synchronous replication state to be DOWNGRADE_ACTIVE firstly.");</span>
+<span class="source-line-no">207</span><span id="line-207">    }</span>
+<span class="source-line-no">208</span><span id="line-208">  }</span>
+<span class="source-line-no">209</span><span id="line-209"></span>
+<span class="source-line-no">210</span><span id="line-210">  ReplicationPeerConfig preRemovePeer(String peerId) throws DoNotRetryIOException {</span>
+<span class="source-line-no">211</span><span id="line-211">    ReplicationPeerDescription pd = checkPeerExists(peerId);</span>
+<span class="source-line-no">212</span><span id="line-212">    checkPeerInDAStateIfSyncReplication(peerId);</span>
+<span class="source-line-no">213</span><span id="line-213">    return pd.getPeerConfig();</span>
+<span class="source-line-no">214</span><span id="line-214">  }</span>
+<span class="source-line-no">215</span><span id="line-215"></span>
+<span class="source-line-no">216</span><span id="line-216">  void preEnablePeer(String peerId) throws DoNotRetryIOException {</span>
+<span class="source-line-no">217</span><span id="line-217">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
+<span class="source-line-no">218</span><span id="line-218">    if (desc.isEnabled()) {</span>
+<span class="source-line-no">219</span><span id="line-219">      throw new DoNotRetryIOException("Replication peer " + peerId + " has already been enabled");</span>
+<span class="source-line-no">220</span><span id="line-220">    }</span>
+<span class="source-line-no">221</span><span id="line-221">  }</span>
+<span class="source-line-no">222</span><span id="line-222"></span>
+<span class="source-line-no">223</span><span id="line-223">  void preDisablePeer(String peerId) throws DoNotRetryIOException {</span>
+<span class="source-line-no">224</span><span id="line-224">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
+<span class="source-line-no">225</span><span id="line-225">    if (!desc.isEnabled()) {</span>
+<span class="source-line-no">226</span><span id="line-226">      throw new DoNotRetryIOException("Replication peer " + peerId + " has already been disabled");</span>
+<span class="source-line-no">227</span><span id="line-227">    }</span>
+<span class="source-line-no">228</span><span id="line-228">  }</span>
+<span class="source-line-no">229</span><span id="line-229"></span>
+<span class="source-line-no">230</span><span id="line-230">  /**</span>
+<span class="source-line-no">231</span><span id="line-231">   * Return the old peer description. Can never be null.</span>
+<span class="source-line-no">232</span><span id="line-232">   */</span>
+<span class="source-line-no">233</span><span id="line-233">  ReplicationPeerDescription preUpdatePeerConfig(String peerId, ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">234</span><span id="line-234">    throws DoNotRetryIOException {</span>
+<span class="source-line-no">235</span><span id="line-235">    checkPeerConfig(peerConfig);</span>
+<span class="source-line-no">236</span><span id="line-236">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
+<span class="source-line-no">237</span><span id="line-237">    ReplicationPeerConfig oldPeerConfig = desc.getPeerConfig();</span>
+<span class="source-line-no">238</span><span id="line-238">    if (!isStringEquals(peerConfig.getClusterKey(), oldPeerConfig.getClusterKey())) {</span>
+<span class="source-line-no">239</span><span id="line-239">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">240</span><span id="line-240">        "Changing the cluster key on an existing peer is not allowed. Existing key '"</span>
+<span class="source-line-no">241</span><span id="line-241">          + oldPeerConfig.getClusterKey() + "' for peer " + peerId + " does not match new key '"</span>
+<span class="source-line-no">242</span><span id="line-242">          + peerConfig.getClusterKey() + "'");</span>
+<span class="source-line-no">243</span><span id="line-243">    }</span>
+<span class="source-line-no">244</span><span id="line-244"></span>
+<span class="source-line-no">245</span><span id="line-245">    if (</span>
+<span class="source-line-no">246</span><span id="line-246">      !isStringEquals(peerConfig.getReplicationEndpointImpl(),</span>
+<span class="source-line-no">247</span><span id="line-247">        oldPeerConfig.getReplicationEndpointImpl())</span>
+<span class="source-line-no">248</span><span id="line-248">    ) {</span>
+<span class="source-line-no">249</span><span id="line-249">      throw new DoNotRetryIOException("Changing the replication endpoint implementation class "</span>
+<span class="source-line-no">250</span><span id="line-250">        + "on an existing peer is not allowed. Existing class '"</span>
+<span class="source-line-no">251</span><span id="line-251">        + oldPeerConfig.getReplicationEndpointImpl() + "' for peer " + peerId</span>
+<span class="source-line-no">252</span><span id="line-252">        + " does not match new class '" + peerConfig.getReplicationEndpointImpl() + "'");</span>
+<span class="source-line-no">253</span><span id="line-253">    }</span>
+<span class="source-line-no">254</span><span id="line-254"></span>
+<span class="source-line-no">255</span><span id="line-255">    if (!isStringEquals(peerConfig.getRemoteWALDir(), oldPeerConfig.getRemoteWALDir())) {</span>
+<span class="source-line-no">256</span><span id="line-256">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">257</span><span id="line-257">        "Changing the remote wal dir on an existing peer is not allowed. Existing remote wal "</span>
+<span class="source-line-no">258</span><span id="line-258">          + "dir '" + oldPeerConfig.getRemoteWALDir() + "' for peer " + peerId</span>
+<span class="source-line-no">259</span><span id="line-259">          + " does not match new remote wal dir '" + peerConfig.getRemoteWALDir() + "'");</span>
+<span class="source-line-no">260</span><span id="line-260">    }</span>
+<span class="source-line-no">261</span><span id="line-261"></span>
+<span class="source-line-no">262</span><span id="line-262">    if (oldPeerConfig.isSyncReplication()) {</span>
+<span class="source-line-no">263</span><span id="line-263">      if (!ReplicationUtils.isNamespacesAndTableCFsEqual(oldPeerConfig, peerConfig)) {</span>
+<span class="source-line-no">264</span><span id="line-264">        throw new DoNotRetryIOException(</span>
+<span class="source-line-no">265</span><span id="line-265">          "Changing the replicated namespace/table config on a synchronous replication "</span>
+<span class="source-line-no">266</span><span id="line-266">            + "peer(peerId: " + peerId + ") is not allowed.");</span>
+<span class="source-line-no">267</span><span id="line-267">      }</span>
+<span class="source-line-no">268</span><span id="line-268">    }</span>
+<span class="source-line-no">269</span><span id="line-269">    return desc;</span>
+<span class="source-line-no">270</span><span id="line-270">  }</span>
+<span class="source-line-no">271</span><span id="line-271"></span>
+<span class="source-line-no">272</span><span id="line-272">  /** Returns the old desciption of the peer */</span>
+<span class="source-line-no">273</span><span id="line-273">  ReplicationPeerDescription preTransitPeerSyncReplicationState(String peerId,</span>
+<span class="source-line-no">274</span><span id="line-274">    SyncReplicationState state) throws DoNotRetryIOException {</span>
+<span class="source-line-no">275</span><span id="line-275">    ReplicationPeerDescription desc = checkPeerExists(peerId);</span>
+<span class="source-line-no">276</span><span id="line-276">    SyncReplicationState fromState = desc.getSyncReplicationState();</span>
+<span class="source-line-no">277</span><span id="line-277">    EnumSet&lt;SyncReplicationState&gt; allowedToStates = allowedTransition.get(fromState);</span>
+<span class="source-line-no">278</span><span id="line-278">    if (allowedToStates == null || !allowedToStates.contains(state)) {</span>
+<span class="source-line-no">279</span><span id="line-279">      throw new DoNotRetryIOException("Can not transit current cluster state from " + fromState</span>
+<span class="source-line-no">280</span><span id="line-280">        + " to " + state + " for peer id=" + peerId);</span>
+<span class="source-line-no">281</span><span id="line-281">    }</span>
+<span class="source-line-no">282</span><span id="line-282">    return desc;</span>
+<span class="source-line-no">283</span><span id="line-283">  }</span>
+<span class="source-line-no">284</span><span id="line-284"></span>
+<span class="source-line-no">285</span><span id="line-285">  public void addPeer(String peerId, ReplicationPeerConfig peerConfig, boolean enabled)</span>
+<span class="source-line-no">286</span><span id="line-286">    throws ReplicationException {</span>
+<span class="source-line-no">287</span><span id="line-287">    if (peers.containsKey(peerId)) {</span>
+<span class="source-line-no">288</span><span id="line-288">      // this should be a retry, just return</span>
+<span class="source-line-no">289</span><span id="line-289">      return;</span>
+<span class="source-line-no">290</span><span id="line-290">    }</span>
+<span class="source-line-no">291</span><span id="line-291">    peerConfig = ReplicationPeerConfigUtil.updateReplicationBasePeerConfigs(conf, peerConfig);</span>
+<span class="source-line-no">292</span><span id="line-292">    ReplicationPeerConfig copiedPeerConfig = ReplicationPeerConfig.newBuilder(peerConfig).build();</span>
+<span class="source-line-no">293</span><span id="line-293">    SyncReplicationState syncReplicationState = copiedPeerConfig.isSyncReplication()</span>
+<span class="source-line-no">294</span><span id="line-294">      ? SyncReplicationState.DOWNGRADE_ACTIVE</span>
+<span class="source-line-no">295</span><span id="line-295">      : SyncReplicationState.NONE;</span>
+<span class="source-line-no">296</span><span id="line-296">    peerStorage.addPeer(peerId, copiedPeerConfig, enabled, syncReplicationState);</span>
+<span class="source-line-no">297</span><span id="line-297">    peers.put(peerId,</span>
+<span class="source-line-no">298</span><span id="line-298">      new ReplicationPeerDescription(peerId, enabled, copiedPeerConfig, syncReplicationState));</span>
+<span class="source-line-no">299</span><span id="line-299">  }</span>
+<span class="source-line-no">300</span><span id="line-300"></span>
+<span class="source-line-no">301</span><span id="line-301">  public void removePeer(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">302</span><span id="line-302">    if (!peers.containsKey(peerId)) {</span>
+<span class="source-line-no">303</span><span id="line-303">      // this should be a retry, just return</span>
+<span class="source-line-no">304</span><span id="line-304">      return;</span>
+<span class="source-line-no">305</span><span id="line-305">    }</span>
+<span class="source-line-no">306</span><span id="line-306">    peerStorage.removePeer(peerId);</span>
+<span class="source-line-no">307</span><span id="line-307">    peers.remove(peerId);</span>
+<span class="source-line-no">308</span><span id="line-308">  }</span>
+<span class="source-line-no">309</span><span id="line-309"></span>
+<span class="source-line-no">310</span><span id="line-310">  private void setPeerState(String peerId, boolean enabled) throws ReplicationException {</span>
+<span class="source-line-no">311</span><span id="line-311">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">312</span><span id="line-312">    if (desc.isEnabled() == enabled) {</span>
+<span class="source-line-no">313</span><span id="line-313">      // this should be a retry, just return</span>
+<span class="source-line-no">314</span><span id="line-314">      return;</span>
+<span class="source-line-no">315</span><span id="line-315">    }</span>
+<span class="source-line-no">316</span><span id="line-316">    peerStorage.setPeerState(peerId, enabled);</span>
+<span class="source-line-no">317</span><span id="line-317">    peers.put(peerId, new ReplicationPeerDescription(peerId, enabled, desc.getPeerConfig(),</span>
+<span class="source-line-no">318</span><span id="line-318">      desc.getSyncReplicationState()));</span>
+<span class="source-line-no">319</span><span id="line-319">  }</span>
+<span class="source-line-no">320</span><span id="line-320"></span>
+<span class="source-line-no">321</span><span id="line-321">  public boolean getPeerState(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">322</span><span id="line-322">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">323</span><span id="line-323">    if (desc != null) {</span>
+<span class="source-line-no">324</span><span id="line-324">      return desc.isEnabled();</span>
+<span class="source-line-no">325</span><span id="line-325">    } else {</span>
+<span class="source-line-no">326</span><span id="line-326">      throw new ReplicationException("Replication Peer of " + peerId + " does not exist.");</span>
+<span class="source-line-no">327</span><span id="line-327">    }</span>
+<span class="source-line-no">328</span><span id="line-328">  }</span>
+<span class="source-line-no">329</span><span id="line-329"></span>
+<span class="source-line-no">330</span><span id="line-330">  public void enablePeer(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">331</span><span id="line-331">    setPeerState(peerId, true);</span>
+<span class="source-line-no">332</span><span id="line-332">  }</span>
+<span class="source-line-no">333</span><span id="line-333"></span>
+<span class="source-line-no">334</span><span id="line-334">  public void disablePeer(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">335</span><span id="line-335">    setPeerState(peerId, false);</span>
+<span class="source-line-no">336</span><span id="line-336">  }</span>
+<span class="source-line-no">337</span><span id="line-337"></span>
+<span class="source-line-no">338</span><span id="line-338">  public void updatePeerConfig(String peerId, ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">339</span><span id="line-339">    throws ReplicationException {</span>
+<span class="source-line-no">340</span><span id="line-340">    // the checking rules are too complicated here so we give up checking whether this is a retry.</span>
+<span class="source-line-no">341</span><span id="line-341">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">342</span><span id="line-342">    ReplicationPeerConfig oldPeerConfig = desc.getPeerConfig();</span>
+<span class="source-line-no">343</span><span id="line-343">    ReplicationPeerConfigBuilder newPeerConfigBuilder =</span>
+<span class="source-line-no">344</span><span id="line-344">      ReplicationPeerConfig.newBuilder(peerConfig);</span>
+<span class="source-line-no">345</span><span id="line-345">    // we need to use the new conf to overwrite the old one.</span>
+<span class="source-line-no">346</span><span id="line-346">    newPeerConfigBuilder.putAllConfiguration(oldPeerConfig.getConfiguration());</span>
+<span class="source-line-no">347</span><span id="line-347">    newPeerConfigBuilder.putAllConfiguration(peerConfig.getConfiguration());</span>
+<span class="source-line-no">348</span><span id="line-348">    ReplicationPeerConfig newPeerConfig = newPeerConfigBuilder.build();</span>
+<span class="source-line-no">349</span><span id="line-349">    peerStorage.updatePeerConfig(peerId, newPeerConfig);</span>
+<span class="source-line-no">350</span><span id="line-350">    peers.put(peerId, new ReplicationPeerDescription(peerId, desc.isEnabled(), newPeerConfig,</span>
+<span class="source-line-no">351</span><span id="line-351">      desc.getSyncReplicationState()));</span>
+<span class="source-line-no">352</span><span id="line-352">  }</span>
+<span class="source-line-no">353</span><span id="line-353"></span>
+<span class="source-line-no">354</span><span id="line-354">  public List&lt;ReplicationPeerDescription&gt; listPeers(Pattern pattern) {</span>
+<span class="source-line-no">355</span><span id="line-355">    if (pattern == null) {</span>
+<span class="source-line-no">356</span><span id="line-356">      return new ArrayList&lt;&gt;(peers.values());</span>
+<span class="source-line-no">357</span><span id="line-357">    }</span>
+<span class="source-line-no">358</span><span id="line-358">    return peers.values().stream().filter(r -&gt; pattern.matcher(r.getPeerId()).matches())</span>
+<span class="source-line-no">359</span><span id="line-359">      .collect(Collectors.toList());</span>
+<span class="source-line-no">360</span><span id="line-360">  }</span>
+<span class="source-line-no">361</span><span id="line-361"></span>
+<span class="source-line-no">362</span><span id="line-362">  public Optional&lt;ReplicationPeerConfig&gt; getPeerConfig(String peerId) {</span>
+<span class="source-line-no">363</span><span id="line-363">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">364</span><span id="line-364">    return desc != null ? Optional.of(desc.getPeerConfig()) : Optional.empty();</span>
+<span class="source-line-no">365</span><span id="line-365">  }</span>
+<span class="source-line-no">366</span><span id="line-366"></span>
+<span class="source-line-no">367</span><span id="line-367">  void removeAllLastPushedSeqIds(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">368</span><span id="line-368">    queueStorage.removeLastSequenceIds(peerId);</span>
+<span class="source-line-no">369</span><span id="line-369">  }</span>
+<span class="source-line-no">370</span><span id="line-370"></span>
+<span class="source-line-no">371</span><span id="line-371">  public void setPeerNewSyncReplicationState(String peerId, SyncReplicationState state)</span>
+<span class="source-line-no">372</span><span id="line-372">    throws ReplicationException {</span>
+<span class="source-line-no">373</span><span id="line-373">    peerStorage.setPeerNewSyncReplicationState(peerId, state);</span>
+<span class="source-line-no">374</span><span id="line-374">  }</span>
+<span class="source-line-no">375</span><span id="line-375"></span>
+<span class="source-line-no">376</span><span id="line-376">  public void transitPeerSyncReplicationState(String peerId, SyncReplicationState newState)</span>
+<span class="source-line-no">377</span><span id="line-377">    throws ReplicationException {</span>
+<span class="source-line-no">378</span><span id="line-378">    if (peerStorage.getPeerNewSyncReplicationState(peerId) != SyncReplicationState.NONE) {</span>
+<span class="source-line-no">379</span><span id="line-379">      // Only transit if this is not a retry</span>
+<span class="source-line-no">380</span><span id="line-380">      peerStorage.transitPeerSyncReplicationState(peerId);</span>
+<span class="source-line-no">381</span><span id="line-381">    }</span>
+<span class="source-line-no">382</span><span id="line-382">    ReplicationPeerDescription desc = peers.get(peerId);</span>
+<span class="source-line-no">383</span><span id="line-383">    if (desc.getSyncReplicationState() != newState) {</span>
+<span class="source-line-no">384</span><span id="line-384">      // Only recreate the desc if this is not a retry</span>
+<span class="source-line-no">385</span><span id="line-385">      peers.put(peerId,</span>
+<span class="source-line-no">386</span><span id="line-386">        new ReplicationPeerDescription(peerId, desc.isEnabled(), desc.getPeerConfig(), newState));</span>
+<span class="source-line-no">387</span><span id="line-387">    }</span>
+<span class="source-line-no">388</span><span id="line-388">  }</span>
+<span class="source-line-no">389</span><span id="line-389"></span>
+<span class="source-line-no">390</span><span id="line-390">  public void removeAllQueues(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">391</span><span id="line-391">    // Here we need two passes to address the problem of claimQueue. Maybe a claimQueue is still</span>
+<span class="source-line-no">392</span><span id="line-392">    // on-going when the refresh peer config procedure is done, if a RS which has already been</span>
+<span class="source-line-no">393</span><span id="line-393">    // scanned claims the queue of a RS which has not been scanned yet, we will miss that queue in</span>
+<span class="source-line-no">394</span><span id="line-394">    // the scan here, and if the RS who has claimed the queue crashed before creating recovered</span>
+<span class="source-line-no">395</span><span id="line-395">    // source, then the queue will leave there until the another RS detects the crash and helps</span>
+<span class="source-line-no">396</span><span id="line-396">    // removing the queue.</span>
+<span class="source-line-no">397</span><span id="line-397">    // A two pass scan can solve the problem. Anyway, the queue will not disappear during the</span>
+<span class="source-line-no">398</span><span id="line-398">    // claiming, it will either under the old RS or under the new RS, and a queue can only be</span>
+<span class="source-line-no">399</span><span id="line-399">    // claimed once after the refresh peer procedure done(as the next claim queue will just delete</span>
+<span class="source-line-no">400</span><span id="line-400">    // it), so we can make sure that a two pass scan will finally find the queue and remove it,</span>
+<span class="source-line-no">401</span><span id="line-401">    // unless it has already been removed by others.</span>
 <span class="source-line-no">402</span><span id="line-402">    queueStorage.removeAllQueues(peerId);</span>
-<span class="source-line-no">403</span><span id="line-403">  }</span>
-<span class="source-line-no">404</span><span id="line-404"></span>
-<span class="source-line-no">405</span><span id="line-405">  public void removeAllQueuesAndHFileRefs(String peerId) throws ReplicationException {</span>
-<span class="source-line-no">406</span><span id="line-406">    removeAllQueues(peerId);</span>
-<span class="source-line-no">407</span><span id="line-407">    queueStorage.removePeerFromHFileRefs(peerId);</span>
-<span class="source-line-no">408</span><span id="line-408">  }</span>
-<span class="source-line-no">409</span><span id="line-409"></span>
-<span class="source-line-no">410</span><span id="line-410">  private void checkClusterKey(String clusterKey, ReplicationEndpoint endpoint)</span>
-<span class="source-line-no">411</span><span id="line-411">    throws DoNotRetryIOException {</span>
-<span class="source-line-no">412</span><span id="line-412">    if (endpoint != null &amp;&amp; !(endpoint instanceof HBaseReplicationEndpoint)) {</span>
-<span class="source-line-no">413</span><span id="line-413">      return;</span>
-<span class="source-line-no">414</span><span id="line-414">    }</span>
-<span class="source-line-no">415</span><span id="line-415">    // Endpoints implementing HBaseReplicationEndpoint need to check cluster key</span>
-<span class="source-line-no">416</span><span id="line-416">    URI connectionUri = ConnectionRegistryFactory.tryParseAsConnectionURI(clusterKey);</span>
-<span class="source-line-no">417</span><span id="line-417">    try {</span>
-<span class="source-line-no">418</span><span id="line-418">      if (connectionUri != null) {</span>
-<span class="source-line-no">419</span><span id="line-419">        ConnectionRegistryFactory.validate(connectionUri);</span>
-<span class="source-line-no">420</span><span id="line-420">      } else {</span>
-<span class="source-line-no">421</span><span id="line-421">        ZKConfig.validateClusterKey(clusterKey);</span>
-<span class="source-line-no">422</span><span id="line-422">      }</span>
-<span class="source-line-no">423</span><span id="line-423">    } catch (IOException e) {</span>
-<span class="source-line-no">424</span><span id="line-424">      throw new DoNotRetryIOException("Invalid cluster key: " + clusterKey, e);</span>
-<span class="source-line-no">425</span><span id="line-425">    }</span>
-<span class="source-line-no">426</span><span id="line-426">    if (endpoint != null &amp;&amp; endpoint.canReplicateToSameCluster()) {</span>
-<span class="source-line-no">427</span><span id="line-427">      return;</span>
-<span class="source-line-no">428</span><span id="line-428">    }</span>
-<span class="source-line-no">429</span><span id="line-429">    // make sure we do not replicate to same cluster</span>
-<span class="source-line-no">430</span><span id="line-430">    String peerClusterId;</span>
-<span class="source-line-no">431</span><span id="line-431">    try {</span>
-<span class="source-line-no">432</span><span id="line-432">      if (connectionUri != null) {</span>
-<span class="source-line-no">433</span><span id="line-433">        // fetch cluster id through standard admin API</span>
-<span class="source-line-no">434</span><span id="line-434">        try (Connection conn = ConnectionFactory.createConnection(connectionUri, conf);</span>
-<span class="source-line-no">435</span><span id="line-435">          Admin admin = conn.getAdmin()) {</span>
-<span class="source-line-no">436</span><span id="line-436">          peerClusterId =</span>
-<span class="source-line-no">437</span><span id="line-437">            admin.getClusterMetrics(EnumSet.of(ClusterMetrics.Option.CLUSTER_ID)).getClusterId();</span>
-<span class="source-line-no">438</span><span id="line-438">        }</span>
-<span class="source-line-no">439</span><span id="line-439">      } else {</span>
-<span class="source-line-no">440</span><span id="line-440">        // Create the peer cluster config for get peer cluster id</span>
-<span class="source-line-no">441</span><span id="line-441">        Configuration peerConf = HBaseConfiguration.createClusterConf(conf, clusterKey);</span>
-<span class="source-line-no">442</span><span id="line-442">        try (ZKWatcher zkWatcher = new ZKWatcher(peerConf, this + "check-peer-cluster-id", null)) {</span>
-<span class="source-line-no">443</span><span id="line-443">          peerClusterId = ZKClusterId.readClusterIdZNode(zkWatcher);</span>
-<span class="source-line-no">444</span><span id="line-444">        }</span>
-<span class="source-line-no">445</span><span id="line-445">      }</span>
-<span class="source-line-no">446</span><span id="line-446">    } catch (IOException | KeeperException e) {</span>
-<span class="source-line-no">447</span><span id="line-447">      // we just want to check whether we will replicate to the same cluster, so if we get an error</span>
-<span class="source-line-no">448</span><span id="line-448">      // while getting the cluster id of the peer cluster, it means we are not connecting to</span>
-<span class="source-line-no">449</span><span id="line-449">      // ourselves, as we are still alive. So here we just log the error and continue</span>
-<span class="source-line-no">450</span><span id="line-450">      LOG.warn("Can't get peerClusterId for clusterKey=" + clusterKey, e);</span>
-<span class="source-line-no">451</span><span id="line-451">      return;</span>
-<span class="source-line-no">452</span><span id="line-452">    }</span>
-<span class="source-line-no">453</span><span id="line-453">    // In rare case, zookeeper setting may be messed up. That leads to the incorrect</span>
-<span class="source-line-no">454</span><span id="line-454">    // peerClusterId value, which is the same as the source clusterId</span>
-<span class="source-line-no">455</span><span id="line-455">    if (clusterId.equals(peerClusterId)) {</span>
-<span class="source-line-no">456</span><span id="line-456">      throw new DoNotRetryIOException("Invalid cluster key: " + clusterKey</span>
-<span class="source-line-no">457</span><span id="line-457">        + ", should not replicate to itself for HBaseInterClusterReplicationEndpoint");</span>
-<span class="source-line-no">458</span><span id="line-458">    }</span>
-<span class="source-line-no">459</span><span id="line-459">  }</span>
-<span class="source-line-no">460</span><span id="line-460"></span>
-<span class="source-line-no">461</span><span id="line-461">  private void checkPeerConfig(ReplicationPeerConfig peerConfig) throws DoNotRetryIOException {</span>
-<span class="source-line-no">462</span><span id="line-462">    String replicationEndpointImpl = peerConfig.getReplicationEndpointImpl();</span>
-<span class="source-line-no">463</span><span id="line-463">    ReplicationEndpoint endpoint = null;</span>
-<span class="source-line-no">464</span><span id="line-464">    if (!StringUtils.isBlank(replicationEndpointImpl)) {</span>
-<span class="source-line-no">465</span><span id="line-465">      try {</span>
-<span class="source-line-no">466</span><span id="line-466">        // try creating a instance</span>
-<span class="source-line-no">467</span><span id="line-467">        endpoint = Class.forName(replicationEndpointImpl).asSubclass(ReplicationEndpoint.class)</span>
-<span class="source-line-no">468</span><span id="line-468">          .getDeclaredConstructor().newInstance();</span>
-<span class="source-line-no">469</span><span id="line-469">      } catch (Throwable e) {</span>
-<span class="source-line-no">470</span><span id="line-470">        throw new DoNotRetryIOException(</span>
-<span class="source-line-no">471</span><span id="line-471">          "Can not instantiate configured replication endpoint class=" + replicationEndpointImpl,</span>
-<span class="source-line-no">472</span><span id="line-472">          e);</span>
-<span class="source-line-no">473</span><span id="line-473">      }</span>
-<span class="source-line-no">474</span><span id="line-474">    }</span>
-<span class="source-line-no">475</span><span id="line-475">    checkClusterKey(peerConfig.getClusterKey(), endpoint);</span>
-<span class="source-line-no">476</span><span id="line-476"></span>
-<span class="source-line-no">477</span><span id="line-477">    if (peerConfig.replicateAllUserTables()) {</span>
-<span class="source-line-no">478</span><span id="line-478">      // If replicate_all flag is true, it means all user tables will be replicated to peer cluster.</span>
-<span class="source-line-no">479</span><span id="line-479">      // Then allow config exclude namespaces or exclude table-cfs which can't be replicated to peer</span>
-<span class="source-line-no">480</span><span id="line-480">      // cluster.</span>
-<span class="source-line-no">481</span><span id="line-481">      if (</span>
-<span class="source-line-no">482</span><span id="line-482">        (peerConfig.getNamespaces() != null &amp;&amp; !peerConfig.getNamespaces().isEmpty())</span>
-<span class="source-line-no">483</span><span id="line-483">          || (peerConfig.getTableCFsMap() != null &amp;&amp; !peerConfig.getTableCFsMap().isEmpty())</span>
-<span class="source-line-no">484</span><span id="line-484">      ) {</span>
-<span class="source-line-no">485</span><span id="line-485">        throw new DoNotRetryIOException("Need clean namespaces or table-cfs config firstly "</span>
-<span class="source-line-no">486</span><span id="line-486">          + "when you want replicate all cluster");</span>
-<span class="source-line-no">487</span><span id="line-487">      }</span>
-<span class="source-line-no">488</span><span id="line-488">      checkNamespacesAndTableCfsConfigConflict(peerConfig.getExcludeNamespaces(),</span>
-<span class="source-line-no">489</span><span id="line-489">        peerConfig.getExcludeTableCFsMap());</span>
-<span class="source-line-no">490</span><span id="line-490">    } else {</span>
-<span class="source-line-no">491</span><span id="line-491">      // If replicate_all flag is false, it means all user tables can't be replicated to peer</span>
-<span class="source-line-no">492</span><span id="line-492">      // cluster. Then allow to config namespaces or table-cfs which will be replicated to peer</span>
-<span class="source-line-no">493</span><span id="line-493">      // cluster.</span>
-<span class="source-line-no">494</span><span id="line-494">      if (</span>
-<span class="source-line-no">495</span><span id="line-495">        (peerConfig.getExcludeNamespaces() != null &amp;&amp; !peerConfig.getExcludeNamespaces().isEmpty())</span>
-<span class="source-line-no">496</span><span id="line-496">          || (peerConfig.getExcludeTableCFsMap() != null</span>
-<span class="source-line-no">497</span><span id="line-497">            &amp;&amp; !peerConfig.getExcludeTableCFsMap().isEmpty())</span>
-<span class="source-line-no">498</span><span id="line-498">      ) {</span>
-<span class="source-line-no">499</span><span id="line-499">        throw new DoNotRetryIOException(</span>
-<span class="source-line-no">500</span><span id="line-500">          "Need clean exclude-namespaces or exclude-table-cfs config firstly"</span>
-<span class="source-line-no">501</span><span id="line-501">            + " when replicate_all flag is false");</span>
-<span class="source-line-no">502</span><span id="line-502">      }</span>
-<span class="source-line-no">503</span><span id="line-503">      checkNamespacesAndTableCfsConfigConflict(peerConfig.getNamespaces(),</span>
-<span class="source-line-no">504</span><span id="line-504">        peerConfig.getTableCFsMap());</span>
-<span class="source-line-no">505</span><span id="line-505">    }</span>
-<span class="source-line-no">506</span><span id="line-506"></span>
-<span class="source-line-no">507</span><span id="line-507">    if (peerConfig.isSyncReplication()) {</span>
-<span class="source-line-no">508</span><span id="line-508">      checkPeerConfigForSyncReplication(peerConfig);</span>
-<span class="source-line-no">509</span><span id="line-509">    }</span>
-<span class="source-line-no">510</span><span id="line-510"></span>
-<span class="source-line-no">511</span><span id="line-511">    checkConfiguredWALEntryFilters(peerConfig);</span>
-<span class="source-line-no">512</span><span id="line-512">  }</span>
-<span class="source-line-no">513</span><span id="line-513"></span>
-<span class="source-line-no">514</span><span id="line-514">  private void checkPeerConfigForSyncReplication(ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">515</span><span id="line-515">    throws DoNotRetryIOException {</span>
-<span class="source-line-no">516</span><span id="line-516">    // This is used to reduce the difficulty for implementing the sync replication state transition</span>
-<span class="source-line-no">517</span><span id="line-517">    // as we need to reopen all the related regions.</span>
-<span class="source-line-no">518</span><span id="line-518">    // TODO: Add namespace, replicat_all flag back</span>
-<span class="source-line-no">519</span><span id="line-519">    if (peerConfig.replicateAllUserTables()) {</span>
-<span class="source-line-no">520</span><span id="line-520">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">521</span><span id="line-521">        "Only support replicated table config for sync replication peer");</span>
-<span class="source-line-no">522</span><span id="line-522">    }</span>
-<span class="source-line-no">523</span><span id="line-523">    if (peerConfig.getNamespaces() != null &amp;&amp; !peerConfig.getNamespaces().isEmpty()) {</span>
-<span class="source-line-no">524</span><span id="line-524">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">525</span><span id="line-525">        "Only support replicated table config for sync replication peer");</span>
-<span class="source-line-no">526</span><span id="line-526">    }</span>
-<span class="source-line-no">527</span><span id="line-527">    if (peerConfig.getTableCFsMap() == null || peerConfig.getTableCFsMap().isEmpty()) {</span>
-<span class="source-line-no">528</span><span id="line-528">      throw new DoNotRetryIOException("Need config replicated tables for sync replication peer");</span>
-<span class="source-line-no">529</span><span id="line-529">    }</span>
-<span class="source-line-no">530</span><span id="line-530">    for (List&lt;String&gt; cfs : peerConfig.getTableCFsMap().values()) {</span>
-<span class="source-line-no">531</span><span id="line-531">      if (cfs != null &amp;&amp; !cfs.isEmpty()) {</span>
-<span class="source-line-no">532</span><span id="line-532">        throw new DoNotRetryIOException(</span>
-<span class="source-line-no">533</span><span id="line-533">          "Only support replicated table config for sync replication peer");</span>
-<span class="source-line-no">534</span><span id="line-534">      }</span>
-<span class="source-line-no">535</span><span id="line-535">    }</span>
-<span class="source-line-no">536</span><span id="line-536"></span>
-<span class="source-line-no">537</span><span id="line-537">    Path remoteWALDir = new Path(peerConfig.getRemoteWALDir());</span>
-<span class="source-line-no">538</span><span id="line-538">    if (!remoteWALDir.isAbsolute()) {</span>
-<span class="source-line-no">539</span><span id="line-539">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">540</span><span id="line-540">        "The remote WAL directory " + peerConfig.getRemoteWALDir() + " is not absolute");</span>
-<span class="source-line-no">541</span><span id="line-541">    }</span>
-<span class="source-line-no">542</span><span id="line-542">    URI remoteWALDirUri = remoteWALDir.toUri();</span>
-<span class="source-line-no">543</span><span id="line-543">    if (remoteWALDirUri.getScheme() == null || remoteWALDirUri.getAuthority() == null) {</span>
-<span class="source-line-no">544</span><span id="line-544">      throw new DoNotRetryIOException("The remote WAL directory " + peerConfig.getRemoteWALDir()</span>
-<span class="source-line-no">545</span><span id="line-545">        + " is not qualified, you must provide scheme and authority");</span>
-<span class="source-line-no">546</span><span id="line-546">    }</span>
-<span class="source-line-no">547</span><span id="line-547">  }</span>
-<span class="source-line-no">548</span><span id="line-548"></span>
-<span class="source-line-no">549</span><span id="line-549">  private void checkSyncReplicationPeerConfigConflict(ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">550</span><span id="line-550">    throws DoNotRetryIOException {</span>
-<span class="source-line-no">551</span><span id="line-551">    for (TableName tableName : peerConfig.getTableCFsMap().keySet()) {</span>
-<span class="source-line-no">552</span><span id="line-552">      for (Map.Entry&lt;String, ReplicationPeerDescription&gt; entry : peers.entrySet()) {</span>
-<span class="source-line-no">553</span><span id="line-553">        ReplicationPeerConfig rpc = entry.getValue().getPeerConfig();</span>
-<span class="source-line-no">554</span><span id="line-554">        if (rpc.isSyncReplication() &amp;&amp; rpc.getTableCFsMap().containsKey(tableName)) {</span>
-<span class="source-line-no">555</span><span id="line-555">          throw new DoNotRetryIOException(</span>
-<span class="source-line-no">556</span><span id="line-556">            "Table " + tableName + " has been replicated by peer " + entry.getKey());</span>
-<span class="source-line-no">557</span><span id="line-557">        }</span>
-<span class="source-line-no">558</span><span id="line-558">      }</span>
-<span class="source-line-no">559</span><span id="line-559">    }</span>
-<span class="source-line-no">560</span><span id="line-560">  }</span>
-<span class="source-line-no">561</span><span id="line-561"></span>
-<span class="source-line-no">562</span><span id="line-562">  /**</span>
-<span class="source-line-no">563</span><span id="line-563">   * Set a namespace in the peer config means that all tables in this namespace will be replicated</span>
-<span class="source-line-no">564</span><span id="line-564">   * to the peer cluster.</span>
-<span class="source-line-no">565</span><span id="line-565">   * &lt;ol&gt;</span>
-<span class="source-line-no">566</span><span id="line-566">   * &lt;li&gt;If peer config already has a namespace, then not allow set any table of this namespace to</span>
-<span class="source-line-no">567</span><span id="line-567">   * the peer config.&lt;/li&gt;</span>
-<span class="source-line-no">568</span><span id="line-568">   * &lt;li&gt;If peer config already has a table, then not allow set this table's namespace to the peer</span>
-<span class="source-line-no">569</span><span id="line-569">   * config.&lt;/li&gt;</span>
-<span class="source-line-no">570</span><span id="line-570">   * &lt;/ol&gt;</span>
-<span class="source-line-no">571</span><span id="line-571">   * &lt;p&gt;</span>
-<span class="source-line-no">572</span><span id="line-572">   * Set a exclude namespace in the peer config means that all tables in this namespace can't be</span>
-<span class="source-line-no">573</span><span id="line-573">   * replicated to the peer cluster.</span>
-<span class="source-line-no">574</span><span id="line-574">   * &lt;ol&gt;</span>
-<span class="source-line-no">575</span><span id="line-575">   * &lt;li&gt;If peer config already has a exclude namespace, then not allow set any exclude table of</span>
-<span class="source-line-no">576</span><span id="line-576">   * this namespace to the peer config.&lt;/li&gt;</span>
-<span class="source-line-no">577</span><span id="line-577">   * &lt;li&gt;If peer config already has a exclude table, then not allow set this table's namespace as a</span>
-<span class="source-line-no">578</span><span id="line-578">   * exclude namespace.&lt;/li&gt;</span>
-<span class="source-line-no">579</span><span id="line-579">   * &lt;/ol&gt;</span>
-<span class="source-line-no">580</span><span id="line-580">   */</span>
-<span class="source-line-no">581</span><span id="line-581">  private void checkNamespacesAndTableCfsConfigConflict(Set&lt;String&gt; namespaces,</span>
-<span class="source-line-no">582</span><span id="line-582">    Map&lt;TableName, ? extends Collection&lt;String&gt;&gt; tableCfs) throws DoNotRetryIOException {</span>
-<span class="source-line-no">583</span><span id="line-583">    if (namespaces == null || namespaces.isEmpty()) {</span>
-<span class="source-line-no">584</span><span id="line-584">      return;</span>
-<span class="source-line-no">585</span><span id="line-585">    }</span>
-<span class="source-line-no">586</span><span id="line-586">    if (tableCfs == null || tableCfs.isEmpty()) {</span>
-<span class="source-line-no">587</span><span id="line-587">      return;</span>
-<span class="source-line-no">588</span><span id="line-588">    }</span>
-<span class="source-line-no">589</span><span id="line-589">    for (Map.Entry&lt;TableName, ? extends Collection&lt;String&gt;&gt; entry : tableCfs.entrySet()) {</span>
-<span class="source-line-no">590</span><span id="line-590">      TableName table = entry.getKey();</span>
-<span class="source-line-no">591</span><span id="line-591">      if (namespaces.contains(table.getNamespaceAsString())) {</span>
-<span class="source-line-no">592</span><span id="line-592">        throw new DoNotRetryIOException("Table-cfs " + table + " is conflict with namespaces "</span>
-<span class="source-line-no">593</span><span id="line-593">          + table.getNamespaceAsString() + " in peer config");</span>
-<span class="source-line-no">594</span><span id="line-594">      }</span>
-<span class="source-line-no">595</span><span id="line-595">    }</span>
-<span class="source-line-no">596</span><span id="line-596">  }</span>
-<span class="source-line-no">597</span><span id="line-597"></span>
-<span class="source-line-no">598</span><span id="line-598">  private void checkConfiguredWALEntryFilters(ReplicationPeerConfig peerConfig)</span>
-<span class="source-line-no">599</span><span id="line-599">    throws DoNotRetryIOException {</span>
-<span class="source-line-no">600</span><span id="line-600">    String filterCSV = peerConfig.getConfiguration()</span>
-<span class="source-line-no">601</span><span id="line-601">      .get(BaseReplicationEndpoint.REPLICATION_WALENTRYFILTER_CONFIG_KEY);</span>
-<span class="source-line-no">602</span><span id="line-602">    if (filterCSV != null &amp;&amp; !filterCSV.isEmpty()) {</span>
-<span class="source-line-no">603</span><span id="line-603">      String[] filters = filterCSV.split(",");</span>
-<span class="source-line-no">604</span><span id="line-604">      for (String filter : filters) {</span>
-<span class="source-line-no">605</span><span id="line-605">        try {</span>
-<span class="source-line-no">606</span><span id="line-606">          Class.forName(filter).getDeclaredConstructor().newInstance();</span>
-<span class="source-line-no">607</span><span id="line-607">        } catch (Exception e) {</span>
-<span class="source-line-no">608</span><span id="line-608">          throw new DoNotRetryIOException("Configured WALEntryFilter " + filter</span>
-<span class="source-line-no">609</span><span id="line-609">            + " could not be created. Failing add/update peer operation.", e);</span>
-<span class="source-line-no">610</span><span id="line-610">        }</span>
-<span class="source-line-no">611</span><span id="line-611">      }</span>
-<span class="source-line-no">612</span><span id="line-612">    }</span>
-<span class="source-line-no">613</span><span id="line-613">  }</span>
-<span class="source-line-no">614</span><span id="line-614"></span>
-<span class="source-line-no">615</span><span id="line-615">  public List&lt;String&gt; getSerialPeerIdsBelongsTo(TableName tableName) {</span>
-<span class="source-line-no">616</span><span id="line-616">    return peers.values().stream().filter(p -&gt; p.getPeerConfig().isSerial())</span>
-<span class="source-line-no">617</span><span id="line-617">      .filter(p -&gt; p.getPeerConfig().needToReplicate(tableName)).map(p -&gt; p.getPeerId())</span>
-<span class="source-line-no">618</span><span id="line-618">      .collect(Collectors.toList());</span>
-<span class="source-line-no">619</span><span id="line-619">  }</span>
-<span class="source-line-no">620</span><span id="line-620"></span>
-<span class="source-line-no">621</span><span id="line-621">  @RestrictedApi(explanation = "Should only be called in tests", link = "",</span>
-<span class="source-line-no">622</span><span id="line-622">      allowedOnPath = ".*/src/test/.*")</span>
-<span class="source-line-no">623</span><span id="line-623">  public ReplicationPeerStorage getPeerStorage() {</span>
-<span class="source-line-no">624</span><span id="line-624">    return peerStorage;</span>
-<span class="source-line-no">625</span><span id="line-625">  }</span>
-<span class="source-line-no">626</span><span id="line-626"></span>
-<span class="source-line-no">627</span><span id="line-627">  public ReplicationQueueStorage getQueueStorage() {</span>
-<span class="source-line-no">628</span><span id="line-628">    return queueStorage;</span>
-<span class="source-line-no">629</span><span id="line-629">  }</span>
-<span class="source-line-no">630</span><span id="line-630"></span>
-<span class="source-line-no">631</span><span id="line-631">  private static Pair&lt;ReplicationQueueStorage, ReplicationQueueStorageInitializer&gt;</span>
-<span class="source-line-no">632</span><span id="line-632">    createReplicationQueueStorage(MasterServices services) throws IOException {</span>
-<span class="source-line-no">633</span><span id="line-633">    Configuration conf = services.getConfiguration();</span>
-<span class="source-line-no">634</span><span id="line-634">    TableName replicationQueueTableName =</span>
-<span class="source-line-no">635</span><span id="line-635">      TableName.valueOf(conf.get(ReplicationStorageFactory.REPLICATION_QUEUE_TABLE_NAME,</span>
-<span class="source-line-no">636</span><span id="line-636">        ReplicationStorageFactory.REPLICATION_QUEUE_TABLE_NAME_DEFAULT.getNameAsString()));</span>
-<span class="source-line-no">637</span><span id="line-637">    ReplicationQueueStorageInitializer initializer;</span>
-<span class="source-line-no">638</span><span id="line-638">    if (services.getTableDescriptors().exists(replicationQueueTableName)) {</span>
-<span class="source-line-no">639</span><span id="line-639">      // no need to create the table</span>
-<span class="source-line-no">640</span><span id="line-640">      initializer = () -&gt; {</span>
-<span class="source-line-no">641</span><span id="line-641">      };</span>
-<span class="source-line-no">642</span><span id="line-642">    } else {</span>
-<span class="source-line-no">643</span><span id="line-643">      // lazy create the replication table.</span>
-<span class="source-line-no">644</span><span id="line-644">      initializer = new ReplicationQueueStorageInitializer() {</span>
-<span class="source-line-no">645</span><span id="line-645"></span>
-<span class="source-line-no">646</span><span id="line-646">        private volatile boolean created = false;</span>
-<span class="source-line-no">647</span><span id="line-647"></span>
-<span class="source-line-no">648</span><span id="line-648">        @Override</span>
-<span class="source-line-no">649</span><span id="line-649">        public void initialize() throws IOException {</span>
-<span class="source-line-no">650</span><span id="line-650">          if (created) {</span>
-<span class="source-line-no">651</span><span id="line-651">            return;</span>
-<span class="source-line-no">652</span><span id="line-652">          }</span>
-<span class="source-line-no">653</span><span id="line-653">          synchronized (this) {</span>
-<span class="source-line-no">654</span><span id="line-654">            if (created) {</span>
-<span class="source-line-no">655</span><span id="line-655">              return;</span>
-<span class="source-line-no">656</span><span id="line-656">            }</span>
-<span class="source-line-no">657</span><span id="line-657">            if (services.getTableDescriptors().exists(replicationQueueTableName)) {</span>
-<span class="source-line-no">658</span><span id="line-658">              created = true;</span>
-<span class="source-line-no">659</span><span id="line-659">              return;</span>
-<span class="source-line-no">660</span><span id="line-660">            }</span>
-<span class="source-line-no">661</span><span id="line-661">            long procId = services.createSystemTable(ReplicationStorageFactory</span>
-<span class="source-line-no">662</span><span id="line-662">              .createReplicationQueueTableDescriptor(replicationQueueTableName));</span>
-<span class="source-line-no">663</span><span id="line-663">            ProcedureExecutor&lt;MasterProcedureEnv&gt; procExec = services.getMasterProcedureExecutor();</span>
-<span class="source-line-no">664</span><span id="line-664">            ProcedureSyncWait.waitFor(procExec.getEnvironment(), TimeUnit.MINUTES.toMillis(1),</span>
-<span class="source-line-no">665</span><span id="line-665">              "Creating table " + replicationQueueTableName, () -&gt; procExec.isFinished(procId));</span>
-<span class="source-line-no">666</span><span id="line-666">          }</span>
-<span class="source-line-no">667</span><span id="line-667">        }</span>
-<span class="source-line-no">668</span><span id="line-668">      };</span>
-<span class="source-line-no">669</span><span id="line-669">    }</span>
-<span class="source-line-no">670</span><span id="line-670">    return Pair.newPair(ReplicationStorageFactory.getReplicationQueueStorage(</span>
-<span class="source-line-no">671</span><span id="line-671">      services.getConnection(), conf, replicationQueueTableName), initializer);</span>
-<span class="source-line-no">672</span><span id="line-672">  }</span>
-<span class="source-line-no">673</span><span id="line-673"></span>
-<span class="source-line-no">674</span><span id="line-674">  public static ReplicationPeerManager create(MasterServices services, String clusterId)</span>
-<span class="source-line-no">675</span><span id="line-675">    throws ReplicationException, IOException {</span>
-<span class="source-line-no">676</span><span id="line-676">    Configuration conf = services.getConfiguration();</span>
-<span class="source-line-no">677</span><span id="line-677">    FileSystem fs = services.getMasterFileSystem().getFileSystem();</span>
-<span class="source-line-no">678</span><span id="line-678">    ZKWatcher zk = services.getZooKeeper();</span>
-<span class="source-line-no">679</span><span id="line-679">    ReplicationPeerStorage peerStorage =</span>
-<span class="source-line-no">680</span><span id="line-680">      ReplicationStorageFactory.getReplicationPeerStorage(fs, zk, conf);</span>
-<span class="source-line-no">681</span><span id="line-681">    Pair&lt;ReplicationQueueStorage, ReplicationQueueStorageInitializer&gt; pair =</span>
-<span class="source-line-no">682</span><span id="line-682">      createReplicationQueueStorage(services);</span>
-<span class="source-line-no">683</span><span id="line-683">    ReplicationQueueStorage queueStorage = pair.getFirst();</span>
-<span class="source-line-no">684</span><span id="line-684">    ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers = new ConcurrentHashMap&lt;&gt;();</span>
-<span class="source-line-no">685</span><span id="line-685">    for (String peerId : peerStorage.listPeerIds()) {</span>
-<span class="source-line-no">686</span><span id="line-686">      ReplicationPeerConfig peerConfig = peerStorage.getPeerConfig(peerId);</span>
-<span class="source-line-no">687</span><span id="line-687">      if (</span>
-<span class="source-line-no">688</span><span id="line-688">        ReplicationUtils.LEGACY_REGION_REPLICATION_ENDPOINT_NAME</span>
-<span class="source-line-no">689</span><span id="line-689">          .equals(peerConfig.getReplicationEndpointImpl())</span>
-<span class="source-line-no">690</span><span id="line-690">      ) {</span>
-<span class="source-line-no">691</span><span id="line-691">        // we do not use this endpoint for region replication any more, see HBASE-26233</span>
-<span class="source-line-no">692</span><span id="line-692">        LOG.info("Legacy region replication peer found, removing: {}", peerConfig);</span>
-<span class="source-line-no">693</span><span id="line-693">        // do it asynchronous to not block the start up of HMaster</span>
-<span class="source-line-no">694</span><span id="line-694">        new Thread("Remove legacy replication peer " + peerId) {</span>
-<span class="source-line-no">695</span><span id="line-695"></span>
-<span class="source-line-no">696</span><span id="line-696">          @Override</span>
-<span class="source-line-no">697</span><span id="line-697">          public void run() {</span>
-<span class="source-line-no">698</span><span id="line-698">            try {</span>
-<span class="source-line-no">699</span><span id="line-699">              // need to delete two times to make sure we delete all the queues, see the comments in</span>
-<span class="source-line-no">700</span><span id="line-700">              // above</span>
-<span class="source-line-no">701</span><span id="line-701">              // removeAllQueues method for more details.</span>
-<span class="source-line-no">702</span><span id="line-702">              queueStorage.removeAllQueues(peerId);</span>
-<span class="source-line-no">703</span><span id="line-703">              queueStorage.removeAllQueues(peerId);</span>
-<span class="source-line-no">704</span><span id="line-704">              // delete queue first and then peer, because we use peer as a flag.</span>
-<span class="source-line-no">705</span><span id="line-705">              peerStorage.removePeer(peerId);</span>
-<span class="source-line-no">706</span><span id="line-706">            } catch (Exception e) {</span>
-<span class="source-line-no">707</span><span id="line-707">              LOG.warn("Failed to delete legacy replication peer {}", peerId);</span>
-<span class="source-line-no">708</span><span id="line-708">            }</span>
-<span class="source-line-no">709</span><span id="line-709">          }</span>
-<span class="source-line-no">710</span><span id="line-710">        }.start();</span>
-<span class="source-line-no">711</span><span id="line-711">        continue;</span>
-<span class="source-line-no">712</span><span id="line-712">      }</span>
-<span class="source-line-no">713</span><span id="line-713">      peerConfig = ReplicationPeerConfigUtil.updateReplicationBasePeerConfigs(conf, peerConfig);</span>
-<span class="source-line-no">714</span><span id="line-714">      peerStorage.updatePeerConfig(peerId, peerConfig);</span>
-<span class="source-line-no">715</span><span id="line-715">      boolean enabled = peerStorage.isPeerEnabled(peerId);</span>
-<span class="source-line-no">716</span><span id="line-716">      SyncReplicationState state = peerStorage.getPeerSyncReplicationState(peerId);</span>
-<span class="source-line-no">717</span><span id="line-717">      peers.put(peerId, new ReplicationPeerDescription(peerId, enabled, peerConfig, state));</span>
-<span class="source-line-no">718</span><span id="line-718">    }</span>
-<span class="source-line-no">719</span><span id="line-719">    return new ReplicationPeerManager(fs, zk, peerStorage, queueStorage, peers, conf, clusterId,</span>
-<span class="source-line-no">720</span><span id="line-720">      pair.getSecond());</span>
-<span class="source-line-no">721</span><span id="line-721">  }</span>
-<span class="source-line-no">722</span><span id="line-722"></span>
-<span class="source-line-no">723</span><span id="line-723">  /**</span>
-<span class="source-line-no">724</span><span id="line-724">   * For replication peer cluster key or endpoint class, null and empty string is same. So here</span>
-<span class="source-line-no">725</span><span id="line-725">   * don't use {@link StringUtils#equals(CharSequence, CharSequence)} directly.</span>
-<span class="source-line-no">726</span><span id="line-726">   */</span>
-<span class="source-line-no">727</span><span id="line-727">  private boolean isStringEquals(String s1, String s2) {</span>
-<span class="source-line-no">728</span><span id="line-728">    if (StringUtils.isBlank(s1)) {</span>
-<span class="source-line-no">729</span><span id="line-729">      return StringUtils.isBlank(s2);</span>
-<span class="source-line-no">730</span><span id="line-730">    }</span>
-<span class="source-line-no">731</span><span id="line-731">    return s1.equals(s2);</span>
-<span class="source-line-no">732</span><span id="line-732">  }</span>
-<span class="source-line-no">733</span><span id="line-733"></span>
-<span class="source-line-no">734</span><span id="line-734">  @Override</span>
-<span class="source-line-no">735</span><span id="line-735">  public void onConfigurationChange(Configuration conf) {</span>
-<span class="source-line-no">736</span><span id="line-736">    this.conf = conf;</span>
-<span class="source-line-no">737</span><span id="line-737">    this.peerStorage = ReplicationStorageFactory.getReplicationPeerStorage(fs, zk, conf);</span>
-<span class="source-line-no">738</span><span id="line-738">  }</span>
-<span class="source-line-no">739</span><span id="line-739"></span>
-<span class="source-line-no">740</span><span id="line-740">  private ReplicationQueueData convert(ZkReplicationQueueData zkData) {</span>
-<span class="source-line-no">741</span><span id="line-741">    Map&lt;String, ReplicationGroupOffset&gt; groupOffsets = new HashMap&lt;&gt;();</span>
-<span class="source-line-no">742</span><span id="line-742">    zkData.getWalOffsets().forEach((wal, offset) -&gt; {</span>
-<span class="source-line-no">743</span><span id="line-743">      String walGroup = AbstractFSWALProvider.getWALPrefixFromWALName(wal);</span>
-<span class="source-line-no">744</span><span id="line-744">      groupOffsets.compute(walGroup, (k, oldOffset) -&gt; {</span>
-<span class="source-line-no">745</span><span id="line-745">        if (oldOffset == null) {</span>
-<span class="source-line-no">746</span><span id="line-746">          return new ReplicationGroupOffset(wal, offset);</span>
-<span class="source-line-no">747</span><span id="line-747">        }</span>
-<span class="source-line-no">748</span><span id="line-748">        // we should record the first wal's offset</span>
-<span class="source-line-no">749</span><span id="line-749">        long oldWalTs = AbstractFSWALProvider.getTimestamp(oldOffset.getWal());</span>
-<span class="source-line-no">750</span><span id="line-750">        long walTs = AbstractFSWALProvider.getTimestamp(wal);</span>
-<span class="source-line-no">751</span><span id="line-751">        if (walTs &lt; oldWalTs) {</span>
-<span class="source-line-no">752</span><span id="line-752">          return new ReplicationGroupOffset(wal, offset);</span>
-<span class="source-line-no">753</span><span id="line-753">        }</span>
-<span class="source-line-no">754</span><span id="line-754">        return oldOffset;</span>
-<span class="source-line-no">755</span><span id="line-755">      });</span>
-<span class="source-line-no">756</span><span id="line-756">    });</span>
-<span class="source-line-no">757</span><span id="line-757">    return new ReplicationQueueData(zkData.getQueueId(), ImmutableMap.copyOf(groupOffsets));</span>
-<span class="source-line-no">758</span><span id="line-758">  }</span>
-<span class="source-line-no">759</span><span id="line-759"></span>
-<span class="source-line-no">760</span><span id="line-760">  private void migrateQueues(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
-<span class="source-line-no">761</span><span id="line-761">    throws Exception {</span>
-<span class="source-line-no">762</span><span id="line-762">    MigrationIterator&lt;Pair&lt;ServerName, List&lt;ZkReplicationQueueData&gt;&gt;&gt; iter =</span>
-<span class="source-line-no">763</span><span id="line-763">      oldQueueStorage.listAllQueues();</span>
-<span class="source-line-no">764</span><span id="line-764">    for (;;) {</span>
-<span class="source-line-no">765</span><span id="line-765">      Pair&lt;ServerName, List&lt;ZkReplicationQueueData&gt;&gt; pair = iter.next();</span>
-<span class="source-line-no">766</span><span id="line-766">      if (pair == null) {</span>
-<span class="source-line-no">767</span><span id="line-767">        return;</span>
-<span class="source-line-no">768</span><span id="line-768">      }</span>
-<span class="source-line-no">769</span><span id="line-769">      queueStorage.batchUpdateQueues(pair.getFirst(),</span>
-<span class="source-line-no">770</span><span id="line-770">        pair.getSecond().stream().filter(data -&gt; peers.containsKey(data.getQueueId().getPeerId()))</span>
-<span class="source-line-no">771</span><span id="line-771">          .map(this::convert).collect(Collectors.toList()));</span>
-<span class="source-line-no">772</span><span id="line-772">    }</span>
-<span class="source-line-no">773</span><span id="line-773">  }</span>
-<span class="source-line-no">774</span><span id="line-774"></span>
-<span class="source-line-no">775</span><span id="line-775">  private void migrateLastPushedSeqIds(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
-<span class="source-line-no">776</span><span id="line-776">    throws Exception {</span>
-<span class="source-line-no">777</span><span id="line-777">    MigrationIterator&lt;List&lt;ZkLastPushedSeqId&gt;&gt; iter = oldQueueStorage.listAllLastPushedSeqIds();</span>
-<span class="source-line-no">778</span><span id="line-778">    for (;;) {</span>
-<span class="source-line-no">779</span><span id="line-779">      List&lt;ZkLastPushedSeqId&gt; list = iter.next();</span>
-<span class="source-line-no">780</span><span id="line-780">      if (list == null) {</span>
-<span class="source-line-no">781</span><span id="line-781">        return;</span>
-<span class="source-line-no">782</span><span id="line-782">      }</span>
-<span class="source-line-no">783</span><span id="line-783">      queueStorage.batchUpdateLastSequenceIds(list.stream()</span>
-<span class="source-line-no">784</span><span id="line-784">        .filter(data -&gt; peers.containsKey(data.getPeerId())).collect(Collectors.toList()));</span>
-<span class="source-line-no">785</span><span id="line-785">    }</span>
-<span class="source-line-no">786</span><span id="line-786">  }</span>
-<span class="source-line-no">787</span><span id="line-787"></span>
-<span class="source-line-no">788</span><span id="line-788">  private void migrateHFileRefs(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
-<span class="source-line-no">789</span><span id="line-789">    throws Exception {</span>
-<span class="source-line-no">790</span><span id="line-790">    MigrationIterator&lt;Pair&lt;String, List&lt;String&gt;&gt;&gt; iter = oldQueueStorage.listAllHFileRefs();</span>
-<span class="source-line-no">791</span><span id="line-791">    for (;;) {</span>
-<span class="source-line-no">792</span><span id="line-792">      Pair&lt;String, List&lt;String&gt;&gt; pair = iter.next();</span>
-<span class="source-line-no">793</span><span id="line-793">      if (pair == null) {</span>
-<span class="source-line-no">794</span><span id="line-794">        return;</span>
-<span class="source-line-no">795</span><span id="line-795">      }</span>
-<span class="source-line-no">796</span><span id="line-796">      if (peers.containsKey(pair.getFirst())) {</span>
-<span class="source-line-no">797</span><span id="line-797">        queueStorage.batchUpdateHFileRefs(pair.getFirst(), pair.getSecond());</span>
-<span class="source-line-no">798</span><span id="line-798">      }</span>
-<span class="source-line-no">799</span><span id="line-799">    }</span>
-<span class="source-line-no">800</span><span id="line-800">  }</span>
-<span class="source-line-no">801</span><span id="line-801"></span>
-<span class="source-line-no">802</span><span id="line-802">  private interface ExceptionalRunnable {</span>
-<span class="source-line-no">803</span><span id="line-803">    void run() throws Exception;</span>
-<span class="source-line-no">804</span><span id="line-804">  }</span>
-<span class="source-line-no">805</span><span id="line-805"></span>
-<span class="source-line-no">806</span><span id="line-806">  private CompletableFuture&lt;?&gt; runAsync(ExceptionalRunnable task, ExecutorService executor) {</span>
-<span class="source-line-no">807</span><span id="line-807">    CompletableFuture&lt;?&gt; future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">808</span><span id="line-808">    executor.execute(() -&gt; {</span>
-<span class="source-line-no">809</span><span id="line-809">      try {</span>
-<span class="source-line-no">810</span><span id="line-810">        task.run();</span>
-<span class="source-line-no">811</span><span id="line-811">        future.complete(null);</span>
-<span class="source-line-no">812</span><span id="line-812">      } catch (Exception e) {</span>
-<span class="source-line-no">813</span><span id="line-813">        future.completeExceptionally(e);</span>
-<span class="source-line-no">814</span><span id="line-814">      }</span>
-<span class="source-line-no">815</span><span id="line-815">    });</span>
-<span class="source-line-no">816</span><span id="line-816">    return future;</span>
-<span class="source-line-no">817</span><span id="line-817">  }</span>
-<span class="source-line-no">818</span><span id="line-818"></span>
-<span class="source-line-no">819</span><span id="line-819">  /**</span>
-<span class="source-line-no">820</span><span id="line-820">   * Submit the migration tasks to the given {@code executor}.</span>
-<span class="source-line-no">821</span><span id="line-821">   */</span>
-<span class="source-line-no">822</span><span id="line-822">  CompletableFuture&lt;Void&gt; migrateQueuesFromZk(ZKWatcher zookeeper, ExecutorService executor) {</span>
-<span class="source-line-no">823</span><span id="line-823">    // the replication queue table creation is asynchronous and will be triggered by addPeer, so</span>
-<span class="source-line-no">824</span><span id="line-824">    // here we need to manually initialize it since we will not call addPeer.</span>
-<span class="source-line-no">825</span><span id="line-825">    try {</span>
-<span class="source-line-no">826</span><span id="line-826">      initializeQueueStorage();</span>
-<span class="source-line-no">827</span><span id="line-827">    } catch (IOException e) {</span>
-<span class="source-line-no">828</span><span id="line-828">      return FutureUtils.failedFuture(e);</span>
-<span class="source-line-no">829</span><span id="line-829">    }</span>
-<span class="source-line-no">830</span><span id="line-830">    ZKReplicationQueueStorageForMigration oldStorage =</span>
-<span class="source-line-no">831</span><span id="line-831">      new ZKReplicationQueueStorageForMigration(zookeeper, conf);</span>
-<span class="source-line-no">832</span><span id="line-832">    return CompletableFuture.allOf(runAsync(() -&gt; migrateQueues(oldStorage), executor),</span>
-<span class="source-line-no">833</span><span id="line-833">      runAsync(() -&gt; migrateLastPushedSeqIds(oldStorage), executor),</span>
-<span class="source-line-no">834</span><span id="line-834">      runAsync(() -&gt; migrateHFileRefs(oldStorage), executor));</span>
-<span class="source-line-no">835</span><span id="line-835">  }</span>
-<span class="source-line-no">836</span><span id="line-836">}</span>
+<span class="source-line-no">403</span><span id="line-403">    queueStorage.removeAllQueues(peerId);</span>
+<span class="source-line-no">404</span><span id="line-404">  }</span>
+<span class="source-line-no">405</span><span id="line-405"></span>
+<span class="source-line-no">406</span><span id="line-406">  public void removeAllQueuesAndHFileRefs(String peerId) throws ReplicationException {</span>
+<span class="source-line-no">407</span><span id="line-407">    removeAllQueues(peerId);</span>
+<span class="source-line-no">408</span><span id="line-408">    queueStorage.removePeerFromHFileRefs(peerId);</span>
+<span class="source-line-no">409</span><span id="line-409">  }</span>
+<span class="source-line-no">410</span><span id="line-410"></span>
+<span class="source-line-no">411</span><span id="line-411">  private void checkClusterKey(String clusterKey, ReplicationEndpoint endpoint)</span>
+<span class="source-line-no">412</span><span id="line-412">    throws DoNotRetryIOException {</span>
+<span class="source-line-no">413</span><span id="line-413">    if (endpoint != null &amp;&amp; !(endpoint instanceof HBaseReplicationEndpoint)) {</span>
+<span class="source-line-no">414</span><span id="line-414">      return;</span>
+<span class="source-line-no">415</span><span id="line-415">    }</span>
+<span class="source-line-no">416</span><span id="line-416">    // Endpoints implementing HBaseReplicationEndpoint need to check cluster key</span>
+<span class="source-line-no">417</span><span id="line-417">    URI connectionUri = ConnectionRegistryFactory.tryParseAsConnectionURI(clusterKey);</span>
+<span class="source-line-no">418</span><span id="line-418">    try {</span>
+<span class="source-line-no">419</span><span id="line-419">      if (connectionUri != null) {</span>
+<span class="source-line-no">420</span><span id="line-420">        ConnectionRegistryFactory.validate(connectionUri);</span>
+<span class="source-line-no">421</span><span id="line-421">      } else {</span>
+<span class="source-line-no">422</span><span id="line-422">        ZKConfig.validateClusterKey(clusterKey);</span>
+<span class="source-line-no">423</span><span id="line-423">      }</span>
+<span class="source-line-no">424</span><span id="line-424">    } catch (IOException e) {</span>
+<span class="source-line-no">425</span><span id="line-425">      throw new DoNotRetryIOException("Invalid cluster key: " + clusterKey, e);</span>
+<span class="source-line-no">426</span><span id="line-426">    }</span>
+<span class="source-line-no">427</span><span id="line-427">    if (endpoint != null &amp;&amp; endpoint.canReplicateToSameCluster()) {</span>
+<span class="source-line-no">428</span><span id="line-428">      return;</span>
+<span class="source-line-no">429</span><span id="line-429">    }</span>
+<span class="source-line-no">430</span><span id="line-430">    // make sure we do not replicate to same cluster</span>
+<span class="source-line-no">431</span><span id="line-431">    String peerClusterId;</span>
+<span class="source-line-no">432</span><span id="line-432">    try {</span>
+<span class="source-line-no">433</span><span id="line-433">      if (connectionUri != null) {</span>
+<span class="source-line-no">434</span><span id="line-434">        // fetch cluster id through standard admin API</span>
+<span class="source-line-no">435</span><span id="line-435">        try (Connection conn = ConnectionFactory.createConnection(connectionUri, conf);</span>
+<span class="source-line-no">436</span><span id="line-436">          Admin admin = conn.getAdmin()) {</span>
+<span class="source-line-no">437</span><span id="line-437">          peerClusterId =</span>
+<span class="source-line-no">438</span><span id="line-438">            admin.getClusterMetrics(EnumSet.of(ClusterMetrics.Option.CLUSTER_ID)).getClusterId();</span>
+<span class="source-line-no">439</span><span id="line-439">        }</span>
+<span class="source-line-no">440</span><span id="line-440">      } else {</span>
+<span class="source-line-no">441</span><span id="line-441">        // Create the peer cluster config for get peer cluster id</span>
+<span class="source-line-no">442</span><span id="line-442">        Configuration peerConf = HBaseConfiguration.createClusterConf(conf, clusterKey);</span>
+<span class="source-line-no">443</span><span id="line-443">        try (ZKWatcher zkWatcher = new ZKWatcher(peerConf, this + "check-peer-cluster-id", null)) {</span>
+<span class="source-line-no">444</span><span id="line-444">          peerClusterId = ZKClusterId.readClusterIdZNode(zkWatcher);</span>
+<span class="source-line-no">445</span><span id="line-445">        }</span>
+<span class="source-line-no">446</span><span id="line-446">      }</span>
+<span class="source-line-no">447</span><span id="line-447">    } catch (IOException | KeeperException e) {</span>
+<span class="source-line-no">448</span><span id="line-448">      // we just want to check whether we will replicate to the same cluster, so if we get an error</span>
+<span class="source-line-no">449</span><span id="line-449">      // while getting the cluster id of the peer cluster, it means we are not connecting to</span>
+<span class="source-line-no">450</span><span id="line-450">      // ourselves, as we are still alive. So here we just log the error and continue</span>
+<span class="source-line-no">451</span><span id="line-451">      LOG.warn("Can't get peerClusterId for clusterKey=" + clusterKey, e);</span>
+<span class="source-line-no">452</span><span id="line-452">      return;</span>
+<span class="source-line-no">453</span><span id="line-453">    }</span>
+<span class="source-line-no">454</span><span id="line-454">    // In rare case, zookeeper setting may be messed up. That leads to the incorrect</span>
+<span class="source-line-no">455</span><span id="line-455">    // peerClusterId value, which is the same as the source clusterId</span>
+<span class="source-line-no">456</span><span id="line-456">    if (clusterId.equals(peerClusterId)) {</span>
+<span class="source-line-no">457</span><span id="line-457">      throw new DoNotRetryIOException("Invalid cluster key: " + clusterKey</span>
+<span class="source-line-no">458</span><span id="line-458">        + ", should not replicate to itself for HBaseInterClusterReplicationEndpoint");</span>
+<span class="source-line-no">459</span><span id="line-459">    }</span>
+<span class="source-line-no">460</span><span id="line-460">  }</span>
+<span class="source-line-no">461</span><span id="line-461"></span>
+<span class="source-line-no">462</span><span id="line-462">  private void checkPeerConfig(ReplicationPeerConfig peerConfig) throws DoNotRetryIOException {</span>
+<span class="source-line-no">463</span><span id="line-463">    String replicationEndpointImpl = peerConfig.getReplicationEndpointImpl();</span>
+<span class="source-line-no">464</span><span id="line-464">    ReplicationEndpoint endpoint = null;</span>
+<span class="source-line-no">465</span><span id="line-465">    if (!StringUtils.isBlank(replicationEndpointImpl)) {</span>
+<span class="source-line-no">466</span><span id="line-466">      try {</span>
+<span class="source-line-no">467</span><span id="line-467">        // try creating a instance</span>
+<span class="source-line-no">468</span><span id="line-468">        endpoint = Class.forName(replicationEndpointImpl).asSubclass(ReplicationEndpoint.class)</span>
+<span class="source-line-no">469</span><span id="line-469">          .getDeclaredConstructor().newInstance();</span>
+<span class="source-line-no">470</span><span id="line-470">      } catch (Throwable e) {</span>
+<span class="source-line-no">471</span><span id="line-471">        throw new DoNotRetryIOException(</span>
+<span class="source-line-no">472</span><span id="line-472">          "Can not instantiate configured replication endpoint class=" + replicationEndpointImpl,</span>
+<span class="source-line-no">473</span><span id="line-473">          e);</span>
+<span class="source-line-no">474</span><span id="line-474">      }</span>
+<span class="source-line-no">475</span><span id="line-475">    }</span>
+<span class="source-line-no">476</span><span id="line-476">    checkClusterKey(peerConfig.getClusterKey(), endpoint);</span>
+<span class="source-line-no">477</span><span id="line-477"></span>
+<span class="source-line-no">478</span><span id="line-478">    if (peerConfig.replicateAllUserTables()) {</span>
+<span class="source-line-no">479</span><span id="line-479">      // If replicate_all flag is true, it means all user tables will be replicated to peer cluster.</span>
+<span class="source-line-no">480</span><span id="line-480">      // Then allow config exclude namespaces or exclude table-cfs which can't be replicated to peer</span>
+<span class="source-line-no">481</span><span id="line-481">      // cluster.</span>
+<span class="source-line-no">482</span><span id="line-482">      if (</span>
+<span class="source-line-no">483</span><span id="line-483">        (peerConfig.getNamespaces() != null &amp;&amp; !peerConfig.getNamespaces().isEmpty())</span>
+<span class="source-line-no">484</span><span id="line-484">          || (peerConfig.getTableCFsMap() != null &amp;&amp; !peerConfig.getTableCFsMap().isEmpty())</span>
+<span class="source-line-no">485</span><span id="line-485">      ) {</span>
+<span class="source-line-no">486</span><span id="line-486">        throw new DoNotRetryIOException("Need clean namespaces or table-cfs config firstly "</span>
+<span class="source-line-no">487</span><span id="line-487">          + "when you want replicate all cluster");</span>
+<span class="source-line-no">488</span><span id="line-488">      }</span>
+<span class="source-line-no">489</span><span id="line-489">      checkNamespacesAndTableCfsConfigConflict(peerConfig.getExcludeNamespaces(),</span>
+<span class="source-line-no">490</span><span id="line-490">        peerConfig.getExcludeTableCFsMap());</span>
+<span class="source-line-no">491</span><span id="line-491">    } else {</span>
+<span class="source-line-no">492</span><span id="line-492">      // If replicate_all flag is false, it means all user tables can't be replicated to peer</span>
+<span class="source-line-no">493</span><span id="line-493">      // cluster. Then allow to config namespaces or table-cfs which will be replicated to peer</span>
+<span class="source-line-no">494</span><span id="line-494">      // cluster.</span>
+<span class="source-line-no">495</span><span id="line-495">      if (</span>
+<span class="source-line-no">496</span><span id="line-496">        (peerConfig.getExcludeNamespaces() != null &amp;&amp; !peerConfig.getExcludeNamespaces().isEmpty())</span>
+<span class="source-line-no">497</span><span id="line-497">          || (peerConfig.getExcludeTableCFsMap() != null</span>
+<span class="source-line-no">498</span><span id="line-498">            &amp;&amp; !peerConfig.getExcludeTableCFsMap().isEmpty())</span>
+<span class="source-line-no">499</span><span id="line-499">      ) {</span>
+<span class="source-line-no">500</span><span id="line-500">        throw new DoNotRetryIOException(</span>
+<span class="source-line-no">501</span><span id="line-501">          "Need clean exclude-namespaces or exclude-table-cfs config firstly"</span>
+<span class="source-line-no">502</span><span id="line-502">            + " when replicate_all flag is false");</span>
+<span class="source-line-no">503</span><span id="line-503">      }</span>
+<span class="source-line-no">504</span><span id="line-504">      checkNamespacesAndTableCfsConfigConflict(peerConfig.getNamespaces(),</span>
+<span class="source-line-no">505</span><span id="line-505">        peerConfig.getTableCFsMap());</span>
+<span class="source-line-no">506</span><span id="line-506">    }</span>
+<span class="source-line-no">507</span><span id="line-507"></span>
+<span class="source-line-no">508</span><span id="line-508">    if (peerConfig.isSyncReplication()) {</span>
+<span class="source-line-no">509</span><span id="line-509">      checkPeerConfigForSyncReplication(peerConfig);</span>
+<span class="source-line-no">510</span><span id="line-510">    }</span>
+<span class="source-line-no">511</span><span id="line-511"></span>
+<span class="source-line-no">512</span><span id="line-512">    checkConfiguredWALEntryFilters(peerConfig);</span>
+<span class="source-line-no">513</span><span id="line-513">  }</span>
+<span class="source-line-no">514</span><span id="line-514"></span>
+<span class="source-line-no">515</span><span id="line-515">  private void checkPeerConfigForSyncReplication(ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">516</span><span id="line-516">    throws DoNotRetryIOException {</span>
+<span class="source-line-no">517</span><span id="line-517">    // This is used to reduce the difficulty for implementing the sync replication state transition</span>
+<span class="source-line-no">518</span><span id="line-518">    // as we need to reopen all the related regions.</span>
+<span class="source-line-no">519</span><span id="line-519">    // TODO: Add namespace, replicat_all flag back</span>
+<span class="source-line-no">520</span><span id="line-520">    if (peerConfig.replicateAllUserTables()) {</span>
+<span class="source-line-no">521</span><span id="line-521">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">522</span><span id="line-522">        "Only support replicated table config for sync replication peer");</span>
+<span class="source-line-no">523</span><span id="line-523">    }</span>
+<span class="source-line-no">524</span><span id="line-524">    if (peerConfig.getNamespaces() != null &amp;&amp; !peerConfig.getNamespaces().isEmpty()) {</span>
+<span class="source-line-no">525</span><span id="line-525">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">526</span><span id="line-526">        "Only support replicated table config for sync replication peer");</span>
+<span class="source-line-no">527</span><span id="line-527">    }</span>
+<span class="source-line-no">528</span><span id="line-528">    if (peerConfig.getTableCFsMap() == null || peerConfig.getTableCFsMap().isEmpty()) {</span>
+<span class="source-line-no">529</span><span id="line-529">      throw new DoNotRetryIOException("Need config replicated tables for sync replication peer");</span>
+<span class="source-line-no">530</span><span id="line-530">    }</span>
+<span class="source-line-no">531</span><span id="line-531">    for (List&lt;String&gt; cfs : peerConfig.getTableCFsMap().values()) {</span>
+<span class="source-line-no">532</span><span id="line-532">      if (cfs != null &amp;&amp; !cfs.isEmpty()) {</span>
+<span class="source-line-no">533</span><span id="line-533">        throw new DoNotRetryIOException(</span>
+<span class="source-line-no">534</span><span id="line-534">          "Only support replicated table config for sync replication peer");</span>
+<span class="source-line-no">535</span><span id="line-535">      }</span>
+<span class="source-line-no">536</span><span id="line-536">    }</span>
+<span class="source-line-no">537</span><span id="line-537"></span>
+<span class="source-line-no">538</span><span id="line-538">    Path remoteWALDir = new Path(peerConfig.getRemoteWALDir());</span>
+<span class="source-line-no">539</span><span id="line-539">    if (!remoteWALDir.isAbsolute()) {</span>
+<span class="source-line-no">540</span><span id="line-540">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">541</span><span id="line-541">        "The remote WAL directory " + peerConfig.getRemoteWALDir() + " is not absolute");</span>
+<span class="source-line-no">542</span><span id="line-542">    }</span>
+<span class="source-line-no">543</span><span id="line-543">    URI remoteWALDirUri = remoteWALDir.toUri();</span>
+<span class="source-line-no">544</span><span id="line-544">    if (remoteWALDirUri.getScheme() == null || remoteWALDirUri.getAuthority() == null) {</span>
+<span class="source-line-no">545</span><span id="line-545">      throw new DoNotRetryIOException("The remote WAL directory " + peerConfig.getRemoteWALDir()</span>
+<span class="source-line-no">546</span><span id="line-546">        + " is not qualified, you must provide scheme and authority");</span>
+<span class="source-line-no">547</span><span id="line-547">    }</span>
+<span class="source-line-no">548</span><span id="line-548">  }</span>
+<span class="source-line-no">549</span><span id="line-549"></span>
+<span class="source-line-no">550</span><span id="line-550">  private void checkSyncReplicationPeerConfigConflict(ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">551</span><span id="line-551">    throws DoNotRetryIOException {</span>
+<span class="source-line-no">552</span><span id="line-552">    for (TableName tableName : peerConfig.getTableCFsMap().keySet()) {</span>
+<span class="source-line-no">553</span><span id="line-553">      for (Map.Entry&lt;String, ReplicationPeerDescription&gt; entry : peers.entrySet()) {</span>
+<span class="source-line-no">554</span><span id="line-554">        ReplicationPeerConfig rpc = entry.getValue().getPeerConfig();</span>
+<span class="source-line-no">555</span><span id="line-555">        if (rpc.isSyncReplication() &amp;&amp; rpc.getTableCFsMap().containsKey(tableName)) {</span>
+<span class="source-line-no">556</span><span id="line-556">          throw new DoNotRetryIOException(</span>
+<span class="source-line-no">557</span><span id="line-557">            "Table " + tableName + " has been replicated by peer " + entry.getKey());</span>
+<span class="source-line-no">558</span><span id="line-558">        }</span>
+<span class="source-line-no">559</span><span id="line-559">      }</span>
+<span class="source-line-no">560</span><span id="line-560">    }</span>
+<span class="source-line-no">561</span><span id="line-561">  }</span>
+<span class="source-line-no">562</span><span id="line-562"></span>
+<span class="source-line-no">563</span><span id="line-563">  /**</span>
+<span class="source-line-no">564</span><span id="line-564">   * Set a namespace in the peer config means that all tables in this namespace will be replicated</span>
+<span class="source-line-no">565</span><span id="line-565">   * to the peer cluster.</span>
+<span class="source-line-no">566</span><span id="line-566">   * &lt;ol&gt;</span>
+<span class="source-line-no">567</span><span id="line-567">   * &lt;li&gt;If peer config already has a namespace, then not allow set any table of this namespace to</span>
+<span class="source-line-no">568</span><span id="line-568">   * the peer config.&lt;/li&gt;</span>
+<span class="source-line-no">569</span><span id="line-569">   * &lt;li&gt;If peer config already has a table, then not allow set this table's namespace to the peer</span>
+<span class="source-line-no">570</span><span id="line-570">   * config.&lt;/li&gt;</span>
+<span class="source-line-no">571</span><span id="line-571">   * &lt;/ol&gt;</span>
+<span class="source-line-no">572</span><span id="line-572">   * &lt;p&gt;</span>
+<span class="source-line-no">573</span><span id="line-573">   * Set a exclude namespace in the peer config means that all tables in this namespace can't be</span>
+<span class="source-line-no">574</span><span id="line-574">   * replicated to the peer cluster.</span>
+<span class="source-line-no">575</span><span id="line-575">   * &lt;ol&gt;</span>
+<span class="source-line-no">576</span><span id="line-576">   * &lt;li&gt;If peer config already has a exclude namespace, then not allow set any exclude table of</span>
+<span class="source-line-no">577</span><span id="line-577">   * this namespace to the peer config.&lt;/li&gt;</span>
+<span class="source-line-no">578</span><span id="line-578">   * &lt;li&gt;If peer config already has a exclude table, then not allow set this table's namespace as a</span>
+<span class="source-line-no">579</span><span id="line-579">   * exclude namespace.&lt;/li&gt;</span>
+<span class="source-line-no">580</span><span id="line-580">   * &lt;/ol&gt;</span>
+<span class="source-line-no">581</span><span id="line-581">   */</span>
+<span class="source-line-no">582</span><span id="line-582">  private void checkNamespacesAndTableCfsConfigConflict(Set&lt;String&gt; namespaces,</span>
+<span class="source-line-no">583</span><span id="line-583">    Map&lt;TableName, ? extends Collection&lt;String&gt;&gt; tableCfs) throws DoNotRetryIOException {</span>
+<span class="source-line-no">584</span><span id="line-584">    if (namespaces == null || namespaces.isEmpty()) {</span>
+<span class="source-line-no">585</span><span id="line-585">      return;</span>
+<span class="source-line-no">586</span><span id="line-586">    }</span>
+<span class="source-line-no">587</span><span id="line-587">    if (tableCfs == null || tableCfs.isEmpty()) {</span>
+<span class="source-line-no">588</span><span id="line-588">      return;</span>
+<span class="source-line-no">589</span><span id="line-589">    }</span>
+<span class="source-line-no">590</span><span id="line-590">    for (Map.Entry&lt;TableName, ? extends Collection&lt;String&gt;&gt; entry : tableCfs.entrySet()) {</span>
+<span class="source-line-no">591</span><span id="line-591">      TableName table = entry.getKey();</span>
+<span class="source-line-no">592</span><span id="line-592">      if (namespaces.contains(table.getNamespaceAsString())) {</span>
+<span class="source-line-no">593</span><span id="line-593">        throw new DoNotRetryIOException("Table-cfs " + table + " is conflict with namespaces "</span>
+<span class="source-line-no">594</span><span id="line-594">          + table.getNamespaceAsString() + " in peer config");</span>
+<span class="source-line-no">595</span><span id="line-595">      }</span>
+<span class="source-line-no">596</span><span id="line-596">    }</span>
+<span class="source-line-no">597</span><span id="line-597">  }</span>
+<span class="source-line-no">598</span><span id="line-598"></span>
+<span class="source-line-no">599</span><span id="line-599">  private void checkConfiguredWALEntryFilters(ReplicationPeerConfig peerConfig)</span>
+<span class="source-line-no">600</span><span id="line-600">    throws DoNotRetryIOException {</span>
+<span class="source-line-no">601</span><span id="line-601">    String filterCSV = peerConfig.getConfiguration()</span>
+<span class="source-line-no">602</span><span id="line-602">      .get(BaseReplicationEndpoint.REPLICATION_WALENTRYFILTER_CONFIG_KEY);</span>
+<span class="source-line-no">603</span><span id="line-603">    if (filterCSV != null &amp;&amp; !filterCSV.isEmpty()) {</span>
+<span class="source-line-no">604</span><span id="line-604">      String[] filters = filterCSV.split(",");</span>
+<span class="source-line-no">605</span><span id="line-605">      for (String filter : filters) {</span>
+<span class="source-line-no">606</span><span id="line-606">        try {</span>
+<span class="source-line-no">607</span><span id="line-607">          Class.forName(filter).getDeclaredConstructor().newInstance();</span>
+<span class="source-line-no">608</span><span id="line-608">        } catch (Exception e) {</span>
+<span class="source-line-no">609</span><span id="line-609">          throw new DoNotRetryIOException("Configured WALEntryFilter " + filter</span>
+<span class="source-line-no">610</span><span id="line-610">            + " could not be created. Failing add/update peer operation.", e);</span>
+<span class="source-line-no">611</span><span id="line-611">        }</span>
+<span class="source-line-no">612</span><span id="line-612">      }</span>
+<span class="source-line-no">613</span><span id="line-613">    }</span>
+<span class="source-line-no">614</span><span id="line-614">  }</span>
+<span class="source-line-no">615</span><span id="line-615"></span>
+<span class="source-line-no">616</span><span id="line-616">  public List&lt;String&gt; getSerialPeerIdsBelongsTo(TableName tableName) {</span>
+<span class="source-line-no">617</span><span id="line-617">    return peers.values().stream().filter(p -&gt; p.getPeerConfig().isSerial())</span>
+<span class="source-line-no">618</span><span id="line-618">      .filter(p -&gt; p.getPeerConfig().needToReplicate(tableName)).map(p -&gt; p.getPeerId())</span>
+<span class="source-line-no">619</span><span id="line-619">      .collect(Collectors.toList());</span>
+<span class="source-line-no">620</span><span id="line-620">  }</span>
+<span class="source-line-no">621</span><span id="line-621"></span>
+<span class="source-line-no">622</span><span id="line-622">  @RestrictedApi(explanation = "Should only be called in tests", link = "",</span>
+<span class="source-line-no">623</span><span id="line-623">      allowedOnPath = ".*/src/test/.*")</span>
+<span class="source-line-no">624</span><span id="line-624">  public ReplicationPeerStorage getPeerStorage() {</span>
+<span class="source-line-no">625</span><span id="line-625">    return peerStorage;</span>
+<span class="source-line-no">626</span><span id="line-626">  }</span>
+<span class="source-line-no">627</span><span id="line-627"></span>
+<span class="source-line-no">628</span><span id="line-628">  public ReplicationQueueStorage getQueueStorage() {</span>
+<span class="source-line-no">629</span><span id="line-629">    return queueStorage;</span>
+<span class="source-line-no">630</span><span id="line-630">  }</span>
+<span class="source-line-no">631</span><span id="line-631"></span>
+<span class="source-line-no">632</span><span id="line-632">  private static Pair&lt;ReplicationQueueStorage, ReplicationQueueStorageInitializer&gt;</span>
+<span class="source-line-no">633</span><span id="line-633">    createReplicationQueueStorage(MasterServices services) throws IOException {</span>
+<span class="source-line-no">634</span><span id="line-634">    Configuration conf = services.getConfiguration();</span>
+<span class="source-line-no">635</span><span id="line-635">    TableName replicationQueueTableName =</span>
+<span class="source-line-no">636</span><span id="line-636">      TableName.valueOf(conf.get(ReplicationStorageFactory.REPLICATION_QUEUE_TABLE_NAME,</span>
+<span class="source-line-no">637</span><span id="line-637">        ReplicationStorageFactory.REPLICATION_QUEUE_TABLE_NAME_DEFAULT.getNameAsString()));</span>
+<span class="source-line-no">638</span><span id="line-638">    ReplicationQueueStorageInitializer initializer;</span>
+<span class="source-line-no">639</span><span id="line-639">    if (services.getTableDescriptors().exists(replicationQueueTableName)) {</span>
+<span class="source-line-no">640</span><span id="line-640">      // no need to create the table</span>
+<span class="source-line-no">641</span><span id="line-641">      initializer = () -&gt; {</span>
+<span class="source-line-no">642</span><span id="line-642">      };</span>
+<span class="source-line-no">643</span><span id="line-643">    } else {</span>
+<span class="source-line-no">644</span><span id="line-644">      // lazy create the replication table.</span>
+<span class="source-line-no">645</span><span id="line-645">      initializer = new ReplicationQueueStorageInitializer() {</span>
+<span class="source-line-no">646</span><span id="line-646"></span>
+<span class="source-line-no">647</span><span id="line-647">        private volatile boolean created = false;</span>
+<span class="source-line-no">648</span><span id="line-648"></span>
+<span class="source-line-no">649</span><span id="line-649">        @Override</span>
+<span class="source-line-no">650</span><span id="line-650">        public void initialize() throws IOException {</span>
+<span class="source-line-no">651</span><span id="line-651">          if (created) {</span>
+<span class="source-line-no">652</span><span id="line-652">            return;</span>
+<span class="source-line-no">653</span><span id="line-653">          }</span>
+<span class="source-line-no">654</span><span id="line-654">          synchronized (this) {</span>
+<span class="source-line-no">655</span><span id="line-655">            if (created) {</span>
+<span class="source-line-no">656</span><span id="line-656">              return;</span>
+<span class="source-line-no">657</span><span id="line-657">            }</span>
+<span class="source-line-no">658</span><span id="line-658">            if (services.getTableDescriptors().exists(replicationQueueTableName)) {</span>
+<span class="source-line-no">659</span><span id="line-659">              created = true;</span>
+<span class="source-line-no">660</span><span id="line-660">              return;</span>
+<span class="source-line-no">661</span><span id="line-661">            }</span>
+<span class="source-line-no">662</span><span id="line-662">            long procId = services.createSystemTable(ReplicationStorageFactory</span>
+<span class="source-line-no">663</span><span id="line-663">              .createReplicationQueueTableDescriptor(replicationQueueTableName));</span>
+<span class="source-line-no">664</span><span id="line-664">            ProcedureExecutor&lt;MasterProcedureEnv&gt; procExec = services.getMasterProcedureExecutor();</span>
+<span class="source-line-no">665</span><span id="line-665">            ProcedureSyncWait.waitFor(procExec.getEnvironment(), TimeUnit.MINUTES.toMillis(1),</span>
+<span class="source-line-no">666</span><span id="line-666">              "Creating table " + replicationQueueTableName, () -&gt; procExec.isFinished(procId));</span>
+<span class="source-line-no">667</span><span id="line-667">          }</span>
+<span class="source-line-no">668</span><span id="line-668">        }</span>
+<span class="source-line-no">669</span><span id="line-669">      };</span>
+<span class="source-line-no">670</span><span id="line-670">    }</span>
+<span class="source-line-no">671</span><span id="line-671">    return Pair.newPair(ReplicationStorageFactory.getReplicationQueueStorage(</span>
+<span class="source-line-no">672</span><span id="line-672">      services.getConnection(), conf, replicationQueueTableName), initializer);</span>
+<span class="source-line-no">673</span><span id="line-673">  }</span>
+<span class="source-line-no">674</span><span id="line-674"></span>
+<span class="source-line-no">675</span><span id="line-675">  public static ReplicationPeerManager create(MasterServices services, String clusterId)</span>
+<span class="source-line-no">676</span><span id="line-676">    throws ReplicationException, IOException {</span>
+<span class="source-line-no">677</span><span id="line-677">    Configuration conf = services.getConfiguration();</span>
+<span class="source-line-no">678</span><span id="line-678">    FileSystem fs = services.getMasterFileSystem().getFileSystem();</span>
+<span class="source-line-no">679</span><span id="line-679">    ZKWatcher zk = services.getZooKeeper();</span>
+<span class="source-line-no">680</span><span id="line-680">    ReplicationPeerStorage peerStorage =</span>
+<span class="source-line-no">681</span><span id="line-681">      ReplicationStorageFactory.getReplicationPeerStorage(fs, zk, conf);</span>
+<span class="source-line-no">682</span><span id="line-682">    Pair&lt;ReplicationQueueStorage, ReplicationQueueStorageInitializer&gt; pair =</span>
+<span class="source-line-no">683</span><span id="line-683">      createReplicationQueueStorage(services);</span>
+<span class="source-line-no">684</span><span id="line-684">    ReplicationQueueStorage queueStorage = pair.getFirst();</span>
+<span class="source-line-no">685</span><span id="line-685">    ConcurrentMap&lt;String, ReplicationPeerDescription&gt; peers = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="source-line-no">686</span><span id="line-686">    for (String peerId : peerStorage.listPeerIds()) {</span>
+<span class="source-line-no">687</span><span id="line-687">      ReplicationPeerConfig peerConfig = peerStorage.getPeerConfig(peerId);</span>
+<span class="source-line-no">688</span><span id="line-688">      if (</span>
+<span class="source-line-no">689</span><span id="line-689">        ReplicationUtils.LEGACY_REGION_REPLICATION_ENDPOINT_NAME</span>
+<span class="source-line-no">690</span><span id="line-690">          .equals(peerConfig.getReplicationEndpointImpl())</span>
+<span class="source-line-no">691</span><span id="line-691">      ) {</span>
+<span class="source-line-no">692</span><span id="line-692">        // If memstore region replication is enabled, there will be a special replication peer</span>
+<span class="source-line-no">693</span><span id="line-693">        // usually called 'region_replica_replication'. We do not need to load it or migrate its</span>
+<span class="source-line-no">694</span><span id="line-694">        // replication queue data since we do not rely on general replication framework for</span>
+<span class="source-line-no">695</span><span id="line-695">        // region replication in 3.x now, please see HBASE-26233 for more details.</span>
+<span class="source-line-no">696</span><span id="line-696">        // We can not delete it now since region server with old version still want to update</span>
+<span class="source-line-no">697</span><span id="line-697">        // the replicated wal position to zk, if we delete the replication queue zk node, rs</span>
+<span class="source-line-no">698</span><span id="line-698">        // will crash. See HBASE-29169 for more details.</span>
+<span class="source-line-no">699</span><span id="line-699">        // In MigrateReplicationQueueFromZkToTableProcedure, finally we will call a deleteAllData on</span>
+<span class="source-line-no">700</span><span id="line-700">        // the old replication queue storage, to make sure that we will delete the the queue data</span>
+<span class="source-line-no">701</span><span id="line-701">        // for this peer and also the peer info in replication peer storage</span>
+<span class="source-line-no">702</span><span id="line-702">        LOG.info("Found old region replica replication peer '{}', skip loading it", peerId);</span>
+<span class="source-line-no">703</span><span id="line-703">        continue;</span>
+<span class="source-line-no">704</span><span id="line-704">      }</span>
+<span class="source-line-no">705</span><span id="line-705">      peerConfig = ReplicationPeerConfigUtil.updateReplicationBasePeerConfigs(conf, peerConfig);</span>
+<span class="source-line-no">706</span><span id="line-706">      peerStorage.updatePeerConfig(peerId, peerConfig);</span>
+<span class="source-line-no">707</span><span id="line-707">      boolean enabled = peerStorage.isPeerEnabled(peerId);</span>
+<span class="source-line-no">708</span><span id="line-708">      SyncReplicationState state = peerStorage.getPeerSyncReplicationState(peerId);</span>
+<span class="source-line-no">709</span><span id="line-709">      peers.put(peerId, new ReplicationPeerDescription(peerId, enabled, peerConfig, state));</span>
+<span class="source-line-no">710</span><span id="line-710">    }</span>
+<span class="source-line-no">711</span><span id="line-711">    return new ReplicationPeerManager(fs, zk, peerStorage, queueStorage, peers, conf, clusterId,</span>
+<span class="source-line-no">712</span><span id="line-712">      pair.getSecond());</span>
+<span class="source-line-no">713</span><span id="line-713">  }</span>
+<span class="source-line-no">714</span><span id="line-714"></span>
+<span class="source-line-no">715</span><span id="line-715">  /**</span>
+<span class="source-line-no">716</span><span id="line-716">   * For replication peer cluster key or endpoint class, null and empty string is same. So here</span>
+<span class="source-line-no">717</span><span id="line-717">   * don't use {@link StringUtils#equals(CharSequence, CharSequence)} directly.</span>
+<span class="source-line-no">718</span><span id="line-718">   */</span>
+<span class="source-line-no">719</span><span id="line-719">  private boolean isStringEquals(String s1, String s2) {</span>
+<span class="source-line-no">720</span><span id="line-720">    if (StringUtils.isBlank(s1)) {</span>
+<span class="source-line-no">721</span><span id="line-721">      return StringUtils.isBlank(s2);</span>
+<span class="source-line-no">722</span><span id="line-722">    }</span>
+<span class="source-line-no">723</span><span id="line-723">    return s1.equals(s2);</span>
+<span class="source-line-no">724</span><span id="line-724">  }</span>
+<span class="source-line-no">725</span><span id="line-725"></span>
+<span class="source-line-no">726</span><span id="line-726">  @Override</span>
+<span class="source-line-no">727</span><span id="line-727">  public void onConfigurationChange(Configuration conf) {</span>
+<span class="source-line-no">728</span><span id="line-728">    this.conf = conf;</span>
+<span class="source-line-no">729</span><span id="line-729">    this.peerStorage = ReplicationStorageFactory.getReplicationPeerStorage(fs, zk, conf);</span>
+<span class="source-line-no">730</span><span id="line-730">  }</span>
+<span class="source-line-no">731</span><span id="line-731"></span>
+<span class="source-line-no">732</span><span id="line-732">  private ReplicationQueueData convert(ZkReplicationQueueData zkData) {</span>
+<span class="source-line-no">733</span><span id="line-733">    Map&lt;String, ReplicationGroupOffset&gt; groupOffsets = new HashMap&lt;&gt;();</span>
+<span class="source-line-no">734</span><span id="line-734">    zkData.getWalOffsets().forEach((wal, offset) -&gt; {</span>
+<span class="source-line-no">735</span><span id="line-735">      String walGroup = AbstractFSWALProvider.getWALPrefixFromWALName(wal);</span>
+<span class="source-line-no">736</span><span id="line-736">      groupOffsets.compute(walGroup, (k, oldOffset) -&gt; {</span>
+<span class="source-line-no">737</span><span id="line-737">        if (oldOffset == null) {</span>
+<span class="source-line-no">738</span><span id="line-738">          return new ReplicationGroupOffset(wal, offset);</span>
+<span class="source-line-no">739</span><span id="line-739">        }</span>
+<span class="source-line-no">740</span><span id="line-740">        // we should record the first wal's offset</span>
+<span class="source-line-no">741</span><span id="line-741">        long oldWalTs = AbstractFSWALProvider.getTimestamp(oldOffset.getWal());</span>
+<span class="source-line-no">742</span><span id="line-742">        long walTs = AbstractFSWALProvider.getTimestamp(wal);</span>
+<span class="source-line-no">743</span><span id="line-743">        if (walTs &lt; oldWalTs) {</span>
+<span class="source-line-no">744</span><span id="line-744">          return new ReplicationGroupOffset(wal, offset);</span>
+<span class="source-line-no">745</span><span id="line-745">        }</span>
+<span class="source-line-no">746</span><span id="line-746">        return oldOffset;</span>
+<span class="source-line-no">747</span><span id="line-747">      });</span>
+<span class="source-line-no">748</span><span id="line-748">    });</span>
+<span class="source-line-no">749</span><span id="line-749">    return new ReplicationQueueData(zkData.getQueueId(), ImmutableMap.copyOf(groupOffsets));</span>
+<span class="source-line-no">750</span><span id="line-750">  }</span>
+<span class="source-line-no">751</span><span id="line-751"></span>
+<span class="source-line-no">752</span><span id="line-752">  private void migrateQueues(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
+<span class="source-line-no">753</span><span id="line-753">    throws Exception {</span>
+<span class="source-line-no">754</span><span id="line-754">    MigrationIterator&lt;Pair&lt;ServerName, List&lt;ZkReplicationQueueData&gt;&gt;&gt; iter =</span>
+<span class="source-line-no">755</span><span id="line-755">      oldQueueStorage.listAllQueues();</span>
+<span class="source-line-no">756</span><span id="line-756">    for (;;) {</span>
+<span class="source-line-no">757</span><span id="line-757">      Pair&lt;ServerName, List&lt;ZkReplicationQueueData&gt;&gt; pair = iter.next();</span>
+<span class="source-line-no">758</span><span id="line-758">      if (pair == null) {</span>
+<span class="source-line-no">759</span><span id="line-759">        return;</span>
+<span class="source-line-no">760</span><span id="line-760">      }</span>
+<span class="source-line-no">761</span><span id="line-761">      queueStorage.batchUpdateQueues(pair.getFirst(),</span>
+<span class="source-line-no">762</span><span id="line-762">        pair.getSecond().stream().filter(data -&gt; peers.containsKey(data.getQueueId().getPeerId()))</span>
+<span class="source-line-no">763</span><span id="line-763">          .map(this::convert).collect(Collectors.toList()));</span>
+<span class="source-line-no">764</span><span id="line-764">    }</span>
+<span class="source-line-no">765</span><span id="line-765">  }</span>
+<span class="source-line-no">766</span><span id="line-766"></span>
+<span class="source-line-no">767</span><span id="line-767">  private void migrateLastPushedSeqIds(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
+<span class="source-line-no">768</span><span id="line-768">    throws Exception {</span>
+<span class="source-line-no">769</span><span id="line-769">    MigrationIterator&lt;List&lt;ZkLastPushedSeqId&gt;&gt; iter = oldQueueStorage.listAllLastPushedSeqIds();</span>
+<span class="source-line-no">770</span><span id="line-770">    for (;;) {</span>
+<span class="source-line-no">771</span><span id="line-771">      List&lt;ZkLastPushedSeqId&gt; list = iter.next();</span>
+<span class="source-line-no">772</span><span id="line-772">      if (list == null) {</span>
+<span class="source-line-no">773</span><span id="line-773">        return;</span>
+<span class="source-line-no">774</span><span id="line-774">      }</span>
+<span class="source-line-no">775</span><span id="line-775">      queueStorage.batchUpdateLastSequenceIds(list.stream()</span>
+<span class="source-line-no">776</span><span id="line-776">        .filter(data -&gt; peers.containsKey(data.getPeerId())).collect(Collectors.toList()));</span>
+<span class="source-line-no">777</span><span id="line-777">    }</span>
+<span class="source-line-no">778</span><span id="line-778">  }</span>
+<span class="source-line-no">779</span><span id="line-779"></span>
+<span class="source-line-no">780</span><span id="line-780">  private void migrateHFileRefs(ZKReplicationQueueStorageForMigration oldQueueStorage)</span>
+<span class="source-line-no">781</span><span id="line-781">    throws Exception {</span>
+<span class="source-line-no">782</span><span id="line-782">    MigrationIterator&lt;Pair&lt;String, List&lt;String&gt;&gt;&gt; iter = oldQueueStorage.listAllHFileRefs();</span>
+<span class="source-line-no">783</span><span id="line-783">    for (;;) {</span>
+<span class="source-line-no">784</span><span id="line-784">      Pair&lt;String, List&lt;String&gt;&gt; pair = iter.next();</span>
+<span class="source-line-no">785</span><span id="line-785">      if (pair == null) {</span>
+<span class="source-line-no">786</span><span id="line-786">        return;</span>
+<span class="source-line-no">787</span><span id="line-787">      }</span>
+<span class="source-line-no">788</span><span id="line-788">      if (peers.containsKey(pair.getFirst())) {</span>
+<span class="source-line-no">789</span><span id="line-789">        queueStorage.batchUpdateHFileRefs(pair.getFirst(), pair.getSecond());</span>
+<span class="source-line-no">790</span><span id="line-790">      }</span>
+<span class="source-line-no">791</span><span id="line-791">    }</span>
+<span class="source-line-no">792</span><span id="line-792">  }</span>
+<span class="source-line-no">793</span><span id="line-793"></span>
+<span class="source-line-no">794</span><span id="line-794">  private interface ExceptionalRunnable {</span>
+<span class="source-line-no">795</span><span id="line-795">    void run() throws Exception;</span>
+<span class="source-line-no">796</span><span id="line-796">  }</span>
+<span class="source-line-no">797</span><span id="line-797"></span>
+<span class="source-line-no">798</span><span id="line-798">  private CompletableFuture&lt;?&gt; runAsync(ExceptionalRunnable task, ExecutorService executor) {</span>
+<span class="source-line-no">799</span><span id="line-799">    CompletableFuture&lt;?&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">800</span><span id="line-800">    executor.execute(() -&gt; {</span>
+<span class="source-line-no">801</span><span id="line-801">      try {</span>
+<span class="source-line-no">802</span><span id="line-802">        task.run();</span>
+<span class="source-line-no">803</span><span id="line-803">        future.complete(null);</span>
+<span class="source-line-no">804</span><span id="line-804">      } catch (Exception e) {</span>
+<span class="source-line-no">805</span><span id="line-805">        future.completeExceptionally(e);</span>
+<span class="source-line-no">806</span><span id="line-806">      }</span>
+<span class="source-line-no">807</span><span id="line-807">    });</span>
+<span class="source-line-no">808</span><span id="line-808">    return future;</span>
+<span class="source-line-no">809</span><span id="line-809">  }</span>
+<span class="source-line-no">810</span><span id="line-810"></span>
+<span class="source-line-no">811</span><span id="line-811">  // this is for upgrading from 2.x to 3.x, in 3.x we will not load the 'region_replica_replication'</span>
+<span class="source-line-no">812</span><span id="line-812">  // peer, but we still need to know whether we have it on the old storage</span>
+<span class="source-line-no">813</span><span id="line-813">  boolean hasRegionReplicaReplicationPeer() throws ReplicationException {</span>
+<span class="source-line-no">814</span><span id="line-814">    return peerStorage.listPeerIds().stream()</span>
+<span class="source-line-no">815</span><span id="line-815">      .anyMatch(p -&gt; p.equals(ServerRegionReplicaUtil.REGION_REPLICA_REPLICATION_PEER));</span>
+<span class="source-line-no">816</span><span id="line-816">  }</span>
+<span class="source-line-no">817</span><span id="line-817"></span>
+<span class="source-line-no">818</span><span id="line-818">  /**</span>
+<span class="source-line-no">819</span><span id="line-819">   * Submit the migration tasks to the given {@code executor}.</span>
+<span class="source-line-no">820</span><span id="line-820">   */</span>
+<span class="source-line-no">821</span><span id="line-821">  CompletableFuture&lt;Void&gt; migrateQueuesFromZk(ZKWatcher zookeeper, ExecutorService executor) {</span>
+<span class="source-line-no">822</span><span id="line-822">    // the replication queue table creation is asynchronous and will be triggered by addPeer, so</span>
+<span class="source-line-no">823</span><span id="line-823">    // here we need to manually initialize it since we will not call addPeer.</span>
+<span class="source-line-no">824</span><span id="line-824">    try {</span>
+<span class="source-line-no">825</span><span id="line-825">      initializeQueueStorage();</span>
+<span class="source-line-no">826</span><span id="line-826">    } catch (IOException e) {</span>
+<span class="source-line-no">827</span><span id="line-827">      return FutureUtils.failedFuture(e);</span>
+<span class="source-line-no">828</span><span id="line-828">    }</span>
+<span class="source-line-no">829</span><span id="line-829">    ZKReplicationQueueStorageForMigration oldStorage =</span>
+<span class="source-line-no">830</span><span id="line-830">      new ZKReplicationQueueStorageForMigration(zookeeper, conf);</span>
+<span class="source-line-no">831</span><span id="line-831">    return CompletableFuture.allOf(runAsync(() -&gt; migrateQueues(oldStorage), executor),</span>
+<span class="source-line-no">832</span><span id="line-832">      runAsync(() -&gt; migrateLastPushedSeqIds(oldStorage), executor),</span>
+<span class="source-line-no">833</span><span id="line-833">      runAsync(() -&gt; migrateHFileRefs(oldStorage), executor));</span>
+<span class="source-line-no">834</span><span id="line-834">  }</span>
+<span class="source-line-no">835</span><span id="line-835"></span>
+<span class="source-line-no">836</span><span id="line-836">  void deleteLegacyRegionReplicaReplicationPeer() throws ReplicationException {</span>
+<span class="source-line-no">837</span><span id="line-837">    for (String peerId : peerStorage.listPeerIds()) {</span>
+<span class="source-line-no">838</span><span id="line-838">      ReplicationPeerConfig peerConfig = peerStorage.getPeerConfig(peerId);</span>
+<span class="source-line-no">839</span><span id="line-839">      if (</span>
+<span class="source-line-no">840</span><span id="line-840">        ReplicationUtils.LEGACY_REGION_REPLICATION_ENDPOINT_NAME</span>
+<span class="source-line-no">841</span><span id="line-841">          .equals(peerConfig.getReplicationEndpointImpl())</span>
+<span class="source-line-no">842</span><span id="line-842">      ) {</span>
+<span class="source-line-no">843</span><span id="line-843">        LOG.info("Delete old region replica replication peer '{}'", peerId);</span>
+<span class="source-line-no">844</span><span id="line-844">        peerStorage.removePeer(peerId);</span>
+<span class="source-line-no">845</span><span id="line-845">      }</span>
+<span class="source-line-no">846</span><span id="line-846">    }</span>
+<span class="source-line-no">847</span><span id="line-847">  }</span>
+<span class="source-line-no">848</span><span id="line-848">}</span>
 
 
 
