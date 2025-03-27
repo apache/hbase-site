@@ -32,142 +32,159 @@
 <span class="source-line-no">019</span><span id="line-19"></span>
 <span class="source-line-no">020</span><span id="line-20">import edu.umd.cs.findbugs.annotations.NonNull;</span>
 <span class="source-line-no">021</span><span id="line-21">import java.io.IOException;</span>
-<span class="source-line-no">022</span><span id="line-22">import java.util.List;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.util.Map;</span>
-<span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.conf.Configuration;</span>
-<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.hbase.ClusterMetrics;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.ServerName;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.Stoppable;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.client.RegionInfo;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.conf.ConfigurationObserver;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.master.balancer.ClusterInfoProvider;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">033</span><span id="line-33"></span>
-<span class="source-line-no">034</span><span id="line-34">/**</span>
-<span class="source-line-no">035</span><span id="line-35"> * Makes decisions about the placement and movement of Regions across RegionServers.</span>
-<span class="source-line-no">036</span><span id="line-36"> * &lt;p/&gt;</span>
-<span class="source-line-no">037</span><span id="line-37"> * Cluster-wide load balancing will occur only when there are no regions in transition and according</span>
-<span class="source-line-no">038</span><span id="line-38"> * to a fixed period of a time using {@link #balanceCluster(Map)}.</span>
-<span class="source-line-no">039</span><span id="line-39"> * &lt;p/&gt;</span>
-<span class="source-line-no">040</span><span id="line-40"> * On cluster startup, bulk assignment can be used to determine locations for all Regions in a</span>
-<span class="source-line-no">041</span><span id="line-41"> * cluster.</span>
-<span class="source-line-no">042</span><span id="line-42"> * &lt;p/&gt;</span>
-<span class="source-line-no">043</span><span id="line-43"> * This class produces plans for the {@code AssignmentManager} to execute.</span>
-<span class="source-line-no">044</span><span id="line-44"> * &lt;p/&gt;</span>
-<span class="source-line-no">045</span><span id="line-45"> * About locking:</span>
-<span class="source-line-no">046</span><span id="line-46"> * &lt;ul&gt;</span>
-<span class="source-line-no">047</span><span id="line-47"> * &lt;li&gt;We will first call {@link #setClusterInfoProvider(ClusterInfoProvider)} and then</span>
-<span class="source-line-no">048</span><span id="line-48"> * {@link #initialize()} to initialize the balancer, and before calling {@link #initialize()}, we</span>
-<span class="source-line-no">049</span><span id="line-49"> * will never call any methods of this balancer. So these two methods do not need to be</span>
-<span class="source-line-no">050</span><span id="line-50"> * synchronized.&lt;/li&gt;</span>
-<span class="source-line-no">051</span><span id="line-51"> * &lt;li&gt;The {@link #balanceCluster(Map)} method will use the {@link ClusterMetrics} which is set by</span>
-<span class="source-line-no">052</span><span id="line-52"> * {@link #updateClusterMetrics(ClusterMetrics)}, and also lots of configurations, which could be</span>
-<span class="source-line-no">053</span><span id="line-53"> * changed by {@link #onConfigurationChange(Configuration)}, so the easier way is to make these</span>
-<span class="source-line-no">054</span><span id="line-54"> * three methods synchronized. And since there will be only one balancing thread, this will not</span>
-<span class="source-line-no">055</span><span id="line-55"> * impact performance too much.&lt;/li&gt;</span>
-<span class="source-line-no">056</span><span id="line-56"> * &lt;li&gt;The {@link #roundRobinAssignment(List, List)}, {@link #retainAssignment(Map, List)} and</span>
-<span class="source-line-no">057</span><span id="line-57"> * {@link #randomAssignment(RegionInfo, List)} could be called from multiple threads concurrently,</span>
-<span class="source-line-no">058</span><span id="line-58"> * so these three methods should not be synchronized, the implementation classes need to make sure</span>
-<span class="source-line-no">059</span><span id="line-59"> * that they are thread safe.&lt;/li&gt;</span>
-<span class="source-line-no">060</span><span id="line-60"> * &lt;/ul&gt;</span>
-<span class="source-line-no">061</span><span id="line-61"> */</span>
-<span class="source-line-no">062</span><span id="line-62">@InterfaceAudience.Private</span>
-<span class="source-line-no">063</span><span id="line-63">public interface LoadBalancer extends Stoppable, ConfigurationObserver {</span>
-<span class="source-line-no">064</span><span id="line-64"></span>
-<span class="source-line-no">065</span><span id="line-65">  // Used to signal to the caller that the region(s) cannot be assigned</span>
-<span class="source-line-no">066</span><span id="line-66">  // We deliberately use 'localhost' so the operation will fail fast</span>
-<span class="source-line-no">067</span><span id="line-67">  ServerName BOGUS_SERVER_NAME = ServerName.valueOf("localhost,1,1");</span>
-<span class="source-line-no">068</span><span id="line-68"></span>
-<span class="source-line-no">069</span><span id="line-69">  /**</span>
-<span class="source-line-no">070</span><span id="line-70">   * Config for pluggable load balancers.</span>
-<span class="source-line-no">071</span><span id="line-71">   * @deprecated since 3.0.0, will be removed in 4.0.0. In the new implementation, as the base load</span>
-<span class="source-line-no">072</span><span id="line-72">   *             balancer will always be the rs group based one, you should just use</span>
-<span class="source-line-no">073</span><span id="line-73">   *             {@link org.apache.hadoop.hbase.HConstants#HBASE_MASTER_LOADBALANCER_CLASS} to</span>
-<span class="source-line-no">074</span><span id="line-74">   *             config the per group load balancer.</span>
-<span class="source-line-no">075</span><span id="line-75">   */</span>
-<span class="source-line-no">076</span><span id="line-76">  @Deprecated</span>
-<span class="source-line-no">077</span><span id="line-77">  String HBASE_RSGROUP_LOADBALANCER_CLASS = "hbase.rsgroup.grouploadbalancer.class";</span>
-<span class="source-line-no">078</span><span id="line-78"></span>
-<span class="source-line-no">079</span><span id="line-79">  /**</span>
-<span class="source-line-no">080</span><span id="line-80">   * Set the current cluster status. This allows a LoadBalancer to map host name to a server</span>
-<span class="source-line-no">081</span><span id="line-81">   */</span>
-<span class="source-line-no">082</span><span id="line-82">  void updateClusterMetrics(ClusterMetrics metrics);</span>
-<span class="source-line-no">083</span><span id="line-83"></span>
-<span class="source-line-no">084</span><span id="line-84">  /**</span>
-<span class="source-line-no">085</span><span id="line-85">   * Set the cluster info provider. Usually it is just a wrapper of master.</span>
-<span class="source-line-no">086</span><span id="line-86">   */</span>
-<span class="source-line-no">087</span><span id="line-87">  void setClusterInfoProvider(ClusterInfoProvider provider);</span>
-<span class="source-line-no">088</span><span id="line-88"></span>
-<span class="source-line-no">089</span><span id="line-89">  /**</span>
-<span class="source-line-no">090</span><span id="line-90">   * Perform the major balance operation for cluster.</span>
-<span class="source-line-no">091</span><span id="line-91">   * @param loadOfAllTable region load of servers for all table</span>
-<span class="source-line-no">092</span><span id="line-92">   * @return a list of regions to be moved, including source and destination, or null if cluster is</span>
-<span class="source-line-no">093</span><span id="line-93">   *         already balanced</span>
+<span class="source-line-no">022</span><span id="line-22">import java.time.Duration;</span>
+<span class="source-line-no">023</span><span id="line-23">import java.util.List;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.util.Map;</span>
+<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.conf.Configuration;</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.ClusterMetrics;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.ServerName;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.Stoppable;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.client.RegionInfo;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.conf.ConfigurationObserver;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.master.balancer.ClusterInfoProvider;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">034</span><span id="line-34"></span>
+<span class="source-line-no">035</span><span id="line-35">/**</span>
+<span class="source-line-no">036</span><span id="line-36"> * Makes decisions about the placement and movement of Regions across RegionServers.</span>
+<span class="source-line-no">037</span><span id="line-37"> * &lt;p/&gt;</span>
+<span class="source-line-no">038</span><span id="line-38"> * Cluster-wide load balancing will occur only when there are no regions in transition and according</span>
+<span class="source-line-no">039</span><span id="line-39"> * to a fixed period of a time using {@link #balanceCluster(Map)}.</span>
+<span class="source-line-no">040</span><span id="line-40"> * &lt;p/&gt;</span>
+<span class="source-line-no">041</span><span id="line-41"> * On cluster startup, bulk assignment can be used to determine locations for all Regions in a</span>
+<span class="source-line-no">042</span><span id="line-42"> * cluster.</span>
+<span class="source-line-no">043</span><span id="line-43"> * &lt;p/&gt;</span>
+<span class="source-line-no">044</span><span id="line-44"> * This class produces plans for the {@code AssignmentManager} to execute.</span>
+<span class="source-line-no">045</span><span id="line-45"> * &lt;p/&gt;</span>
+<span class="source-line-no">046</span><span id="line-46"> * About locking:</span>
+<span class="source-line-no">047</span><span id="line-47"> * &lt;ul&gt;</span>
+<span class="source-line-no">048</span><span id="line-48"> * &lt;li&gt;We will first call {@link #setClusterInfoProvider(ClusterInfoProvider)} and then</span>
+<span class="source-line-no">049</span><span id="line-49"> * {@link #initialize()} to initialize the balancer, and before calling {@link #initialize()}, we</span>
+<span class="source-line-no">050</span><span id="line-50"> * will never call any methods of this balancer. So these two methods do not need to be</span>
+<span class="source-line-no">051</span><span id="line-51"> * synchronized.&lt;/li&gt;</span>
+<span class="source-line-no">052</span><span id="line-52"> * &lt;li&gt;The {@link #balanceCluster(Map)} method will use the {@link ClusterMetrics} which is set by</span>
+<span class="source-line-no">053</span><span id="line-53"> * {@link #updateClusterMetrics(ClusterMetrics)}, and also lots of configurations, which could be</span>
+<span class="source-line-no">054</span><span id="line-54"> * changed by {@link #onConfigurationChange(Configuration)}, so the easier way is to make these</span>
+<span class="source-line-no">055</span><span id="line-55"> * three methods synchronized. And since there will be only one balancing thread, this will not</span>
+<span class="source-line-no">056</span><span id="line-56"> * impact performance too much.&lt;/li&gt;</span>
+<span class="source-line-no">057</span><span id="line-57"> * &lt;li&gt;The {@link #roundRobinAssignment(List, List)}, {@link #retainAssignment(Map, List)} and</span>
+<span class="source-line-no">058</span><span id="line-58"> * {@link #randomAssignment(RegionInfo, List)} could be called from multiple threads concurrently,</span>
+<span class="source-line-no">059</span><span id="line-59"> * so these three methods should not be synchronized, the implementation classes need to make sure</span>
+<span class="source-line-no">060</span><span id="line-60"> * that they are thread safe.&lt;/li&gt;</span>
+<span class="source-line-no">061</span><span id="line-61"> * &lt;/ul&gt;</span>
+<span class="source-line-no">062</span><span id="line-62"> */</span>
+<span class="source-line-no">063</span><span id="line-63">@InterfaceAudience.Private</span>
+<span class="source-line-no">064</span><span id="line-64">public interface LoadBalancer extends Stoppable, ConfigurationObserver {</span>
+<span class="source-line-no">065</span><span id="line-65"></span>
+<span class="source-line-no">066</span><span id="line-66">  // Used to signal to the caller that the region(s) cannot be assigned</span>
+<span class="source-line-no">067</span><span id="line-67">  // We deliberately use 'localhost' so the operation will fail fast</span>
+<span class="source-line-no">068</span><span id="line-68">  ServerName BOGUS_SERVER_NAME = ServerName.valueOf("localhost,1,1");</span>
+<span class="source-line-no">069</span><span id="line-69"></span>
+<span class="source-line-no">070</span><span id="line-70">  /**</span>
+<span class="source-line-no">071</span><span id="line-71">   * Config for pluggable load balancers.</span>
+<span class="source-line-no">072</span><span id="line-72">   * @deprecated since 3.0.0, will be removed in 4.0.0. In the new implementation, as the base load</span>
+<span class="source-line-no">073</span><span id="line-73">   *             balancer will always be the rs group based one, you should just use</span>
+<span class="source-line-no">074</span><span id="line-74">   *             {@link org.apache.hadoop.hbase.HConstants#HBASE_MASTER_LOADBALANCER_CLASS} to</span>
+<span class="source-line-no">075</span><span id="line-75">   *             config the per group load balancer.</span>
+<span class="source-line-no">076</span><span id="line-76">   */</span>
+<span class="source-line-no">077</span><span id="line-77">  @Deprecated</span>
+<span class="source-line-no">078</span><span id="line-78">  String HBASE_RSGROUP_LOADBALANCER_CLASS = "hbase.rsgroup.grouploadbalancer.class";</span>
+<span class="source-line-no">079</span><span id="line-79"></span>
+<span class="source-line-no">080</span><span id="line-80">  /**</span>
+<span class="source-line-no">081</span><span id="line-81">   * Configuration to determine the time to sleep when throttling (if throttling is implemented by</span>
+<span class="source-line-no">082</span><span id="line-82">   * the underlying implementation).</span>
+<span class="source-line-no">083</span><span id="line-83">   */</span>
+<span class="source-line-no">084</span><span id="line-84">  String MOVE_THROTTLING = "hbase.master.balancer.move.throttlingMillis";</span>
+<span class="source-line-no">085</span><span id="line-85"></span>
+<span class="source-line-no">086</span><span id="line-86">  /**</span>
+<span class="source-line-no">087</span><span id="line-87">   * The default value, in milliseconds, for the hbase.master.balancer.move.throttlingMillis if</span>
+<span class="source-line-no">088</span><span id="line-88">   * throttling is implemented.</span>
+<span class="source-line-no">089</span><span id="line-89">   */</span>
+<span class="source-line-no">090</span><span id="line-90">  Duration MOVE_THROTTLING_DEFAULT = Duration.ofMillis(60 * 1000);</span>
+<span class="source-line-no">091</span><span id="line-91"></span>
+<span class="source-line-no">092</span><span id="line-92">  /**</span>
+<span class="source-line-no">093</span><span id="line-93">   * Set the current cluster status. This allows a LoadBalancer to map host name to a server</span>
 <span class="source-line-no">094</span><span id="line-94">   */</span>
-<span class="source-line-no">095</span><span id="line-95">  List&lt;RegionPlan&gt; balanceCluster(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable)</span>
-<span class="source-line-no">096</span><span id="line-96">    throws IOException;</span>
-<span class="source-line-no">097</span><span id="line-97"></span>
-<span class="source-line-no">098</span><span id="line-98">  /**</span>
-<span class="source-line-no">099</span><span id="line-99">   * Perform a Round Robin assignment of regions.</span>
-<span class="source-line-no">100</span><span id="line-100">   * @return Map of servername to regioninfos</span>
-<span class="source-line-no">101</span><span id="line-101">   */</span>
-<span class="source-line-no">102</span><span id="line-102">  @NonNull</span>
-<span class="source-line-no">103</span><span id="line-103">  Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; roundRobinAssignment(List&lt;RegionInfo&gt; regions,</span>
-<span class="source-line-no">104</span><span id="line-104">    List&lt;ServerName&gt; servers) throws IOException;</span>
-<span class="source-line-no">105</span><span id="line-105"></span>
-<span class="source-line-no">106</span><span id="line-106">  /**</span>
-<span class="source-line-no">107</span><span id="line-107">   * Assign regions to the previously hosting region server</span>
-<span class="source-line-no">108</span><span id="line-108">   * @return List of plans</span>
-<span class="source-line-no">109</span><span id="line-109">   */</span>
-<span class="source-line-no">110</span><span id="line-110">  @NonNull</span>
-<span class="source-line-no">111</span><span id="line-111">  Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; retainAssignment(Map&lt;RegionInfo, ServerName&gt; regions,</span>
-<span class="source-line-no">112</span><span id="line-112">    List&lt;ServerName&gt; servers) throws IOException;</span>
-<span class="source-line-no">113</span><span id="line-113"></span>
-<span class="source-line-no">114</span><span id="line-114">  /**</span>
-<span class="source-line-no">115</span><span id="line-115">   * Get a random region server from the list</span>
-<span class="source-line-no">116</span><span id="line-116">   * @param regionInfo Region for which this selection is being done.</span>
-<span class="source-line-no">117</span><span id="line-117">   */</span>
-<span class="source-line-no">118</span><span id="line-118">  ServerName randomAssignment(RegionInfo regionInfo, List&lt;ServerName&gt; servers) throws IOException;</span>
-<span class="source-line-no">119</span><span id="line-119"></span>
-<span class="source-line-no">120</span><span id="line-120">  /**</span>
-<span class="source-line-no">121</span><span id="line-121">   * Initialize the load balancer. Must be called after setters.</span>
+<span class="source-line-no">095</span><span id="line-95">  void updateClusterMetrics(ClusterMetrics metrics);</span>
+<span class="source-line-no">096</span><span id="line-96"></span>
+<span class="source-line-no">097</span><span id="line-97">  /**</span>
+<span class="source-line-no">098</span><span id="line-98">   * Set the cluster info provider. Usually it is just a wrapper of master.</span>
+<span class="source-line-no">099</span><span id="line-99">   */</span>
+<span class="source-line-no">100</span><span id="line-100">  void setClusterInfoProvider(ClusterInfoProvider provider);</span>
+<span class="source-line-no">101</span><span id="line-101"></span>
+<span class="source-line-no">102</span><span id="line-102">  /**</span>
+<span class="source-line-no">103</span><span id="line-103">   * Perform the major balance operation for cluster.</span>
+<span class="source-line-no">104</span><span id="line-104">   * @param loadOfAllTable region load of servers for all table</span>
+<span class="source-line-no">105</span><span id="line-105">   * @return a list of regions to be moved, including source and destination, or null if cluster is</span>
+<span class="source-line-no">106</span><span id="line-106">   *         already balanced</span>
+<span class="source-line-no">107</span><span id="line-107">   */</span>
+<span class="source-line-no">108</span><span id="line-108">  List&lt;RegionPlan&gt; balanceCluster(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable)</span>
+<span class="source-line-no">109</span><span id="line-109">    throws IOException;</span>
+<span class="source-line-no">110</span><span id="line-110"></span>
+<span class="source-line-no">111</span><span id="line-111">  /**</span>
+<span class="source-line-no">112</span><span id="line-112">   * Perform a Round Robin assignment of regions.</span>
+<span class="source-line-no">113</span><span id="line-113">   * @return Map of servername to regioninfos</span>
+<span class="source-line-no">114</span><span id="line-114">   */</span>
+<span class="source-line-no">115</span><span id="line-115">  @NonNull</span>
+<span class="source-line-no">116</span><span id="line-116">  Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; roundRobinAssignment(List&lt;RegionInfo&gt; regions,</span>
+<span class="source-line-no">117</span><span id="line-117">    List&lt;ServerName&gt; servers) throws IOException;</span>
+<span class="source-line-no">118</span><span id="line-118"></span>
+<span class="source-line-no">119</span><span id="line-119">  /**</span>
+<span class="source-line-no">120</span><span id="line-120">   * Assign regions to the previously hosting region server</span>
+<span class="source-line-no">121</span><span id="line-121">   * @return List of plans</span>
 <span class="source-line-no">122</span><span id="line-122">   */</span>
-<span class="source-line-no">123</span><span id="line-123">  void initialize() throws IOException;</span>
-<span class="source-line-no">124</span><span id="line-124"></span>
-<span class="source-line-no">125</span><span id="line-125">  /**</span>
-<span class="source-line-no">126</span><span id="line-126">   * Marks the region as online at balancer.</span>
-<span class="source-line-no">127</span><span id="line-127">   */</span>
-<span class="source-line-no">128</span><span id="line-128">  void regionOnline(RegionInfo regionInfo, ServerName sn);</span>
-<span class="source-line-no">129</span><span id="line-129"></span>
-<span class="source-line-no">130</span><span id="line-130">  /**</span>
-<span class="source-line-no">131</span><span id="line-131">   * Marks the region as offline at balancer.</span>
-<span class="source-line-no">132</span><span id="line-132">   */</span>
-<span class="source-line-no">133</span><span id="line-133">  void regionOffline(RegionInfo regionInfo);</span>
-<span class="source-line-no">134</span><span id="line-134"></span>
-<span class="source-line-no">135</span><span id="line-135">  /**</span>
-<span class="source-line-no">136</span><span id="line-136">   * Notification that config has changed</span>
-<span class="source-line-no">137</span><span id="line-137">   */</span>
-<span class="source-line-no">138</span><span id="line-138">  @Override</span>
-<span class="source-line-no">139</span><span id="line-139">  void onConfigurationChange(Configuration conf);</span>
-<span class="source-line-no">140</span><span id="line-140"></span>
-<span class="source-line-no">141</span><span id="line-141">  /**</span>
-<span class="source-line-no">142</span><span id="line-142">   * If balancer needs to do initialization after Master has started up, lets do that here.</span>
-<span class="source-line-no">143</span><span id="line-143">   */</span>
-<span class="source-line-no">144</span><span id="line-144">  void postMasterStartupInitialize();</span>
-<span class="source-line-no">145</span><span id="line-145"></span>
-<span class="source-line-no">146</span><span id="line-146">  /* Updates balancer status tag reported to JMX */</span>
-<span class="source-line-no">147</span><span id="line-147">  void updateBalancerStatus(boolean status);</span>
-<span class="source-line-no">148</span><span id="line-148"></span>
-<span class="source-line-no">149</span><span id="line-149">  /**</span>
-<span class="source-line-no">150</span><span id="line-150">   * In some scenarios, Balancer needs to update internal status or information according to the</span>
-<span class="source-line-no">151</span><span id="line-151">   * current tables load</span>
-<span class="source-line-no">152</span><span id="line-152">   * @param loadOfAllTable region load of servers for all table</span>
-<span class="source-line-no">153</span><span id="line-153">   */</span>
-<span class="source-line-no">154</span><span id="line-154">  default void</span>
-<span class="source-line-no">155</span><span id="line-155">    updateBalancerLoadInfo(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) {</span>
-<span class="source-line-no">156</span><span id="line-156">  }</span>
-<span class="source-line-no">157</span><span id="line-157">}</span>
+<span class="source-line-no">123</span><span id="line-123">  @NonNull</span>
+<span class="source-line-no">124</span><span id="line-124">  Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; retainAssignment(Map&lt;RegionInfo, ServerName&gt; regions,</span>
+<span class="source-line-no">125</span><span id="line-125">    List&lt;ServerName&gt; servers) throws IOException;</span>
+<span class="source-line-no">126</span><span id="line-126"></span>
+<span class="source-line-no">127</span><span id="line-127">  /**</span>
+<span class="source-line-no">128</span><span id="line-128">   * Get a random region server from the list</span>
+<span class="source-line-no">129</span><span id="line-129">   * @param regionInfo Region for which this selection is being done.</span>
+<span class="source-line-no">130</span><span id="line-130">   */</span>
+<span class="source-line-no">131</span><span id="line-131">  ServerName randomAssignment(RegionInfo regionInfo, List&lt;ServerName&gt; servers) throws IOException;</span>
+<span class="source-line-no">132</span><span id="line-132"></span>
+<span class="source-line-no">133</span><span id="line-133">  /**</span>
+<span class="source-line-no">134</span><span id="line-134">   * Initialize the load balancer. Must be called after setters.</span>
+<span class="source-line-no">135</span><span id="line-135">   */</span>
+<span class="source-line-no">136</span><span id="line-136">  void initialize() throws IOException;</span>
+<span class="source-line-no">137</span><span id="line-137"></span>
+<span class="source-line-no">138</span><span id="line-138">  /**</span>
+<span class="source-line-no">139</span><span id="line-139">   * Marks the region as online at balancer.</span>
+<span class="source-line-no">140</span><span id="line-140">   */</span>
+<span class="source-line-no">141</span><span id="line-141">  void regionOnline(RegionInfo regionInfo, ServerName sn);</span>
+<span class="source-line-no">142</span><span id="line-142"></span>
+<span class="source-line-no">143</span><span id="line-143">  /**</span>
+<span class="source-line-no">144</span><span id="line-144">   * Marks the region as offline at balancer.</span>
+<span class="source-line-no">145</span><span id="line-145">   */</span>
+<span class="source-line-no">146</span><span id="line-146">  void regionOffline(RegionInfo regionInfo);</span>
+<span class="source-line-no">147</span><span id="line-147"></span>
+<span class="source-line-no">148</span><span id="line-148">  /**</span>
+<span class="source-line-no">149</span><span id="line-149">   * Notification that config has changed</span>
+<span class="source-line-no">150</span><span id="line-150">   */</span>
+<span class="source-line-no">151</span><span id="line-151">  @Override</span>
+<span class="source-line-no">152</span><span id="line-152">  void onConfigurationChange(Configuration conf);</span>
+<span class="source-line-no">153</span><span id="line-153"></span>
+<span class="source-line-no">154</span><span id="line-154">  /**</span>
+<span class="source-line-no">155</span><span id="line-155">   * If balancer needs to do initialization after Master has started up, lets do that here.</span>
+<span class="source-line-no">156</span><span id="line-156">   */</span>
+<span class="source-line-no">157</span><span id="line-157">  void postMasterStartupInitialize();</span>
+<span class="source-line-no">158</span><span id="line-158"></span>
+<span class="source-line-no">159</span><span id="line-159">  /* Updates balancer status tag reported to JMX */</span>
+<span class="source-line-no">160</span><span id="line-160">  void updateBalancerStatus(boolean status);</span>
+<span class="source-line-no">161</span><span id="line-161"></span>
+<span class="source-line-no">162</span><span id="line-162">  /**</span>
+<span class="source-line-no">163</span><span id="line-163">   * In some scenarios, Balancer needs to update internal status or information according to the</span>
+<span class="source-line-no">164</span><span id="line-164">   * current tables load</span>
+<span class="source-line-no">165</span><span id="line-165">   * @param loadOfAllTable region load of servers for all table</span>
+<span class="source-line-no">166</span><span id="line-166">   */</span>
+<span class="source-line-no">167</span><span id="line-167">  default void</span>
+<span class="source-line-no">168</span><span id="line-168">    updateBalancerLoadInfo(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) {</span>
+<span class="source-line-no">169</span><span id="line-169">  }</span>
+<span class="source-line-no">170</span><span id="line-170"></span>
+<span class="source-line-no">171</span><span id="line-171">  default void throttle(RegionPlan plan) throws Exception {</span>
+<span class="source-line-no">172</span><span id="line-172">    // noop</span>
+<span class="source-line-no">173</span><span id="line-173">  }</span>
+<span class="source-line-no">174</span><span id="line-174">}</span>
 
 
 
