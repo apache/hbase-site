@@ -40,139 +40,146 @@
 <span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.HConstants;</span>
 <span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.PrivateCellUtil;</span>
 <span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.client.metrics.ScanMetrics;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.io.hfile.BlockCache;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.io.hfile.BlockCacheFactory;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.mob.MobFileCache;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.regionserver.HRegion;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.regionserver.RegionScanner;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.util.CommonFSUtils;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.slf4j.Logger;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">039</span><span id="line-39"></span>
-<span class="source-line-no">040</span><span id="line-40">/**</span>
-<span class="source-line-no">041</span><span id="line-41"> * A client scanner for a region opened for read-only on the client side. Assumes region data is not</span>
-<span class="source-line-no">042</span><span id="line-42"> * changing.</span>
-<span class="source-line-no">043</span><span id="line-43"> */</span>
-<span class="source-line-no">044</span><span id="line-44">@InterfaceAudience.Private</span>
-<span class="source-line-no">045</span><span id="line-45">public class ClientSideRegionScanner extends AbstractClientScanner {</span>
-<span class="source-line-no">046</span><span id="line-46"></span>
-<span class="source-line-no">047</span><span id="line-47">  private static final Logger LOG = LoggerFactory.getLogger(ClientSideRegionScanner.class);</span>
-<span class="source-line-no">048</span><span id="line-48"></span>
-<span class="source-line-no">049</span><span id="line-49">  private HRegion region;</span>
-<span class="source-line-no">050</span><span id="line-50">  private MobFileCache mobFileCache;</span>
-<span class="source-line-no">051</span><span id="line-51">  private BlockCache blockCache;</span>
-<span class="source-line-no">052</span><span id="line-52">  RegionScanner scanner;</span>
-<span class="source-line-no">053</span><span id="line-53">  List&lt;Cell&gt; values;</span>
-<span class="source-line-no">054</span><span id="line-54">  boolean hasMore = true;</span>
-<span class="source-line-no">055</span><span id="line-55"></span>
-<span class="source-line-no">056</span><span id="line-56">  public ClientSideRegionScanner(Configuration conf, FileSystem fs, Path rootDir,</span>
-<span class="source-line-no">057</span><span id="line-57">    TableDescriptor htd, RegionInfo hri, Scan scan, ScanMetrics scanMetrics) throws IOException {</span>
-<span class="source-line-no">058</span><span id="line-58">    // region is immutable, set isolation level</span>
-<span class="source-line-no">059</span><span id="line-59">    scan.setIsolationLevel(IsolationLevel.READ_UNCOMMITTED);</span>
-<span class="source-line-no">060</span><span id="line-60"></span>
-<span class="source-line-no">061</span><span id="line-61">    htd = TableDescriptorBuilder.newBuilder(htd).setReadOnly(true).build();</span>
-<span class="source-line-no">062</span><span id="line-62"></span>
-<span class="source-line-no">063</span><span id="line-63">    // open region from the snapshot directory</span>
-<span class="source-line-no">064</span><span id="line-64">    region = HRegion.newHRegion(CommonFSUtils.getTableDir(rootDir, htd.getTableName()), null, fs,</span>
-<span class="source-line-no">065</span><span id="line-65">      conf, hri, htd, null);</span>
-<span class="source-line-no">066</span><span id="line-66">    region.setRestoredRegion(true);</span>
-<span class="source-line-no">067</span><span id="line-67">    // non RS process does not have a block cache, and this a client side scanner,</span>
-<span class="source-line-no">068</span><span id="line-68">    // create one for MapReduce jobs to cache the INDEX block by setting to use</span>
-<span class="source-line-no">069</span><span id="line-69">    // IndexOnlyLruBlockCache and set a value to HBASE_CLIENT_SCANNER_BLOCK_CACHE_SIZE_KEY</span>
-<span class="source-line-no">070</span><span id="line-70">    conf.set(BlockCacheFactory.BLOCKCACHE_POLICY_KEY, "IndexOnlyLRU");</span>
-<span class="source-line-no">071</span><span id="line-71">    conf.setIfUnset(HConstants.HFILE_ONHEAP_BLOCK_CACHE_FIXED_SIZE_KEY,</span>
-<span class="source-line-no">072</span><span id="line-72">      String.valueOf(HConstants.HBASE_CLIENT_SCANNER_ONHEAP_BLOCK_CACHE_FIXED_SIZE_DEFAULT));</span>
-<span class="source-line-no">073</span><span id="line-73">    // don't allow L2 bucket cache for non RS process to avoid unexpected disk usage.</span>
-<span class="source-line-no">074</span><span id="line-74">    conf.unset(HConstants.BUCKET_CACHE_IOENGINE_KEY);</span>
-<span class="source-line-no">075</span><span id="line-75">    blockCache = BlockCacheFactory.createBlockCache(conf);</span>
-<span class="source-line-no">076</span><span id="line-76">    region.setBlockCache(blockCache);</span>
-<span class="source-line-no">077</span><span id="line-77">    // we won't initialize the MobFileCache when not running in RS process. so provided an</span>
-<span class="source-line-no">078</span><span id="line-78">    // initialized cache. Consider the case: an CF was set from an mob to non-mob. if we only</span>
-<span class="source-line-no">079</span><span id="line-79">    // initialize cache for MOB region, NPE from HMobStore will still happen. So Initialize the</span>
-<span class="source-line-no">080</span><span id="line-80">    // cache for every region although it may hasn't any mob CF, BTW the cache is very light-weight.</span>
-<span class="source-line-no">081</span><span id="line-81">    mobFileCache = new MobFileCache(conf);</span>
-<span class="source-line-no">082</span><span id="line-82">    region.setMobFileCache(mobFileCache);</span>
-<span class="source-line-no">083</span><span id="line-83">    region.initialize();</span>
-<span class="source-line-no">084</span><span id="line-84"></span>
-<span class="source-line-no">085</span><span id="line-85">    // create an internal region scanner</span>
-<span class="source-line-no">086</span><span id="line-86">    this.scanner = region.getScanner(scan);</span>
-<span class="source-line-no">087</span><span id="line-87">    values = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">088</span><span id="line-88"></span>
-<span class="source-line-no">089</span><span id="line-89">    if (scanMetrics == null) {</span>
-<span class="source-line-no">090</span><span id="line-90">      initScanMetrics(scan);</span>
-<span class="source-line-no">091</span><span id="line-91">    } else {</span>
-<span class="source-line-no">092</span><span id="line-92">      this.scanMetrics = scanMetrics;</span>
-<span class="source-line-no">093</span><span id="line-93">    }</span>
-<span class="source-line-no">094</span><span id="line-94">    region.startRegionOperation();</span>
-<span class="source-line-no">095</span><span id="line-95">  }</span>
-<span class="source-line-no">096</span><span id="line-96"></span>
-<span class="source-line-no">097</span><span id="line-97">  @Override</span>
-<span class="source-line-no">098</span><span id="line-98">  public Result next() throws IOException {</span>
-<span class="source-line-no">099</span><span id="line-99">    do {</span>
-<span class="source-line-no">100</span><span id="line-100">      if (!hasMore) {</span>
-<span class="source-line-no">101</span><span id="line-101">        return null;</span>
-<span class="source-line-no">102</span><span id="line-102">      }</span>
-<span class="source-line-no">103</span><span id="line-103">      values.clear();</span>
-<span class="source-line-no">104</span><span id="line-104">      this.hasMore = scanner.nextRaw(values);</span>
-<span class="source-line-no">105</span><span id="line-105">    } while (values.isEmpty());</span>
-<span class="source-line-no">106</span><span id="line-106"></span>
-<span class="source-line-no">107</span><span id="line-107">    Result result = Result.create(values);</span>
-<span class="source-line-no">108</span><span id="line-108">    if (this.scanMetrics != null) {</span>
-<span class="source-line-no">109</span><span id="line-109">      long resultSize = 0;</span>
-<span class="source-line-no">110</span><span id="line-110">      for (Cell cell : values) {</span>
-<span class="source-line-no">111</span><span id="line-111">        resultSize += PrivateCellUtil.estimatedSerializedSizeOf(cell);</span>
-<span class="source-line-no">112</span><span id="line-112">      }</span>
-<span class="source-line-no">113</span><span id="line-113">      this.scanMetrics.countOfBytesInResults.addAndGet(resultSize);</span>
-<span class="source-line-no">114</span><span id="line-114">      this.scanMetrics.countOfRowsScanned.incrementAndGet();</span>
-<span class="source-line-no">115</span><span id="line-115">    }</span>
-<span class="source-line-no">116</span><span id="line-116"></span>
-<span class="source-line-no">117</span><span id="line-117">    return result;</span>
-<span class="source-line-no">118</span><span id="line-118">  }</span>
-<span class="source-line-no">119</span><span id="line-119"></span>
-<span class="source-line-no">120</span><span id="line-120">  @Override</span>
-<span class="source-line-no">121</span><span id="line-121">  public void close() {</span>
-<span class="source-line-no">122</span><span id="line-122">    if (this.scanner != null) {</span>
-<span class="source-line-no">123</span><span id="line-123">      try {</span>
-<span class="source-line-no">124</span><span id="line-124">        this.scanner.close();</span>
-<span class="source-line-no">125</span><span id="line-125">        this.scanner = null;</span>
-<span class="source-line-no">126</span><span id="line-126">      } catch (IOException ex) {</span>
-<span class="source-line-no">127</span><span id="line-127">        LOG.warn("Exception while closing scanner", ex);</span>
-<span class="source-line-no">128</span><span id="line-128">      }</span>
-<span class="source-line-no">129</span><span id="line-129">    }</span>
-<span class="source-line-no">130</span><span id="line-130">    if (this.region != null) {</span>
-<span class="source-line-no">131</span><span id="line-131">      try {</span>
-<span class="source-line-no">132</span><span id="line-132">        this.region.closeRegionOperation();</span>
-<span class="source-line-no">133</span><span id="line-133">        this.region.close(true);</span>
-<span class="source-line-no">134</span><span id="line-134">        this.region = null;</span>
-<span class="source-line-no">135</span><span id="line-135">      } catch (IOException ex) {</span>
-<span class="source-line-no">136</span><span id="line-136">        LOG.warn("Exception while closing region", ex);</span>
-<span class="source-line-no">137</span><span id="line-137">      }</span>
-<span class="source-line-no">138</span><span id="line-138">    }</span>
-<span class="source-line-no">139</span><span id="line-139"></span>
-<span class="source-line-no">140</span><span id="line-140">    // In typical region operation, RegionServerServices would handle the lifecycle of</span>
-<span class="source-line-no">141</span><span id="line-141">    // the MobFileCache and BlockCache. In ClientSideRegionScanner, we need to handle</span>
-<span class="source-line-no">142</span><span id="line-142">    // the lifecycle of these components ourselves to avoid resource leaks.</span>
-<span class="source-line-no">143</span><span id="line-143">    if (mobFileCache != null) {</span>
-<span class="source-line-no">144</span><span id="line-144">      mobFileCache.shutdown();</span>
-<span class="source-line-no">145</span><span id="line-145">      mobFileCache = null;</span>
-<span class="source-line-no">146</span><span id="line-146">    }</span>
-<span class="source-line-no">147</span><span id="line-147"></span>
-<span class="source-line-no">148</span><span id="line-148">    if (blockCache != null) {</span>
-<span class="source-line-no">149</span><span id="line-149">      blockCache.shutdown();</span>
-<span class="source-line-no">150</span><span id="line-150">      blockCache = null;</span>
-<span class="source-line-no">151</span><span id="line-151">    }</span>
-<span class="source-line-no">152</span><span id="line-152">  }</span>
-<span class="source-line-no">153</span><span id="line-153"></span>
-<span class="source-line-no">154</span><span id="line-154">  HRegion getRegion() {</span>
-<span class="source-line-no">155</span><span id="line-155">    return region;</span>
-<span class="source-line-no">156</span><span id="line-156">  }</span>
-<span class="source-line-no">157</span><span id="line-157"></span>
-<span class="source-line-no">158</span><span id="line-158">  @Override</span>
-<span class="source-line-no">159</span><span id="line-159">  public boolean renewLease() {</span>
-<span class="source-line-no">160</span><span id="line-160">    throw new UnsupportedOperationException();</span>
-<span class="source-line-no">161</span><span id="line-161">  }</span>
-<span class="source-line-no">162</span><span id="line-162">}</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.client.metrics.ServerSideScanMetrics;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.io.hfile.BlockCache;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.io.hfile.BlockCacheFactory;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.mob.MobFileCache;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.regionserver.HRegion;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.regionserver.RegionScanner;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.util.CommonFSUtils;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.slf4j.Logger;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">040</span><span id="line-40"></span>
+<span class="source-line-no">041</span><span id="line-41">/**</span>
+<span class="source-line-no">042</span><span id="line-42"> * A client scanner for a region opened for read-only on the client side. Assumes region data is not</span>
+<span class="source-line-no">043</span><span id="line-43"> * changing.</span>
+<span class="source-line-no">044</span><span id="line-44"> */</span>
+<span class="source-line-no">045</span><span id="line-45">@InterfaceAudience.Private</span>
+<span class="source-line-no">046</span><span id="line-46">public class ClientSideRegionScanner extends AbstractClientScanner {</span>
+<span class="source-line-no">047</span><span id="line-47"></span>
+<span class="source-line-no">048</span><span id="line-48">  private static final Logger LOG = LoggerFactory.getLogger(ClientSideRegionScanner.class);</span>
+<span class="source-line-no">049</span><span id="line-49"></span>
+<span class="source-line-no">050</span><span id="line-50">  private HRegion region;</span>
+<span class="source-line-no">051</span><span id="line-51">  private MobFileCache mobFileCache;</span>
+<span class="source-line-no">052</span><span id="line-52">  private BlockCache blockCache;</span>
+<span class="source-line-no">053</span><span id="line-53">  RegionScanner scanner;</span>
+<span class="source-line-no">054</span><span id="line-54">  List&lt;Cell&gt; values;</span>
+<span class="source-line-no">055</span><span id="line-55">  boolean hasMore = true;</span>
+<span class="source-line-no">056</span><span id="line-56"></span>
+<span class="source-line-no">057</span><span id="line-57">  public ClientSideRegionScanner(Configuration conf, FileSystem fs, Path rootDir,</span>
+<span class="source-line-no">058</span><span id="line-58">    TableDescriptor htd, RegionInfo hri, Scan scan, ScanMetrics scanMetrics) throws IOException {</span>
+<span class="source-line-no">059</span><span id="line-59">    // region is immutable, set isolation level</span>
+<span class="source-line-no">060</span><span id="line-60">    scan.setIsolationLevel(IsolationLevel.READ_UNCOMMITTED);</span>
+<span class="source-line-no">061</span><span id="line-61"></span>
+<span class="source-line-no">062</span><span id="line-62">    htd = TableDescriptorBuilder.newBuilder(htd).setReadOnly(true).build();</span>
+<span class="source-line-no">063</span><span id="line-63"></span>
+<span class="source-line-no">064</span><span id="line-64">    // open region from the snapshot directory</span>
+<span class="source-line-no">065</span><span id="line-65">    region = HRegion.newHRegion(CommonFSUtils.getTableDir(rootDir, htd.getTableName()), null, fs,</span>
+<span class="source-line-no">066</span><span id="line-66">      conf, hri, htd, null);</span>
+<span class="source-line-no">067</span><span id="line-67">    region.setRestoredRegion(true);</span>
+<span class="source-line-no">068</span><span id="line-68">    // non RS process does not have a block cache, and this a client side scanner,</span>
+<span class="source-line-no">069</span><span id="line-69">    // create one for MapReduce jobs to cache the INDEX block by setting to use</span>
+<span class="source-line-no">070</span><span id="line-70">    // IndexOnlyLruBlockCache and set a value to HBASE_CLIENT_SCANNER_BLOCK_CACHE_SIZE_KEY</span>
+<span class="source-line-no">071</span><span id="line-71">    conf.set(BlockCacheFactory.BLOCKCACHE_POLICY_KEY, "IndexOnlyLRU");</span>
+<span class="source-line-no">072</span><span id="line-72">    conf.setIfUnset(HConstants.HFILE_ONHEAP_BLOCK_CACHE_FIXED_SIZE_KEY,</span>
+<span class="source-line-no">073</span><span id="line-73">      String.valueOf(HConstants.HBASE_CLIENT_SCANNER_ONHEAP_BLOCK_CACHE_FIXED_SIZE_DEFAULT));</span>
+<span class="source-line-no">074</span><span id="line-74">    // don't allow L2 bucket cache for non RS process to avoid unexpected disk usage.</span>
+<span class="source-line-no">075</span><span id="line-75">    conf.unset(HConstants.BUCKET_CACHE_IOENGINE_KEY);</span>
+<span class="source-line-no">076</span><span id="line-76">    blockCache = BlockCacheFactory.createBlockCache(conf);</span>
+<span class="source-line-no">077</span><span id="line-77">    region.setBlockCache(blockCache);</span>
+<span class="source-line-no">078</span><span id="line-78">    // we won't initialize the MobFileCache when not running in RS process. so provided an</span>
+<span class="source-line-no">079</span><span id="line-79">    // initialized cache. Consider the case: an CF was set from an mob to non-mob. if we only</span>
+<span class="source-line-no">080</span><span id="line-80">    // initialize cache for MOB region, NPE from HMobStore will still happen. So Initialize the</span>
+<span class="source-line-no">081</span><span id="line-81">    // cache for every region although it may hasn't any mob CF, BTW the cache is very light-weight.</span>
+<span class="source-line-no">082</span><span id="line-82">    mobFileCache = new MobFileCache(conf);</span>
+<span class="source-line-no">083</span><span id="line-83">    region.setMobFileCache(mobFileCache);</span>
+<span class="source-line-no">084</span><span id="line-84">    region.initialize();</span>
+<span class="source-line-no">085</span><span id="line-85"></span>
+<span class="source-line-no">086</span><span id="line-86">    // create an internal region scanner</span>
+<span class="source-line-no">087</span><span id="line-87">    this.scanner = region.getScanner(scan);</span>
+<span class="source-line-no">088</span><span id="line-88">    values = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">089</span><span id="line-89"></span>
+<span class="source-line-no">090</span><span id="line-90">    if (scanMetrics == null) {</span>
+<span class="source-line-no">091</span><span id="line-91">      initScanMetrics(scan);</span>
+<span class="source-line-no">092</span><span id="line-92">    } else {</span>
+<span class="source-line-no">093</span><span id="line-93">      this.scanMetrics = scanMetrics;</span>
+<span class="source-line-no">094</span><span id="line-94">      setIsScanMetricsByRegionEnabled(scan.isScanMetricsByRegionEnabled());</span>
+<span class="source-line-no">095</span><span id="line-95">    }</span>
+<span class="source-line-no">096</span><span id="line-96">    if (isScanMetricsByRegionEnabled()) {</span>
+<span class="source-line-no">097</span><span id="line-97">      this.scanMetrics.moveToNextRegion();</span>
+<span class="source-line-no">098</span><span id="line-98">      this.scanMetrics.initScanMetricsRegionInfo(region.getRegionInfo().getEncodedName(), null);</span>
+<span class="source-line-no">099</span><span id="line-99">      // The server name will be null in scan metrics as this is a client side region scanner</span>
+<span class="source-line-no">100</span><span id="line-100">    }</span>
+<span class="source-line-no">101</span><span id="line-101">    region.startRegionOperation();</span>
+<span class="source-line-no">102</span><span id="line-102">  }</span>
+<span class="source-line-no">103</span><span id="line-103"></span>
+<span class="source-line-no">104</span><span id="line-104">  @Override</span>
+<span class="source-line-no">105</span><span id="line-105">  public Result next() throws IOException {</span>
+<span class="source-line-no">106</span><span id="line-106">    do {</span>
+<span class="source-line-no">107</span><span id="line-107">      if (!hasMore) {</span>
+<span class="source-line-no">108</span><span id="line-108">        return null;</span>
+<span class="source-line-no">109</span><span id="line-109">      }</span>
+<span class="source-line-no">110</span><span id="line-110">      values.clear();</span>
+<span class="source-line-no">111</span><span id="line-111">      this.hasMore = scanner.nextRaw(values);</span>
+<span class="source-line-no">112</span><span id="line-112">    } while (values.isEmpty());</span>
+<span class="source-line-no">113</span><span id="line-113"></span>
+<span class="source-line-no">114</span><span id="line-114">    Result result = Result.create(values);</span>
+<span class="source-line-no">115</span><span id="line-115">    if (this.scanMetrics != null) {</span>
+<span class="source-line-no">116</span><span id="line-116">      long resultSize = 0;</span>
+<span class="source-line-no">117</span><span id="line-117">      for (Cell cell : values) {</span>
+<span class="source-line-no">118</span><span id="line-118">        resultSize += PrivateCellUtil.estimatedSerializedSizeOf(cell);</span>
+<span class="source-line-no">119</span><span id="line-119">      }</span>
+<span class="source-line-no">120</span><span id="line-120">      this.scanMetrics.addToCounter(ScanMetrics.BYTES_IN_RESULTS_METRIC_NAME, resultSize);</span>
+<span class="source-line-no">121</span><span id="line-121">      this.scanMetrics.addToCounter(ServerSideScanMetrics.COUNT_OF_ROWS_SCANNED_KEY_METRIC_NAME, 1);</span>
+<span class="source-line-no">122</span><span id="line-122">    }</span>
+<span class="source-line-no">123</span><span id="line-123"></span>
+<span class="source-line-no">124</span><span id="line-124">    return result;</span>
+<span class="source-line-no">125</span><span id="line-125">  }</span>
+<span class="source-line-no">126</span><span id="line-126"></span>
+<span class="source-line-no">127</span><span id="line-127">  @Override</span>
+<span class="source-line-no">128</span><span id="line-128">  public void close() {</span>
+<span class="source-line-no">129</span><span id="line-129">    if (this.scanner != null) {</span>
+<span class="source-line-no">130</span><span id="line-130">      try {</span>
+<span class="source-line-no">131</span><span id="line-131">        this.scanner.close();</span>
+<span class="source-line-no">132</span><span id="line-132">        this.scanner = null;</span>
+<span class="source-line-no">133</span><span id="line-133">      } catch (IOException ex) {</span>
+<span class="source-line-no">134</span><span id="line-134">        LOG.warn("Exception while closing scanner", ex);</span>
+<span class="source-line-no">135</span><span id="line-135">      }</span>
+<span class="source-line-no">136</span><span id="line-136">    }</span>
+<span class="source-line-no">137</span><span id="line-137">    if (this.region != null) {</span>
+<span class="source-line-no">138</span><span id="line-138">      try {</span>
+<span class="source-line-no">139</span><span id="line-139">        this.region.closeRegionOperation();</span>
+<span class="source-line-no">140</span><span id="line-140">        this.region.close(true);</span>
+<span class="source-line-no">141</span><span id="line-141">        this.region = null;</span>
+<span class="source-line-no">142</span><span id="line-142">      } catch (IOException ex) {</span>
+<span class="source-line-no">143</span><span id="line-143">        LOG.warn("Exception while closing region", ex);</span>
+<span class="source-line-no">144</span><span id="line-144">      }</span>
+<span class="source-line-no">145</span><span id="line-145">    }</span>
+<span class="source-line-no">146</span><span id="line-146"></span>
+<span class="source-line-no">147</span><span id="line-147">    // In typical region operation, RegionServerServices would handle the lifecycle of</span>
+<span class="source-line-no">148</span><span id="line-148">    // the MobFileCache and BlockCache. In ClientSideRegionScanner, we need to handle</span>
+<span class="source-line-no">149</span><span id="line-149">    // the lifecycle of these components ourselves to avoid resource leaks.</span>
+<span class="source-line-no">150</span><span id="line-150">    if (mobFileCache != null) {</span>
+<span class="source-line-no">151</span><span id="line-151">      mobFileCache.shutdown();</span>
+<span class="source-line-no">152</span><span id="line-152">      mobFileCache = null;</span>
+<span class="source-line-no">153</span><span id="line-153">    }</span>
+<span class="source-line-no">154</span><span id="line-154"></span>
+<span class="source-line-no">155</span><span id="line-155">    if (blockCache != null) {</span>
+<span class="source-line-no">156</span><span id="line-156">      blockCache.shutdown();</span>
+<span class="source-line-no">157</span><span id="line-157">      blockCache = null;</span>
+<span class="source-line-no">158</span><span id="line-158">    }</span>
+<span class="source-line-no">159</span><span id="line-159">  }</span>
+<span class="source-line-no">160</span><span id="line-160"></span>
+<span class="source-line-no">161</span><span id="line-161">  HRegion getRegion() {</span>
+<span class="source-line-no">162</span><span id="line-162">    return region;</span>
+<span class="source-line-no">163</span><span id="line-163">  }</span>
+<span class="source-line-no">164</span><span id="line-164"></span>
+<span class="source-line-no">165</span><span id="line-165">  @Override</span>
+<span class="source-line-no">166</span><span id="line-166">  public boolean renewLease() {</span>
+<span class="source-line-no">167</span><span id="line-167">    throw new UnsupportedOperationException();</span>
+<span class="source-line-no">168</span><span id="line-168">  }</span>
+<span class="source-line-no">169</span><span id="line-169">}</span>
 
 
 
