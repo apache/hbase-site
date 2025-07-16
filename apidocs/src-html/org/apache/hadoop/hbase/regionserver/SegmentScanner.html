@@ -40,354 +40,367 @@
 <span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.ExtendedCell;</span>
 <span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.PrivateCellUtil;</span>
 <span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.client.Scan;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">031</span><span id="line-31"></span>
-<span class="source-line-no">032</span><span id="line-32">/**</span>
-<span class="source-line-no">033</span><span id="line-33"> * A scanner of a single memstore segment.</span>
-<span class="source-line-no">034</span><span id="line-34"> */</span>
-<span class="source-line-no">035</span><span id="line-35">@InterfaceAudience.Private</span>
-<span class="source-line-no">036</span><span id="line-36">public class SegmentScanner implements KeyValueScanner {</span>
-<span class="source-line-no">037</span><span id="line-37"></span>
-<span class="source-line-no">038</span><span id="line-38">  // the observed structure</span>
-<span class="source-line-no">039</span><span id="line-39">  protected final Segment segment;</span>
-<span class="source-line-no">040</span><span id="line-40">  // the highest relevant MVCC</span>
-<span class="source-line-no">041</span><span id="line-41">  private long readPoint;</span>
-<span class="source-line-no">042</span><span id="line-42">  // the current iterator that can be reinitialized by</span>
-<span class="source-line-no">043</span><span id="line-43">  // seek(), backwardSeek(), or reseek()</span>
-<span class="source-line-no">044</span><span id="line-44">  protected Iterator&lt;ExtendedCell&gt; iter;</span>
-<span class="source-line-no">045</span><span id="line-45">  // the pre-calculated cell to be returned by peek()</span>
-<span class="source-line-no">046</span><span id="line-46">  protected ExtendedCell current = null;</span>
-<span class="source-line-no">047</span><span id="line-47">  // or next()</span>
-<span class="source-line-no">048</span><span id="line-48">  // A flag represents whether could stop skipping KeyValues for MVCC</span>
-<span class="source-line-no">049</span><span id="line-49">  // if have encountered the next row. Only used for reversed scan</span>
-<span class="source-line-no">050</span><span id="line-50">  private boolean stopSkippingKVsIfNextRow = false;</span>
-<span class="source-line-no">051</span><span id="line-51">  // Stop skipping KeyValues for MVCC if finish this row. Only used for reversed scan</span>
-<span class="source-line-no">052</span><span id="line-52">  private ExtendedCell stopSkippingKVsRow;</span>
-<span class="source-line-no">053</span><span id="line-53">  // last iterated KVs by seek (to restore the iterator state after reseek)</span>
-<span class="source-line-no">054</span><span id="line-54">  private ExtendedCell last = null;</span>
-<span class="source-line-no">055</span><span id="line-55"></span>
-<span class="source-line-no">056</span><span id="line-56">  // flag to indicate if this scanner is closed</span>
-<span class="source-line-no">057</span><span id="line-57">  protected boolean closed = false;</span>
-<span class="source-line-no">058</span><span id="line-58"></span>
-<span class="source-line-no">059</span><span id="line-59">  /**</span>
-<span class="source-line-no">060</span><span id="line-60">   * Scanners are ordered from 0 (oldest) to newest in increasing order.</span>
-<span class="source-line-no">061</span><span id="line-61">   */</span>
-<span class="source-line-no">062</span><span id="line-62">  protected SegmentScanner(Segment segment, long readPoint) {</span>
-<span class="source-line-no">063</span><span id="line-63">    this.segment = segment;</span>
-<span class="source-line-no">064</span><span id="line-64">    this.readPoint = readPoint;</span>
-<span class="source-line-no">065</span><span id="line-65">    // increase the reference count so the underlying structure will not be de-allocated</span>
-<span class="source-line-no">066</span><span id="line-66">    this.segment.incScannerCount();</span>
-<span class="source-line-no">067</span><span id="line-67">    iter = segment.iterator();</span>
-<span class="source-line-no">068</span><span id="line-68">    // the initialization of the current is required for working with heap of SegmentScanners</span>
-<span class="source-line-no">069</span><span id="line-69">    updateCurrent();</span>
-<span class="source-line-no">070</span><span id="line-70">    if (current == null) {</span>
-<span class="source-line-no">071</span><span id="line-71">      // nothing to fetch from this scanner</span>
-<span class="source-line-no">072</span><span id="line-72">      close();</span>
-<span class="source-line-no">073</span><span id="line-73">    }</span>
-<span class="source-line-no">074</span><span id="line-74">  }</span>
-<span class="source-line-no">075</span><span id="line-75"></span>
-<span class="source-line-no">076</span><span id="line-76">  /**</span>
-<span class="source-line-no">077</span><span id="line-77">   * Look at the next Cell in this scanner, but do not iterate the scanner</span>
-<span class="source-line-no">078</span><span id="line-78">   * @return the currently observed Cell</span>
-<span class="source-line-no">079</span><span id="line-79">   */</span>
-<span class="source-line-no">080</span><span id="line-80">  @Override</span>
-<span class="source-line-no">081</span><span id="line-81">  public ExtendedCell peek() { // sanity check, the current should be always valid</span>
-<span class="source-line-no">082</span><span id="line-82">    if (closed) {</span>
-<span class="source-line-no">083</span><span id="line-83">      return null;</span>
-<span class="source-line-no">084</span><span id="line-84">    }</span>
-<span class="source-line-no">085</span><span id="line-85">    if (current != null &amp;&amp; current.getSequenceId() &gt; readPoint) {</span>
-<span class="source-line-no">086</span><span id="line-86">      throw new RuntimeException("current is invalid: read point is " + readPoint + ", "</span>
-<span class="source-line-no">087</span><span id="line-87">        + "while current sequence id is " + current.getSequenceId());</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.monitoring.ThreadLocalServerSideScanMetrics;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">032</span><span id="line-32"></span>
+<span class="source-line-no">033</span><span id="line-33">/**</span>
+<span class="source-line-no">034</span><span id="line-34"> * A scanner of a single memstore segment.</span>
+<span class="source-line-no">035</span><span id="line-35"> */</span>
+<span class="source-line-no">036</span><span id="line-36">@InterfaceAudience.Private</span>
+<span class="source-line-no">037</span><span id="line-37">public class SegmentScanner implements KeyValueScanner {</span>
+<span class="source-line-no">038</span><span id="line-38"></span>
+<span class="source-line-no">039</span><span id="line-39">  // the observed structure</span>
+<span class="source-line-no">040</span><span id="line-40">  protected final Segment segment;</span>
+<span class="source-line-no">041</span><span id="line-41">  // the highest relevant MVCC</span>
+<span class="source-line-no">042</span><span id="line-42">  private long readPoint;</span>
+<span class="source-line-no">043</span><span id="line-43">  // the current iterator that can be reinitialized by</span>
+<span class="source-line-no">044</span><span id="line-44">  // seek(), backwardSeek(), or reseek()</span>
+<span class="source-line-no">045</span><span id="line-45">  protected Iterator&lt;ExtendedCell&gt; iter;</span>
+<span class="source-line-no">046</span><span id="line-46">  // the pre-calculated cell to be returned by peek()</span>
+<span class="source-line-no">047</span><span id="line-47">  protected ExtendedCell current = null;</span>
+<span class="source-line-no">048</span><span id="line-48">  // or next()</span>
+<span class="source-line-no">049</span><span id="line-49">  // A flag represents whether could stop skipping KeyValues for MVCC</span>
+<span class="source-line-no">050</span><span id="line-50">  // if have encountered the next row. Only used for reversed scan</span>
+<span class="source-line-no">051</span><span id="line-51">  private boolean stopSkippingKVsIfNextRow = false;</span>
+<span class="source-line-no">052</span><span id="line-52">  // Stop skipping KeyValues for MVCC if finish this row. Only used for reversed scan</span>
+<span class="source-line-no">053</span><span id="line-53">  private ExtendedCell stopSkippingKVsRow;</span>
+<span class="source-line-no">054</span><span id="line-54">  // last iterated KVs by seek (to restore the iterator state after reseek)</span>
+<span class="source-line-no">055</span><span id="line-55">  private ExtendedCell last = null;</span>
+<span class="source-line-no">056</span><span id="line-56"></span>
+<span class="source-line-no">057</span><span id="line-57">  // flag to indicate if this scanner is closed</span>
+<span class="source-line-no">058</span><span id="line-58">  protected boolean closed = false;</span>
+<span class="source-line-no">059</span><span id="line-59">  private boolean isScanMetricsEnabled = false;</span>
+<span class="source-line-no">060</span><span id="line-60"></span>
+<span class="source-line-no">061</span><span id="line-61">  /**</span>
+<span class="source-line-no">062</span><span id="line-62">   * Scanners are ordered from 0 (oldest) to newest in increasing order.</span>
+<span class="source-line-no">063</span><span id="line-63">   */</span>
+<span class="source-line-no">064</span><span id="line-64">  protected SegmentScanner(Segment segment, long readPoint) {</span>
+<span class="source-line-no">065</span><span id="line-65">    this.segment = segment;</span>
+<span class="source-line-no">066</span><span id="line-66">    this.readPoint = readPoint;</span>
+<span class="source-line-no">067</span><span id="line-67">    // increase the reference count so the underlying structure will not be de-allocated</span>
+<span class="source-line-no">068</span><span id="line-68">    this.segment.incScannerCount();</span>
+<span class="source-line-no">069</span><span id="line-69">    iter = segment.iterator();</span>
+<span class="source-line-no">070</span><span id="line-70">    // the initialization of the current is required for working with heap of SegmentScanners</span>
+<span class="source-line-no">071</span><span id="line-71">    updateCurrent();</span>
+<span class="source-line-no">072</span><span id="line-72">    // Enable scan metrics for tracking bytes read after initialization of current</span>
+<span class="source-line-no">073</span><span id="line-73">    this.isScanMetricsEnabled = ThreadLocalServerSideScanMetrics.isScanMetricsEnabled();</span>
+<span class="source-line-no">074</span><span id="line-74">    if (current == null) {</span>
+<span class="source-line-no">075</span><span id="line-75">      // nothing to fetch from this scanner</span>
+<span class="source-line-no">076</span><span id="line-76">      close();</span>
+<span class="source-line-no">077</span><span id="line-77">    }</span>
+<span class="source-line-no">078</span><span id="line-78">  }</span>
+<span class="source-line-no">079</span><span id="line-79"></span>
+<span class="source-line-no">080</span><span id="line-80">  /**</span>
+<span class="source-line-no">081</span><span id="line-81">   * Look at the next Cell in this scanner, but do not iterate the scanner</span>
+<span class="source-line-no">082</span><span id="line-82">   * @return the currently observed Cell</span>
+<span class="source-line-no">083</span><span id="line-83">   */</span>
+<span class="source-line-no">084</span><span id="line-84">  @Override</span>
+<span class="source-line-no">085</span><span id="line-85">  public ExtendedCell peek() { // sanity check, the current should be always valid</span>
+<span class="source-line-no">086</span><span id="line-86">    if (closed) {</span>
+<span class="source-line-no">087</span><span id="line-87">      return null;</span>
 <span class="source-line-no">088</span><span id="line-88">    }</span>
-<span class="source-line-no">089</span><span id="line-89">    return current;</span>
-<span class="source-line-no">090</span><span id="line-90">  }</span>
-<span class="source-line-no">091</span><span id="line-91"></span>
-<span class="source-line-no">092</span><span id="line-92">  /**</span>
-<span class="source-line-no">093</span><span id="line-93">   * Return the next Cell in this scanner, iterating the scanner</span>
-<span class="source-line-no">094</span><span id="line-94">   * @return the next Cell or null if end of scanner</span>
-<span class="source-line-no">095</span><span id="line-95">   */</span>
-<span class="source-line-no">096</span><span id="line-96">  @Override</span>
-<span class="source-line-no">097</span><span id="line-97">  public ExtendedCell next() throws IOException {</span>
-<span class="source-line-no">098</span><span id="line-98">    if (closed) {</span>
-<span class="source-line-no">099</span><span id="line-99">      return null;</span>
-<span class="source-line-no">100</span><span id="line-100">    }</span>
-<span class="source-line-no">101</span><span id="line-101">    ExtendedCell oldCurrent = current;</span>
-<span class="source-line-no">102</span><span id="line-102">    updateCurrent(); // update the currently observed Cell</span>
-<span class="source-line-no">103</span><span id="line-103">    return oldCurrent;</span>
-<span class="source-line-no">104</span><span id="line-104">  }</span>
-<span class="source-line-no">105</span><span id="line-105"></span>
-<span class="source-line-no">106</span><span id="line-106">  /**</span>
-<span class="source-line-no">107</span><span id="line-107">   * Seek the scanner at or after the specified Cell.</span>
-<span class="source-line-no">108</span><span id="line-108">   * @param cell seek value</span>
-<span class="source-line-no">109</span><span id="line-109">   * @return true if scanner has values left, false if end of scanner</span>
-<span class="source-line-no">110</span><span id="line-110">   */</span>
-<span class="source-line-no">111</span><span id="line-111">  @Override</span>
-<span class="source-line-no">112</span><span id="line-112">  public boolean seek(ExtendedCell cell) throws IOException {</span>
-<span class="source-line-no">113</span><span id="line-113">    if (closed) {</span>
-<span class="source-line-no">114</span><span id="line-114">      return false;</span>
-<span class="source-line-no">115</span><span id="line-115">    }</span>
-<span class="source-line-no">116</span><span id="line-116">    if (cell == null) {</span>
-<span class="source-line-no">117</span><span id="line-117">      close();</span>
+<span class="source-line-no">089</span><span id="line-89">    if (current != null &amp;&amp; current.getSequenceId() &gt; readPoint) {</span>
+<span class="source-line-no">090</span><span id="line-90">      throw new RuntimeException("current is invalid: read point is " + readPoint + ", "</span>
+<span class="source-line-no">091</span><span id="line-91">        + "while current sequence id is " + current.getSequenceId());</span>
+<span class="source-line-no">092</span><span id="line-92">    }</span>
+<span class="source-line-no">093</span><span id="line-93">    return current;</span>
+<span class="source-line-no">094</span><span id="line-94">  }</span>
+<span class="source-line-no">095</span><span id="line-95"></span>
+<span class="source-line-no">096</span><span id="line-96">  /**</span>
+<span class="source-line-no">097</span><span id="line-97">   * Return the next Cell in this scanner, iterating the scanner</span>
+<span class="source-line-no">098</span><span id="line-98">   * @return the next Cell or null if end of scanner</span>
+<span class="source-line-no">099</span><span id="line-99">   */</span>
+<span class="source-line-no">100</span><span id="line-100">  @Override</span>
+<span class="source-line-no">101</span><span id="line-101">  public ExtendedCell next() throws IOException {</span>
+<span class="source-line-no">102</span><span id="line-102">    if (closed) {</span>
+<span class="source-line-no">103</span><span id="line-103">      return null;</span>
+<span class="source-line-no">104</span><span id="line-104">    }</span>
+<span class="source-line-no">105</span><span id="line-105">    ExtendedCell oldCurrent = current;</span>
+<span class="source-line-no">106</span><span id="line-106">    updateCurrent(); // update the currently observed Cell</span>
+<span class="source-line-no">107</span><span id="line-107">    return oldCurrent;</span>
+<span class="source-line-no">108</span><span id="line-108">  }</span>
+<span class="source-line-no">109</span><span id="line-109"></span>
+<span class="source-line-no">110</span><span id="line-110">  /**</span>
+<span class="source-line-no">111</span><span id="line-111">   * Seek the scanner at or after the specified Cell.</span>
+<span class="source-line-no">112</span><span id="line-112">   * @param cell seek value</span>
+<span class="source-line-no">113</span><span id="line-113">   * @return true if scanner has values left, false if end of scanner</span>
+<span class="source-line-no">114</span><span id="line-114">   */</span>
+<span class="source-line-no">115</span><span id="line-115">  @Override</span>
+<span class="source-line-no">116</span><span id="line-116">  public boolean seek(ExtendedCell cell) throws IOException {</span>
+<span class="source-line-no">117</span><span id="line-117">    if (closed) {</span>
 <span class="source-line-no">118</span><span id="line-118">      return false;</span>
 <span class="source-line-no">119</span><span id="line-119">    }</span>
-<span class="source-line-no">120</span><span id="line-120">    // restart the iterator from new key</span>
-<span class="source-line-no">121</span><span id="line-121">    iter = getIterator(cell);</span>
-<span class="source-line-no">122</span><span id="line-122">    // last is going to be reinitialized in the next getNext() call</span>
-<span class="source-line-no">123</span><span id="line-123">    last = null;</span>
-<span class="source-line-no">124</span><span id="line-124">    updateCurrent();</span>
-<span class="source-line-no">125</span><span id="line-125">    return (current != null);</span>
-<span class="source-line-no">126</span><span id="line-126">  }</span>
-<span class="source-line-no">127</span><span id="line-127"></span>
-<span class="source-line-no">128</span><span id="line-128">  protected Iterator&lt;ExtendedCell&gt; getIterator(ExtendedCell cell) {</span>
-<span class="source-line-no">129</span><span id="line-129">    return segment.tailSet(cell).iterator();</span>
+<span class="source-line-no">120</span><span id="line-120">    if (cell == null) {</span>
+<span class="source-line-no">121</span><span id="line-121">      close();</span>
+<span class="source-line-no">122</span><span id="line-122">      return false;</span>
+<span class="source-line-no">123</span><span id="line-123">    }</span>
+<span class="source-line-no">124</span><span id="line-124">    // restart the iterator from new key</span>
+<span class="source-line-no">125</span><span id="line-125">    iter = getIterator(cell);</span>
+<span class="source-line-no">126</span><span id="line-126">    // last is going to be reinitialized in the next getNext() call</span>
+<span class="source-line-no">127</span><span id="line-127">    last = null;</span>
+<span class="source-line-no">128</span><span id="line-128">    updateCurrent();</span>
+<span class="source-line-no">129</span><span id="line-129">    return (current != null);</span>
 <span class="source-line-no">130</span><span id="line-130">  }</span>
 <span class="source-line-no">131</span><span id="line-131"></span>
-<span class="source-line-no">132</span><span id="line-132">  /**</span>
-<span class="source-line-no">133</span><span id="line-133">   * Reseek the scanner at or after the specified KeyValue. This method is guaranteed to seek at or</span>
-<span class="source-line-no">134</span><span id="line-134">   * after the required key only if the key comes after the current position of the scanner. Should</span>
-<span class="source-line-no">135</span><span id="line-135">   * not be used to seek to a key which may come before the current position.</span>
-<span class="source-line-no">136</span><span id="line-136">   * @param cell seek value (should be non-null)</span>
-<span class="source-line-no">137</span><span id="line-137">   * @return true if scanner has values left, false if end of scanner</span>
-<span class="source-line-no">138</span><span id="line-138">   */</span>
-<span class="source-line-no">139</span><span id="line-139">  @Override</span>
-<span class="source-line-no">140</span><span id="line-140">  public boolean reseek(ExtendedCell cell) throws IOException {</span>
-<span class="source-line-no">141</span><span id="line-141">    if (closed) {</span>
-<span class="source-line-no">142</span><span id="line-142">      return false;</span>
-<span class="source-line-no">143</span><span id="line-143">    }</span>
-<span class="source-line-no">144</span><span id="line-144">    /*</span>
-<span class="source-line-no">145</span><span id="line-145">     * See HBASE-4195 &amp; HBASE-3855 &amp; HBASE-6591 for the background on this implementation. This code</span>
-<span class="source-line-no">146</span><span id="line-146">     * is executed concurrently with flush and puts, without locks. The ideal implementation for</span>
-<span class="source-line-no">147</span><span id="line-147">     * performance would use the sub skip list implicitly pointed by the iterator. Unfortunately the</span>
-<span class="source-line-no">148</span><span id="line-148">     * Java API does not offer a method to get it. So we remember the last keys we iterated to and</span>
-<span class="source-line-no">149</span><span id="line-149">     * restore the reseeked set to at least that point.</span>
-<span class="source-line-no">150</span><span id="line-150">     */</span>
-<span class="source-line-no">151</span><span id="line-151">    iter = getIterator(getHighest(cell, last));</span>
-<span class="source-line-no">152</span><span id="line-152">    updateCurrent();</span>
-<span class="source-line-no">153</span><span id="line-153">    return (current != null);</span>
-<span class="source-line-no">154</span><span id="line-154">  }</span>
-<span class="source-line-no">155</span><span id="line-155"></span>
-<span class="source-line-no">156</span><span id="line-156">  /**</span>
-<span class="source-line-no">157</span><span id="line-157">   * Seek the scanner at or before the row of specified Cell, it firstly tries to seek the scanner</span>
-<span class="source-line-no">158</span><span id="line-158">   * at or after the specified Cell, return if peek KeyValue of scanner has the same row with</span>
-<span class="source-line-no">159</span><span id="line-159">   * specified Cell, otherwise seek the scanner at the first Cell of the row which is the previous</span>
-<span class="source-line-no">160</span><span id="line-160">   * row of specified KeyValue</span>
-<span class="source-line-no">161</span><span id="line-161">   * @param key seek Cell</span>
-<span class="source-line-no">162</span><span id="line-162">   * @return true if the scanner is at the valid KeyValue, false if such Cell does not exist</span>
-<span class="source-line-no">163</span><span id="line-163">   */</span>
-<span class="source-line-no">164</span><span id="line-164">  @Override</span>
-<span class="source-line-no">165</span><span id="line-165">  public boolean backwardSeek(ExtendedCell key) throws IOException {</span>
-<span class="source-line-no">166</span><span id="line-166">    if (closed) {</span>
-<span class="source-line-no">167</span><span id="line-167">      return false;</span>
-<span class="source-line-no">168</span><span id="line-168">    }</span>
-<span class="source-line-no">169</span><span id="line-169">    seek(key); // seek forward then go backward</span>
-<span class="source-line-no">170</span><span id="line-170">    if (peek() == null || segment.compareRows(peek(), key) &gt; 0) {</span>
-<span class="source-line-no">171</span><span id="line-171">      return seekToPreviousRow(key);</span>
+<span class="source-line-no">132</span><span id="line-132">  protected Iterator&lt;ExtendedCell&gt; getIterator(ExtendedCell cell) {</span>
+<span class="source-line-no">133</span><span id="line-133">    return segment.tailSet(cell).iterator();</span>
+<span class="source-line-no">134</span><span id="line-134">  }</span>
+<span class="source-line-no">135</span><span id="line-135"></span>
+<span class="source-line-no">136</span><span id="line-136">  /**</span>
+<span class="source-line-no">137</span><span id="line-137">   * Reseek the scanner at or after the specified KeyValue. This method is guaranteed to seek at or</span>
+<span class="source-line-no">138</span><span id="line-138">   * after the required key only if the key comes after the current position of the scanner. Should</span>
+<span class="source-line-no">139</span><span id="line-139">   * not be used to seek to a key which may come before the current position.</span>
+<span class="source-line-no">140</span><span id="line-140">   * @param cell seek value (should be non-null)</span>
+<span class="source-line-no">141</span><span id="line-141">   * @return true if scanner has values left, false if end of scanner</span>
+<span class="source-line-no">142</span><span id="line-142">   */</span>
+<span class="source-line-no">143</span><span id="line-143">  @Override</span>
+<span class="source-line-no">144</span><span id="line-144">  public boolean reseek(ExtendedCell cell) throws IOException {</span>
+<span class="source-line-no">145</span><span id="line-145">    if (closed) {</span>
+<span class="source-line-no">146</span><span id="line-146">      return false;</span>
+<span class="source-line-no">147</span><span id="line-147">    }</span>
+<span class="source-line-no">148</span><span id="line-148">    /*</span>
+<span class="source-line-no">149</span><span id="line-149">     * See HBASE-4195 &amp; HBASE-3855 &amp; HBASE-6591 for the background on this implementation. This code</span>
+<span class="source-line-no">150</span><span id="line-150">     * is executed concurrently with flush and puts, without locks. The ideal implementation for</span>
+<span class="source-line-no">151</span><span id="line-151">     * performance would use the sub skip list implicitly pointed by the iterator. Unfortunately the</span>
+<span class="source-line-no">152</span><span id="line-152">     * Java API does not offer a method to get it. So we remember the last keys we iterated to and</span>
+<span class="source-line-no">153</span><span id="line-153">     * restore the reseeked set to at least that point.</span>
+<span class="source-line-no">154</span><span id="line-154">     */</span>
+<span class="source-line-no">155</span><span id="line-155">    iter = getIterator(getHighest(cell, last));</span>
+<span class="source-line-no">156</span><span id="line-156">    updateCurrent();</span>
+<span class="source-line-no">157</span><span id="line-157">    return (current != null);</span>
+<span class="source-line-no">158</span><span id="line-158">  }</span>
+<span class="source-line-no">159</span><span id="line-159"></span>
+<span class="source-line-no">160</span><span id="line-160">  /**</span>
+<span class="source-line-no">161</span><span id="line-161">   * Seek the scanner at or before the row of specified Cell, it firstly tries to seek the scanner</span>
+<span class="source-line-no">162</span><span id="line-162">   * at or after the specified Cell, return if peek KeyValue of scanner has the same row with</span>
+<span class="source-line-no">163</span><span id="line-163">   * specified Cell, otherwise seek the scanner at the first Cell of the row which is the previous</span>
+<span class="source-line-no">164</span><span id="line-164">   * row of specified KeyValue</span>
+<span class="source-line-no">165</span><span id="line-165">   * @param key seek Cell</span>
+<span class="source-line-no">166</span><span id="line-166">   * @return true if the scanner is at the valid KeyValue, false if such Cell does not exist</span>
+<span class="source-line-no">167</span><span id="line-167">   */</span>
+<span class="source-line-no">168</span><span id="line-168">  @Override</span>
+<span class="source-line-no">169</span><span id="line-169">  public boolean backwardSeek(ExtendedCell key) throws IOException {</span>
+<span class="source-line-no">170</span><span id="line-170">    if (closed) {</span>
+<span class="source-line-no">171</span><span id="line-171">      return false;</span>
 <span class="source-line-no">172</span><span id="line-172">    }</span>
-<span class="source-line-no">173</span><span id="line-173">    return true;</span>
-<span class="source-line-no">174</span><span id="line-174">  }</span>
-<span class="source-line-no">175</span><span id="line-175"></span>
-<span class="source-line-no">176</span><span id="line-176">  /**</span>
-<span class="source-line-no">177</span><span id="line-177">   * Seek the scanner at the first Cell of the row which is the previous row of specified key</span>
-<span class="source-line-no">178</span><span id="line-178">   * @param cell seek value</span>
-<span class="source-line-no">179</span><span id="line-179">   * @return true if the scanner at the first valid Cell of previous row, false if not existing such</span>
-<span class="source-line-no">180</span><span id="line-180">   *         Cell</span>
-<span class="source-line-no">181</span><span id="line-181">   */</span>
-<span class="source-line-no">182</span><span id="line-182">  @Override</span>
-<span class="source-line-no">183</span><span id="line-183">  public boolean seekToPreviousRow(ExtendedCell cell) throws IOException {</span>
-<span class="source-line-no">184</span><span id="line-184">    if (closed) {</span>
-<span class="source-line-no">185</span><span id="line-185">      return false;</span>
-<span class="source-line-no">186</span><span id="line-186">    }</span>
-<span class="source-line-no">187</span><span id="line-187">    boolean keepSeeking;</span>
-<span class="source-line-no">188</span><span id="line-188">    Cell key = cell;</span>
-<span class="source-line-no">189</span><span id="line-189">    do {</span>
-<span class="source-line-no">190</span><span id="line-190">      ExtendedCell firstKeyOnRow = PrivateCellUtil.createFirstOnRow(key);</span>
-<span class="source-line-no">191</span><span id="line-191">      SortedSet&lt;ExtendedCell&gt; cellHead = segment.headSet(firstKeyOnRow);</span>
-<span class="source-line-no">192</span><span id="line-192">      Cell lastCellBeforeRow = cellHead.isEmpty() ? null : cellHead.last();</span>
-<span class="source-line-no">193</span><span id="line-193">      if (lastCellBeforeRow == null) {</span>
-<span class="source-line-no">194</span><span id="line-194">        current = null;</span>
-<span class="source-line-no">195</span><span id="line-195">        return false;</span>
-<span class="source-line-no">196</span><span id="line-196">      }</span>
-<span class="source-line-no">197</span><span id="line-197">      ExtendedCell firstKeyOnPreviousRow = PrivateCellUtil.createFirstOnRow(lastCellBeforeRow);</span>
-<span class="source-line-no">198</span><span id="line-198">      this.stopSkippingKVsIfNextRow = true;</span>
-<span class="source-line-no">199</span><span id="line-199">      this.stopSkippingKVsRow = firstKeyOnPreviousRow;</span>
-<span class="source-line-no">200</span><span id="line-200">      seek(firstKeyOnPreviousRow);</span>
-<span class="source-line-no">201</span><span id="line-201">      this.stopSkippingKVsIfNextRow = false;</span>
-<span class="source-line-no">202</span><span id="line-202">      if (</span>
-<span class="source-line-no">203</span><span id="line-203">        peek() == null || segment.getComparator().compareRows(peek(), firstKeyOnPreviousRow) &gt; 0</span>
-<span class="source-line-no">204</span><span id="line-204">      ) {</span>
-<span class="source-line-no">205</span><span id="line-205">        keepSeeking = true;</span>
-<span class="source-line-no">206</span><span id="line-206">        key = firstKeyOnPreviousRow;</span>
-<span class="source-line-no">207</span><span id="line-207">        continue;</span>
-<span class="source-line-no">208</span><span id="line-208">      } else {</span>
-<span class="source-line-no">209</span><span id="line-209">        keepSeeking = false;</span>
-<span class="source-line-no">210</span><span id="line-210">      }</span>
-<span class="source-line-no">211</span><span id="line-211">    } while (keepSeeking);</span>
-<span class="source-line-no">212</span><span id="line-212">    return true;</span>
-<span class="source-line-no">213</span><span id="line-213">  }</span>
-<span class="source-line-no">214</span><span id="line-214"></span>
-<span class="source-line-no">215</span><span id="line-215">  /**</span>
-<span class="source-line-no">216</span><span id="line-216">   * Seek the scanner at the first KeyValue of last row</span>
-<span class="source-line-no">217</span><span id="line-217">   * @return true if scanner has values left, false if the underlying data is empty</span>
-<span class="source-line-no">218</span><span id="line-218">   */</span>
-<span class="source-line-no">219</span><span id="line-219">  @Override</span>
-<span class="source-line-no">220</span><span id="line-220">  public boolean seekToLastRow() throws IOException {</span>
-<span class="source-line-no">221</span><span id="line-221">    if (closed) {</span>
-<span class="source-line-no">222</span><span id="line-222">      return false;</span>
-<span class="source-line-no">223</span><span id="line-223">    }</span>
-<span class="source-line-no">224</span><span id="line-224">    ExtendedCell higherCell = segment.isEmpty() ? null : segment.last();</span>
-<span class="source-line-no">225</span><span id="line-225">    if (higherCell == null) {</span>
+<span class="source-line-no">173</span><span id="line-173">    seek(key); // seek forward then go backward</span>
+<span class="source-line-no">174</span><span id="line-174">    if (peek() == null || segment.compareRows(peek(), key) &gt; 0) {</span>
+<span class="source-line-no">175</span><span id="line-175">      return seekToPreviousRow(key);</span>
+<span class="source-line-no">176</span><span id="line-176">    }</span>
+<span class="source-line-no">177</span><span id="line-177">    return true;</span>
+<span class="source-line-no">178</span><span id="line-178">  }</span>
+<span class="source-line-no">179</span><span id="line-179"></span>
+<span class="source-line-no">180</span><span id="line-180">  /**</span>
+<span class="source-line-no">181</span><span id="line-181">   * Seek the scanner at the first Cell of the row which is the previous row of specified key</span>
+<span class="source-line-no">182</span><span id="line-182">   * @param cell seek value</span>
+<span class="source-line-no">183</span><span id="line-183">   * @return true if the scanner at the first valid Cell of previous row, false if not existing such</span>
+<span class="source-line-no">184</span><span id="line-184">   *         Cell</span>
+<span class="source-line-no">185</span><span id="line-185">   */</span>
+<span class="source-line-no">186</span><span id="line-186">  @Override</span>
+<span class="source-line-no">187</span><span id="line-187">  public boolean seekToPreviousRow(ExtendedCell cell) throws IOException {</span>
+<span class="source-line-no">188</span><span id="line-188">    if (closed) {</span>
+<span class="source-line-no">189</span><span id="line-189">      return false;</span>
+<span class="source-line-no">190</span><span id="line-190">    }</span>
+<span class="source-line-no">191</span><span id="line-191">    boolean keepSeeking;</span>
+<span class="source-line-no">192</span><span id="line-192">    Cell key = cell;</span>
+<span class="source-line-no">193</span><span id="line-193">    do {</span>
+<span class="source-line-no">194</span><span id="line-194">      ExtendedCell firstKeyOnRow = PrivateCellUtil.createFirstOnRow(key);</span>
+<span class="source-line-no">195</span><span id="line-195">      SortedSet&lt;ExtendedCell&gt; cellHead = segment.headSet(firstKeyOnRow);</span>
+<span class="source-line-no">196</span><span id="line-196">      Cell lastCellBeforeRow = cellHead.isEmpty() ? null : cellHead.last();</span>
+<span class="source-line-no">197</span><span id="line-197">      if (lastCellBeforeRow == null) {</span>
+<span class="source-line-no">198</span><span id="line-198">        current = null;</span>
+<span class="source-line-no">199</span><span id="line-199">        return false;</span>
+<span class="source-line-no">200</span><span id="line-200">      }</span>
+<span class="source-line-no">201</span><span id="line-201">      ExtendedCell firstKeyOnPreviousRow = PrivateCellUtil.createFirstOnRow(lastCellBeforeRow);</span>
+<span class="source-line-no">202</span><span id="line-202">      this.stopSkippingKVsIfNextRow = true;</span>
+<span class="source-line-no">203</span><span id="line-203">      this.stopSkippingKVsRow = firstKeyOnPreviousRow;</span>
+<span class="source-line-no">204</span><span id="line-204">      seek(firstKeyOnPreviousRow);</span>
+<span class="source-line-no">205</span><span id="line-205">      this.stopSkippingKVsIfNextRow = false;</span>
+<span class="source-line-no">206</span><span id="line-206">      if (</span>
+<span class="source-line-no">207</span><span id="line-207">        peek() == null || segment.getComparator().compareRows(peek(), firstKeyOnPreviousRow) &gt; 0</span>
+<span class="source-line-no">208</span><span id="line-208">      ) {</span>
+<span class="source-line-no">209</span><span id="line-209">        keepSeeking = true;</span>
+<span class="source-line-no">210</span><span id="line-210">        key = firstKeyOnPreviousRow;</span>
+<span class="source-line-no">211</span><span id="line-211">        continue;</span>
+<span class="source-line-no">212</span><span id="line-212">      } else {</span>
+<span class="source-line-no">213</span><span id="line-213">        keepSeeking = false;</span>
+<span class="source-line-no">214</span><span id="line-214">      }</span>
+<span class="source-line-no">215</span><span id="line-215">    } while (keepSeeking);</span>
+<span class="source-line-no">216</span><span id="line-216">    return true;</span>
+<span class="source-line-no">217</span><span id="line-217">  }</span>
+<span class="source-line-no">218</span><span id="line-218"></span>
+<span class="source-line-no">219</span><span id="line-219">  /**</span>
+<span class="source-line-no">220</span><span id="line-220">   * Seek the scanner at the first KeyValue of last row</span>
+<span class="source-line-no">221</span><span id="line-221">   * @return true if scanner has values left, false if the underlying data is empty</span>
+<span class="source-line-no">222</span><span id="line-222">   */</span>
+<span class="source-line-no">223</span><span id="line-223">  @Override</span>
+<span class="source-line-no">224</span><span id="line-224">  public boolean seekToLastRow() throws IOException {</span>
+<span class="source-line-no">225</span><span id="line-225">    if (closed) {</span>
 <span class="source-line-no">226</span><span id="line-226">      return false;</span>
 <span class="source-line-no">227</span><span id="line-227">    }</span>
-<span class="source-line-no">228</span><span id="line-228"></span>
-<span class="source-line-no">229</span><span id="line-229">    ExtendedCell firstCellOnLastRow = PrivateCellUtil.createFirstOnRow(higherCell);</span>
-<span class="source-line-no">230</span><span id="line-230"></span>
-<span class="source-line-no">231</span><span id="line-231">    if (seek(firstCellOnLastRow)) {</span>
-<span class="source-line-no">232</span><span id="line-232">      return true;</span>
-<span class="source-line-no">233</span><span id="line-233">    } else {</span>
-<span class="source-line-no">234</span><span id="line-234">      return seekToPreviousRow(higherCell);</span>
-<span class="source-line-no">235</span><span id="line-235">    }</span>
-<span class="source-line-no">236</span><span id="line-236">  }</span>
-<span class="source-line-no">237</span><span id="line-237"></span>
-<span class="source-line-no">238</span><span id="line-238">  /**</span>
-<span class="source-line-no">239</span><span id="line-239">   * Close the KeyValue scanner.</span>
-<span class="source-line-no">240</span><span id="line-240">   */</span>
-<span class="source-line-no">241</span><span id="line-241">  @Override</span>
-<span class="source-line-no">242</span><span id="line-242">  public void close() {</span>
-<span class="source-line-no">243</span><span id="line-243">    if (closed) {</span>
-<span class="source-line-no">244</span><span id="line-244">      return;</span>
-<span class="source-line-no">245</span><span id="line-245">    }</span>
-<span class="source-line-no">246</span><span id="line-246">    getSegment().decScannerCount();</span>
-<span class="source-line-no">247</span><span id="line-247">    closed = true;</span>
-<span class="source-line-no">248</span><span id="line-248">  }</span>
-<span class="source-line-no">249</span><span id="line-249"></span>
-<span class="source-line-no">250</span><span id="line-250">  /**</span>
-<span class="source-line-no">251</span><span id="line-251">   * This functionality should be resolved in the higher level which is MemStoreScanner, currently</span>
-<span class="source-line-no">252</span><span id="line-252">   * returns true as default. Doesn't throw IllegalStateException in order not to change the</span>
-<span class="source-line-no">253</span><span id="line-253">   * signature of the overridden method</span>
-<span class="source-line-no">254</span><span id="line-254">   */</span>
-<span class="source-line-no">255</span><span id="line-255">  @Override</span>
-<span class="source-line-no">256</span><span id="line-256">  public boolean shouldUseScanner(Scan scan, HStore store, long oldestUnexpiredTS) {</span>
-<span class="source-line-no">257</span><span id="line-257">    return getSegment().shouldSeek(scan.getColumnFamilyTimeRange().getOrDefault(</span>
-<span class="source-line-no">258</span><span id="line-258">      store.getColumnFamilyDescriptor().getName(), scan.getTimeRange()), oldestUnexpiredTS);</span>
-<span class="source-line-no">259</span><span id="line-259">  }</span>
-<span class="source-line-no">260</span><span id="line-260"></span>
-<span class="source-line-no">261</span><span id="line-261">  @Override</span>
-<span class="source-line-no">262</span><span id="line-262">  public boolean requestSeek(ExtendedCell c, boolean forward, boolean useBloom) throws IOException {</span>
-<span class="source-line-no">263</span><span id="line-263">    return NonLazyKeyValueScanner.doRealSeek(this, c, forward);</span>
-<span class="source-line-no">264</span><span id="line-264">  }</span>
-<span class="source-line-no">265</span><span id="line-265"></span>
-<span class="source-line-no">266</span><span id="line-266">  /**</span>
-<span class="source-line-no">267</span><span id="line-267">   * This scanner is working solely on the in-memory MemStore and doesn't work on store files,</span>
-<span class="source-line-no">268</span><span id="line-268">   * MutableCellSetSegmentScanner always does the seek, therefore always returning true.</span>
-<span class="source-line-no">269</span><span id="line-269">   */</span>
-<span class="source-line-no">270</span><span id="line-270">  @Override</span>
-<span class="source-line-no">271</span><span id="line-271">  public boolean realSeekDone() {</span>
-<span class="source-line-no">272</span><span id="line-272">    return true;</span>
-<span class="source-line-no">273</span><span id="line-273">  }</span>
-<span class="source-line-no">274</span><span id="line-274"></span>
-<span class="source-line-no">275</span><span id="line-275">  /**</span>
-<span class="source-line-no">276</span><span id="line-276">   * This function should be never called on scanners that always do real seek operations (i.e. most</span>
-<span class="source-line-no">277</span><span id="line-277">   * of the scanners and also this one). The easiest way to achieve this is to call</span>
-<span class="source-line-no">278</span><span id="line-278">   * {@link #realSeekDone()} first.</span>
-<span class="source-line-no">279</span><span id="line-279">   */</span>
-<span class="source-line-no">280</span><span id="line-280">  @Override</span>
-<span class="source-line-no">281</span><span id="line-281">  public void enforceSeek() throws IOException {</span>
-<span class="source-line-no">282</span><span id="line-282">    throw new NotImplementedException("enforceSeek cannot be called on a SegmentScanner");</span>
-<span class="source-line-no">283</span><span id="line-283">  }</span>
-<span class="source-line-no">284</span><span id="line-284"></span>
-<span class="source-line-no">285</span><span id="line-285">  /** Returns true if this is a file scanner. Otherwise a memory scanner is assumed. */</span>
-<span class="source-line-no">286</span><span id="line-286">  @Override</span>
-<span class="source-line-no">287</span><span id="line-287">  public boolean isFileScanner() {</span>
-<span class="source-line-no">288</span><span id="line-288">    return false;</span>
-<span class="source-line-no">289</span><span id="line-289">  }</span>
-<span class="source-line-no">290</span><span id="line-290"></span>
-<span class="source-line-no">291</span><span id="line-291">  @Override</span>
-<span class="source-line-no">292</span><span id="line-292">  public void recordBlockSize(IntConsumer blockSizeConsumer) {</span>
-<span class="source-line-no">293</span><span id="line-293">    // do nothing</span>
-<span class="source-line-no">294</span><span id="line-294">  }</span>
-<span class="source-line-no">295</span><span id="line-295"></span>
-<span class="source-line-no">296</span><span id="line-296">  @Override</span>
-<span class="source-line-no">297</span><span id="line-297">  public Path getFilePath() {</span>
-<span class="source-line-no">298</span><span id="line-298">    return null;</span>
-<span class="source-line-no">299</span><span id="line-299">  }</span>
-<span class="source-line-no">300</span><span id="line-300"></span>
-<span class="source-line-no">301</span><span id="line-301">  /**</span>
-<span class="source-line-no">302</span><span id="line-302">   * @return the next key in the index (the key to seek to the next block) if known, or null</span>
-<span class="source-line-no">303</span><span id="line-303">   *         otherwise Not relevant for in-memory scanner</span>
-<span class="source-line-no">304</span><span id="line-304">   */</span>
-<span class="source-line-no">305</span><span id="line-305">  @Override</span>
-<span class="source-line-no">306</span><span id="line-306">  public ExtendedCell getNextIndexedKey() {</span>
-<span class="source-line-no">307</span><span id="line-307">    return null;</span>
-<span class="source-line-no">308</span><span id="line-308">  }</span>
-<span class="source-line-no">309</span><span id="line-309"></span>
-<span class="source-line-no">310</span><span id="line-310">  /**</span>
-<span class="source-line-no">311</span><span id="line-311">   * Called after a batch of rows scanned (RPC) and set to be returned to client. Any in between</span>
-<span class="source-line-no">312</span><span id="line-312">   * cleanup can be done here. Nothing to be done for MutableCellSetSegmentScanner.</span>
-<span class="source-line-no">313</span><span id="line-313">   */</span>
-<span class="source-line-no">314</span><span id="line-314">  @Override</span>
-<span class="source-line-no">315</span><span id="line-315">  public void shipped() throws IOException {</span>
-<span class="source-line-no">316</span><span id="line-316">    // do nothing</span>
-<span class="source-line-no">317</span><span id="line-317">  }</span>
-<span class="source-line-no">318</span><span id="line-318"></span>
-<span class="source-line-no">319</span><span id="line-319">  // debug method</span>
-<span class="source-line-no">320</span><span id="line-320">  @Override</span>
-<span class="source-line-no">321</span><span id="line-321">  public String toString() {</span>
-<span class="source-line-no">322</span><span id="line-322">    String res = "Store segment scanner of type " + this.getClass().getName() + "; ";</span>
-<span class="source-line-no">323</span><span id="line-323">    res += "Scanner order " + getScannerOrder() + "; ";</span>
-<span class="source-line-no">324</span><span id="line-324">    res += getSegment().toString();</span>
-<span class="source-line-no">325</span><span id="line-325">    return res;</span>
-<span class="source-line-no">326</span><span id="line-326">  }</span>
-<span class="source-line-no">327</span><span id="line-327"></span>
-<span class="source-line-no">328</span><span id="line-328">  /********************* Private Methods **********************/</span>
-<span class="source-line-no">329</span><span id="line-329"></span>
-<span class="source-line-no">330</span><span id="line-330">  private Segment getSegment() {</span>
-<span class="source-line-no">331</span><span id="line-331">    return segment;</span>
-<span class="source-line-no">332</span><span id="line-332">  }</span>
+<span class="source-line-no">228</span><span id="line-228">    ExtendedCell higherCell = segment.isEmpty() ? null : segment.last();</span>
+<span class="source-line-no">229</span><span id="line-229">    if (higherCell == null) {</span>
+<span class="source-line-no">230</span><span id="line-230">      return false;</span>
+<span class="source-line-no">231</span><span id="line-231">    }</span>
+<span class="source-line-no">232</span><span id="line-232"></span>
+<span class="source-line-no">233</span><span id="line-233">    ExtendedCell firstCellOnLastRow = PrivateCellUtil.createFirstOnRow(higherCell);</span>
+<span class="source-line-no">234</span><span id="line-234"></span>
+<span class="source-line-no">235</span><span id="line-235">    if (seek(firstCellOnLastRow)) {</span>
+<span class="source-line-no">236</span><span id="line-236">      return true;</span>
+<span class="source-line-no">237</span><span id="line-237">    } else {</span>
+<span class="source-line-no">238</span><span id="line-238">      return seekToPreviousRow(higherCell);</span>
+<span class="source-line-no">239</span><span id="line-239">    }</span>
+<span class="source-line-no">240</span><span id="line-240">  }</span>
+<span class="source-line-no">241</span><span id="line-241"></span>
+<span class="source-line-no">242</span><span id="line-242">  /**</span>
+<span class="source-line-no">243</span><span id="line-243">   * Close the KeyValue scanner.</span>
+<span class="source-line-no">244</span><span id="line-244">   */</span>
+<span class="source-line-no">245</span><span id="line-245">  @Override</span>
+<span class="source-line-no">246</span><span id="line-246">  public void close() {</span>
+<span class="source-line-no">247</span><span id="line-247">    if (closed) {</span>
+<span class="source-line-no">248</span><span id="line-248">      return;</span>
+<span class="source-line-no">249</span><span id="line-249">    }</span>
+<span class="source-line-no">250</span><span id="line-250">    getSegment().decScannerCount();</span>
+<span class="source-line-no">251</span><span id="line-251">    closed = true;</span>
+<span class="source-line-no">252</span><span id="line-252">  }</span>
+<span class="source-line-no">253</span><span id="line-253"></span>
+<span class="source-line-no">254</span><span id="line-254">  /**</span>
+<span class="source-line-no">255</span><span id="line-255">   * This functionality should be resolved in the higher level which is MemStoreScanner, currently</span>
+<span class="source-line-no">256</span><span id="line-256">   * returns true as default. Doesn't throw IllegalStateException in order not to change the</span>
+<span class="source-line-no">257</span><span id="line-257">   * signature of the overridden method</span>
+<span class="source-line-no">258</span><span id="line-258">   */</span>
+<span class="source-line-no">259</span><span id="line-259">  @Override</span>
+<span class="source-line-no">260</span><span id="line-260">  public boolean shouldUseScanner(Scan scan, HStore store, long oldestUnexpiredTS) {</span>
+<span class="source-line-no">261</span><span id="line-261">    return getSegment().shouldSeek(scan.getColumnFamilyTimeRange().getOrDefault(</span>
+<span class="source-line-no">262</span><span id="line-262">      store.getColumnFamilyDescriptor().getName(), scan.getTimeRange()), oldestUnexpiredTS);</span>
+<span class="source-line-no">263</span><span id="line-263">  }</span>
+<span class="source-line-no">264</span><span id="line-264"></span>
+<span class="source-line-no">265</span><span id="line-265">  @Override</span>
+<span class="source-line-no">266</span><span id="line-266">  public boolean requestSeek(ExtendedCell c, boolean forward, boolean useBloom) throws IOException {</span>
+<span class="source-line-no">267</span><span id="line-267">    return NonLazyKeyValueScanner.doRealSeek(this, c, forward);</span>
+<span class="source-line-no">268</span><span id="line-268">  }</span>
+<span class="source-line-no">269</span><span id="line-269"></span>
+<span class="source-line-no">270</span><span id="line-270">  /**</span>
+<span class="source-line-no">271</span><span id="line-271">   * This scanner is working solely on the in-memory MemStore and doesn't work on store files,</span>
+<span class="source-line-no">272</span><span id="line-272">   * MutableCellSetSegmentScanner always does the seek, therefore always returning true.</span>
+<span class="source-line-no">273</span><span id="line-273">   */</span>
+<span class="source-line-no">274</span><span id="line-274">  @Override</span>
+<span class="source-line-no">275</span><span id="line-275">  public boolean realSeekDone() {</span>
+<span class="source-line-no">276</span><span id="line-276">    return true;</span>
+<span class="source-line-no">277</span><span id="line-277">  }</span>
+<span class="source-line-no">278</span><span id="line-278"></span>
+<span class="source-line-no">279</span><span id="line-279">  /**</span>
+<span class="source-line-no">280</span><span id="line-280">   * This function should be never called on scanners that always do real seek operations (i.e. most</span>
+<span class="source-line-no">281</span><span id="line-281">   * of the scanners and also this one). The easiest way to achieve this is to call</span>
+<span class="source-line-no">282</span><span id="line-282">   * {@link #realSeekDone()} first.</span>
+<span class="source-line-no">283</span><span id="line-283">   */</span>
+<span class="source-line-no">284</span><span id="line-284">  @Override</span>
+<span class="source-line-no">285</span><span id="line-285">  public void enforceSeek() throws IOException {</span>
+<span class="source-line-no">286</span><span id="line-286">    throw new NotImplementedException("enforceSeek cannot be called on a SegmentScanner");</span>
+<span class="source-line-no">287</span><span id="line-287">  }</span>
+<span class="source-line-no">288</span><span id="line-288"></span>
+<span class="source-line-no">289</span><span id="line-289">  /** Returns true if this is a file scanner. Otherwise a memory scanner is assumed. */</span>
+<span class="source-line-no">290</span><span id="line-290">  @Override</span>
+<span class="source-line-no">291</span><span id="line-291">  public boolean isFileScanner() {</span>
+<span class="source-line-no">292</span><span id="line-292">    return false;</span>
+<span class="source-line-no">293</span><span id="line-293">  }</span>
+<span class="source-line-no">294</span><span id="line-294"></span>
+<span class="source-line-no">295</span><span id="line-295">  @Override</span>
+<span class="source-line-no">296</span><span id="line-296">  public void recordBlockSize(IntConsumer blockSizeConsumer) {</span>
+<span class="source-line-no">297</span><span id="line-297">    // do nothing</span>
+<span class="source-line-no">298</span><span id="line-298">  }</span>
+<span class="source-line-no">299</span><span id="line-299"></span>
+<span class="source-line-no">300</span><span id="line-300">  @Override</span>
+<span class="source-line-no">301</span><span id="line-301">  public Path getFilePath() {</span>
+<span class="source-line-no">302</span><span id="line-302">    return null;</span>
+<span class="source-line-no">303</span><span id="line-303">  }</span>
+<span class="source-line-no">304</span><span id="line-304"></span>
+<span class="source-line-no">305</span><span id="line-305">  /**</span>
+<span class="source-line-no">306</span><span id="line-306">   * @return the next key in the index (the key to seek to the next block) if known, or null</span>
+<span class="source-line-no">307</span><span id="line-307">   *         otherwise Not relevant for in-memory scanner</span>
+<span class="source-line-no">308</span><span id="line-308">   */</span>
+<span class="source-line-no">309</span><span id="line-309">  @Override</span>
+<span class="source-line-no">310</span><span id="line-310">  public ExtendedCell getNextIndexedKey() {</span>
+<span class="source-line-no">311</span><span id="line-311">    return null;</span>
+<span class="source-line-no">312</span><span id="line-312">  }</span>
+<span class="source-line-no">313</span><span id="line-313"></span>
+<span class="source-line-no">314</span><span id="line-314">  /**</span>
+<span class="source-line-no">315</span><span id="line-315">   * Called after a batch of rows scanned (RPC) and set to be returned to client. Any in between</span>
+<span class="source-line-no">316</span><span id="line-316">   * cleanup can be done here. Nothing to be done for MutableCellSetSegmentScanner.</span>
+<span class="source-line-no">317</span><span id="line-317">   */</span>
+<span class="source-line-no">318</span><span id="line-318">  @Override</span>
+<span class="source-line-no">319</span><span id="line-319">  public void shipped() throws IOException {</span>
+<span class="source-line-no">320</span><span id="line-320">    // do nothing</span>
+<span class="source-line-no">321</span><span id="line-321">  }</span>
+<span class="source-line-no">322</span><span id="line-322"></span>
+<span class="source-line-no">323</span><span id="line-323">  // debug method</span>
+<span class="source-line-no">324</span><span id="line-324">  @Override</span>
+<span class="source-line-no">325</span><span id="line-325">  public String toString() {</span>
+<span class="source-line-no">326</span><span id="line-326">    String res = "Store segment scanner of type " + this.getClass().getName() + "; ";</span>
+<span class="source-line-no">327</span><span id="line-327">    res += "Scanner order " + getScannerOrder() + "; ";</span>
+<span class="source-line-no">328</span><span id="line-328">    res += getSegment().toString();</span>
+<span class="source-line-no">329</span><span id="line-329">    return res;</span>
+<span class="source-line-no">330</span><span id="line-330">  }</span>
+<span class="source-line-no">331</span><span id="line-331"></span>
+<span class="source-line-no">332</span><span id="line-332">  /********************* Private Methods **********************/</span>
 <span class="source-line-no">333</span><span id="line-333"></span>
-<span class="source-line-no">334</span><span id="line-334">  /**</span>
-<span class="source-line-no">335</span><span id="line-335">   * Private internal method for iterating over the segment, skipping the cells with irrelevant MVCC</span>
-<span class="source-line-no">336</span><span id="line-336">   */</span>
-<span class="source-line-no">337</span><span id="line-337">  protected void updateCurrent() {</span>
-<span class="source-line-no">338</span><span id="line-338">    ExtendedCell next = null;</span>
-<span class="source-line-no">339</span><span id="line-339"></span>
-<span class="source-line-no">340</span><span id="line-340">    try {</span>
-<span class="source-line-no">341</span><span id="line-341">      while (iter.hasNext()) {</span>
-<span class="source-line-no">342</span><span id="line-342">        next = iter.next();</span>
-<span class="source-line-no">343</span><span id="line-343">        if (next.getSequenceId() &lt;= this.readPoint) {</span>
-<span class="source-line-no">344</span><span id="line-344">          current = next;</span>
-<span class="source-line-no">345</span><span id="line-345">          return;// skip irrelevant versions</span>
-<span class="source-line-no">346</span><span id="line-346">        }</span>
-<span class="source-line-no">347</span><span id="line-347">        // for backwardSeek() stay in the boundaries of a single row</span>
-<span class="source-line-no">348</span><span id="line-348">        if (stopSkippingKVsIfNextRow &amp;&amp; segment.compareRows(next, stopSkippingKVsRow) &gt; 0) {</span>
-<span class="source-line-no">349</span><span id="line-349">          current = null;</span>
-<span class="source-line-no">350</span><span id="line-350">          return;</span>
+<span class="source-line-no">334</span><span id="line-334">  private Segment getSegment() {</span>
+<span class="source-line-no">335</span><span id="line-335">    return segment;</span>
+<span class="source-line-no">336</span><span id="line-336">  }</span>
+<span class="source-line-no">337</span><span id="line-337"></span>
+<span class="source-line-no">338</span><span id="line-338">  /**</span>
+<span class="source-line-no">339</span><span id="line-339">   * Private internal method for iterating over the segment, skipping the cells with irrelevant MVCC</span>
+<span class="source-line-no">340</span><span id="line-340">   */</span>
+<span class="source-line-no">341</span><span id="line-341">  protected void updateCurrent() {</span>
+<span class="source-line-no">342</span><span id="line-342">    ExtendedCell next = null;</span>
+<span class="source-line-no">343</span><span id="line-343">    long totalBytesRead = 0;</span>
+<span class="source-line-no">344</span><span id="line-344"></span>
+<span class="source-line-no">345</span><span id="line-345">    try {</span>
+<span class="source-line-no">346</span><span id="line-346">      while (iter.hasNext()) {</span>
+<span class="source-line-no">347</span><span id="line-347">        next = iter.next();</span>
+<span class="source-line-no">348</span><span id="line-348">        if (isScanMetricsEnabled) {</span>
+<span class="source-line-no">349</span><span id="line-349">          // Batch collect bytes to reduce method call overhead</span>
+<span class="source-line-no">350</span><span id="line-350">          totalBytesRead += Segment.getCellLength(next);</span>
 <span class="source-line-no">351</span><span id="line-351">        }</span>
-<span class="source-line-no">352</span><span id="line-352">      } // end of while</span>
-<span class="source-line-no">353</span><span id="line-353"></span>
-<span class="source-line-no">354</span><span id="line-354">      current = null; // nothing found</span>
-<span class="source-line-no">355</span><span id="line-355">    } finally {</span>
-<span class="source-line-no">356</span><span id="line-356">      if (next != null) {</span>
-<span class="source-line-no">357</span><span id="line-357">        // in all cases, remember the last KV we iterated to, needed for reseek()</span>
-<span class="source-line-no">358</span><span id="line-358">        last = next;</span>
-<span class="source-line-no">359</span><span id="line-359">      }</span>
-<span class="source-line-no">360</span><span id="line-360">    }</span>
-<span class="source-line-no">361</span><span id="line-361">  }</span>
+<span class="source-line-no">352</span><span id="line-352">        if (next.getSequenceId() &lt;= this.readPoint) {</span>
+<span class="source-line-no">353</span><span id="line-353">          current = next;</span>
+<span class="source-line-no">354</span><span id="line-354">          return;// skip irrelevant versions</span>
+<span class="source-line-no">355</span><span id="line-355">        }</span>
+<span class="source-line-no">356</span><span id="line-356">        // for backwardSeek() stay in the boundaries of a single row</span>
+<span class="source-line-no">357</span><span id="line-357">        if (stopSkippingKVsIfNextRow &amp;&amp; segment.compareRows(next, stopSkippingKVsRow) &gt; 0) {</span>
+<span class="source-line-no">358</span><span id="line-358">          current = null;</span>
+<span class="source-line-no">359</span><span id="line-359">          return;</span>
+<span class="source-line-no">360</span><span id="line-360">        }</span>
+<span class="source-line-no">361</span><span id="line-361">      } // end of while</span>
 <span class="source-line-no">362</span><span id="line-362"></span>
-<span class="source-line-no">363</span><span id="line-363">  /**</span>
-<span class="source-line-no">364</span><span id="line-364">   * Private internal method that returns the higher of the two key values, or null if they are both</span>
-<span class="source-line-no">365</span><span id="line-365">   * null</span>
-<span class="source-line-no">366</span><span id="line-366">   */</span>
-<span class="source-line-no">367</span><span id="line-367">  private ExtendedCell getHighest(ExtendedCell first, ExtendedCell second) {</span>
-<span class="source-line-no">368</span><span id="line-368">    if (first == null &amp;&amp; second == null) {</span>
-<span class="source-line-no">369</span><span id="line-369">      return null;</span>
-<span class="source-line-no">370</span><span id="line-370">    }</span>
-<span class="source-line-no">371</span><span id="line-371">    if (first != null &amp;&amp; second != null) {</span>
-<span class="source-line-no">372</span><span id="line-372">      int compare = segment.compare(first, second);</span>
-<span class="source-line-no">373</span><span id="line-373">      return (compare &gt; 0 ? first : second);</span>
-<span class="source-line-no">374</span><span id="line-374">    }</span>
-<span class="source-line-no">375</span><span id="line-375">    return (first != null ? first : second);</span>
-<span class="source-line-no">376</span><span id="line-376">  }</span>
-<span class="source-line-no">377</span><span id="line-377">}</span>
+<span class="source-line-no">363</span><span id="line-363">      current = null; // nothing found</span>
+<span class="source-line-no">364</span><span id="line-364">    } finally {</span>
+<span class="source-line-no">365</span><span id="line-365">      // Add accumulated bytes before returning</span>
+<span class="source-line-no">366</span><span id="line-366">      if (totalBytesRead &gt; 0) {</span>
+<span class="source-line-no">367</span><span id="line-367">        ThreadLocalServerSideScanMetrics.addBytesReadFromMemstore(totalBytesRead);</span>
+<span class="source-line-no">368</span><span id="line-368">      }</span>
+<span class="source-line-no">369</span><span id="line-369">      if (next != null) {</span>
+<span class="source-line-no">370</span><span id="line-370">        // in all cases, remember the last KV we iterated to, needed for reseek()</span>
+<span class="source-line-no">371</span><span id="line-371">        last = next;</span>
+<span class="source-line-no">372</span><span id="line-372">      }</span>
+<span class="source-line-no">373</span><span id="line-373">    }</span>
+<span class="source-line-no">374</span><span id="line-374">  }</span>
+<span class="source-line-no">375</span><span id="line-375"></span>
+<span class="source-line-no">376</span><span id="line-376">  /**</span>
+<span class="source-line-no">377</span><span id="line-377">   * Private internal method that returns the higher of the two key values, or null if they are both</span>
+<span class="source-line-no">378</span><span id="line-378">   * null</span>
+<span class="source-line-no">379</span><span id="line-379">   */</span>
+<span class="source-line-no">380</span><span id="line-380">  private ExtendedCell getHighest(ExtendedCell first, ExtendedCell second) {</span>
+<span class="source-line-no">381</span><span id="line-381">    if (first == null &amp;&amp; second == null) {</span>
+<span class="source-line-no">382</span><span id="line-382">      return null;</span>
+<span class="source-line-no">383</span><span id="line-383">    }</span>
+<span class="source-line-no">384</span><span id="line-384">    if (first != null &amp;&amp; second != null) {</span>
+<span class="source-line-no">385</span><span id="line-385">      int compare = segment.compare(first, second);</span>
+<span class="source-line-no">386</span><span id="line-386">      return (compare &gt; 0 ? first : second);</span>
+<span class="source-line-no">387</span><span id="line-387">    }</span>
+<span class="source-line-no">388</span><span id="line-388">    return (first != null ? first : second);</span>
+<span class="source-line-no">389</span><span id="line-389">  }</span>
+<span class="source-line-no">390</span><span id="line-390">}</span>
 
 
 

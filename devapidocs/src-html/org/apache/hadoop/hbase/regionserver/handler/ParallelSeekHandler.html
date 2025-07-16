@@ -32,55 +32,91 @@
 <span class="source-line-no">019</span><span id="line-19"></span>
 <span class="source-line-no">020</span><span id="line-20">import java.io.IOException;</span>
 <span class="source-line-no">021</span><span id="line-21">import java.util.concurrent.CountDownLatch;</span>
-<span class="source-line-no">022</span><span id="line-22">import org.apache.hadoop.hbase.ExtendedCell;</span>
-<span class="source-line-no">023</span><span id="line-23">import org.apache.hadoop.hbase.executor.EventHandler;</span>
-<span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.hbase.executor.EventType;</span>
-<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.hbase.regionserver.KeyValueScanner;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.slf4j.Logger;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">029</span><span id="line-29"></span>
-<span class="source-line-no">030</span><span id="line-30">/**</span>
-<span class="source-line-no">031</span><span id="line-31"> * Handler to seek storefiles in parallel.</span>
-<span class="source-line-no">032</span><span id="line-32"> */</span>
-<span class="source-line-no">033</span><span id="line-33">@InterfaceAudience.Private</span>
-<span class="source-line-no">034</span><span id="line-34">public class ParallelSeekHandler extends EventHandler {</span>
-<span class="source-line-no">035</span><span id="line-35">  private static final Logger LOG = LoggerFactory.getLogger(ParallelSeekHandler.class);</span>
-<span class="source-line-no">036</span><span id="line-36">  private KeyValueScanner scanner;</span>
-<span class="source-line-no">037</span><span id="line-37">  private ExtendedCell keyValue;</span>
-<span class="source-line-no">038</span><span id="line-38">  private long readPoint;</span>
-<span class="source-line-no">039</span><span id="line-39">  private CountDownLatch latch;</span>
-<span class="source-line-no">040</span><span id="line-40">  private Throwable err = null;</span>
-<span class="source-line-no">041</span><span id="line-41"></span>
-<span class="source-line-no">042</span><span id="line-42">  public ParallelSeekHandler(KeyValueScanner scanner, ExtendedCell keyValue, long readPoint,</span>
-<span class="source-line-no">043</span><span id="line-43">    CountDownLatch latch) {</span>
-<span class="source-line-no">044</span><span id="line-44">    super(null, EventType.RS_PARALLEL_SEEK);</span>
-<span class="source-line-no">045</span><span id="line-45">    this.scanner = scanner;</span>
-<span class="source-line-no">046</span><span id="line-46">    this.keyValue = keyValue;</span>
-<span class="source-line-no">047</span><span id="line-47">    this.readPoint = readPoint;</span>
-<span class="source-line-no">048</span><span id="line-48">    this.latch = latch;</span>
-<span class="source-line-no">049</span><span id="line-49">  }</span>
-<span class="source-line-no">050</span><span id="line-50"></span>
-<span class="source-line-no">051</span><span id="line-51">  @Override</span>
-<span class="source-line-no">052</span><span id="line-52">  public void process() {</span>
-<span class="source-line-no">053</span><span id="line-53">    try {</span>
-<span class="source-line-no">054</span><span id="line-54">      scanner.seek(keyValue);</span>
-<span class="source-line-no">055</span><span id="line-55">    } catch (IOException e) {</span>
-<span class="source-line-no">056</span><span id="line-56">      LOG.error("", e);</span>
-<span class="source-line-no">057</span><span id="line-57">      setErr(e);</span>
-<span class="source-line-no">058</span><span id="line-58">    } finally {</span>
-<span class="source-line-no">059</span><span id="line-59">      latch.countDown();</span>
-<span class="source-line-no">060</span><span id="line-60">    }</span>
-<span class="source-line-no">061</span><span id="line-61">  }</span>
-<span class="source-line-no">062</span><span id="line-62"></span>
-<span class="source-line-no">063</span><span id="line-63">  public Throwable getErr() {</span>
-<span class="source-line-no">064</span><span id="line-64">    return err;</span>
-<span class="source-line-no">065</span><span id="line-65">  }</span>
-<span class="source-line-no">066</span><span id="line-66"></span>
-<span class="source-line-no">067</span><span id="line-67">  public void setErr(Throwable err) {</span>
-<span class="source-line-no">068</span><span id="line-68">    this.err = err;</span>
-<span class="source-line-no">069</span><span id="line-69">  }</span>
-<span class="source-line-no">070</span><span id="line-70">}</span>
+<span class="source-line-no">022</span><span id="line-22">import java.util.concurrent.atomic.AtomicLong;</span>
+<span class="source-line-no">023</span><span id="line-23">import org.apache.hadoop.hbase.ExtendedCell;</span>
+<span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.hbase.executor.EventHandler;</span>
+<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.hbase.executor.EventType;</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.monitoring.ThreadLocalServerSideScanMetrics;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.regionserver.KeyValueScanner;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.slf4j.Logger;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">031</span><span id="line-31"></span>
+<span class="source-line-no">032</span><span id="line-32">/**</span>
+<span class="source-line-no">033</span><span id="line-33"> * Handler to seek storefiles in parallel.</span>
+<span class="source-line-no">034</span><span id="line-34"> */</span>
+<span class="source-line-no">035</span><span id="line-35">@InterfaceAudience.Private</span>
+<span class="source-line-no">036</span><span id="line-36">public class ParallelSeekHandler extends EventHandler {</span>
+<span class="source-line-no">037</span><span id="line-37">  private static final Logger LOG = LoggerFactory.getLogger(ParallelSeekHandler.class);</span>
+<span class="source-line-no">038</span><span id="line-38">  private KeyValueScanner scanner;</span>
+<span class="source-line-no">039</span><span id="line-39">  private ExtendedCell keyValue;</span>
+<span class="source-line-no">040</span><span id="line-40">  private long readPoint;</span>
+<span class="source-line-no">041</span><span id="line-41">  private CountDownLatch latch;</span>
+<span class="source-line-no">042</span><span id="line-42">  private Throwable err = null;</span>
+<span class="source-line-no">043</span><span id="line-43"></span>
+<span class="source-line-no">044</span><span id="line-44">  // Flag to enable/disable scan metrics collection and thread-local counters for capturing scan</span>
+<span class="source-line-no">045</span><span id="line-45">  // performance during parallel store file seeking.</span>
+<span class="source-line-no">046</span><span id="line-46">  // These aggregate metrics from worker threads back to the main scan thread.</span>
+<span class="source-line-no">047</span><span id="line-47">  private final boolean isScanMetricsEnabled;</span>
+<span class="source-line-no">048</span><span id="line-48">  // Thread-local counter for bytes read from FS.</span>
+<span class="source-line-no">049</span><span id="line-49">  private final AtomicLong bytesReadFromFs;</span>
+<span class="source-line-no">050</span><span id="line-50">  // Thread-local counter for bytes read from BlockCache.</span>
+<span class="source-line-no">051</span><span id="line-51">  private final AtomicLong bytesReadFromBlockCache;</span>
+<span class="source-line-no">052</span><span id="line-52">  // Thread-local counter for block read operations count.</span>
+<span class="source-line-no">053</span><span id="line-53">  private final AtomicLong blockReadOpsCount;</span>
+<span class="source-line-no">054</span><span id="line-54"></span>
+<span class="source-line-no">055</span><span id="line-55">  public ParallelSeekHandler(KeyValueScanner scanner, ExtendedCell keyValue, long readPoint,</span>
+<span class="source-line-no">056</span><span id="line-56">    CountDownLatch latch) {</span>
+<span class="source-line-no">057</span><span id="line-57">    super(null, EventType.RS_PARALLEL_SEEK);</span>
+<span class="source-line-no">058</span><span id="line-58">    this.scanner = scanner;</span>
+<span class="source-line-no">059</span><span id="line-59">    this.keyValue = keyValue;</span>
+<span class="source-line-no">060</span><span id="line-60">    this.readPoint = readPoint;</span>
+<span class="source-line-no">061</span><span id="line-61">    this.latch = latch;</span>
+<span class="source-line-no">062</span><span id="line-62">    this.isScanMetricsEnabled = ThreadLocalServerSideScanMetrics.isScanMetricsEnabled();</span>
+<span class="source-line-no">063</span><span id="line-63">    this.bytesReadFromFs = ThreadLocalServerSideScanMetrics.getBytesReadFromFsCounter();</span>
+<span class="source-line-no">064</span><span id="line-64">    this.bytesReadFromBlockCache =</span>
+<span class="source-line-no">065</span><span id="line-65">      ThreadLocalServerSideScanMetrics.getBytesReadFromBlockCacheCounter();</span>
+<span class="source-line-no">066</span><span id="line-66">    this.blockReadOpsCount = ThreadLocalServerSideScanMetrics.getBlockReadOpsCountCounter();</span>
+<span class="source-line-no">067</span><span id="line-67">  }</span>
+<span class="source-line-no">068</span><span id="line-68"></span>
+<span class="source-line-no">069</span><span id="line-69">  @Override</span>
+<span class="source-line-no">070</span><span id="line-70">  public void process() {</span>
+<span class="source-line-no">071</span><span id="line-71">    try {</span>
+<span class="source-line-no">072</span><span id="line-72">      ThreadLocalServerSideScanMetrics.setScanMetricsEnabled(isScanMetricsEnabled);</span>
+<span class="source-line-no">073</span><span id="line-73">      if (isScanMetricsEnabled) {</span>
+<span class="source-line-no">074</span><span id="line-74">        ThreadLocalServerSideScanMetrics.reset();</span>
+<span class="source-line-no">075</span><span id="line-75">      }</span>
+<span class="source-line-no">076</span><span id="line-76">      scanner.seek(keyValue);</span>
+<span class="source-line-no">077</span><span id="line-77">      if (isScanMetricsEnabled) {</span>
+<span class="source-line-no">078</span><span id="line-78">        long metricValue = ThreadLocalServerSideScanMetrics.getBytesReadFromFsAndReset();</span>
+<span class="source-line-no">079</span><span id="line-79">        if (metricValue &gt; 0) {</span>
+<span class="source-line-no">080</span><span id="line-80">          bytesReadFromFs.addAndGet(metricValue);</span>
+<span class="source-line-no">081</span><span id="line-81">        }</span>
+<span class="source-line-no">082</span><span id="line-82">        metricValue = ThreadLocalServerSideScanMetrics.getBytesReadFromBlockCacheAndReset();</span>
+<span class="source-line-no">083</span><span id="line-83">        if (metricValue &gt; 0) {</span>
+<span class="source-line-no">084</span><span id="line-84">          bytesReadFromBlockCache.addAndGet(metricValue);</span>
+<span class="source-line-no">085</span><span id="line-85">        }</span>
+<span class="source-line-no">086</span><span id="line-86">        metricValue = ThreadLocalServerSideScanMetrics.getBlockReadOpsCountAndReset();</span>
+<span class="source-line-no">087</span><span id="line-87">        if (metricValue &gt; 0) {</span>
+<span class="source-line-no">088</span><span id="line-88">          blockReadOpsCount.addAndGet(metricValue);</span>
+<span class="source-line-no">089</span><span id="line-89">        }</span>
+<span class="source-line-no">090</span><span id="line-90">      }</span>
+<span class="source-line-no">091</span><span id="line-91">    } catch (IOException e) {</span>
+<span class="source-line-no">092</span><span id="line-92">      LOG.error("", e);</span>
+<span class="source-line-no">093</span><span id="line-93">      setErr(e);</span>
+<span class="source-line-no">094</span><span id="line-94">    } finally {</span>
+<span class="source-line-no">095</span><span id="line-95">      latch.countDown();</span>
+<span class="source-line-no">096</span><span id="line-96">    }</span>
+<span class="source-line-no">097</span><span id="line-97">  }</span>
+<span class="source-line-no">098</span><span id="line-98"></span>
+<span class="source-line-no">099</span><span id="line-99">  public Throwable getErr() {</span>
+<span class="source-line-no">100</span><span id="line-100">    return err;</span>
+<span class="source-line-no">101</span><span id="line-101">  }</span>
+<span class="source-line-no">102</span><span id="line-102"></span>
+<span class="source-line-no">103</span><span id="line-103">  public void setErr(Throwable err) {</span>
+<span class="source-line-no">104</span><span id="line-104">    this.err = err;</span>
+<span class="source-line-no">105</span><span id="line-105">  }</span>
+<span class="source-line-no">106</span><span id="line-106">}</span>
 
 
 
