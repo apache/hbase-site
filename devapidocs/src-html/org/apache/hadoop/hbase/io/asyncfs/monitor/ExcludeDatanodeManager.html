@@ -36,96 +36,121 @@
 <span class="source-line-no">023</span><span id="line-23">import org.apache.hadoop.conf.Configuration;</span>
 <span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.hbase.conf.ConfigurationObserver;</span>
 <span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hdfs.protocol.DatanodeInfo;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.slf4j.Logger;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">030</span><span id="line-30"></span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hbase.thirdparty.com.google.common.cache.Cache;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hbase.thirdparty.com.google.common.cache.CacheBuilder;</span>
-<span class="source-line-no">033</span><span id="line-33"></span>
-<span class="source-line-no">034</span><span id="line-34">/**</span>
-<span class="source-line-no">035</span><span id="line-35"> * The class to manage the excluded datanodes of the WALs on the regionserver.</span>
-<span class="source-line-no">036</span><span id="line-36"> */</span>
-<span class="source-line-no">037</span><span id="line-37">@InterfaceAudience.Private</span>
-<span class="source-line-no">038</span><span id="line-38">public class ExcludeDatanodeManager implements ConfigurationObserver {</span>
-<span class="source-line-no">039</span><span id="line-39">  private static final Logger LOG = LoggerFactory.getLogger(ExcludeDatanodeManager.class);</span>
-<span class="source-line-no">040</span><span id="line-40"></span>
-<span class="source-line-no">041</span><span id="line-41">  /**</span>
-<span class="source-line-no">042</span><span id="line-42">   * Configure for the max count the excluded datanodes.</span>
-<span class="source-line-no">043</span><span id="line-43">   */</span>
-<span class="source-line-no">044</span><span id="line-44">  public static final String WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY =</span>
-<span class="source-line-no">045</span><span id="line-45">    "hbase.regionserver.async.wal.max.exclude.datanode.count";</span>
-<span class="source-line-no">046</span><span id="line-46">  public static final int DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT = 3;</span>
-<span class="source-line-no">047</span><span id="line-47"></span>
-<span class="source-line-no">048</span><span id="line-48">  /**</span>
-<span class="source-line-no">049</span><span id="line-49">   * Configure for the TTL time of the datanodes excluded</span>
-<span class="source-line-no">050</span><span id="line-50">   */</span>
-<span class="source-line-no">051</span><span id="line-51">  public static final String WAL_EXCLUDE_DATANODE_TTL_KEY =</span>
-<span class="source-line-no">052</span><span id="line-52">    "hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour";</span>
-<span class="source-line-no">053</span><span id="line-53">  public static final int DEFAULT_WAL_EXCLUDE_DATANODE_TTL = 6; // 6 hours</span>
-<span class="source-line-no">054</span><span id="line-54"></span>
-<span class="source-line-no">055</span><span id="line-55">  private volatile Cache&lt;DatanodeInfo, Long&gt; excludeDNsCache;</span>
-<span class="source-line-no">056</span><span id="line-56">  private final int maxExcludeDNCount;</span>
-<span class="source-line-no">057</span><span id="line-57">  private final Configuration conf;</span>
-<span class="source-line-no">058</span><span id="line-58">  // This is a map of providerId-&gt;StreamSlowMonitor</span>
-<span class="source-line-no">059</span><span id="line-59">  private final Map&lt;String, StreamSlowMonitor&gt; streamSlowMonitors = new ConcurrentHashMap&lt;&gt;(1);</span>
-<span class="source-line-no">060</span><span id="line-60"></span>
-<span class="source-line-no">061</span><span id="line-61">  public ExcludeDatanodeManager(Configuration conf) {</span>
-<span class="source-line-no">062</span><span id="line-62">    this.conf = conf;</span>
-<span class="source-line-no">063</span><span id="line-63">    this.maxExcludeDNCount = conf.getInt(WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY,</span>
-<span class="source-line-no">064</span><span id="line-64">      DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT);</span>
-<span class="source-line-no">065</span><span id="line-65">    this.excludeDNsCache = CacheBuilder.newBuilder()</span>
-<span class="source-line-no">066</span><span id="line-66">      .expireAfterWrite(</span>
-<span class="source-line-no">067</span><span id="line-67">        this.conf.getLong(WAL_EXCLUDE_DATANODE_TTL_KEY, DEFAULT_WAL_EXCLUDE_DATANODE_TTL),</span>
-<span class="source-line-no">068</span><span id="line-68">        TimeUnit.HOURS)</span>
-<span class="source-line-no">069</span><span id="line-69">      .maximumSize(this.maxExcludeDNCount).build();</span>
-<span class="source-line-no">070</span><span id="line-70">  }</span>
-<span class="source-line-no">071</span><span id="line-71"></span>
-<span class="source-line-no">072</span><span id="line-72">  /**</span>
-<span class="source-line-no">073</span><span id="line-73">   * Try to add a datanode to the regionserver excluding cache</span>
-<span class="source-line-no">074</span><span id="line-74">   * @param datanodeInfo the datanode to be added to the excluded cache</span>
-<span class="source-line-no">075</span><span id="line-75">   * @param cause        the cause that the datanode is hope to be excluded</span>
-<span class="source-line-no">076</span><span id="line-76">   * @return True if the datanode is added to the regionserver excluding cache, false otherwise</span>
-<span class="source-line-no">077</span><span id="line-77">   */</span>
-<span class="source-line-no">078</span><span id="line-78">  public boolean tryAddExcludeDN(DatanodeInfo datanodeInfo, String cause) {</span>
-<span class="source-line-no">079</span><span id="line-79">    boolean alreadyMarkedSlow = getExcludeDNs().containsKey(datanodeInfo);</span>
-<span class="source-line-no">080</span><span id="line-80">    if (!alreadyMarkedSlow) {</span>
-<span class="source-line-no">081</span><span id="line-81">      excludeDNsCache.put(datanodeInfo, EnvironmentEdgeManager.currentTime());</span>
-<span class="source-line-no">082</span><span id="line-82">      LOG.info(</span>
-<span class="source-line-no">083</span><span id="line-83">        "Added datanode: {} to exclude cache by [{}] success, current excludeDNsCache size={}",</span>
-<span class="source-line-no">084</span><span id="line-84">        datanodeInfo, cause, excludeDNsCache.size());</span>
-<span class="source-line-no">085</span><span id="line-85">      return true;</span>
-<span class="source-line-no">086</span><span id="line-86">    }</span>
-<span class="source-line-no">087</span><span id="line-87">    LOG.debug(</span>
-<span class="source-line-no">088</span><span id="line-88">      "Try add datanode {} to exclude cache by [{}] failed, " + "current exclude DNs are {}",</span>
-<span class="source-line-no">089</span><span id="line-89">      datanodeInfo, cause, getExcludeDNs().keySet());</span>
-<span class="source-line-no">090</span><span id="line-90">    return false;</span>
-<span class="source-line-no">091</span><span id="line-91">  }</span>
-<span class="source-line-no">092</span><span id="line-92"></span>
-<span class="source-line-no">093</span><span id="line-93">  public StreamSlowMonitor getStreamSlowMonitor(String name) {</span>
-<span class="source-line-no">094</span><span id="line-94">    String key = name == null || name.isEmpty() ? "defaultMonitorName" : name;</span>
-<span class="source-line-no">095</span><span id="line-95">    return streamSlowMonitors.computeIfAbsent(key, k -&gt; new StreamSlowMonitor(conf, key, this));</span>
-<span class="source-line-no">096</span><span id="line-96">  }</span>
-<span class="source-line-no">097</span><span id="line-97"></span>
-<span class="source-line-no">098</span><span id="line-98">  public Map&lt;DatanodeInfo, Long&gt; getExcludeDNs() {</span>
-<span class="source-line-no">099</span><span id="line-99">    return excludeDNsCache.asMap();</span>
-<span class="source-line-no">100</span><span id="line-100">  }</span>
-<span class="source-line-no">101</span><span id="line-101"></span>
-<span class="source-line-no">102</span><span id="line-102">  @Override</span>
-<span class="source-line-no">103</span><span id="line-103">  public void onConfigurationChange(Configuration conf) {</span>
-<span class="source-line-no">104</span><span id="line-104">    for (StreamSlowMonitor monitor : streamSlowMonitors.values()) {</span>
-<span class="source-line-no">105</span><span id="line-105">      monitor.onConfigurationChange(conf);</span>
-<span class="source-line-no">106</span><span id="line-106">    }</span>
-<span class="source-line-no">107</span><span id="line-107">    this.excludeDNsCache = CacheBuilder.newBuilder()</span>
-<span class="source-line-no">108</span><span id="line-108">      .expireAfterWrite(</span>
-<span class="source-line-no">109</span><span id="line-109">        this.conf.getLong(WAL_EXCLUDE_DATANODE_TTL_KEY, DEFAULT_WAL_EXCLUDE_DATANODE_TTL),</span>
-<span class="source-line-no">110</span><span id="line-110">        TimeUnit.HOURS)</span>
-<span class="source-line-no">111</span><span id="line-111">      .maximumSize(this.conf.getInt(WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY,</span>
-<span class="source-line-no">112</span><span id="line-112">        DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT))</span>
-<span class="source-line-no">113</span><span id="line-113">      .build();</span>
-<span class="source-line-no">114</span><span id="line-114">  }</span>
-<span class="source-line-no">115</span><span id="line-115">}</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.util.Pair;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hdfs.protocol.DatanodeInfo;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.slf4j.Logger;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">031</span><span id="line-31"></span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hbase.thirdparty.com.google.common.cache.Cache;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hbase.thirdparty.com.google.common.cache.CacheBuilder;</span>
+<span class="source-line-no">034</span><span id="line-34"></span>
+<span class="source-line-no">035</span><span id="line-35">/**</span>
+<span class="source-line-no">036</span><span id="line-36"> * The class to manage the excluded datanodes of the WALs on the regionserver.</span>
+<span class="source-line-no">037</span><span id="line-37"> */</span>
+<span class="source-line-no">038</span><span id="line-38">@InterfaceAudience.Private</span>
+<span class="source-line-no">039</span><span id="line-39">public class ExcludeDatanodeManager implements ConfigurationObserver {</span>
+<span class="source-line-no">040</span><span id="line-40">  private static final Logger LOG = LoggerFactory.getLogger(ExcludeDatanodeManager.class);</span>
+<span class="source-line-no">041</span><span id="line-41"></span>
+<span class="source-line-no">042</span><span id="line-42">  /**</span>
+<span class="source-line-no">043</span><span id="line-43">   * Configure for the max count the excluded datanodes.</span>
+<span class="source-line-no">044</span><span id="line-44">   */</span>
+<span class="source-line-no">045</span><span id="line-45">  public static final String WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY =</span>
+<span class="source-line-no">046</span><span id="line-46">    "hbase.regionserver.async.wal.max.exclude.datanode.count";</span>
+<span class="source-line-no">047</span><span id="line-47">  public static final int DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT = 3;</span>
+<span class="source-line-no">048</span><span id="line-48"></span>
+<span class="source-line-no">049</span><span id="line-49">  /**</span>
+<span class="source-line-no">050</span><span id="line-50">   * Configure for the TTL time of the datanodes excluded</span>
+<span class="source-line-no">051</span><span id="line-51">   */</span>
+<span class="source-line-no">052</span><span id="line-52">  public static final String WAL_EXCLUDE_DATANODE_TTL_KEY =</span>
+<span class="source-line-no">053</span><span id="line-53">    "hbase.regionserver.async.wal.exclude.datanode.info.ttl.hour";</span>
+<span class="source-line-no">054</span><span id="line-54">  public static final int DEFAULT_WAL_EXCLUDE_DATANODE_TTL = 6; // 6 hours</span>
+<span class="source-line-no">055</span><span id="line-55"></span>
+<span class="source-line-no">056</span><span id="line-56">  private volatile Cache&lt;DatanodeInfo, Pair&lt;String, Long&gt;&gt; excludeDNsCache;</span>
+<span class="source-line-no">057</span><span id="line-57">  private final int maxExcludeDNCount;</span>
+<span class="source-line-no">058</span><span id="line-58">  private final Configuration conf;</span>
+<span class="source-line-no">059</span><span id="line-59">  // This is a map of providerId-&gt;StreamSlowMonitor</span>
+<span class="source-line-no">060</span><span id="line-60">  private final Map&lt;String, StreamSlowMonitor&gt; streamSlowMonitors = new ConcurrentHashMap&lt;&gt;(1);</span>
+<span class="source-line-no">061</span><span id="line-61"></span>
+<span class="source-line-no">062</span><span id="line-62">  public ExcludeDatanodeManager(Configuration conf) {</span>
+<span class="source-line-no">063</span><span id="line-63">    this.conf = conf;</span>
+<span class="source-line-no">064</span><span id="line-64">    this.maxExcludeDNCount = conf.getInt(WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY,</span>
+<span class="source-line-no">065</span><span id="line-65">      DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT);</span>
+<span class="source-line-no">066</span><span id="line-66">    this.excludeDNsCache = CacheBuilder.newBuilder()</span>
+<span class="source-line-no">067</span><span id="line-67">      .expireAfterWrite(</span>
+<span class="source-line-no">068</span><span id="line-68">        this.conf.getLong(WAL_EXCLUDE_DATANODE_TTL_KEY, DEFAULT_WAL_EXCLUDE_DATANODE_TTL),</span>
+<span class="source-line-no">069</span><span id="line-69">        TimeUnit.HOURS)</span>
+<span class="source-line-no">070</span><span id="line-70">      .maximumSize(this.maxExcludeDNCount).build();</span>
+<span class="source-line-no">071</span><span id="line-71">  }</span>
+<span class="source-line-no">072</span><span id="line-72"></span>
+<span class="source-line-no">073</span><span id="line-73">  /**</span>
+<span class="source-line-no">074</span><span id="line-74">   * Try to add a datanode to the regionserver excluding cache</span>
+<span class="source-line-no">075</span><span id="line-75">   * @param datanodeInfo the datanode to be added to the excluded cache</span>
+<span class="source-line-no">076</span><span id="line-76">   * @param cause        the cause that the datanode is hope to be excluded</span>
+<span class="source-line-no">077</span><span id="line-77">   * @return True if the datanode is added to the regionserver excluding cache, false otherwise</span>
+<span class="source-line-no">078</span><span id="line-78">   */</span>
+<span class="source-line-no">079</span><span id="line-79">  public boolean tryAddExcludeDN(DatanodeInfo datanodeInfo, String cause) {</span>
+<span class="source-line-no">080</span><span id="line-80">    boolean alreadyMarkedSlow = getExcludeDNs().containsKey(datanodeInfo);</span>
+<span class="source-line-no">081</span><span id="line-81">    if (!alreadyMarkedSlow) {</span>
+<span class="source-line-no">082</span><span id="line-82">      excludeDNsCache.put(datanodeInfo, new Pair&lt;&gt;(cause, EnvironmentEdgeManager.currentTime()));</span>
+<span class="source-line-no">083</span><span id="line-83">      LOG.info(</span>
+<span class="source-line-no">084</span><span id="line-84">        "Added datanode: {} to exclude cache by [{}] success, current excludeDNsCache size={}",</span>
+<span class="source-line-no">085</span><span id="line-85">        datanodeInfo, cause, excludeDNsCache.size());</span>
+<span class="source-line-no">086</span><span id="line-86">      return true;</span>
+<span class="source-line-no">087</span><span id="line-87">    }</span>
+<span class="source-line-no">088</span><span id="line-88">    LOG.debug(</span>
+<span class="source-line-no">089</span><span id="line-89">      "Try add datanode {} to exclude cache by [{}] failed, " + "current exclude DNs are {}",</span>
+<span class="source-line-no">090</span><span id="line-90">      datanodeInfo, cause, getExcludeDNs().keySet());</span>
+<span class="source-line-no">091</span><span id="line-91">    return false;</span>
+<span class="source-line-no">092</span><span id="line-92">  }</span>
+<span class="source-line-no">093</span><span id="line-93"></span>
+<span class="source-line-no">094</span><span id="line-94">  public StreamSlowMonitor getStreamSlowMonitor(String name) {</span>
+<span class="source-line-no">095</span><span id="line-95">    String key = name == null || name.isEmpty() ? "defaultMonitorName" : name;</span>
+<span class="source-line-no">096</span><span id="line-96">    return streamSlowMonitors.computeIfAbsent(key, k -&gt; new StreamSlowMonitor(conf, key, this));</span>
+<span class="source-line-no">097</span><span id="line-97">  }</span>
+<span class="source-line-no">098</span><span id="line-98"></span>
+<span class="source-line-no">099</span><span id="line-99">  /**</span>
+<span class="source-line-no">100</span><span id="line-100">   * Enumerates the reason of excluding a Datanode from WAL Write due to specific cause. Each enum</span>
+<span class="source-line-no">101</span><span id="line-101">   * constant represents a specific cause leading to exclusion.</span>
+<span class="source-line-no">102</span><span id="line-102">   */</span>
+<span class="source-line-no">103</span><span id="line-103">  public enum ExcludeCause {</span>
+<span class="source-line-no">104</span><span id="line-104">    CONNECT_ERROR("connect error"),</span>
+<span class="source-line-no">105</span><span id="line-105">    SLOW_PACKET_ACK("slow packet ack");</span>
+<span class="source-line-no">106</span><span id="line-106"></span>
+<span class="source-line-no">107</span><span id="line-107">    private final String cause;</span>
+<span class="source-line-no">108</span><span id="line-108"></span>
+<span class="source-line-no">109</span><span id="line-109">    ExcludeCause(String cause) {</span>
+<span class="source-line-no">110</span><span id="line-110">      this.cause = cause;</span>
+<span class="source-line-no">111</span><span id="line-111">    }</span>
+<span class="source-line-no">112</span><span id="line-112"></span>
+<span class="source-line-no">113</span><span id="line-113">    public String getCause() {</span>
+<span class="source-line-no">114</span><span id="line-114">      return cause;</span>
+<span class="source-line-no">115</span><span id="line-115">    }</span>
+<span class="source-line-no">116</span><span id="line-116"></span>
+<span class="source-line-no">117</span><span id="line-117">    @Override</span>
+<span class="source-line-no">118</span><span id="line-118">    public String toString() {</span>
+<span class="source-line-no">119</span><span id="line-119">      return cause;</span>
+<span class="source-line-no">120</span><span id="line-120">    }</span>
+<span class="source-line-no">121</span><span id="line-121">  }</span>
+<span class="source-line-no">122</span><span id="line-122"></span>
+<span class="source-line-no">123</span><span id="line-123">  public Map&lt;DatanodeInfo, Pair&lt;String, Long&gt;&gt; getExcludeDNs() {</span>
+<span class="source-line-no">124</span><span id="line-124">    return excludeDNsCache.asMap();</span>
+<span class="source-line-no">125</span><span id="line-125">  }</span>
+<span class="source-line-no">126</span><span id="line-126"></span>
+<span class="source-line-no">127</span><span id="line-127">  @Override</span>
+<span class="source-line-no">128</span><span id="line-128">  public void onConfigurationChange(Configuration conf) {</span>
+<span class="source-line-no">129</span><span id="line-129">    for (StreamSlowMonitor monitor : streamSlowMonitors.values()) {</span>
+<span class="source-line-no">130</span><span id="line-130">      monitor.onConfigurationChange(conf);</span>
+<span class="source-line-no">131</span><span id="line-131">    }</span>
+<span class="source-line-no">132</span><span id="line-132">    this.excludeDNsCache = CacheBuilder.newBuilder()</span>
+<span class="source-line-no">133</span><span id="line-133">      .expireAfterWrite(</span>
+<span class="source-line-no">134</span><span id="line-134">        this.conf.getLong(WAL_EXCLUDE_DATANODE_TTL_KEY, DEFAULT_WAL_EXCLUDE_DATANODE_TTL),</span>
+<span class="source-line-no">135</span><span id="line-135">        TimeUnit.HOURS)</span>
+<span class="source-line-no">136</span><span id="line-136">      .maximumSize(this.conf.getInt(WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT_KEY,</span>
+<span class="source-line-no">137</span><span id="line-137">        DEFAULT_WAL_MAX_EXCLUDE_SLOW_DATANODE_COUNT))</span>
+<span class="source-line-no">138</span><span id="line-138">      .build();</span>
+<span class="source-line-no">139</span><span id="line-139">  }</span>
+<span class="source-line-no">140</span><span id="line-140">}</span>
 
 
 
