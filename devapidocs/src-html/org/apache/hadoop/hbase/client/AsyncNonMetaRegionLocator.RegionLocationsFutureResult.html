@@ -38,676 +38,677 @@
 <span class="source-line-no">025</span><span id="line-25">import static org.apache.hadoop.hbase.TableName.META_TABLE_NAME;</span>
 <span class="source-line-no">026</span><span id="line-26">import static org.apache.hadoop.hbase.client.AsyncRegionLocatorHelper.createRegionLocations;</span>
 <span class="source-line-no">027</span><span id="line-27">import static org.apache.hadoop.hbase.client.AsyncRegionLocatorHelper.isGood;</span>
-<span class="source-line-no">028</span><span id="line-28">import static org.apache.hadoop.hbase.client.ConnectionUtils.createClosestRowAfter;</span>
-<span class="source-line-no">029</span><span id="line-29">import static org.apache.hadoop.hbase.client.ConnectionUtils.isEmptyStopRow;</span>
-<span class="source-line-no">030</span><span id="line-30">import static org.apache.hadoop.hbase.client.RegionInfo.createRegionName;</span>
-<span class="source-line-no">031</span><span id="line-31">import static org.apache.hadoop.hbase.client.RegionLocator.LOCATOR_META_REPLICAS_MODE;</span>
-<span class="source-line-no">032</span><span id="line-32">import static org.apache.hadoop.hbase.util.ConcurrentMapUtils.computeIfAbsent;</span>
-<span class="source-line-no">033</span><span id="line-33"></span>
-<span class="source-line-no">034</span><span id="line-34">import java.io.IOException;</span>
-<span class="source-line-no">035</span><span id="line-35">import java.util.ArrayList;</span>
-<span class="source-line-no">036</span><span id="line-36">import java.util.Arrays;</span>
-<span class="source-line-no">037</span><span id="line-37">import java.util.HashSet;</span>
-<span class="source-line-no">038</span><span id="line-38">import java.util.Iterator;</span>
-<span class="source-line-no">039</span><span id="line-39">import java.util.LinkedHashMap;</span>
-<span class="source-line-no">040</span><span id="line-40">import java.util.List;</span>
-<span class="source-line-no">041</span><span id="line-41">import java.util.Map;</span>
-<span class="source-line-no">042</span><span id="line-42">import java.util.Optional;</span>
-<span class="source-line-no">043</span><span id="line-43">import java.util.Set;</span>
-<span class="source-line-no">044</span><span id="line-44">import java.util.concurrent.CompletableFuture;</span>
-<span class="source-line-no">045</span><span id="line-45">import java.util.concurrent.ConcurrentHashMap;</span>
-<span class="source-line-no">046</span><span id="line-46">import java.util.concurrent.ConcurrentMap;</span>
-<span class="source-line-no">047</span><span id="line-47">import java.util.concurrent.TimeUnit;</span>
-<span class="source-line-no">048</span><span id="line-48">import org.apache.commons.lang3.ObjectUtils;</span>
-<span class="source-line-no">049</span><span id="line-49">import org.apache.hadoop.hbase.CatalogFamilyFormat;</span>
-<span class="source-line-no">050</span><span id="line-50">import org.apache.hadoop.hbase.CatalogReplicaMode;</span>
-<span class="source-line-no">051</span><span id="line-51">import org.apache.hadoop.hbase.HBaseIOException;</span>
-<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.HConstants;</span>
-<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.HRegionLocation;</span>
-<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.RegionLocations;</span>
-<span class="source-line-no">055</span><span id="line-55">import org.apache.hadoop.hbase.ServerName;</span>
-<span class="source-line-no">056</span><span id="line-56">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">057</span><span id="line-57">import org.apache.hadoop.hbase.TableNotFoundException;</span>
-<span class="source-line-no">058</span><span id="line-58">import org.apache.hadoop.hbase.client.Scan.ReadType;</span>
-<span class="source-line-no">059</span><span id="line-59">import org.apache.hadoop.hbase.util.Bytes;</span>
-<span class="source-line-no">060</span><span id="line-60">import org.apache.hadoop.hbase.util.FutureUtils;</span>
-<span class="source-line-no">061</span><span id="line-61">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">062</span><span id="line-62">import org.slf4j.Logger;</span>
-<span class="source-line-no">063</span><span id="line-63">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">064</span><span id="line-64"></span>
-<span class="source-line-no">065</span><span id="line-65">import org.apache.hbase.thirdparty.io.netty.util.HashedWheelTimer;</span>
-<span class="source-line-no">066</span><span id="line-66">import org.apache.hbase.thirdparty.io.netty.util.Timeout;</span>
-<span class="source-line-no">067</span><span id="line-67">import org.apache.hbase.thirdparty.io.netty.util.TimerTask;</span>
-<span class="source-line-no">068</span><span id="line-68"></span>
-<span class="source-line-no">069</span><span id="line-69">/**</span>
-<span class="source-line-no">070</span><span id="line-70"> * The asynchronous locator for regions other than meta.</span>
-<span class="source-line-no">071</span><span id="line-71"> */</span>
-<span class="source-line-no">072</span><span id="line-72">@InterfaceAudience.Private</span>
-<span class="source-line-no">073</span><span id="line-73">class AsyncNonMetaRegionLocator {</span>
-<span class="source-line-no">074</span><span id="line-74"></span>
-<span class="source-line-no">075</span><span id="line-75">  private static final Logger LOG = LoggerFactory.getLogger(AsyncNonMetaRegionLocator.class);</span>
-<span class="source-line-no">076</span><span id="line-76"></span>
-<span class="source-line-no">077</span><span id="line-77">  static final String MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE =</span>
-<span class="source-line-no">078</span><span id="line-78">    "hbase.client.meta.max.concurrent.locate.per.table";</span>
-<span class="source-line-no">079</span><span id="line-79"></span>
-<span class="source-line-no">080</span><span id="line-80">  private static final int DEFAULT_MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE = 8;</span>
-<span class="source-line-no">081</span><span id="line-81"></span>
-<span class="source-line-no">082</span><span id="line-82">  static String LOCATE_PREFETCH_LIMIT = "hbase.client.locate.prefetch.limit";</span>
-<span class="source-line-no">083</span><span id="line-83"></span>
-<span class="source-line-no">084</span><span id="line-84">  private static final int DEFAULT_LOCATE_PREFETCH_LIMIT = 10;</span>
-<span class="source-line-no">085</span><span id="line-85"></span>
-<span class="source-line-no">086</span><span id="line-86">  private final AsyncConnectionImpl conn;</span>
-<span class="source-line-no">087</span><span id="line-87"></span>
-<span class="source-line-no">088</span><span id="line-88">  private final int maxConcurrentLocateRequestPerTable;</span>
-<span class="source-line-no">089</span><span id="line-89"></span>
-<span class="source-line-no">090</span><span id="line-90">  private final int locatePrefetchLimit;</span>
-<span class="source-line-no">091</span><span id="line-91"></span>
-<span class="source-line-no">092</span><span id="line-92">  // The mode tells if HedgedRead, LoadBalance mode is supported.</span>
-<span class="source-line-no">093</span><span id="line-93">  // The default mode is CatalogReplicaMode.None.</span>
-<span class="source-line-no">094</span><span id="line-94">  private CatalogReplicaMode metaReplicaMode;</span>
-<span class="source-line-no">095</span><span id="line-95">  private CatalogReplicaLoadBalanceSelector metaReplicaSelector;</span>
-<span class="source-line-no">096</span><span id="line-96"></span>
-<span class="source-line-no">097</span><span id="line-97">  private final ConcurrentMap&lt;TableName, TableCache&gt; cache = new ConcurrentHashMap&lt;&gt;();</span>
-<span class="source-line-no">098</span><span id="line-98"></span>
-<span class="source-line-no">099</span><span id="line-99">  private final HashedWheelTimer retryTimer;</span>
-<span class="source-line-no">100</span><span id="line-100"></span>
-<span class="source-line-no">101</span><span id="line-101">  private static final class LocateRequest {</span>
-<span class="source-line-no">102</span><span id="line-102"></span>
-<span class="source-line-no">103</span><span id="line-103">    private final byte[] row;</span>
-<span class="source-line-no">104</span><span id="line-104"></span>
-<span class="source-line-no">105</span><span id="line-105">    private final RegionLocateType locateType;</span>
-<span class="source-line-no">106</span><span id="line-106"></span>
-<span class="source-line-no">107</span><span id="line-107">    public LocateRequest(byte[] row, RegionLocateType locateType) {</span>
-<span class="source-line-no">108</span><span id="line-108">      this.row = row;</span>
-<span class="source-line-no">109</span><span id="line-109">      this.locateType = locateType;</span>
-<span class="source-line-no">110</span><span id="line-110">    }</span>
-<span class="source-line-no">111</span><span id="line-111"></span>
-<span class="source-line-no">112</span><span id="line-112">    @Override</span>
-<span class="source-line-no">113</span><span id="line-113">    public int hashCode() {</span>
-<span class="source-line-no">114</span><span id="line-114">      return Bytes.hashCode(row) ^ locateType.hashCode();</span>
-<span class="source-line-no">115</span><span id="line-115">    }</span>
-<span class="source-line-no">116</span><span id="line-116"></span>
-<span class="source-line-no">117</span><span id="line-117">    @Override</span>
-<span class="source-line-no">118</span><span id="line-118">    public boolean equals(Object obj) {</span>
-<span class="source-line-no">119</span><span id="line-119">      if (obj == null || obj.getClass() != LocateRequest.class) {</span>
-<span class="source-line-no">120</span><span id="line-120">        return false;</span>
-<span class="source-line-no">121</span><span id="line-121">      }</span>
-<span class="source-line-no">122</span><span id="line-122">      LocateRequest that = (LocateRequest) obj;</span>
-<span class="source-line-no">123</span><span id="line-123">      return locateType.equals(that.locateType) &amp;&amp; Bytes.equals(row, that.row);</span>
-<span class="source-line-no">124</span><span id="line-124">    }</span>
-<span class="source-line-no">125</span><span id="line-125">  }</span>
-<span class="source-line-no">126</span><span id="line-126"></span>
-<span class="source-line-no">127</span><span id="line-127">  private static final class RegionLocationsFutureResult {</span>
-<span class="source-line-no">128</span><span id="line-128">    private final CompletableFuture&lt;RegionLocations&gt; future;</span>
-<span class="source-line-no">129</span><span id="line-129">    private final RegionLocations result;</span>
-<span class="source-line-no">130</span><span id="line-130">    private final Throwable e;</span>
-<span class="source-line-no">131</span><span id="line-131"></span>
-<span class="source-line-no">132</span><span id="line-132">    public RegionLocationsFutureResult(CompletableFuture&lt;RegionLocations&gt; future,</span>
-<span class="source-line-no">133</span><span id="line-133">      RegionLocations result, Throwable e) {</span>
-<span class="source-line-no">134</span><span id="line-134">      this.future = future;</span>
-<span class="source-line-no">135</span><span id="line-135">      this.result = result;</span>
-<span class="source-line-no">136</span><span id="line-136">      this.e = e;</span>
-<span class="source-line-no">137</span><span id="line-137">    }</span>
-<span class="source-line-no">138</span><span id="line-138"></span>
-<span class="source-line-no">139</span><span id="line-139">    public void complete() {</span>
-<span class="source-line-no">140</span><span id="line-140">      if (e != null) {</span>
-<span class="source-line-no">141</span><span id="line-141">        future.completeExceptionally(e);</span>
-<span class="source-line-no">142</span><span id="line-142">      }</span>
-<span class="source-line-no">143</span><span id="line-143">      future.complete(result);</span>
-<span class="source-line-no">144</span><span id="line-144">    }</span>
-<span class="source-line-no">145</span><span id="line-145">  }</span>
-<span class="source-line-no">146</span><span id="line-146"></span>
-<span class="source-line-no">147</span><span id="line-147">  private static final class TableCache {</span>
-<span class="source-line-no">148</span><span id="line-148"></span>
-<span class="source-line-no">149</span><span id="line-149">    private final Set&lt;LocateRequest&gt; pendingRequests = new HashSet&lt;&gt;();</span>
-<span class="source-line-no">150</span><span id="line-150"></span>
-<span class="source-line-no">151</span><span id="line-151">    private final Map&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt; allRequests =</span>
-<span class="source-line-no">152</span><span id="line-152">      new LinkedHashMap&lt;&gt;();</span>
-<span class="source-line-no">153</span><span id="line-153">    private final AsyncRegionLocationCache regionLocationCache;</span>
-<span class="source-line-no">154</span><span id="line-154"></span>
-<span class="source-line-no">155</span><span id="line-155">    public TableCache(TableName tableName) {</span>
-<span class="source-line-no">156</span><span id="line-156">      regionLocationCache = new AsyncRegionLocationCache(tableName);</span>
-<span class="source-line-no">157</span><span id="line-157">    }</span>
-<span class="source-line-no">158</span><span id="line-158"></span>
-<span class="source-line-no">159</span><span id="line-159">    public boolean hasQuota(int max) {</span>
-<span class="source-line-no">160</span><span id="line-160">      return pendingRequests.size() &lt; max;</span>
-<span class="source-line-no">161</span><span id="line-161">    }</span>
-<span class="source-line-no">162</span><span id="line-162"></span>
-<span class="source-line-no">163</span><span id="line-163">    public boolean isPending(LocateRequest req) {</span>
-<span class="source-line-no">164</span><span id="line-164">      return pendingRequests.contains(req);</span>
-<span class="source-line-no">165</span><span id="line-165">    }</span>
-<span class="source-line-no">166</span><span id="line-166"></span>
-<span class="source-line-no">167</span><span id="line-167">    public void send(LocateRequest req) {</span>
-<span class="source-line-no">168</span><span id="line-168">      pendingRequests.add(req);</span>
-<span class="source-line-no">169</span><span id="line-169">    }</span>
-<span class="source-line-no">170</span><span id="line-170"></span>
-<span class="source-line-no">171</span><span id="line-171">    public Optional&lt;LocateRequest&gt; getCandidate() {</span>
-<span class="source-line-no">172</span><span id="line-172">      return allRequests.keySet().stream().filter(r -&gt; !isPending(r)).findFirst();</span>
-<span class="source-line-no">173</span><span id="line-173">    }</span>
-<span class="source-line-no">174</span><span id="line-174"></span>
-<span class="source-line-no">175</span><span id="line-175">    public List&lt;RegionLocationsFutureResult&gt; clearCompletedRequests(RegionLocations locations) {</span>
-<span class="source-line-no">176</span><span id="line-176">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">177</span><span id="line-177">      for (Iterator&lt;Map.Entry&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt;&gt; iter =</span>
-<span class="source-line-no">178</span><span id="line-178">        allRequests.entrySet().iterator(); iter.hasNext();) {</span>
-<span class="source-line-no">179</span><span id="line-179">        Map.Entry&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt; entry = iter.next();</span>
-<span class="source-line-no">180</span><span id="line-180">        if (tryComplete(entry.getKey(), entry.getValue(), locations, futureResultList)) {</span>
-<span class="source-line-no">181</span><span id="line-181">          iter.remove();</span>
-<span class="source-line-no">182</span><span id="line-182">        }</span>
-<span class="source-line-no">183</span><span id="line-183">      }</span>
-<span class="source-line-no">184</span><span id="line-184">      return futureResultList;</span>
-<span class="source-line-no">185</span><span id="line-185">    }</span>
-<span class="source-line-no">186</span><span id="line-186"></span>
-<span class="source-line-no">187</span><span id="line-187">    private boolean tryComplete(LocateRequest req, CompletableFuture&lt;RegionLocations&gt; future,</span>
-<span class="source-line-no">188</span><span id="line-188">      RegionLocations locations, List&lt;RegionLocationsFutureResult&gt; futureResultList) {</span>
-<span class="source-line-no">189</span><span id="line-189">      if (future.isDone()) {</span>
-<span class="source-line-no">190</span><span id="line-190">        return true;</span>
-<span class="source-line-no">191</span><span id="line-191">      }</span>
-<span class="source-line-no">192</span><span id="line-192">      if (locations == null) {</span>
-<span class="source-line-no">193</span><span id="line-193">        return false;</span>
-<span class="source-line-no">194</span><span id="line-194">      }</span>
-<span class="source-line-no">195</span><span id="line-195">      HRegionLocation loc = ObjectUtils.firstNonNull(locations.getRegionLocations());</span>
-<span class="source-line-no">196</span><span id="line-196">      // we should at least have one location available, otherwise the request should fail and</span>
-<span class="source-line-no">197</span><span id="line-197">      // should not arrive here</span>
-<span class="source-line-no">198</span><span id="line-198">      assert loc != null;</span>
-<span class="source-line-no">199</span><span id="line-199">      boolean completed;</span>
-<span class="source-line-no">200</span><span id="line-200">      if (req.locateType.equals(RegionLocateType.BEFORE)) {</span>
-<span class="source-line-no">201</span><span id="line-201">        // for locating the row before current row, the common case is to find the previous region</span>
-<span class="source-line-no">202</span><span id="line-202">        // in reverse scan, so we check the endKey first. In general, the condition should be</span>
-<span class="source-line-no">203</span><span id="line-203">        // startKey &lt; req.row and endKey &gt;= req.row. Here we split it to endKey == req.row ||</span>
-<span class="source-line-no">204</span><span id="line-204">        // (endKey &gt; req.row &amp;&amp; startKey &lt; req.row). The two conditions are equal since startKey &lt;</span>
-<span class="source-line-no">205</span><span id="line-205">        // endKey.</span>
-<span class="source-line-no">206</span><span id="line-206">        byte[] endKey = loc.getRegion().getEndKey();</span>
-<span class="source-line-no">207</span><span id="line-207">        int c = Bytes.compareTo(endKey, req.row);</span>
-<span class="source-line-no">208</span><span id="line-208">        completed = c == 0 || ((c &gt; 0 || Bytes.equals(EMPTY_END_ROW, endKey))</span>
-<span class="source-line-no">209</span><span id="line-209">          &amp;&amp; Bytes.compareTo(loc.getRegion().getStartKey(), req.row) &lt; 0);</span>
-<span class="source-line-no">210</span><span id="line-210">      } else {</span>
-<span class="source-line-no">211</span><span id="line-211">        completed = loc.getRegion().containsRow(req.row);</span>
-<span class="source-line-no">212</span><span id="line-212">      }</span>
-<span class="source-line-no">213</span><span id="line-213">      if (completed) {</span>
-<span class="source-line-no">214</span><span id="line-214">        futureResultList.add(new RegionLocationsFutureResult(future, locations, null));</span>
-<span class="source-line-no">215</span><span id="line-215">        return true;</span>
-<span class="source-line-no">216</span><span id="line-216">      } else {</span>
-<span class="source-line-no">217</span><span id="line-217">        return false;</span>
-<span class="source-line-no">218</span><span id="line-218">      }</span>
-<span class="source-line-no">219</span><span id="line-219">    }</span>
-<span class="source-line-no">220</span><span id="line-220">  }</span>
-<span class="source-line-no">221</span><span id="line-221"></span>
-<span class="source-line-no">222</span><span id="line-222">  AsyncNonMetaRegionLocator(AsyncConnectionImpl conn, HashedWheelTimer retryTimer) {</span>
-<span class="source-line-no">223</span><span id="line-223">    this.conn = conn;</span>
-<span class="source-line-no">224</span><span id="line-224">    this.maxConcurrentLocateRequestPerTable = conn.getConfiguration().getInt(</span>
-<span class="source-line-no">225</span><span id="line-225">      MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE, DEFAULT_MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE);</span>
-<span class="source-line-no">226</span><span id="line-226">    this.locatePrefetchLimit =</span>
-<span class="source-line-no">227</span><span id="line-227">      conn.getConfiguration().getInt(LOCATE_PREFETCH_LIMIT, DEFAULT_LOCATE_PREFETCH_LIMIT);</span>
-<span class="source-line-no">228</span><span id="line-228"></span>
-<span class="source-line-no">229</span><span id="line-229">    // Get the region locator's meta replica mode.</span>
-<span class="source-line-no">230</span><span id="line-230">    this.metaReplicaMode = CatalogReplicaMode.fromString(</span>
-<span class="source-line-no">231</span><span id="line-231">      conn.getConfiguration().get(LOCATOR_META_REPLICAS_MODE, CatalogReplicaMode.NONE.toString()));</span>
-<span class="source-line-no">232</span><span id="line-232"></span>
-<span class="source-line-no">233</span><span id="line-233">    switch (this.metaReplicaMode) {</span>
-<span class="source-line-no">234</span><span id="line-234">      case LOAD_BALANCE:</span>
-<span class="source-line-no">235</span><span id="line-235">        String replicaSelectorClass =</span>
-<span class="source-line-no">236</span><span id="line-236">          conn.getConfiguration().get(RegionLocator.LOCATOR_META_REPLICAS_MODE_LOADBALANCE_SELECTOR,</span>
-<span class="source-line-no">237</span><span id="line-237">            CatalogReplicaLoadBalanceSimpleSelector.class.getName());</span>
-<span class="source-line-no">238</span><span id="line-238"></span>
-<span class="source-line-no">239</span><span id="line-239">        this.metaReplicaSelector = CatalogReplicaLoadBalanceSelectorFactory</span>
-<span class="source-line-no">240</span><span id="line-240">          .createSelector(replicaSelectorClass, META_TABLE_NAME, conn, () -&gt; {</span>
-<span class="source-line-no">241</span><span id="line-241">            int numOfReplicas = CatalogReplicaLoadBalanceSelector.UNINITIALIZED_NUM_OF_REPLICAS;</span>
-<span class="source-line-no">242</span><span id="line-242">            try {</span>
-<span class="source-line-no">243</span><span id="line-243">              RegionLocations metaLocations = conn.registry.getMetaRegionLocations()</span>
-<span class="source-line-no">244</span><span id="line-244">                .get(conn.connConf.getMetaReadRpcTimeoutNs(), TimeUnit.NANOSECONDS);</span>
-<span class="source-line-no">245</span><span id="line-245">              numOfReplicas = metaLocations.size();</span>
-<span class="source-line-no">246</span><span id="line-246">            } catch (Exception e) {</span>
-<span class="source-line-no">247</span><span id="line-247">              LOG.error("Failed to get table {}'s region replication, ", META_TABLE_NAME, e);</span>
-<span class="source-line-no">248</span><span id="line-248">            }</span>
-<span class="source-line-no">249</span><span id="line-249">            return numOfReplicas;</span>
-<span class="source-line-no">250</span><span id="line-250">          });</span>
-<span class="source-line-no">251</span><span id="line-251">        break;</span>
-<span class="source-line-no">252</span><span id="line-252">      case NONE:</span>
-<span class="source-line-no">253</span><span id="line-253">        // If user does not configure LOCATOR_META_REPLICAS_MODE, let's check the legacy config.</span>
-<span class="source-line-no">254</span><span id="line-254">        boolean useMetaReplicas =</span>
-<span class="source-line-no">255</span><span id="line-255">          conn.getConfiguration().getBoolean(USE_META_REPLICAS, DEFAULT_USE_META_REPLICAS);</span>
-<span class="source-line-no">256</span><span id="line-256">        if (useMetaReplicas) {</span>
-<span class="source-line-no">257</span><span id="line-257">          this.metaReplicaMode = CatalogReplicaMode.HEDGED_READ;</span>
-<span class="source-line-no">258</span><span id="line-258">        }</span>
-<span class="source-line-no">259</span><span id="line-259">        break;</span>
-<span class="source-line-no">260</span><span id="line-260">      default:</span>
-<span class="source-line-no">261</span><span id="line-261">        // Doing nothing</span>
-<span class="source-line-no">262</span><span id="line-262">    }</span>
-<span class="source-line-no">263</span><span id="line-263"></span>
-<span class="source-line-no">264</span><span id="line-264">    // The interval of invalidate meta cache task,</span>
-<span class="source-line-no">265</span><span id="line-265">    // if disable/delete table using same connection or usually create a new connection, no need to</span>
-<span class="source-line-no">266</span><span id="line-266">    // set it.</span>
-<span class="source-line-no">267</span><span id="line-267">    // Suggest set it to 24h or a higher value, because disable/delete table usually not very</span>
-<span class="source-line-no">268</span><span id="line-268">    // frequently.</span>
-<span class="source-line-no">269</span><span id="line-269">    this.retryTimer = retryTimer;</span>
-<span class="source-line-no">270</span><span id="line-270">    long metaCacheInvalidateInterval = conn.getConfiguration()</span>
-<span class="source-line-no">271</span><span id="line-271">      .getLong("hbase.client.connection.metacache.invalidate-interval.ms", 0L);</span>
-<span class="source-line-no">272</span><span id="line-272">    if (metaCacheInvalidateInterval &gt; 0) {</span>
-<span class="source-line-no">273</span><span id="line-273">      TimerTask invalidateMetaCacheTask = getInvalidateMetaCacheTask(metaCacheInvalidateInterval);</span>
-<span class="source-line-no">274</span><span id="line-274">      this.retryTimer.newTimeout(invalidateMetaCacheTask, metaCacheInvalidateInterval,</span>
-<span class="source-line-no">275</span><span id="line-275">        TimeUnit.MILLISECONDS);</span>
-<span class="source-line-no">276</span><span id="line-276">    }</span>
-<span class="source-line-no">277</span><span id="line-277">  }</span>
-<span class="source-line-no">278</span><span id="line-278"></span>
-<span class="source-line-no">279</span><span id="line-279">  private TableCache getTableCache(TableName tableName) {</span>
-<span class="source-line-no">280</span><span id="line-280">    return computeIfAbsent(cache, tableName, () -&gt; new TableCache(tableName));</span>
-<span class="source-line-no">281</span><span id="line-281">  }</span>
-<span class="source-line-no">282</span><span id="line-282"></span>
-<span class="source-line-no">283</span><span id="line-283">  private void complete(TableName tableName, LocateRequest req, RegionLocations locs,</span>
-<span class="source-line-no">284</span><span id="line-284">    Throwable error) {</span>
-<span class="source-line-no">285</span><span id="line-285">    if (error != null) {</span>
-<span class="source-line-no">286</span><span id="line-286">      LOG.warn("Failed to locate region in '" + tableName + "', row='"</span>
-<span class="source-line-no">287</span><span id="line-287">        + Bytes.toStringBinary(req.row) + "', locateType=" + req.locateType, error);</span>
-<span class="source-line-no">288</span><span id="line-288">    }</span>
-<span class="source-line-no">289</span><span id="line-289">    Optional&lt;LocateRequest&gt; toSend = Optional.empty();</span>
-<span class="source-line-no">290</span><span id="line-290">    TableCache tableCache = getTableCache(tableName);</span>
-<span class="source-line-no">291</span><span id="line-291">    if (locs != null) {</span>
-<span class="source-line-no">292</span><span id="line-292">      RegionLocations addedLocs = tableCache.regionLocationCache.add(locs);</span>
-<span class="source-line-no">293</span><span id="line-293">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">294</span><span id="line-294">      synchronized (tableCache) {</span>
-<span class="source-line-no">295</span><span id="line-295">        tableCache.pendingRequests.remove(req);</span>
-<span class="source-line-no">296</span><span id="line-296">        futureResultList.addAll(tableCache.clearCompletedRequests(addedLocs));</span>
-<span class="source-line-no">297</span><span id="line-297">        // Remove a complete locate request in a synchronized block, so the table cache must have</span>
-<span class="source-line-no">298</span><span id="line-298">        // quota to send a candidate request.</span>
-<span class="source-line-no">299</span><span id="line-299">        toSend = tableCache.getCandidate();</span>
-<span class="source-line-no">300</span><span id="line-300">        toSend.ifPresent(r -&gt; tableCache.send(r));</span>
-<span class="source-line-no">301</span><span id="line-301">      }</span>
-<span class="source-line-no">302</span><span id="line-302">      futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
-<span class="source-line-no">303</span><span id="line-303">      toSend.ifPresent(r -&gt; locateInMeta(tableName, r));</span>
-<span class="source-line-no">304</span><span id="line-304">    } else {</span>
-<span class="source-line-no">305</span><span id="line-305">      // we meet an error</span>
-<span class="source-line-no">306</span><span id="line-306">      assert error != null;</span>
-<span class="source-line-no">307</span><span id="line-307">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">308</span><span id="line-308">      synchronized (tableCache) {</span>
-<span class="source-line-no">309</span><span id="line-309">        tableCache.pendingRequests.remove(req);</span>
-<span class="source-line-no">310</span><span id="line-310">        // fail the request itself, no matter whether it is a DoNotRetryIOException, as we have</span>
-<span class="source-line-no">311</span><span id="line-311">        // already retried several times</span>
-<span class="source-line-no">312</span><span id="line-312">        CompletableFuture&lt;RegionLocations&gt; future = tableCache.allRequests.remove(req);</span>
-<span class="source-line-no">313</span><span id="line-313">        if (future != null) {</span>
-<span class="source-line-no">314</span><span id="line-314">          futureResultList.add(new RegionLocationsFutureResult(future, null, error));</span>
-<span class="source-line-no">315</span><span id="line-315">        }</span>
-<span class="source-line-no">316</span><span id="line-316">        futureResultList.addAll(tableCache.clearCompletedRequests(null));</span>
-<span class="source-line-no">317</span><span id="line-317">        // Remove a complete locate request in a synchronized block, so the table cache must have</span>
-<span class="source-line-no">318</span><span id="line-318">        // quota to send a candidate request.</span>
-<span class="source-line-no">319</span><span id="line-319">        toSend = tableCache.getCandidate();</span>
-<span class="source-line-no">320</span><span id="line-320">        toSend.ifPresent(r -&gt; tableCache.send(r));</span>
-<span class="source-line-no">321</span><span id="line-321">      }</span>
-<span class="source-line-no">322</span><span id="line-322">      futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
-<span class="source-line-no">323</span><span id="line-323">      toSend.ifPresent(r -&gt; locateInMeta(tableName, r));</span>
-<span class="source-line-no">324</span><span id="line-324">    }</span>
-<span class="source-line-no">325</span><span id="line-325">  }</span>
-<span class="source-line-no">326</span><span id="line-326"></span>
-<span class="source-line-no">327</span><span id="line-327">  // return whether we should stop the scan</span>
-<span class="source-line-no">328</span><span id="line-328">  private boolean onScanNext(TableName tableName, LocateRequest req, Result result) {</span>
-<span class="source-line-no">329</span><span id="line-329">    RegionLocations locs = CatalogFamilyFormat.getRegionLocations(result);</span>
-<span class="source-line-no">330</span><span id="line-330">    if (LOG.isDebugEnabled()) {</span>
-<span class="source-line-no">331</span><span id="line-331">      LOG.debug("The fetched location of '{}', row='{}', locateType={} is {}", tableName,</span>
-<span class="source-line-no">332</span><span id="line-332">        Bytes.toStringBinary(req.row), req.locateType, locs);</span>
-<span class="source-line-no">333</span><span id="line-333">    }</span>
-<span class="source-line-no">334</span><span id="line-334">    // remove HRegionLocation with null location, i.e, getServerName returns null.</span>
-<span class="source-line-no">335</span><span id="line-335">    if (locs != null) {</span>
-<span class="source-line-no">336</span><span id="line-336">      locs = locs.removeElementsWithNullLocation();</span>
-<span class="source-line-no">337</span><span id="line-337">    }</span>
-<span class="source-line-no">338</span><span id="line-338"></span>
-<span class="source-line-no">339</span><span id="line-339">    // the default region location should always be presented when fetching from meta, otherwise</span>
-<span class="source-line-no">340</span><span id="line-340">    // let's fail the request.</span>
-<span class="source-line-no">341</span><span id="line-341">    if (locs == null || locs.getDefaultRegionLocation() == null) {</span>
-<span class="source-line-no">342</span><span id="line-342">      complete(tableName, req, null,</span>
-<span class="source-line-no">343</span><span id="line-343">        new HBaseIOException(String.format("No location found for '%s', row='%s', locateType=%s",</span>
-<span class="source-line-no">344</span><span id="line-344">          tableName, Bytes.toStringBinary(req.row), req.locateType)));</span>
-<span class="source-line-no">345</span><span id="line-345">      return true;</span>
-<span class="source-line-no">346</span><span id="line-346">    }</span>
-<span class="source-line-no">347</span><span id="line-347">    HRegionLocation loc = locs.getDefaultRegionLocation();</span>
-<span class="source-line-no">348</span><span id="line-348">    RegionInfo info = loc.getRegion();</span>
-<span class="source-line-no">349</span><span id="line-349">    if (info == null) {</span>
-<span class="source-line-no">350</span><span id="line-350">      complete(tableName, req, null,</span>
-<span class="source-line-no">351</span><span id="line-351">        new HBaseIOException(String.format("HRegionInfo is null for '%s', row='%s', locateType=%s",</span>
-<span class="source-line-no">352</span><span id="line-352">          tableName, Bytes.toStringBinary(req.row), req.locateType)));</span>
-<span class="source-line-no">353</span><span id="line-353">      return true;</span>
-<span class="source-line-no">354</span><span id="line-354">    }</span>
-<span class="source-line-no">355</span><span id="line-355">    if (info.isSplitParent()) {</span>
-<span class="source-line-no">356</span><span id="line-356">      return false;</span>
-<span class="source-line-no">357</span><span id="line-357">    }</span>
-<span class="source-line-no">358</span><span id="line-358">    complete(tableName, req, locs, null);</span>
-<span class="source-line-no">359</span><span id="line-359">    return true;</span>
-<span class="source-line-no">360</span><span id="line-360">  }</span>
-<span class="source-line-no">361</span><span id="line-361"></span>
-<span class="source-line-no">362</span><span id="line-362">  private void recordCacheHit() {</span>
-<span class="source-line-no">363</span><span id="line-363">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheHit);</span>
-<span class="source-line-no">364</span><span id="line-364">  }</span>
-<span class="source-line-no">365</span><span id="line-365"></span>
-<span class="source-line-no">366</span><span id="line-366">  private void recordCacheMiss() {</span>
-<span class="source-line-no">367</span><span id="line-367">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheMiss);</span>
-<span class="source-line-no">368</span><span id="line-368">  }</span>
-<span class="source-line-no">369</span><span id="line-369"></span>
-<span class="source-line-no">370</span><span id="line-370">  private RegionLocations locateRowInCache(TableCache tableCache, byte[] row, int replicaId) {</span>
-<span class="source-line-no">371</span><span id="line-371">    RegionLocations locs = tableCache.regionLocationCache.findForRow(row, replicaId);</span>
-<span class="source-line-no">372</span><span id="line-372">    if (locs == null) {</span>
-<span class="source-line-no">373</span><span id="line-373">      recordCacheMiss();</span>
-<span class="source-line-no">374</span><span id="line-374">    } else {</span>
-<span class="source-line-no">375</span><span id="line-375">      recordCacheHit();</span>
-<span class="source-line-no">376</span><span id="line-376">    }</span>
-<span class="source-line-no">377</span><span id="line-377">    return locs;</span>
-<span class="source-line-no">378</span><span id="line-378">  }</span>
-<span class="source-line-no">379</span><span id="line-379"></span>
-<span class="source-line-no">380</span><span id="line-380">  private RegionLocations locateRowBeforeInCache(TableCache tableCache, byte[] row, int replicaId) {</span>
-<span class="source-line-no">381</span><span id="line-381">    RegionLocations locs = tableCache.regionLocationCache.findForBeforeRow(row, replicaId);</span>
-<span class="source-line-no">382</span><span id="line-382">    if (locs == null) {</span>
-<span class="source-line-no">383</span><span id="line-383">      recordCacheMiss();</span>
-<span class="source-line-no">384</span><span id="line-384">    } else {</span>
-<span class="source-line-no">385</span><span id="line-385">      recordCacheHit();</span>
-<span class="source-line-no">386</span><span id="line-386">    }</span>
-<span class="source-line-no">387</span><span id="line-387">    return locs;</span>
-<span class="source-line-no">388</span><span id="line-388">  }</span>
-<span class="source-line-no">389</span><span id="line-389"></span>
-<span class="source-line-no">390</span><span id="line-390">  private void locateInMeta(TableName tableName, LocateRequest req) {</span>
-<span class="source-line-no">391</span><span id="line-391">    if (LOG.isTraceEnabled()) {</span>
-<span class="source-line-no">392</span><span id="line-392">      LOG.trace("Try locate '" + tableName + "', row='" + Bytes.toStringBinary(req.row)</span>
-<span class="source-line-no">393</span><span id="line-393">        + "', locateType=" + req.locateType + " in meta");</span>
-<span class="source-line-no">394</span><span id="line-394">    }</span>
-<span class="source-line-no">395</span><span id="line-395">    byte[] metaStartKey;</span>
-<span class="source-line-no">396</span><span id="line-396">    if (req.locateType.equals(RegionLocateType.BEFORE)) {</span>
-<span class="source-line-no">397</span><span id="line-397">      if (isEmptyStopRow(req.row)) {</span>
-<span class="source-line-no">398</span><span id="line-398">        byte[] binaryTableName = tableName.getName();</span>
-<span class="source-line-no">399</span><span id="line-399">        metaStartKey = Arrays.copyOf(binaryTableName, binaryTableName.length + 1);</span>
-<span class="source-line-no">400</span><span id="line-400">      } else {</span>
-<span class="source-line-no">401</span><span id="line-401">        metaStartKey = createRegionName(tableName, req.row, ZEROES, false);</span>
-<span class="source-line-no">402</span><span id="line-402">      }</span>
-<span class="source-line-no">403</span><span id="line-403">    } else {</span>
-<span class="source-line-no">404</span><span id="line-404">      metaStartKey = createRegionName(tableName, req.row, NINES, false);</span>
-<span class="source-line-no">405</span><span id="line-405">    }</span>
-<span class="source-line-no">406</span><span id="line-406">    byte[] metaStopKey =</span>
-<span class="source-line-no">407</span><span id="line-407">      RegionInfo.createRegionName(tableName, HConstants.EMPTY_START_ROW, "", false);</span>
-<span class="source-line-no">408</span><span id="line-408">    Scan scan = new Scan().withStartRow(metaStartKey).withStopRow(metaStopKey, true)</span>
-<span class="source-line-no">409</span><span id="line-409">      .addFamily(HConstants.CATALOG_FAMILY).setReversed(true).setCaching(locatePrefetchLimit)</span>
-<span class="source-line-no">410</span><span id="line-410">      .setReadType(ReadType.PREAD);</span>
-<span class="source-line-no">411</span><span id="line-411"></span>
-<span class="source-line-no">412</span><span id="line-412">    switch (this.metaReplicaMode) {</span>
-<span class="source-line-no">413</span><span id="line-413">      case LOAD_BALANCE:</span>
-<span class="source-line-no">414</span><span id="line-414">        int metaReplicaId = this.metaReplicaSelector.select(tableName, req.row, req.locateType);</span>
-<span class="source-line-no">415</span><span id="line-415">        if (metaReplicaId != RegionInfo.DEFAULT_REPLICA_ID) {</span>
-<span class="source-line-no">416</span><span id="line-416">          // If the selector gives a non-primary meta replica region, then go with it.</span>
-<span class="source-line-no">417</span><span id="line-417">          // Otherwise, just go to primary in non-hedgedRead mode.</span>
-<span class="source-line-no">418</span><span id="line-418">          scan.setConsistency(Consistency.TIMELINE);</span>
-<span class="source-line-no">419</span><span id="line-419">          scan.setReplicaId(metaReplicaId);</span>
-<span class="source-line-no">420</span><span id="line-420">        }</span>
-<span class="source-line-no">421</span><span id="line-421">        break;</span>
-<span class="source-line-no">422</span><span id="line-422">      case HEDGED_READ:</span>
-<span class="source-line-no">423</span><span id="line-423">        scan.setConsistency(Consistency.TIMELINE);</span>
-<span class="source-line-no">424</span><span id="line-424">        break;</span>
-<span class="source-line-no">425</span><span id="line-425">      default:</span>
-<span class="source-line-no">426</span><span id="line-426">        // do nothing</span>
-<span class="source-line-no">427</span><span id="line-427">    }</span>
-<span class="source-line-no">428</span><span id="line-428"></span>
-<span class="source-line-no">429</span><span id="line-429">    conn.getTable(META_TABLE_NAME).scan(scan, new AdvancedScanResultConsumer() {</span>
-<span class="source-line-no">430</span><span id="line-430"></span>
-<span class="source-line-no">431</span><span id="line-431">      private boolean completeNormally = false;</span>
-<span class="source-line-no">432</span><span id="line-432"></span>
-<span class="source-line-no">433</span><span id="line-433">      private boolean tableNotFound = true;</span>
-<span class="source-line-no">434</span><span id="line-434"></span>
-<span class="source-line-no">435</span><span id="line-435">      @Override</span>
-<span class="source-line-no">436</span><span id="line-436">      public void onError(Throwable error) {</span>
-<span class="source-line-no">437</span><span id="line-437">        complete(tableName, req, null, error);</span>
-<span class="source-line-no">438</span><span id="line-438">      }</span>
-<span class="source-line-no">439</span><span id="line-439"></span>
-<span class="source-line-no">440</span><span id="line-440">      @Override</span>
-<span class="source-line-no">441</span><span id="line-441">      public void onComplete() {</span>
-<span class="source-line-no">442</span><span id="line-442">        if (tableNotFound) {</span>
-<span class="source-line-no">443</span><span id="line-443">          complete(tableName, req, null, new TableNotFoundException(tableName));</span>
-<span class="source-line-no">444</span><span id="line-444">        } else if (!completeNormally) {</span>
-<span class="source-line-no">445</span><span id="line-445">          complete(tableName, req, null, new IOException(</span>
-<span class="source-line-no">446</span><span id="line-446">            "Unable to find region for '" + Bytes.toStringBinary(req.row) + "' in " + tableName));</span>
-<span class="source-line-no">447</span><span id="line-447">        }</span>
-<span class="source-line-no">448</span><span id="line-448">      }</span>
-<span class="source-line-no">449</span><span id="line-449"></span>
-<span class="source-line-no">450</span><span id="line-450">      @Override</span>
-<span class="source-line-no">451</span><span id="line-451">      public void onNext(Result[] results, ScanController controller) {</span>
-<span class="source-line-no">452</span><span id="line-452">        if (results.length == 0) {</span>
-<span class="source-line-no">453</span><span id="line-453">          return;</span>
-<span class="source-line-no">454</span><span id="line-454">        }</span>
-<span class="source-line-no">455</span><span id="line-455">        tableNotFound = false;</span>
-<span class="source-line-no">456</span><span id="line-456">        int i = 0;</span>
-<span class="source-line-no">457</span><span id="line-457">        for (; i &lt; results.length; i++) {</span>
-<span class="source-line-no">458</span><span id="line-458">          if (onScanNext(tableName, req, results[i])) {</span>
-<span class="source-line-no">459</span><span id="line-459">            completeNormally = true;</span>
-<span class="source-line-no">460</span><span id="line-460">            controller.terminate();</span>
-<span class="source-line-no">461</span><span id="line-461">            i++;</span>
-<span class="source-line-no">462</span><span id="line-462">            break;</span>
-<span class="source-line-no">463</span><span id="line-463">          }</span>
-<span class="source-line-no">464</span><span id="line-464">        }</span>
-<span class="source-line-no">465</span><span id="line-465">        // Add the remaining results into cache</span>
-<span class="source-line-no">466</span><span id="line-466">        if (i &lt; results.length) {</span>
-<span class="source-line-no">467</span><span id="line-467">          TableCache tableCache = getTableCache(tableName);</span>
-<span class="source-line-no">468</span><span id="line-468">          for (; i &lt; results.length; i++) {</span>
-<span class="source-line-no">469</span><span id="line-469">            RegionLocations locs = CatalogFamilyFormat.getRegionLocations(results[i]);</span>
-<span class="source-line-no">470</span><span id="line-470">            if (locs == null) {</span>
-<span class="source-line-no">471</span><span id="line-471">              continue;</span>
-<span class="source-line-no">472</span><span id="line-472">            }</span>
-<span class="source-line-no">473</span><span id="line-473">            HRegionLocation loc = locs.getDefaultRegionLocation();</span>
-<span class="source-line-no">474</span><span id="line-474">            if (loc == null) {</span>
-<span class="source-line-no">475</span><span id="line-475">              continue;</span>
-<span class="source-line-no">476</span><span id="line-476">            }</span>
-<span class="source-line-no">477</span><span id="line-477">            RegionInfo info = loc.getRegion();</span>
-<span class="source-line-no">478</span><span id="line-478">            if (info == null || info.isOffline() || info.isSplitParent()) {</span>
-<span class="source-line-no">479</span><span id="line-479">              continue;</span>
-<span class="source-line-no">480</span><span id="line-480">            }</span>
-<span class="source-line-no">481</span><span id="line-481">            RegionLocations addedLocs = tableCache.regionLocationCache.add(locs);</span>
-<span class="source-line-no">482</span><span id="line-482">            List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">483</span><span id="line-483">            synchronized (tableCache) {</span>
-<span class="source-line-no">484</span><span id="line-484">              futureResultList.addAll(tableCache.clearCompletedRequests(addedLocs));</span>
-<span class="source-line-no">485</span><span id="line-485">            }</span>
-<span class="source-line-no">486</span><span id="line-486">            futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
-<span class="source-line-no">487</span><span id="line-487">          }</span>
-<span class="source-line-no">488</span><span id="line-488">        }</span>
-<span class="source-line-no">489</span><span id="line-489">      }</span>
-<span class="source-line-no">490</span><span id="line-490">    });</span>
-<span class="source-line-no">491</span><span id="line-491">  }</span>
-<span class="source-line-no">492</span><span id="line-492"></span>
-<span class="source-line-no">493</span><span id="line-493">  private RegionLocations locateInCache(TableCache tableCache, byte[] row, int replicaId,</span>
-<span class="source-line-no">494</span><span id="line-494">    RegionLocateType locateType) {</span>
-<span class="source-line-no">495</span><span id="line-495">    return locateType.equals(RegionLocateType.BEFORE)</span>
-<span class="source-line-no">496</span><span id="line-496">      ? locateRowBeforeInCache(tableCache, row, replicaId)</span>
-<span class="source-line-no">497</span><span id="line-497">      : locateRowInCache(tableCache, row, replicaId);</span>
-<span class="source-line-no">498</span><span id="line-498">  }</span>
-<span class="source-line-no">499</span><span id="line-499"></span>
-<span class="source-line-no">500</span><span id="line-500">  // locateToPrevious is true means we will use the start key of a region to locate the region</span>
-<span class="source-line-no">501</span><span id="line-501">  // placed before it. Used for reverse scan. See the comment of</span>
-<span class="source-line-no">502</span><span id="line-502">  // AsyncRegionLocator.getPreviousRegionLocation.</span>
-<span class="source-line-no">503</span><span id="line-503">  private CompletableFuture&lt;RegionLocations&gt; getRegionLocationsInternal(TableName tableName,</span>
-<span class="source-line-no">504</span><span id="line-504">    byte[] row, int replicaId, RegionLocateType locateType, boolean reload) {</span>
-<span class="source-line-no">505</span><span id="line-505">    // AFTER should be convert to CURRENT before calling this method</span>
-<span class="source-line-no">506</span><span id="line-506">    assert !locateType.equals(RegionLocateType.AFTER);</span>
-<span class="source-line-no">507</span><span id="line-507">    TableCache tableCache = getTableCache(tableName);</span>
-<span class="source-line-no">508</span><span id="line-508">    if (!reload) {</span>
-<span class="source-line-no">509</span><span id="line-509">      RegionLocations locs = locateInCache(tableCache, row, replicaId, locateType);</span>
-<span class="source-line-no">510</span><span id="line-510">      if (isGood(locs, replicaId)) {</span>
-<span class="source-line-no">511</span><span id="line-511">        return CompletableFuture.completedFuture(locs);</span>
-<span class="source-line-no">512</span><span id="line-512">      }</span>
-<span class="source-line-no">513</span><span id="line-513">    }</span>
-<span class="source-line-no">514</span><span id="line-514">    CompletableFuture&lt;RegionLocations&gt; future;</span>
-<span class="source-line-no">515</span><span id="line-515">    LocateRequest req;</span>
-<span class="source-line-no">516</span><span id="line-516">    boolean sendRequest = false;</span>
-<span class="source-line-no">517</span><span id="line-517">    synchronized (tableCache) {</span>
-<span class="source-line-no">518</span><span id="line-518">      // check again</span>
-<span class="source-line-no">519</span><span id="line-519">      if (!reload) {</span>
-<span class="source-line-no">520</span><span id="line-520">        RegionLocations locs = locateInCache(tableCache, row, replicaId, locateType);</span>
-<span class="source-line-no">521</span><span id="line-521">        if (isGood(locs, replicaId)) {</span>
-<span class="source-line-no">522</span><span id="line-522">          return CompletableFuture.completedFuture(locs);</span>
-<span class="source-line-no">523</span><span id="line-523">        }</span>
-<span class="source-line-no">524</span><span id="line-524">      }</span>
-<span class="source-line-no">525</span><span id="line-525">      req = new LocateRequest(row, locateType);</span>
-<span class="source-line-no">526</span><span id="line-526">      future = tableCache.allRequests.get(req);</span>
-<span class="source-line-no">527</span><span id="line-527">      if (future == null) {</span>
-<span class="source-line-no">528</span><span id="line-528">        future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">529</span><span id="line-529">        tableCache.allRequests.put(req, future);</span>
-<span class="source-line-no">530</span><span id="line-530">        if (tableCache.hasQuota(maxConcurrentLocateRequestPerTable) &amp;&amp; !tableCache.isPending(req)) {</span>
-<span class="source-line-no">531</span><span id="line-531">          tableCache.send(req);</span>
-<span class="source-line-no">532</span><span id="line-532">          sendRequest = true;</span>
-<span class="source-line-no">533</span><span id="line-533">        }</span>
-<span class="source-line-no">534</span><span id="line-534">      }</span>
-<span class="source-line-no">535</span><span id="line-535">    }</span>
-<span class="source-line-no">536</span><span id="line-536">    if (sendRequest) {</span>
-<span class="source-line-no">537</span><span id="line-537">      locateInMeta(tableName, req);</span>
-<span class="source-line-no">538</span><span id="line-538">    }</span>
-<span class="source-line-no">539</span><span id="line-539">    return future;</span>
-<span class="source-line-no">540</span><span id="line-540">  }</span>
-<span class="source-line-no">541</span><span id="line-541"></span>
-<span class="source-line-no">542</span><span id="line-542">  CompletableFuture&lt;RegionLocations&gt; getRegionLocations(TableName tableName, byte[] row,</span>
-<span class="source-line-no">543</span><span id="line-543">    int replicaId, RegionLocateType locateType, boolean reload) {</span>
-<span class="source-line-no">544</span><span id="line-544">    // as we know the exact row after us, so we can just create the new row, and use the same</span>
-<span class="source-line-no">545</span><span id="line-545">    // algorithm to locate it.</span>
-<span class="source-line-no">546</span><span id="line-546">    if (locateType.equals(RegionLocateType.AFTER)) {</span>
-<span class="source-line-no">547</span><span id="line-547">      row = createClosestRowAfter(row);</span>
-<span class="source-line-no">548</span><span id="line-548">      locateType = RegionLocateType.CURRENT;</span>
-<span class="source-line-no">549</span><span id="line-549">    }</span>
-<span class="source-line-no">550</span><span id="line-550">    return getRegionLocationsInternal(tableName, row, replicaId, locateType, reload);</span>
-<span class="source-line-no">551</span><span id="line-551">  }</span>
-<span class="source-line-no">552</span><span id="line-552"></span>
-<span class="source-line-no">553</span><span id="line-553">  private void recordClearRegionCache() {</span>
-<span class="source-line-no">554</span><span id="line-554">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheNumClearRegion);</span>
-<span class="source-line-no">555</span><span id="line-555">  }</span>
-<span class="source-line-no">556</span><span id="line-556"></span>
-<span class="source-line-no">557</span><span id="line-557">  private void removeLocationFromCache(HRegionLocation loc) {</span>
-<span class="source-line-no">558</span><span id="line-558">    TableCache tableCache = cache.get(loc.getRegion().getTable());</span>
-<span class="source-line-no">559</span><span id="line-559">    if (tableCache != null) {</span>
-<span class="source-line-no">560</span><span id="line-560">      if (tableCache.regionLocationCache.remove(loc)) {</span>
-<span class="source-line-no">561</span><span id="line-561">        recordClearRegionCache();</span>
-<span class="source-line-no">562</span><span id="line-562">        updateMetaReplicaSelector(loc);</span>
-<span class="source-line-no">563</span><span id="line-563">      }</span>
-<span class="source-line-no">564</span><span id="line-564">    }</span>
-<span class="source-line-no">565</span><span id="line-565">  }</span>
-<span class="source-line-no">566</span><span id="line-566"></span>
-<span class="source-line-no">567</span><span id="line-567">  private void updateMetaReplicaSelector(HRegionLocation loc) {</span>
-<span class="source-line-no">568</span><span id="line-568">    // Tell metaReplicaSelector that the location is stale. It will create a stale entry</span>
-<span class="source-line-no">569</span><span id="line-569">    // with timestamp internally. Next time the client looks up the same location,</span>
-<span class="source-line-no">570</span><span id="line-570">    // it will pick a different meta replica region.</span>
-<span class="source-line-no">571</span><span id="line-571">    if (metaReplicaMode == CatalogReplicaMode.LOAD_BALANCE) {</span>
-<span class="source-line-no">572</span><span id="line-572">      metaReplicaSelector.onError(loc);</span>
-<span class="source-line-no">573</span><span id="line-573">    }</span>
-<span class="source-line-no">574</span><span id="line-574">  }</span>
-<span class="source-line-no">575</span><span id="line-575"></span>
-<span class="source-line-no">576</span><span id="line-576">  void addLocationToCache(HRegionLocation loc) {</span>
-<span class="source-line-no">577</span><span id="line-577">    getTableCache(loc.getRegion().getTable()).regionLocationCache.add(createRegionLocations(loc));</span>
-<span class="source-line-no">578</span><span id="line-578">  }</span>
-<span class="source-line-no">579</span><span id="line-579"></span>
-<span class="source-line-no">580</span><span id="line-580">  private HRegionLocation getCachedLocation(HRegionLocation loc) {</span>
-<span class="source-line-no">581</span><span id="line-581">    TableCache tableCache = cache.get(loc.getRegion().getTable());</span>
-<span class="source-line-no">582</span><span id="line-582">    if (tableCache == null) {</span>
-<span class="source-line-no">583</span><span id="line-583">      return null;</span>
-<span class="source-line-no">584</span><span id="line-584">    }</span>
-<span class="source-line-no">585</span><span id="line-585">    RegionLocations locs = tableCache.regionLocationCache.get(loc.getRegion().getStartKey());</span>
-<span class="source-line-no">586</span><span id="line-586">    return locs != null ? locs.getRegionLocation(loc.getRegion().getReplicaId()) : null;</span>
-<span class="source-line-no">587</span><span id="line-587">  }</span>
-<span class="source-line-no">588</span><span id="line-588"></span>
-<span class="source-line-no">589</span><span id="line-589">  void updateCachedLocationOnError(HRegionLocation loc, Throwable exception) {</span>
-<span class="source-line-no">590</span><span id="line-590">    Optional&lt;MetricsConnection&gt; connectionMetrics = conn.getConnectionMetrics();</span>
-<span class="source-line-no">591</span><span id="line-591">    AsyncRegionLocatorHelper.updateCachedLocationOnError(loc, exception, this::getCachedLocation,</span>
-<span class="source-line-no">592</span><span id="line-592">      this::addLocationToCache, this::removeLocationFromCache, connectionMetrics.orElse(null));</span>
-<span class="source-line-no">593</span><span id="line-593">  }</span>
-<span class="source-line-no">594</span><span id="line-594"></span>
-<span class="source-line-no">595</span><span id="line-595">  void clearCache(TableName tableName) {</span>
-<span class="source-line-no">596</span><span id="line-596">    TableCache tableCache = cache.remove(tableName);</span>
-<span class="source-line-no">597</span><span id="line-597">    if (tableCache == null) {</span>
-<span class="source-line-no">598</span><span id="line-598">      return;</span>
-<span class="source-line-no">599</span><span id="line-599">    }</span>
-<span class="source-line-no">600</span><span id="line-600">    List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">601</span><span id="line-601">    synchronized (tableCache) {</span>
-<span class="source-line-no">602</span><span id="line-602">      if (!tableCache.allRequests.isEmpty()) {</span>
-<span class="source-line-no">603</span><span id="line-603">        IOException error = new IOException("Cache cleared");</span>
-<span class="source-line-no">604</span><span id="line-604">        tableCache.allRequests.values().forEach(f -&gt; {</span>
-<span class="source-line-no">605</span><span id="line-605">          futureResultList.add(new RegionLocationsFutureResult(f, null, error));</span>
-<span class="source-line-no">606</span><span id="line-606">        });</span>
-<span class="source-line-no">607</span><span id="line-607">      }</span>
-<span class="source-line-no">608</span><span id="line-608">    }</span>
-<span class="source-line-no">609</span><span id="line-609">    futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
-<span class="source-line-no">610</span><span id="line-610">    conn.getConnectionMetrics().ifPresent(</span>
-<span class="source-line-no">611</span><span id="line-611">      metrics -&gt; metrics.incrMetaCacheNumClearRegion(tableCache.regionLocationCache.size()));</span>
-<span class="source-line-no">612</span><span id="line-612">  }</span>
-<span class="source-line-no">613</span><span id="line-613"></span>
-<span class="source-line-no">614</span><span id="line-614">  void clearCache() {</span>
-<span class="source-line-no">615</span><span id="line-615">    cache.clear();</span>
-<span class="source-line-no">616</span><span id="line-616">  }</span>
-<span class="source-line-no">617</span><span id="line-617"></span>
-<span class="source-line-no">618</span><span id="line-618">  void clearCache(ServerName serverName) {</span>
-<span class="source-line-no">619</span><span id="line-619">    for (TableCache tableCache : cache.values()) {</span>
-<span class="source-line-no">620</span><span id="line-620">      tableCache.regionLocationCache.removeForServer(serverName);</span>
-<span class="source-line-no">621</span><span id="line-621">    }</span>
-<span class="source-line-no">622</span><span id="line-622">  }</span>
-<span class="source-line-no">623</span><span id="line-623"></span>
-<span class="source-line-no">624</span><span id="line-624">  // only used for testing whether we have cached the location for a region.</span>
-<span class="source-line-no">625</span><span id="line-625">  RegionLocations getRegionLocationInCache(TableName tableName, byte[] row) {</span>
-<span class="source-line-no">626</span><span id="line-626">    TableCache tableCache = cache.get(tableName);</span>
-<span class="source-line-no">627</span><span id="line-627">    if (tableCache == null) {</span>
-<span class="source-line-no">628</span><span id="line-628">      return null;</span>
-<span class="source-line-no">629</span><span id="line-629">    }</span>
-<span class="source-line-no">630</span><span id="line-630">    return locateRowInCache(tableCache, row, RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
-<span class="source-line-no">631</span><span id="line-631">  }</span>
-<span class="source-line-no">632</span><span id="line-632"></span>
-<span class="source-line-no">633</span><span id="line-633">  // only used for testing whether we have cached the location for a table.</span>
-<span class="source-line-no">634</span><span id="line-634">  int getNumberOfCachedRegionLocations(TableName tableName) {</span>
-<span class="source-line-no">635</span><span id="line-635">    TableCache tableCache = cache.get(tableName);</span>
-<span class="source-line-no">636</span><span id="line-636">    if (tableCache == null) {</span>
-<span class="source-line-no">637</span><span id="line-637">      return 0;</span>
-<span class="source-line-no">638</span><span id="line-638">    }</span>
-<span class="source-line-no">639</span><span id="line-639">    return tableCache.regionLocationCache.getAll().stream()</span>
-<span class="source-line-no">640</span><span id="line-640">      .mapToInt(RegionLocations::numNonNullElements).sum();</span>
-<span class="source-line-no">641</span><span id="line-641">  }</span>
-<span class="source-line-no">642</span><span id="line-642"></span>
-<span class="source-line-no">643</span><span id="line-643">  private TimerTask getInvalidateMetaCacheTask(long metaCacheInvalidateInterval) {</span>
-<span class="source-line-no">644</span><span id="line-644">    return new TimerTask() {</span>
-<span class="source-line-no">645</span><span id="line-645">      @Override</span>
-<span class="source-line-no">646</span><span id="line-646">      public void run(Timeout timeout) throws Exception {</span>
-<span class="source-line-no">647</span><span id="line-647">        FutureUtils.addListener(invalidateTableCache(), (res, err) -&gt; {</span>
-<span class="source-line-no">648</span><span id="line-648">          if (err != null) {</span>
-<span class="source-line-no">649</span><span id="line-649">            LOG.warn("InvalidateTableCache failed.", err);</span>
-<span class="source-line-no">650</span><span id="line-650">          }</span>
-<span class="source-line-no">651</span><span id="line-651">          AsyncConnectionImpl.RETRY_TIMER.newTimeout(this, metaCacheInvalidateInterval,</span>
-<span class="source-line-no">652</span><span id="line-652">            TimeUnit.MILLISECONDS);</span>
-<span class="source-line-no">653</span><span id="line-653">        });</span>
-<span class="source-line-no">654</span><span id="line-654">      }</span>
-<span class="source-line-no">655</span><span id="line-655">    };</span>
-<span class="source-line-no">656</span><span id="line-656">  }</span>
-<span class="source-line-no">657</span><span id="line-657"></span>
-<span class="source-line-no">658</span><span id="line-658">  private CompletableFuture&lt;Void&gt; invalidateTableCache() {</span>
-<span class="source-line-no">659</span><span id="line-659">    CompletableFuture&lt;Void&gt; future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">660</span><span id="line-660">    Iterator&lt;TableName&gt; tbnIter = cache.keySet().iterator();</span>
-<span class="source-line-no">661</span><span id="line-661">    AsyncAdmin admin = conn.getAdmin();</span>
-<span class="source-line-no">662</span><span id="line-662">    invalidateCache(future, tbnIter, admin);</span>
-<span class="source-line-no">663</span><span id="line-663">    return future;</span>
-<span class="source-line-no">664</span><span id="line-664">  }</span>
-<span class="source-line-no">665</span><span id="line-665"></span>
-<span class="source-line-no">666</span><span id="line-666">  private void invalidateCache(CompletableFuture&lt;Void&gt; future, Iterator&lt;TableName&gt; tbnIter,</span>
-<span class="source-line-no">667</span><span id="line-667">    AsyncAdmin admin) {</span>
-<span class="source-line-no">668</span><span id="line-668">    if (tbnIter.hasNext()) {</span>
-<span class="source-line-no">669</span><span id="line-669">      TableName tableName = tbnIter.next();</span>
-<span class="source-line-no">670</span><span id="line-670">      FutureUtils.addListener(admin.isTableDisabled(tableName), (tableDisabled, err) -&gt; {</span>
-<span class="source-line-no">671</span><span id="line-671">        boolean shouldInvalidateCache = false;</span>
-<span class="source-line-no">672</span><span id="line-672">        if (err != null) {</span>
-<span class="source-line-no">673</span><span id="line-673">          if (err instanceof TableNotFoundException) {</span>
-<span class="source-line-no">674</span><span id="line-674">            LOG.info("Table {} was not exist, will invalidate its cache.", tableName);</span>
-<span class="source-line-no">675</span><span id="line-675">            shouldInvalidateCache = true;</span>
-<span class="source-line-no">676</span><span id="line-676">          } else {</span>
-<span class="source-line-no">677</span><span id="line-677">            // If other exception occurred, just skip to invalidate it cache.</span>
-<span class="source-line-no">678</span><span id="line-678">            LOG.warn("Get table state of {} failed, skip to invalidate its cache.", tableName, err);</span>
-<span class="source-line-no">679</span><span id="line-679">            return;</span>
-<span class="source-line-no">680</span><span id="line-680">          }</span>
-<span class="source-line-no">681</span><span id="line-681">        } else if (tableDisabled) {</span>
-<span class="source-line-no">682</span><span id="line-682">          LOG.info("Table {} was disabled, will invalidate its cache.", tableName);</span>
-<span class="source-line-no">683</span><span id="line-683">          shouldInvalidateCache = true;</span>
-<span class="source-line-no">684</span><span id="line-684">        }</span>
-<span class="source-line-no">685</span><span id="line-685">        if (shouldInvalidateCache) {</span>
-<span class="source-line-no">686</span><span id="line-686">          clearCache(tableName);</span>
-<span class="source-line-no">687</span><span id="line-687">          LOG.info("Invalidate cache for {} succeed.", tableName);</span>
-<span class="source-line-no">688</span><span id="line-688">        } else {</span>
-<span class="source-line-no">689</span><span id="line-689">          LOG.debug("Table {} is normal, no need to invalidate its cache.", tableName);</span>
-<span class="source-line-no">690</span><span id="line-690">        }</span>
-<span class="source-line-no">691</span><span id="line-691">        invalidateCache(future, tbnIter, admin);</span>
-<span class="source-line-no">692</span><span id="line-692">      });</span>
-<span class="source-line-no">693</span><span id="line-693">    } else {</span>
-<span class="source-line-no">694</span><span id="line-694">      future.complete(null);</span>
-<span class="source-line-no">695</span><span id="line-695">    }</span>
-<span class="source-line-no">696</span><span id="line-696">  }</span>
-<span class="source-line-no">697</span><span id="line-697">}</span>
+<span class="source-line-no">028</span><span id="line-28">import static org.apache.hadoop.hbase.client.ConnectionConfiguration.HBASE_CLIENT_META_CACHE_INVALIDATE_INTERVAL;</span>
+<span class="source-line-no">029</span><span id="line-29">import static org.apache.hadoop.hbase.client.ConnectionUtils.createClosestRowAfter;</span>
+<span class="source-line-no">030</span><span id="line-30">import static org.apache.hadoop.hbase.client.ConnectionUtils.isEmptyStopRow;</span>
+<span class="source-line-no">031</span><span id="line-31">import static org.apache.hadoop.hbase.client.RegionInfo.createRegionName;</span>
+<span class="source-line-no">032</span><span id="line-32">import static org.apache.hadoop.hbase.client.RegionLocator.LOCATOR_META_REPLICAS_MODE;</span>
+<span class="source-line-no">033</span><span id="line-33">import static org.apache.hadoop.hbase.util.ConcurrentMapUtils.computeIfAbsent;</span>
+<span class="source-line-no">034</span><span id="line-34"></span>
+<span class="source-line-no">035</span><span id="line-35">import java.io.IOException;</span>
+<span class="source-line-no">036</span><span id="line-36">import java.util.ArrayList;</span>
+<span class="source-line-no">037</span><span id="line-37">import java.util.Arrays;</span>
+<span class="source-line-no">038</span><span id="line-38">import java.util.HashSet;</span>
+<span class="source-line-no">039</span><span id="line-39">import java.util.Iterator;</span>
+<span class="source-line-no">040</span><span id="line-40">import java.util.LinkedHashMap;</span>
+<span class="source-line-no">041</span><span id="line-41">import java.util.List;</span>
+<span class="source-line-no">042</span><span id="line-42">import java.util.Map;</span>
+<span class="source-line-no">043</span><span id="line-43">import java.util.Optional;</span>
+<span class="source-line-no">044</span><span id="line-44">import java.util.Set;</span>
+<span class="source-line-no">045</span><span id="line-45">import java.util.concurrent.CompletableFuture;</span>
+<span class="source-line-no">046</span><span id="line-46">import java.util.concurrent.ConcurrentHashMap;</span>
+<span class="source-line-no">047</span><span id="line-47">import java.util.concurrent.ConcurrentMap;</span>
+<span class="source-line-no">048</span><span id="line-48">import java.util.concurrent.TimeUnit;</span>
+<span class="source-line-no">049</span><span id="line-49">import org.apache.commons.lang3.ObjectUtils;</span>
+<span class="source-line-no">050</span><span id="line-50">import org.apache.hadoop.hbase.CatalogFamilyFormat;</span>
+<span class="source-line-no">051</span><span id="line-51">import org.apache.hadoop.hbase.CatalogReplicaMode;</span>
+<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.HBaseIOException;</span>
+<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.HConstants;</span>
+<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.HRegionLocation;</span>
+<span class="source-line-no">055</span><span id="line-55">import org.apache.hadoop.hbase.RegionLocations;</span>
+<span class="source-line-no">056</span><span id="line-56">import org.apache.hadoop.hbase.ServerName;</span>
+<span class="source-line-no">057</span><span id="line-57">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">058</span><span id="line-58">import org.apache.hadoop.hbase.TableNotFoundException;</span>
+<span class="source-line-no">059</span><span id="line-59">import org.apache.hadoop.hbase.client.Scan.ReadType;</span>
+<span class="source-line-no">060</span><span id="line-60">import org.apache.hadoop.hbase.util.Bytes;</span>
+<span class="source-line-no">061</span><span id="line-61">import org.apache.hadoop.hbase.util.FutureUtils;</span>
+<span class="source-line-no">062</span><span id="line-62">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">063</span><span id="line-63">import org.slf4j.Logger;</span>
+<span class="source-line-no">064</span><span id="line-64">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">065</span><span id="line-65"></span>
+<span class="source-line-no">066</span><span id="line-66">import org.apache.hbase.thirdparty.io.netty.util.HashedWheelTimer;</span>
+<span class="source-line-no">067</span><span id="line-67">import org.apache.hbase.thirdparty.io.netty.util.Timeout;</span>
+<span class="source-line-no">068</span><span id="line-68">import org.apache.hbase.thirdparty.io.netty.util.TimerTask;</span>
+<span class="source-line-no">069</span><span id="line-69"></span>
+<span class="source-line-no">070</span><span id="line-70">/**</span>
+<span class="source-line-no">071</span><span id="line-71"> * The asynchronous locator for regions other than meta.</span>
+<span class="source-line-no">072</span><span id="line-72"> */</span>
+<span class="source-line-no">073</span><span id="line-73">@InterfaceAudience.Private</span>
+<span class="source-line-no">074</span><span id="line-74">class AsyncNonMetaRegionLocator {</span>
+<span class="source-line-no">075</span><span id="line-75"></span>
+<span class="source-line-no">076</span><span id="line-76">  private static final Logger LOG = LoggerFactory.getLogger(AsyncNonMetaRegionLocator.class);</span>
+<span class="source-line-no">077</span><span id="line-77"></span>
+<span class="source-line-no">078</span><span id="line-78">  static final String MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE =</span>
+<span class="source-line-no">079</span><span id="line-79">    "hbase.client.meta.max.concurrent.locate.per.table";</span>
+<span class="source-line-no">080</span><span id="line-80"></span>
+<span class="source-line-no">081</span><span id="line-81">  private static final int DEFAULT_MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE = 8;</span>
+<span class="source-line-no">082</span><span id="line-82"></span>
+<span class="source-line-no">083</span><span id="line-83">  static String LOCATE_PREFETCH_LIMIT = "hbase.client.locate.prefetch.limit";</span>
+<span class="source-line-no">084</span><span id="line-84"></span>
+<span class="source-line-no">085</span><span id="line-85">  private static final int DEFAULT_LOCATE_PREFETCH_LIMIT = 10;</span>
+<span class="source-line-no">086</span><span id="line-86"></span>
+<span class="source-line-no">087</span><span id="line-87">  private final AsyncConnectionImpl conn;</span>
+<span class="source-line-no">088</span><span id="line-88"></span>
+<span class="source-line-no">089</span><span id="line-89">  private final int maxConcurrentLocateRequestPerTable;</span>
+<span class="source-line-no">090</span><span id="line-90"></span>
+<span class="source-line-no">091</span><span id="line-91">  private final int locatePrefetchLimit;</span>
+<span class="source-line-no">092</span><span id="line-92"></span>
+<span class="source-line-no">093</span><span id="line-93">  // The mode tells if HedgedRead, LoadBalance mode is supported.</span>
+<span class="source-line-no">094</span><span id="line-94">  // The default mode is CatalogReplicaMode.None.</span>
+<span class="source-line-no">095</span><span id="line-95">  private CatalogReplicaMode metaReplicaMode;</span>
+<span class="source-line-no">096</span><span id="line-96">  private CatalogReplicaLoadBalanceSelector metaReplicaSelector;</span>
+<span class="source-line-no">097</span><span id="line-97"></span>
+<span class="source-line-no">098</span><span id="line-98">  private final ConcurrentMap&lt;TableName, TableCache&gt; cache = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="source-line-no">099</span><span id="line-99"></span>
+<span class="source-line-no">100</span><span id="line-100">  private final HashedWheelTimer retryTimer;</span>
+<span class="source-line-no">101</span><span id="line-101"></span>
+<span class="source-line-no">102</span><span id="line-102">  private static final class LocateRequest {</span>
+<span class="source-line-no">103</span><span id="line-103"></span>
+<span class="source-line-no">104</span><span id="line-104">    private final byte[] row;</span>
+<span class="source-line-no">105</span><span id="line-105"></span>
+<span class="source-line-no">106</span><span id="line-106">    private final RegionLocateType locateType;</span>
+<span class="source-line-no">107</span><span id="line-107"></span>
+<span class="source-line-no">108</span><span id="line-108">    public LocateRequest(byte[] row, RegionLocateType locateType) {</span>
+<span class="source-line-no">109</span><span id="line-109">      this.row = row;</span>
+<span class="source-line-no">110</span><span id="line-110">      this.locateType = locateType;</span>
+<span class="source-line-no">111</span><span id="line-111">    }</span>
+<span class="source-line-no">112</span><span id="line-112"></span>
+<span class="source-line-no">113</span><span id="line-113">    @Override</span>
+<span class="source-line-no">114</span><span id="line-114">    public int hashCode() {</span>
+<span class="source-line-no">115</span><span id="line-115">      return Bytes.hashCode(row) ^ locateType.hashCode();</span>
+<span class="source-line-no">116</span><span id="line-116">    }</span>
+<span class="source-line-no">117</span><span id="line-117"></span>
+<span class="source-line-no">118</span><span id="line-118">    @Override</span>
+<span class="source-line-no">119</span><span id="line-119">    public boolean equals(Object obj) {</span>
+<span class="source-line-no">120</span><span id="line-120">      if (obj == null || obj.getClass() != LocateRequest.class) {</span>
+<span class="source-line-no">121</span><span id="line-121">        return false;</span>
+<span class="source-line-no">122</span><span id="line-122">      }</span>
+<span class="source-line-no">123</span><span id="line-123">      LocateRequest that = (LocateRequest) obj;</span>
+<span class="source-line-no">124</span><span id="line-124">      return locateType.equals(that.locateType) &amp;&amp; Bytes.equals(row, that.row);</span>
+<span class="source-line-no">125</span><span id="line-125">    }</span>
+<span class="source-line-no">126</span><span id="line-126">  }</span>
+<span class="source-line-no">127</span><span id="line-127"></span>
+<span class="source-line-no">128</span><span id="line-128">  private static final class RegionLocationsFutureResult {</span>
+<span class="source-line-no">129</span><span id="line-129">    private final CompletableFuture&lt;RegionLocations&gt; future;</span>
+<span class="source-line-no">130</span><span id="line-130">    private final RegionLocations result;</span>
+<span class="source-line-no">131</span><span id="line-131">    private final Throwable e;</span>
+<span class="source-line-no">132</span><span id="line-132"></span>
+<span class="source-line-no">133</span><span id="line-133">    public RegionLocationsFutureResult(CompletableFuture&lt;RegionLocations&gt; future,</span>
+<span class="source-line-no">134</span><span id="line-134">      RegionLocations result, Throwable e) {</span>
+<span class="source-line-no">135</span><span id="line-135">      this.future = future;</span>
+<span class="source-line-no">136</span><span id="line-136">      this.result = result;</span>
+<span class="source-line-no">137</span><span id="line-137">      this.e = e;</span>
+<span class="source-line-no">138</span><span id="line-138">    }</span>
+<span class="source-line-no">139</span><span id="line-139"></span>
+<span class="source-line-no">140</span><span id="line-140">    public void complete() {</span>
+<span class="source-line-no">141</span><span id="line-141">      if (e != null) {</span>
+<span class="source-line-no">142</span><span id="line-142">        future.completeExceptionally(e);</span>
+<span class="source-line-no">143</span><span id="line-143">      }</span>
+<span class="source-line-no">144</span><span id="line-144">      future.complete(result);</span>
+<span class="source-line-no">145</span><span id="line-145">    }</span>
+<span class="source-line-no">146</span><span id="line-146">  }</span>
+<span class="source-line-no">147</span><span id="line-147"></span>
+<span class="source-line-no">148</span><span id="line-148">  private static final class TableCache {</span>
+<span class="source-line-no">149</span><span id="line-149"></span>
+<span class="source-line-no">150</span><span id="line-150">    private final Set&lt;LocateRequest&gt; pendingRequests = new HashSet&lt;&gt;();</span>
+<span class="source-line-no">151</span><span id="line-151"></span>
+<span class="source-line-no">152</span><span id="line-152">    private final Map&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt; allRequests =</span>
+<span class="source-line-no">153</span><span id="line-153">      new LinkedHashMap&lt;&gt;();</span>
+<span class="source-line-no">154</span><span id="line-154">    private final AsyncRegionLocationCache regionLocationCache;</span>
+<span class="source-line-no">155</span><span id="line-155"></span>
+<span class="source-line-no">156</span><span id="line-156">    public TableCache(TableName tableName) {</span>
+<span class="source-line-no">157</span><span id="line-157">      regionLocationCache = new AsyncRegionLocationCache(tableName);</span>
+<span class="source-line-no">158</span><span id="line-158">    }</span>
+<span class="source-line-no">159</span><span id="line-159"></span>
+<span class="source-line-no">160</span><span id="line-160">    public boolean hasQuota(int max) {</span>
+<span class="source-line-no">161</span><span id="line-161">      return pendingRequests.size() &lt; max;</span>
+<span class="source-line-no">162</span><span id="line-162">    }</span>
+<span class="source-line-no">163</span><span id="line-163"></span>
+<span class="source-line-no">164</span><span id="line-164">    public boolean isPending(LocateRequest req) {</span>
+<span class="source-line-no">165</span><span id="line-165">      return pendingRequests.contains(req);</span>
+<span class="source-line-no">166</span><span id="line-166">    }</span>
+<span class="source-line-no">167</span><span id="line-167"></span>
+<span class="source-line-no">168</span><span id="line-168">    public void send(LocateRequest req) {</span>
+<span class="source-line-no">169</span><span id="line-169">      pendingRequests.add(req);</span>
+<span class="source-line-no">170</span><span id="line-170">    }</span>
+<span class="source-line-no">171</span><span id="line-171"></span>
+<span class="source-line-no">172</span><span id="line-172">    public Optional&lt;LocateRequest&gt; getCandidate() {</span>
+<span class="source-line-no">173</span><span id="line-173">      return allRequests.keySet().stream().filter(r -&gt; !isPending(r)).findFirst();</span>
+<span class="source-line-no">174</span><span id="line-174">    }</span>
+<span class="source-line-no">175</span><span id="line-175"></span>
+<span class="source-line-no">176</span><span id="line-176">    public List&lt;RegionLocationsFutureResult&gt; clearCompletedRequests(RegionLocations locations) {</span>
+<span class="source-line-no">177</span><span id="line-177">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">178</span><span id="line-178">      for (Iterator&lt;Map.Entry&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt;&gt; iter =</span>
+<span class="source-line-no">179</span><span id="line-179">        allRequests.entrySet().iterator(); iter.hasNext();) {</span>
+<span class="source-line-no">180</span><span id="line-180">        Map.Entry&lt;LocateRequest, CompletableFuture&lt;RegionLocations&gt;&gt; entry = iter.next();</span>
+<span class="source-line-no">181</span><span id="line-181">        if (tryComplete(entry.getKey(), entry.getValue(), locations, futureResultList)) {</span>
+<span class="source-line-no">182</span><span id="line-182">          iter.remove();</span>
+<span class="source-line-no">183</span><span id="line-183">        }</span>
+<span class="source-line-no">184</span><span id="line-184">      }</span>
+<span class="source-line-no">185</span><span id="line-185">      return futureResultList;</span>
+<span class="source-line-no">186</span><span id="line-186">    }</span>
+<span class="source-line-no">187</span><span id="line-187"></span>
+<span class="source-line-no">188</span><span id="line-188">    private boolean tryComplete(LocateRequest req, CompletableFuture&lt;RegionLocations&gt; future,</span>
+<span class="source-line-no">189</span><span id="line-189">      RegionLocations locations, List&lt;RegionLocationsFutureResult&gt; futureResultList) {</span>
+<span class="source-line-no">190</span><span id="line-190">      if (future.isDone()) {</span>
+<span class="source-line-no">191</span><span id="line-191">        return true;</span>
+<span class="source-line-no">192</span><span id="line-192">      }</span>
+<span class="source-line-no">193</span><span id="line-193">      if (locations == null) {</span>
+<span class="source-line-no">194</span><span id="line-194">        return false;</span>
+<span class="source-line-no">195</span><span id="line-195">      }</span>
+<span class="source-line-no">196</span><span id="line-196">      HRegionLocation loc = ObjectUtils.firstNonNull(locations.getRegionLocations());</span>
+<span class="source-line-no">197</span><span id="line-197">      // we should at least have one location available, otherwise the request should fail and</span>
+<span class="source-line-no">198</span><span id="line-198">      // should not arrive here</span>
+<span class="source-line-no">199</span><span id="line-199">      assert loc != null;</span>
+<span class="source-line-no">200</span><span id="line-200">      boolean completed;</span>
+<span class="source-line-no">201</span><span id="line-201">      if (req.locateType.equals(RegionLocateType.BEFORE)) {</span>
+<span class="source-line-no">202</span><span id="line-202">        // for locating the row before current row, the common case is to find the previous region</span>
+<span class="source-line-no">203</span><span id="line-203">        // in reverse scan, so we check the endKey first. In general, the condition should be</span>
+<span class="source-line-no">204</span><span id="line-204">        // startKey &lt; req.row and endKey &gt;= req.row. Here we split it to endKey == req.row ||</span>
+<span class="source-line-no">205</span><span id="line-205">        // (endKey &gt; req.row &amp;&amp; startKey &lt; req.row). The two conditions are equal since startKey &lt;</span>
+<span class="source-line-no">206</span><span id="line-206">        // endKey.</span>
+<span class="source-line-no">207</span><span id="line-207">        byte[] endKey = loc.getRegion().getEndKey();</span>
+<span class="source-line-no">208</span><span id="line-208">        int c = Bytes.compareTo(endKey, req.row);</span>
+<span class="source-line-no">209</span><span id="line-209">        completed = c == 0 || ((c &gt; 0 || Bytes.equals(EMPTY_END_ROW, endKey))</span>
+<span class="source-line-no">210</span><span id="line-210">          &amp;&amp; Bytes.compareTo(loc.getRegion().getStartKey(), req.row) &lt; 0);</span>
+<span class="source-line-no">211</span><span id="line-211">      } else {</span>
+<span class="source-line-no">212</span><span id="line-212">        completed = loc.getRegion().containsRow(req.row);</span>
+<span class="source-line-no">213</span><span id="line-213">      }</span>
+<span class="source-line-no">214</span><span id="line-214">      if (completed) {</span>
+<span class="source-line-no">215</span><span id="line-215">        futureResultList.add(new RegionLocationsFutureResult(future, locations, null));</span>
+<span class="source-line-no">216</span><span id="line-216">        return true;</span>
+<span class="source-line-no">217</span><span id="line-217">      } else {</span>
+<span class="source-line-no">218</span><span id="line-218">        return false;</span>
+<span class="source-line-no">219</span><span id="line-219">      }</span>
+<span class="source-line-no">220</span><span id="line-220">    }</span>
+<span class="source-line-no">221</span><span id="line-221">  }</span>
+<span class="source-line-no">222</span><span id="line-222"></span>
+<span class="source-line-no">223</span><span id="line-223">  AsyncNonMetaRegionLocator(AsyncConnectionImpl conn, HashedWheelTimer retryTimer) {</span>
+<span class="source-line-no">224</span><span id="line-224">    this.conn = conn;</span>
+<span class="source-line-no">225</span><span id="line-225">    this.maxConcurrentLocateRequestPerTable = conn.getConfiguration().getInt(</span>
+<span class="source-line-no">226</span><span id="line-226">      MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE, DEFAULT_MAX_CONCURRENT_LOCATE_REQUEST_PER_TABLE);</span>
+<span class="source-line-no">227</span><span id="line-227">    this.locatePrefetchLimit =</span>
+<span class="source-line-no">228</span><span id="line-228">      conn.getConfiguration().getInt(LOCATE_PREFETCH_LIMIT, DEFAULT_LOCATE_PREFETCH_LIMIT);</span>
+<span class="source-line-no">229</span><span id="line-229"></span>
+<span class="source-line-no">230</span><span id="line-230">    // Get the region locator's meta replica mode.</span>
+<span class="source-line-no">231</span><span id="line-231">    this.metaReplicaMode = CatalogReplicaMode.fromString(</span>
+<span class="source-line-no">232</span><span id="line-232">      conn.getConfiguration().get(LOCATOR_META_REPLICAS_MODE, CatalogReplicaMode.NONE.toString()));</span>
+<span class="source-line-no">233</span><span id="line-233"></span>
+<span class="source-line-no">234</span><span id="line-234">    switch (this.metaReplicaMode) {</span>
+<span class="source-line-no">235</span><span id="line-235">      case LOAD_BALANCE:</span>
+<span class="source-line-no">236</span><span id="line-236">        String replicaSelectorClass =</span>
+<span class="source-line-no">237</span><span id="line-237">          conn.getConfiguration().get(RegionLocator.LOCATOR_META_REPLICAS_MODE_LOADBALANCE_SELECTOR,</span>
+<span class="source-line-no">238</span><span id="line-238">            CatalogReplicaLoadBalanceSimpleSelector.class.getName());</span>
+<span class="source-line-no">239</span><span id="line-239"></span>
+<span class="source-line-no">240</span><span id="line-240">        this.metaReplicaSelector = CatalogReplicaLoadBalanceSelectorFactory</span>
+<span class="source-line-no">241</span><span id="line-241">          .createSelector(replicaSelectorClass, META_TABLE_NAME, conn, () -&gt; {</span>
+<span class="source-line-no">242</span><span id="line-242">            int numOfReplicas = CatalogReplicaLoadBalanceSelector.UNINITIALIZED_NUM_OF_REPLICAS;</span>
+<span class="source-line-no">243</span><span id="line-243">            try {</span>
+<span class="source-line-no">244</span><span id="line-244">              RegionLocations metaLocations = conn.registry.getMetaRegionLocations()</span>
+<span class="source-line-no">245</span><span id="line-245">                .get(conn.connConf.getMetaReadRpcTimeoutNs(), TimeUnit.NANOSECONDS);</span>
+<span class="source-line-no">246</span><span id="line-246">              numOfReplicas = metaLocations.size();</span>
+<span class="source-line-no">247</span><span id="line-247">            } catch (Exception e) {</span>
+<span class="source-line-no">248</span><span id="line-248">              LOG.error("Failed to get table {}'s region replication, ", META_TABLE_NAME, e);</span>
+<span class="source-line-no">249</span><span id="line-249">            }</span>
+<span class="source-line-no">250</span><span id="line-250">            return numOfReplicas;</span>
+<span class="source-line-no">251</span><span id="line-251">          });</span>
+<span class="source-line-no">252</span><span id="line-252">        break;</span>
+<span class="source-line-no">253</span><span id="line-253">      case NONE:</span>
+<span class="source-line-no">254</span><span id="line-254">        // If user does not configure LOCATOR_META_REPLICAS_MODE, let's check the legacy config.</span>
+<span class="source-line-no">255</span><span id="line-255">        boolean useMetaReplicas =</span>
+<span class="source-line-no">256</span><span id="line-256">          conn.getConfiguration().getBoolean(USE_META_REPLICAS, DEFAULT_USE_META_REPLICAS);</span>
+<span class="source-line-no">257</span><span id="line-257">        if (useMetaReplicas) {</span>
+<span class="source-line-no">258</span><span id="line-258">          this.metaReplicaMode = CatalogReplicaMode.HEDGED_READ;</span>
+<span class="source-line-no">259</span><span id="line-259">        }</span>
+<span class="source-line-no">260</span><span id="line-260">        break;</span>
+<span class="source-line-no">261</span><span id="line-261">      default:</span>
+<span class="source-line-no">262</span><span id="line-262">        // Doing nothing</span>
+<span class="source-line-no">263</span><span id="line-263">    }</span>
+<span class="source-line-no">264</span><span id="line-264"></span>
+<span class="source-line-no">265</span><span id="line-265">    // The interval of invalidate meta cache task,</span>
+<span class="source-line-no">266</span><span id="line-266">    // if disable/delete table using same connection or usually create a new connection, no need to</span>
+<span class="source-line-no">267</span><span id="line-267">    // set it.</span>
+<span class="source-line-no">268</span><span id="line-268">    // Suggest set it to 24h or a higher value, because disable/delete table usually not very</span>
+<span class="source-line-no">269</span><span id="line-269">    // frequently.</span>
+<span class="source-line-no">270</span><span id="line-270">    this.retryTimer = retryTimer;</span>
+<span class="source-line-no">271</span><span id="line-271">    long metaCacheInvalidateInterval =</span>
+<span class="source-line-no">272</span><span id="line-272">      conn.getConfiguration().getLong(HBASE_CLIENT_META_CACHE_INVALIDATE_INTERVAL, 0L);</span>
+<span class="source-line-no">273</span><span id="line-273">    if (metaCacheInvalidateInterval &gt; 0) {</span>
+<span class="source-line-no">274</span><span id="line-274">      TimerTask invalidateMetaCacheTask = getInvalidateMetaCacheTask(metaCacheInvalidateInterval);</span>
+<span class="source-line-no">275</span><span id="line-275">      this.retryTimer.newTimeout(invalidateMetaCacheTask, metaCacheInvalidateInterval,</span>
+<span class="source-line-no">276</span><span id="line-276">        TimeUnit.MILLISECONDS);</span>
+<span class="source-line-no">277</span><span id="line-277">    }</span>
+<span class="source-line-no">278</span><span id="line-278">  }</span>
+<span class="source-line-no">279</span><span id="line-279"></span>
+<span class="source-line-no">280</span><span id="line-280">  private TableCache getTableCache(TableName tableName) {</span>
+<span class="source-line-no">281</span><span id="line-281">    return computeIfAbsent(cache, tableName, () -&gt; new TableCache(tableName));</span>
+<span class="source-line-no">282</span><span id="line-282">  }</span>
+<span class="source-line-no">283</span><span id="line-283"></span>
+<span class="source-line-no">284</span><span id="line-284">  private void complete(TableName tableName, LocateRequest req, RegionLocations locs,</span>
+<span class="source-line-no">285</span><span id="line-285">    Throwable error) {</span>
+<span class="source-line-no">286</span><span id="line-286">    if (error != null) {</span>
+<span class="source-line-no">287</span><span id="line-287">      LOG.warn("Failed to locate region in '" + tableName + "', row='"</span>
+<span class="source-line-no">288</span><span id="line-288">        + Bytes.toStringBinary(req.row) + "', locateType=" + req.locateType, error);</span>
+<span class="source-line-no">289</span><span id="line-289">    }</span>
+<span class="source-line-no">290</span><span id="line-290">    Optional&lt;LocateRequest&gt; toSend = Optional.empty();</span>
+<span class="source-line-no">291</span><span id="line-291">    TableCache tableCache = getTableCache(tableName);</span>
+<span class="source-line-no">292</span><span id="line-292">    if (locs != null) {</span>
+<span class="source-line-no">293</span><span id="line-293">      RegionLocations addedLocs = tableCache.regionLocationCache.add(locs);</span>
+<span class="source-line-no">294</span><span id="line-294">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">295</span><span id="line-295">      synchronized (tableCache) {</span>
+<span class="source-line-no">296</span><span id="line-296">        tableCache.pendingRequests.remove(req);</span>
+<span class="source-line-no">297</span><span id="line-297">        futureResultList.addAll(tableCache.clearCompletedRequests(addedLocs));</span>
+<span class="source-line-no">298</span><span id="line-298">        // Remove a complete locate request in a synchronized block, so the table cache must have</span>
+<span class="source-line-no">299</span><span id="line-299">        // quota to send a candidate request.</span>
+<span class="source-line-no">300</span><span id="line-300">        toSend = tableCache.getCandidate();</span>
+<span class="source-line-no">301</span><span id="line-301">        toSend.ifPresent(r -&gt; tableCache.send(r));</span>
+<span class="source-line-no">302</span><span id="line-302">      }</span>
+<span class="source-line-no">303</span><span id="line-303">      futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
+<span class="source-line-no">304</span><span id="line-304">      toSend.ifPresent(r -&gt; locateInMeta(tableName, r));</span>
+<span class="source-line-no">305</span><span id="line-305">    } else {</span>
+<span class="source-line-no">306</span><span id="line-306">      // we meet an error</span>
+<span class="source-line-no">307</span><span id="line-307">      assert error != null;</span>
+<span class="source-line-no">308</span><span id="line-308">      List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">309</span><span id="line-309">      synchronized (tableCache) {</span>
+<span class="source-line-no">310</span><span id="line-310">        tableCache.pendingRequests.remove(req);</span>
+<span class="source-line-no">311</span><span id="line-311">        // fail the request itself, no matter whether it is a DoNotRetryIOException, as we have</span>
+<span class="source-line-no">312</span><span id="line-312">        // already retried several times</span>
+<span class="source-line-no">313</span><span id="line-313">        CompletableFuture&lt;RegionLocations&gt; future = tableCache.allRequests.remove(req);</span>
+<span class="source-line-no">314</span><span id="line-314">        if (future != null) {</span>
+<span class="source-line-no">315</span><span id="line-315">          futureResultList.add(new RegionLocationsFutureResult(future, null, error));</span>
+<span class="source-line-no">316</span><span id="line-316">        }</span>
+<span class="source-line-no">317</span><span id="line-317">        futureResultList.addAll(tableCache.clearCompletedRequests(null));</span>
+<span class="source-line-no">318</span><span id="line-318">        // Remove a complete locate request in a synchronized block, so the table cache must have</span>
+<span class="source-line-no">319</span><span id="line-319">        // quota to send a candidate request.</span>
+<span class="source-line-no">320</span><span id="line-320">        toSend = tableCache.getCandidate();</span>
+<span class="source-line-no">321</span><span id="line-321">        toSend.ifPresent(r -&gt; tableCache.send(r));</span>
+<span class="source-line-no">322</span><span id="line-322">      }</span>
+<span class="source-line-no">323</span><span id="line-323">      futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
+<span class="source-line-no">324</span><span id="line-324">      toSend.ifPresent(r -&gt; locateInMeta(tableName, r));</span>
+<span class="source-line-no">325</span><span id="line-325">    }</span>
+<span class="source-line-no">326</span><span id="line-326">  }</span>
+<span class="source-line-no">327</span><span id="line-327"></span>
+<span class="source-line-no">328</span><span id="line-328">  // return whether we should stop the scan</span>
+<span class="source-line-no">329</span><span id="line-329">  private boolean onScanNext(TableName tableName, LocateRequest req, Result result) {</span>
+<span class="source-line-no">330</span><span id="line-330">    RegionLocations locs = CatalogFamilyFormat.getRegionLocations(result);</span>
+<span class="source-line-no">331</span><span id="line-331">    if (LOG.isDebugEnabled()) {</span>
+<span class="source-line-no">332</span><span id="line-332">      LOG.debug("The fetched location of '{}', row='{}', locateType={} is {}", tableName,</span>
+<span class="source-line-no">333</span><span id="line-333">        Bytes.toStringBinary(req.row), req.locateType, locs);</span>
+<span class="source-line-no">334</span><span id="line-334">    }</span>
+<span class="source-line-no">335</span><span id="line-335">    // remove HRegionLocation with null location, i.e, getServerName returns null.</span>
+<span class="source-line-no">336</span><span id="line-336">    if (locs != null) {</span>
+<span class="source-line-no">337</span><span id="line-337">      locs = locs.removeElementsWithNullLocation();</span>
+<span class="source-line-no">338</span><span id="line-338">    }</span>
+<span class="source-line-no">339</span><span id="line-339"></span>
+<span class="source-line-no">340</span><span id="line-340">    // the default region location should always be presented when fetching from meta, otherwise</span>
+<span class="source-line-no">341</span><span id="line-341">    // let's fail the request.</span>
+<span class="source-line-no">342</span><span id="line-342">    if (locs == null || locs.getDefaultRegionLocation() == null) {</span>
+<span class="source-line-no">343</span><span id="line-343">      complete(tableName, req, null,</span>
+<span class="source-line-no">344</span><span id="line-344">        new HBaseIOException(String.format("No location found for '%s', row='%s', locateType=%s",</span>
+<span class="source-line-no">345</span><span id="line-345">          tableName, Bytes.toStringBinary(req.row), req.locateType)));</span>
+<span class="source-line-no">346</span><span id="line-346">      return true;</span>
+<span class="source-line-no">347</span><span id="line-347">    }</span>
+<span class="source-line-no">348</span><span id="line-348">    HRegionLocation loc = locs.getDefaultRegionLocation();</span>
+<span class="source-line-no">349</span><span id="line-349">    RegionInfo info = loc.getRegion();</span>
+<span class="source-line-no">350</span><span id="line-350">    if (info == null) {</span>
+<span class="source-line-no">351</span><span id="line-351">      complete(tableName, req, null,</span>
+<span class="source-line-no">352</span><span id="line-352">        new HBaseIOException(String.format("HRegionInfo is null for '%s', row='%s', locateType=%s",</span>
+<span class="source-line-no">353</span><span id="line-353">          tableName, Bytes.toStringBinary(req.row), req.locateType)));</span>
+<span class="source-line-no">354</span><span id="line-354">      return true;</span>
+<span class="source-line-no">355</span><span id="line-355">    }</span>
+<span class="source-line-no">356</span><span id="line-356">    if (info.isSplitParent()) {</span>
+<span class="source-line-no">357</span><span id="line-357">      return false;</span>
+<span class="source-line-no">358</span><span id="line-358">    }</span>
+<span class="source-line-no">359</span><span id="line-359">    complete(tableName, req, locs, null);</span>
+<span class="source-line-no">360</span><span id="line-360">    return true;</span>
+<span class="source-line-no">361</span><span id="line-361">  }</span>
+<span class="source-line-no">362</span><span id="line-362"></span>
+<span class="source-line-no">363</span><span id="line-363">  private void recordCacheHit() {</span>
+<span class="source-line-no">364</span><span id="line-364">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheHit);</span>
+<span class="source-line-no">365</span><span id="line-365">  }</span>
+<span class="source-line-no">366</span><span id="line-366"></span>
+<span class="source-line-no">367</span><span id="line-367">  private void recordCacheMiss() {</span>
+<span class="source-line-no">368</span><span id="line-368">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheMiss);</span>
+<span class="source-line-no">369</span><span id="line-369">  }</span>
+<span class="source-line-no">370</span><span id="line-370"></span>
+<span class="source-line-no">371</span><span id="line-371">  private RegionLocations locateRowInCache(TableCache tableCache, byte[] row, int replicaId) {</span>
+<span class="source-line-no">372</span><span id="line-372">    RegionLocations locs = tableCache.regionLocationCache.findForRow(row, replicaId);</span>
+<span class="source-line-no">373</span><span id="line-373">    if (locs == null) {</span>
+<span class="source-line-no">374</span><span id="line-374">      recordCacheMiss();</span>
+<span class="source-line-no">375</span><span id="line-375">    } else {</span>
+<span class="source-line-no">376</span><span id="line-376">      recordCacheHit();</span>
+<span class="source-line-no">377</span><span id="line-377">    }</span>
+<span class="source-line-no">378</span><span id="line-378">    return locs;</span>
+<span class="source-line-no">379</span><span id="line-379">  }</span>
+<span class="source-line-no">380</span><span id="line-380"></span>
+<span class="source-line-no">381</span><span id="line-381">  private RegionLocations locateRowBeforeInCache(TableCache tableCache, byte[] row, int replicaId) {</span>
+<span class="source-line-no">382</span><span id="line-382">    RegionLocations locs = tableCache.regionLocationCache.findForBeforeRow(row, replicaId);</span>
+<span class="source-line-no">383</span><span id="line-383">    if (locs == null) {</span>
+<span class="source-line-no">384</span><span id="line-384">      recordCacheMiss();</span>
+<span class="source-line-no">385</span><span id="line-385">    } else {</span>
+<span class="source-line-no">386</span><span id="line-386">      recordCacheHit();</span>
+<span class="source-line-no">387</span><span id="line-387">    }</span>
+<span class="source-line-no">388</span><span id="line-388">    return locs;</span>
+<span class="source-line-no">389</span><span id="line-389">  }</span>
+<span class="source-line-no">390</span><span id="line-390"></span>
+<span class="source-line-no">391</span><span id="line-391">  private void locateInMeta(TableName tableName, LocateRequest req) {</span>
+<span class="source-line-no">392</span><span id="line-392">    if (LOG.isTraceEnabled()) {</span>
+<span class="source-line-no">393</span><span id="line-393">      LOG.trace("Try locate '" + tableName + "', row='" + Bytes.toStringBinary(req.row)</span>
+<span class="source-line-no">394</span><span id="line-394">        + "', locateType=" + req.locateType + " in meta");</span>
+<span class="source-line-no">395</span><span id="line-395">    }</span>
+<span class="source-line-no">396</span><span id="line-396">    byte[] metaStartKey;</span>
+<span class="source-line-no">397</span><span id="line-397">    if (req.locateType.equals(RegionLocateType.BEFORE)) {</span>
+<span class="source-line-no">398</span><span id="line-398">      if (isEmptyStopRow(req.row)) {</span>
+<span class="source-line-no">399</span><span id="line-399">        byte[] binaryTableName = tableName.getName();</span>
+<span class="source-line-no">400</span><span id="line-400">        metaStartKey = Arrays.copyOf(binaryTableName, binaryTableName.length + 1);</span>
+<span class="source-line-no">401</span><span id="line-401">      } else {</span>
+<span class="source-line-no">402</span><span id="line-402">        metaStartKey = createRegionName(tableName, req.row, ZEROES, false);</span>
+<span class="source-line-no">403</span><span id="line-403">      }</span>
+<span class="source-line-no">404</span><span id="line-404">    } else {</span>
+<span class="source-line-no">405</span><span id="line-405">      metaStartKey = createRegionName(tableName, req.row, NINES, false);</span>
+<span class="source-line-no">406</span><span id="line-406">    }</span>
+<span class="source-line-no">407</span><span id="line-407">    byte[] metaStopKey =</span>
+<span class="source-line-no">408</span><span id="line-408">      RegionInfo.createRegionName(tableName, HConstants.EMPTY_START_ROW, "", false);</span>
+<span class="source-line-no">409</span><span id="line-409">    Scan scan = new Scan().withStartRow(metaStartKey).withStopRow(metaStopKey, true)</span>
+<span class="source-line-no">410</span><span id="line-410">      .addFamily(HConstants.CATALOG_FAMILY).setReversed(true).setCaching(locatePrefetchLimit)</span>
+<span class="source-line-no">411</span><span id="line-411">      .setReadType(ReadType.PREAD);</span>
+<span class="source-line-no">412</span><span id="line-412"></span>
+<span class="source-line-no">413</span><span id="line-413">    switch (this.metaReplicaMode) {</span>
+<span class="source-line-no">414</span><span id="line-414">      case LOAD_BALANCE:</span>
+<span class="source-line-no">415</span><span id="line-415">        int metaReplicaId = this.metaReplicaSelector.select(tableName, req.row, req.locateType);</span>
+<span class="source-line-no">416</span><span id="line-416">        if (metaReplicaId != RegionInfo.DEFAULT_REPLICA_ID) {</span>
+<span class="source-line-no">417</span><span id="line-417">          // If the selector gives a non-primary meta replica region, then go with it.</span>
+<span class="source-line-no">418</span><span id="line-418">          // Otherwise, just go to primary in non-hedgedRead mode.</span>
+<span class="source-line-no">419</span><span id="line-419">          scan.setConsistency(Consistency.TIMELINE);</span>
+<span class="source-line-no">420</span><span id="line-420">          scan.setReplicaId(metaReplicaId);</span>
+<span class="source-line-no">421</span><span id="line-421">        }</span>
+<span class="source-line-no">422</span><span id="line-422">        break;</span>
+<span class="source-line-no">423</span><span id="line-423">      case HEDGED_READ:</span>
+<span class="source-line-no">424</span><span id="line-424">        scan.setConsistency(Consistency.TIMELINE);</span>
+<span class="source-line-no">425</span><span id="line-425">        break;</span>
+<span class="source-line-no">426</span><span id="line-426">      default:</span>
+<span class="source-line-no">427</span><span id="line-427">        // do nothing</span>
+<span class="source-line-no">428</span><span id="line-428">    }</span>
+<span class="source-line-no">429</span><span id="line-429"></span>
+<span class="source-line-no">430</span><span id="line-430">    conn.getTable(META_TABLE_NAME).scan(scan, new AdvancedScanResultConsumer() {</span>
+<span class="source-line-no">431</span><span id="line-431"></span>
+<span class="source-line-no">432</span><span id="line-432">      private boolean completeNormally = false;</span>
+<span class="source-line-no">433</span><span id="line-433"></span>
+<span class="source-line-no">434</span><span id="line-434">      private boolean tableNotFound = true;</span>
+<span class="source-line-no">435</span><span id="line-435"></span>
+<span class="source-line-no">436</span><span id="line-436">      @Override</span>
+<span class="source-line-no">437</span><span id="line-437">      public void onError(Throwable error) {</span>
+<span class="source-line-no">438</span><span id="line-438">        complete(tableName, req, null, error);</span>
+<span class="source-line-no">439</span><span id="line-439">      }</span>
+<span class="source-line-no">440</span><span id="line-440"></span>
+<span class="source-line-no">441</span><span id="line-441">      @Override</span>
+<span class="source-line-no">442</span><span id="line-442">      public void onComplete() {</span>
+<span class="source-line-no">443</span><span id="line-443">        if (tableNotFound) {</span>
+<span class="source-line-no">444</span><span id="line-444">          complete(tableName, req, null, new TableNotFoundException(tableName));</span>
+<span class="source-line-no">445</span><span id="line-445">        } else if (!completeNormally) {</span>
+<span class="source-line-no">446</span><span id="line-446">          complete(tableName, req, null, new IOException(</span>
+<span class="source-line-no">447</span><span id="line-447">            "Unable to find region for '" + Bytes.toStringBinary(req.row) + "' in " + tableName));</span>
+<span class="source-line-no">448</span><span id="line-448">        }</span>
+<span class="source-line-no">449</span><span id="line-449">      }</span>
+<span class="source-line-no">450</span><span id="line-450"></span>
+<span class="source-line-no">451</span><span id="line-451">      @Override</span>
+<span class="source-line-no">452</span><span id="line-452">      public void onNext(Result[] results, ScanController controller) {</span>
+<span class="source-line-no">453</span><span id="line-453">        if (results.length == 0) {</span>
+<span class="source-line-no">454</span><span id="line-454">          return;</span>
+<span class="source-line-no">455</span><span id="line-455">        }</span>
+<span class="source-line-no">456</span><span id="line-456">        tableNotFound = false;</span>
+<span class="source-line-no">457</span><span id="line-457">        int i = 0;</span>
+<span class="source-line-no">458</span><span id="line-458">        for (; i &lt; results.length; i++) {</span>
+<span class="source-line-no">459</span><span id="line-459">          if (onScanNext(tableName, req, results[i])) {</span>
+<span class="source-line-no">460</span><span id="line-460">            completeNormally = true;</span>
+<span class="source-line-no">461</span><span id="line-461">            controller.terminate();</span>
+<span class="source-line-no">462</span><span id="line-462">            i++;</span>
+<span class="source-line-no">463</span><span id="line-463">            break;</span>
+<span class="source-line-no">464</span><span id="line-464">          }</span>
+<span class="source-line-no">465</span><span id="line-465">        }</span>
+<span class="source-line-no">466</span><span id="line-466">        // Add the remaining results into cache</span>
+<span class="source-line-no">467</span><span id="line-467">        if (i &lt; results.length) {</span>
+<span class="source-line-no">468</span><span id="line-468">          TableCache tableCache = getTableCache(tableName);</span>
+<span class="source-line-no">469</span><span id="line-469">          for (; i &lt; results.length; i++) {</span>
+<span class="source-line-no">470</span><span id="line-470">            RegionLocations locs = CatalogFamilyFormat.getRegionLocations(results[i]);</span>
+<span class="source-line-no">471</span><span id="line-471">            if (locs == null) {</span>
+<span class="source-line-no">472</span><span id="line-472">              continue;</span>
+<span class="source-line-no">473</span><span id="line-473">            }</span>
+<span class="source-line-no">474</span><span id="line-474">            HRegionLocation loc = locs.getDefaultRegionLocation();</span>
+<span class="source-line-no">475</span><span id="line-475">            if (loc == null) {</span>
+<span class="source-line-no">476</span><span id="line-476">              continue;</span>
+<span class="source-line-no">477</span><span id="line-477">            }</span>
+<span class="source-line-no">478</span><span id="line-478">            RegionInfo info = loc.getRegion();</span>
+<span class="source-line-no">479</span><span id="line-479">            if (info == null || info.isOffline() || info.isSplitParent()) {</span>
+<span class="source-line-no">480</span><span id="line-480">              continue;</span>
+<span class="source-line-no">481</span><span id="line-481">            }</span>
+<span class="source-line-no">482</span><span id="line-482">            RegionLocations addedLocs = tableCache.regionLocationCache.add(locs);</span>
+<span class="source-line-no">483</span><span id="line-483">            List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">484</span><span id="line-484">            synchronized (tableCache) {</span>
+<span class="source-line-no">485</span><span id="line-485">              futureResultList.addAll(tableCache.clearCompletedRequests(addedLocs));</span>
+<span class="source-line-no">486</span><span id="line-486">            }</span>
+<span class="source-line-no">487</span><span id="line-487">            futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
+<span class="source-line-no">488</span><span id="line-488">          }</span>
+<span class="source-line-no">489</span><span id="line-489">        }</span>
+<span class="source-line-no">490</span><span id="line-490">      }</span>
+<span class="source-line-no">491</span><span id="line-491">    });</span>
+<span class="source-line-no">492</span><span id="line-492">  }</span>
+<span class="source-line-no">493</span><span id="line-493"></span>
+<span class="source-line-no">494</span><span id="line-494">  private RegionLocations locateInCache(TableCache tableCache, byte[] row, int replicaId,</span>
+<span class="source-line-no">495</span><span id="line-495">    RegionLocateType locateType) {</span>
+<span class="source-line-no">496</span><span id="line-496">    return locateType.equals(RegionLocateType.BEFORE)</span>
+<span class="source-line-no">497</span><span id="line-497">      ? locateRowBeforeInCache(tableCache, row, replicaId)</span>
+<span class="source-line-no">498</span><span id="line-498">      : locateRowInCache(tableCache, row, replicaId);</span>
+<span class="source-line-no">499</span><span id="line-499">  }</span>
+<span class="source-line-no">500</span><span id="line-500"></span>
+<span class="source-line-no">501</span><span id="line-501">  // locateToPrevious is true means we will use the start key of a region to locate the region</span>
+<span class="source-line-no">502</span><span id="line-502">  // placed before it. Used for reverse scan. See the comment of</span>
+<span class="source-line-no">503</span><span id="line-503">  // AsyncRegionLocator.getPreviousRegionLocation.</span>
+<span class="source-line-no">504</span><span id="line-504">  private CompletableFuture&lt;RegionLocations&gt; getRegionLocationsInternal(TableName tableName,</span>
+<span class="source-line-no">505</span><span id="line-505">    byte[] row, int replicaId, RegionLocateType locateType, boolean reload) {</span>
+<span class="source-line-no">506</span><span id="line-506">    // AFTER should be convert to CURRENT before calling this method</span>
+<span class="source-line-no">507</span><span id="line-507">    assert !locateType.equals(RegionLocateType.AFTER);</span>
+<span class="source-line-no">508</span><span id="line-508">    TableCache tableCache = getTableCache(tableName);</span>
+<span class="source-line-no">509</span><span id="line-509">    if (!reload) {</span>
+<span class="source-line-no">510</span><span id="line-510">      RegionLocations locs = locateInCache(tableCache, row, replicaId, locateType);</span>
+<span class="source-line-no">511</span><span id="line-511">      if (isGood(locs, replicaId)) {</span>
+<span class="source-line-no">512</span><span id="line-512">        return CompletableFuture.completedFuture(locs);</span>
+<span class="source-line-no">513</span><span id="line-513">      }</span>
+<span class="source-line-no">514</span><span id="line-514">    }</span>
+<span class="source-line-no">515</span><span id="line-515">    CompletableFuture&lt;RegionLocations&gt; future;</span>
+<span class="source-line-no">516</span><span id="line-516">    LocateRequest req;</span>
+<span class="source-line-no">517</span><span id="line-517">    boolean sendRequest = false;</span>
+<span class="source-line-no">518</span><span id="line-518">    synchronized (tableCache) {</span>
+<span class="source-line-no">519</span><span id="line-519">      // check again</span>
+<span class="source-line-no">520</span><span id="line-520">      if (!reload) {</span>
+<span class="source-line-no">521</span><span id="line-521">        RegionLocations locs = locateInCache(tableCache, row, replicaId, locateType);</span>
+<span class="source-line-no">522</span><span id="line-522">        if (isGood(locs, replicaId)) {</span>
+<span class="source-line-no">523</span><span id="line-523">          return CompletableFuture.completedFuture(locs);</span>
+<span class="source-line-no">524</span><span id="line-524">        }</span>
+<span class="source-line-no">525</span><span id="line-525">      }</span>
+<span class="source-line-no">526</span><span id="line-526">      req = new LocateRequest(row, locateType);</span>
+<span class="source-line-no">527</span><span id="line-527">      future = tableCache.allRequests.get(req);</span>
+<span class="source-line-no">528</span><span id="line-528">      if (future == null) {</span>
+<span class="source-line-no">529</span><span id="line-529">        future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">530</span><span id="line-530">        tableCache.allRequests.put(req, future);</span>
+<span class="source-line-no">531</span><span id="line-531">        if (tableCache.hasQuota(maxConcurrentLocateRequestPerTable) &amp;&amp; !tableCache.isPending(req)) {</span>
+<span class="source-line-no">532</span><span id="line-532">          tableCache.send(req);</span>
+<span class="source-line-no">533</span><span id="line-533">          sendRequest = true;</span>
+<span class="source-line-no">534</span><span id="line-534">        }</span>
+<span class="source-line-no">535</span><span id="line-535">      }</span>
+<span class="source-line-no">536</span><span id="line-536">    }</span>
+<span class="source-line-no">537</span><span id="line-537">    if (sendRequest) {</span>
+<span class="source-line-no">538</span><span id="line-538">      locateInMeta(tableName, req);</span>
+<span class="source-line-no">539</span><span id="line-539">    }</span>
+<span class="source-line-no">540</span><span id="line-540">    return future;</span>
+<span class="source-line-no">541</span><span id="line-541">  }</span>
+<span class="source-line-no">542</span><span id="line-542"></span>
+<span class="source-line-no">543</span><span id="line-543">  CompletableFuture&lt;RegionLocations&gt; getRegionLocations(TableName tableName, byte[] row,</span>
+<span class="source-line-no">544</span><span id="line-544">    int replicaId, RegionLocateType locateType, boolean reload) {</span>
+<span class="source-line-no">545</span><span id="line-545">    // as we know the exact row after us, so we can just create the new row, and use the same</span>
+<span class="source-line-no">546</span><span id="line-546">    // algorithm to locate it.</span>
+<span class="source-line-no">547</span><span id="line-547">    if (locateType.equals(RegionLocateType.AFTER)) {</span>
+<span class="source-line-no">548</span><span id="line-548">      row = createClosestRowAfter(row);</span>
+<span class="source-line-no">549</span><span id="line-549">      locateType = RegionLocateType.CURRENT;</span>
+<span class="source-line-no">550</span><span id="line-550">    }</span>
+<span class="source-line-no">551</span><span id="line-551">    return getRegionLocationsInternal(tableName, row, replicaId, locateType, reload);</span>
+<span class="source-line-no">552</span><span id="line-552">  }</span>
+<span class="source-line-no">553</span><span id="line-553"></span>
+<span class="source-line-no">554</span><span id="line-554">  private void recordClearRegionCache() {</span>
+<span class="source-line-no">555</span><span id="line-555">    conn.getConnectionMetrics().ifPresent(MetricsConnection::incrMetaCacheNumClearRegion);</span>
+<span class="source-line-no">556</span><span id="line-556">  }</span>
+<span class="source-line-no">557</span><span id="line-557"></span>
+<span class="source-line-no">558</span><span id="line-558">  private void removeLocationFromCache(HRegionLocation loc) {</span>
+<span class="source-line-no">559</span><span id="line-559">    TableCache tableCache = cache.get(loc.getRegion().getTable());</span>
+<span class="source-line-no">560</span><span id="line-560">    if (tableCache != null) {</span>
+<span class="source-line-no">561</span><span id="line-561">      if (tableCache.regionLocationCache.remove(loc)) {</span>
+<span class="source-line-no">562</span><span id="line-562">        recordClearRegionCache();</span>
+<span class="source-line-no">563</span><span id="line-563">        updateMetaReplicaSelector(loc);</span>
+<span class="source-line-no">564</span><span id="line-564">      }</span>
+<span class="source-line-no">565</span><span id="line-565">    }</span>
+<span class="source-line-no">566</span><span id="line-566">  }</span>
+<span class="source-line-no">567</span><span id="line-567"></span>
+<span class="source-line-no">568</span><span id="line-568">  private void updateMetaReplicaSelector(HRegionLocation loc) {</span>
+<span class="source-line-no">569</span><span id="line-569">    // Tell metaReplicaSelector that the location is stale. It will create a stale entry</span>
+<span class="source-line-no">570</span><span id="line-570">    // with timestamp internally. Next time the client looks up the same location,</span>
+<span class="source-line-no">571</span><span id="line-571">    // it will pick a different meta replica region.</span>
+<span class="source-line-no">572</span><span id="line-572">    if (metaReplicaMode == CatalogReplicaMode.LOAD_BALANCE) {</span>
+<span class="source-line-no">573</span><span id="line-573">      metaReplicaSelector.onError(loc);</span>
+<span class="source-line-no">574</span><span id="line-574">    }</span>
+<span class="source-line-no">575</span><span id="line-575">  }</span>
+<span class="source-line-no">576</span><span id="line-576"></span>
+<span class="source-line-no">577</span><span id="line-577">  void addLocationToCache(HRegionLocation loc) {</span>
+<span class="source-line-no">578</span><span id="line-578">    getTableCache(loc.getRegion().getTable()).regionLocationCache.add(createRegionLocations(loc));</span>
+<span class="source-line-no">579</span><span id="line-579">  }</span>
+<span class="source-line-no">580</span><span id="line-580"></span>
+<span class="source-line-no">581</span><span id="line-581">  private HRegionLocation getCachedLocation(HRegionLocation loc) {</span>
+<span class="source-line-no">582</span><span id="line-582">    TableCache tableCache = cache.get(loc.getRegion().getTable());</span>
+<span class="source-line-no">583</span><span id="line-583">    if (tableCache == null) {</span>
+<span class="source-line-no">584</span><span id="line-584">      return null;</span>
+<span class="source-line-no">585</span><span id="line-585">    }</span>
+<span class="source-line-no">586</span><span id="line-586">    RegionLocations locs = tableCache.regionLocationCache.get(loc.getRegion().getStartKey());</span>
+<span class="source-line-no">587</span><span id="line-587">    return locs != null ? locs.getRegionLocation(loc.getRegion().getReplicaId()) : null;</span>
+<span class="source-line-no">588</span><span id="line-588">  }</span>
+<span class="source-line-no">589</span><span id="line-589"></span>
+<span class="source-line-no">590</span><span id="line-590">  void updateCachedLocationOnError(HRegionLocation loc, Throwable exception) {</span>
+<span class="source-line-no">591</span><span id="line-591">    Optional&lt;MetricsConnection&gt; connectionMetrics = conn.getConnectionMetrics();</span>
+<span class="source-line-no">592</span><span id="line-592">    AsyncRegionLocatorHelper.updateCachedLocationOnError(loc, exception, this::getCachedLocation,</span>
+<span class="source-line-no">593</span><span id="line-593">      this::addLocationToCache, this::removeLocationFromCache, connectionMetrics.orElse(null));</span>
+<span class="source-line-no">594</span><span id="line-594">  }</span>
+<span class="source-line-no">595</span><span id="line-595"></span>
+<span class="source-line-no">596</span><span id="line-596">  void clearCache(TableName tableName) {</span>
+<span class="source-line-no">597</span><span id="line-597">    TableCache tableCache = cache.remove(tableName);</span>
+<span class="source-line-no">598</span><span id="line-598">    if (tableCache == null) {</span>
+<span class="source-line-no">599</span><span id="line-599">      return;</span>
+<span class="source-line-no">600</span><span id="line-600">    }</span>
+<span class="source-line-no">601</span><span id="line-601">    List&lt;RegionLocationsFutureResult&gt; futureResultList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">602</span><span id="line-602">    synchronized (tableCache) {</span>
+<span class="source-line-no">603</span><span id="line-603">      if (!tableCache.allRequests.isEmpty()) {</span>
+<span class="source-line-no">604</span><span id="line-604">        IOException error = new IOException("Cache cleared");</span>
+<span class="source-line-no">605</span><span id="line-605">        tableCache.allRequests.values().forEach(f -&gt; {</span>
+<span class="source-line-no">606</span><span id="line-606">          futureResultList.add(new RegionLocationsFutureResult(f, null, error));</span>
+<span class="source-line-no">607</span><span id="line-607">        });</span>
+<span class="source-line-no">608</span><span id="line-608">      }</span>
+<span class="source-line-no">609</span><span id="line-609">    }</span>
+<span class="source-line-no">610</span><span id="line-610">    futureResultList.forEach(RegionLocationsFutureResult::complete);</span>
+<span class="source-line-no">611</span><span id="line-611">    conn.getConnectionMetrics().ifPresent(</span>
+<span class="source-line-no">612</span><span id="line-612">      metrics -&gt; metrics.incrMetaCacheNumClearRegion(tableCache.regionLocationCache.size()));</span>
+<span class="source-line-no">613</span><span id="line-613">  }</span>
+<span class="source-line-no">614</span><span id="line-614"></span>
+<span class="source-line-no">615</span><span id="line-615">  void clearCache() {</span>
+<span class="source-line-no">616</span><span id="line-616">    cache.clear();</span>
+<span class="source-line-no">617</span><span id="line-617">  }</span>
+<span class="source-line-no">618</span><span id="line-618"></span>
+<span class="source-line-no">619</span><span id="line-619">  void clearCache(ServerName serverName) {</span>
+<span class="source-line-no">620</span><span id="line-620">    for (TableCache tableCache : cache.values()) {</span>
+<span class="source-line-no">621</span><span id="line-621">      tableCache.regionLocationCache.removeForServer(serverName);</span>
+<span class="source-line-no">622</span><span id="line-622">    }</span>
+<span class="source-line-no">623</span><span id="line-623">  }</span>
+<span class="source-line-no">624</span><span id="line-624"></span>
+<span class="source-line-no">625</span><span id="line-625">  // only used for testing whether we have cached the location for a region.</span>
+<span class="source-line-no">626</span><span id="line-626">  RegionLocations getRegionLocationInCache(TableName tableName, byte[] row) {</span>
+<span class="source-line-no">627</span><span id="line-627">    TableCache tableCache = cache.get(tableName);</span>
+<span class="source-line-no">628</span><span id="line-628">    if (tableCache == null) {</span>
+<span class="source-line-no">629</span><span id="line-629">      return null;</span>
+<span class="source-line-no">630</span><span id="line-630">    }</span>
+<span class="source-line-no">631</span><span id="line-631">    return locateRowInCache(tableCache, row, RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
+<span class="source-line-no">632</span><span id="line-632">  }</span>
+<span class="source-line-no">633</span><span id="line-633"></span>
+<span class="source-line-no">634</span><span id="line-634">  // only used for testing whether we have cached the location for a table.</span>
+<span class="source-line-no">635</span><span id="line-635">  int getNumberOfCachedRegionLocations(TableName tableName) {</span>
+<span class="source-line-no">636</span><span id="line-636">    TableCache tableCache = cache.get(tableName);</span>
+<span class="source-line-no">637</span><span id="line-637">    if (tableCache == null) {</span>
+<span class="source-line-no">638</span><span id="line-638">      return 0;</span>
+<span class="source-line-no">639</span><span id="line-639">    }</span>
+<span class="source-line-no">640</span><span id="line-640">    return tableCache.regionLocationCache.getAll().stream()</span>
+<span class="source-line-no">641</span><span id="line-641">      .mapToInt(RegionLocations::numNonNullElements).sum();</span>
+<span class="source-line-no">642</span><span id="line-642">  }</span>
+<span class="source-line-no">643</span><span id="line-643"></span>
+<span class="source-line-no">644</span><span id="line-644">  private TimerTask getInvalidateMetaCacheTask(long metaCacheInvalidateInterval) {</span>
+<span class="source-line-no">645</span><span id="line-645">    return new TimerTask() {</span>
+<span class="source-line-no">646</span><span id="line-646">      @Override</span>
+<span class="source-line-no">647</span><span id="line-647">      public void run(Timeout timeout) throws Exception {</span>
+<span class="source-line-no">648</span><span id="line-648">        FutureUtils.addListener(invalidateTableCache(), (res, err) -&gt; {</span>
+<span class="source-line-no">649</span><span id="line-649">          if (err != null) {</span>
+<span class="source-line-no">650</span><span id="line-650">            LOG.warn("InvalidateTableCache failed.", err);</span>
+<span class="source-line-no">651</span><span id="line-651">          }</span>
+<span class="source-line-no">652</span><span id="line-652">          AsyncConnectionImpl.RETRY_TIMER.newTimeout(this, metaCacheInvalidateInterval,</span>
+<span class="source-line-no">653</span><span id="line-653">            TimeUnit.MILLISECONDS);</span>
+<span class="source-line-no">654</span><span id="line-654">        });</span>
+<span class="source-line-no">655</span><span id="line-655">      }</span>
+<span class="source-line-no">656</span><span id="line-656">    };</span>
+<span class="source-line-no">657</span><span id="line-657">  }</span>
+<span class="source-line-no">658</span><span id="line-658"></span>
+<span class="source-line-no">659</span><span id="line-659">  private CompletableFuture&lt;Void&gt; invalidateTableCache() {</span>
+<span class="source-line-no">660</span><span id="line-660">    CompletableFuture&lt;Void&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">661</span><span id="line-661">    Iterator&lt;TableName&gt; tbnIter = cache.keySet().iterator();</span>
+<span class="source-line-no">662</span><span id="line-662">    AsyncAdmin admin = conn.getAdmin();</span>
+<span class="source-line-no">663</span><span id="line-663">    invalidateCache(future, tbnIter, admin);</span>
+<span class="source-line-no">664</span><span id="line-664">    return future;</span>
+<span class="source-line-no">665</span><span id="line-665">  }</span>
+<span class="source-line-no">666</span><span id="line-666"></span>
+<span class="source-line-no">667</span><span id="line-667">  private void invalidateCache(CompletableFuture&lt;Void&gt; future, Iterator&lt;TableName&gt; tbnIter,</span>
+<span class="source-line-no">668</span><span id="line-668">    AsyncAdmin admin) {</span>
+<span class="source-line-no">669</span><span id="line-669">    if (tbnIter.hasNext()) {</span>
+<span class="source-line-no">670</span><span id="line-670">      TableName tableName = tbnIter.next();</span>
+<span class="source-line-no">671</span><span id="line-671">      FutureUtils.addListener(admin.isTableDisabled(tableName), (tableDisabled, err) -&gt; {</span>
+<span class="source-line-no">672</span><span id="line-672">        boolean shouldInvalidateCache = false;</span>
+<span class="source-line-no">673</span><span id="line-673">        if (err != null) {</span>
+<span class="source-line-no">674</span><span id="line-674">          if (err instanceof TableNotFoundException) {</span>
+<span class="source-line-no">675</span><span id="line-675">            LOG.info("Table {} was not exist, will invalidate its cache.", tableName);</span>
+<span class="source-line-no">676</span><span id="line-676">            shouldInvalidateCache = true;</span>
+<span class="source-line-no">677</span><span id="line-677">          } else {</span>
+<span class="source-line-no">678</span><span id="line-678">            // If other exception occurred, just skip to invalidate it cache.</span>
+<span class="source-line-no">679</span><span id="line-679">            LOG.warn("Get table state of {} failed, skip to invalidate its cache.", tableName, err);</span>
+<span class="source-line-no">680</span><span id="line-680">            return;</span>
+<span class="source-line-no">681</span><span id="line-681">          }</span>
+<span class="source-line-no">682</span><span id="line-682">        } else if (tableDisabled) {</span>
+<span class="source-line-no">683</span><span id="line-683">          LOG.info("Table {} was disabled, will invalidate its cache.", tableName);</span>
+<span class="source-line-no">684</span><span id="line-684">          shouldInvalidateCache = true;</span>
+<span class="source-line-no">685</span><span id="line-685">        }</span>
+<span class="source-line-no">686</span><span id="line-686">        if (shouldInvalidateCache) {</span>
+<span class="source-line-no">687</span><span id="line-687">          clearCache(tableName);</span>
+<span class="source-line-no">688</span><span id="line-688">          LOG.info("Invalidate cache for {} succeed.", tableName);</span>
+<span class="source-line-no">689</span><span id="line-689">        } else {</span>
+<span class="source-line-no">690</span><span id="line-690">          LOG.debug("Table {} is normal, no need to invalidate its cache.", tableName);</span>
+<span class="source-line-no">691</span><span id="line-691">        }</span>
+<span class="source-line-no">692</span><span id="line-692">        invalidateCache(future, tbnIter, admin);</span>
+<span class="source-line-no">693</span><span id="line-693">      });</span>
+<span class="source-line-no">694</span><span id="line-694">    } else {</span>
+<span class="source-line-no">695</span><span id="line-695">      future.complete(null);</span>
+<span class="source-line-no">696</span><span id="line-696">    }</span>
+<span class="source-line-no">697</span><span id="line-697">  }</span>
+<span class="source-line-no">698</span><span id="line-698">}</span>
 
 
 
