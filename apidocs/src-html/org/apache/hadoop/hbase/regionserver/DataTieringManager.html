@@ -30,330 +30,333 @@
 <span class="source-line-no">017</span><span id="line-17"> */</span>
 <span class="source-line-no">018</span><span id="line-18">package org.apache.hadoop.hbase.regionserver;</span>
 <span class="source-line-no">019</span><span id="line-19"></span>
-<span class="source-line-no">020</span><span id="line-20">import java.io.IOException;</span>
-<span class="source-line-no">021</span><span id="line-21">import java.util.Date;</span>
-<span class="source-line-no">022</span><span id="line-22">import java.util.HashMap;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.util.HashSet;</span>
-<span class="source-line-no">024</span><span id="line-24">import java.util.Map;</span>
-<span class="source-line-no">025</span><span id="line-25">import java.util.Set;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.conf.Configuration;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.fs.Path;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.io.hfile.BlockCacheKey;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.io.hfile.HFileInfo;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.util.Bytes;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.slf4j.Logger;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">035</span><span id="line-35"></span>
-<span class="source-line-no">036</span><span id="line-36">/**</span>
-<span class="source-line-no">037</span><span id="line-37"> * The DataTieringManager class categorizes data into hot data and cold data based on the specified</span>
-<span class="source-line-no">038</span><span id="line-38"> * {@link DataTieringType} when DataTiering is enabled. DataTiering is disabled by default with</span>
-<span class="source-line-no">039</span><span id="line-39"> * {@link DataTieringType} set to {@link DataTieringType#NONE}. The {@link DataTieringType}</span>
-<span class="source-line-no">040</span><span id="line-40"> * determines the logic for distinguishing data into hot or cold. By default, all data is considered</span>
-<span class="source-line-no">041</span><span id="line-41"> * as hot.</span>
-<span class="source-line-no">042</span><span id="line-42"> */</span>
-<span class="source-line-no">043</span><span id="line-43">@InterfaceAudience.Private</span>
-<span class="source-line-no">044</span><span id="line-44">public class DataTieringManager {</span>
-<span class="source-line-no">045</span><span id="line-45">  private static final Logger LOG = LoggerFactory.getLogger(DataTieringManager.class);</span>
-<span class="source-line-no">046</span><span id="line-46">  public static final String GLOBAL_DATA_TIERING_ENABLED_KEY =</span>
-<span class="source-line-no">047</span><span id="line-47">    "hbase.regionserver.datatiering.enable";</span>
-<span class="source-line-no">048</span><span id="line-48">  public static final boolean DEFAULT_GLOBAL_DATA_TIERING_ENABLED = false; // disabled by default</span>
-<span class="source-line-no">049</span><span id="line-49">  public static final String DATATIERING_KEY = "hbase.hstore.datatiering.type";</span>
-<span class="source-line-no">050</span><span id="line-50">  public static final String HSTORE_DATATIERING_GRACE_PERIOD_MILLIS_KEY =</span>
-<span class="source-line-no">051</span><span id="line-51">    "hbase.hstore.datatiering.grace.period.millis";</span>
-<span class="source-line-no">052</span><span id="line-52">  public static final long DEFAULT_DATATIERING_GRACE_PERIOD = 0;</span>
-<span class="source-line-no">053</span><span id="line-53">  public static final String DATATIERING_HOT_DATA_AGE_KEY =</span>
-<span class="source-line-no">054</span><span id="line-54">    "hbase.hstore.datatiering.hot.age.millis";</span>
-<span class="source-line-no">055</span><span id="line-55">  public static final DataTieringType DEFAULT_DATATIERING = DataTieringType.NONE;</span>
-<span class="source-line-no">056</span><span id="line-56">  public static final long DEFAULT_DATATIERING_HOT_DATA_AGE = 7 * 24 * 60 * 60 * 1000; // 7 Days</span>
-<span class="source-line-no">057</span><span id="line-57">  private static DataTieringManager instance;</span>
-<span class="source-line-no">058</span><span id="line-58">  private final Map&lt;String, HRegion&gt; onlineRegions;</span>
-<span class="source-line-no">059</span><span id="line-59"></span>
-<span class="source-line-no">060</span><span id="line-60">  private DataTieringManager(Map&lt;String, HRegion&gt; onlineRegions) {</span>
-<span class="source-line-no">061</span><span id="line-61">    this.onlineRegions = onlineRegions;</span>
-<span class="source-line-no">062</span><span id="line-62">  }</span>
-<span class="source-line-no">063</span><span id="line-63"></span>
-<span class="source-line-no">064</span><span id="line-64">  /**</span>
-<span class="source-line-no">065</span><span id="line-65">   * Initializes the DataTieringManager instance with the provided map of online regions, only if</span>
-<span class="source-line-no">066</span><span id="line-66">   * the configuration "hbase.regionserver.datatiering.enable" is enabled.</span>
-<span class="source-line-no">067</span><span id="line-67">   * @param conf          Configuration object.</span>
-<span class="source-line-no">068</span><span id="line-68">   * @param onlineRegions A map containing online regions.</span>
-<span class="source-line-no">069</span><span id="line-69">   * @return True if the instance is instantiated successfully, false otherwise.</span>
-<span class="source-line-no">070</span><span id="line-70">   */</span>
-<span class="source-line-no">071</span><span id="line-71">  public static synchronized boolean instantiate(Configuration conf,</span>
-<span class="source-line-no">072</span><span id="line-72">    Map&lt;String, HRegion&gt; onlineRegions) {</span>
-<span class="source-line-no">073</span><span id="line-73">    if (isDataTieringFeatureEnabled(conf) &amp;&amp; instance == null) {</span>
-<span class="source-line-no">074</span><span id="line-74">      instance = new DataTieringManager(onlineRegions);</span>
-<span class="source-line-no">075</span><span id="line-75">      LOG.info("DataTieringManager instantiated successfully.");</span>
-<span class="source-line-no">076</span><span id="line-76">      return true;</span>
-<span class="source-line-no">077</span><span id="line-77">    } else {</span>
-<span class="source-line-no">078</span><span id="line-78">      LOG.warn("DataTieringManager is already instantiated.");</span>
-<span class="source-line-no">079</span><span id="line-79">    }</span>
-<span class="source-line-no">080</span><span id="line-80">    return false;</span>
-<span class="source-line-no">081</span><span id="line-81">  }</span>
-<span class="source-line-no">082</span><span id="line-82"></span>
-<span class="source-line-no">083</span><span id="line-83">  /**</span>
-<span class="source-line-no">084</span><span id="line-84">   * Retrieves the instance of DataTieringManager.</span>
-<span class="source-line-no">085</span><span id="line-85">   * @return The instance of DataTieringManager, if instantiated, null otherwise.</span>
-<span class="source-line-no">086</span><span id="line-86">   */</span>
-<span class="source-line-no">087</span><span id="line-87">  public static synchronized DataTieringManager getInstance() {</span>
-<span class="source-line-no">088</span><span id="line-88">    return instance;</span>
-<span class="source-line-no">089</span><span id="line-89">  }</span>
-<span class="source-line-no">090</span><span id="line-90"></span>
-<span class="source-line-no">091</span><span id="line-91">  /**</span>
-<span class="source-line-no">092</span><span id="line-92">   * Determines whether data tiering is enabled for the given block cache key.</span>
-<span class="source-line-no">093</span><span id="line-93">   * @param key the block cache key</span>
-<span class="source-line-no">094</span><span id="line-94">   * @return {@code true} if data tiering is enabled for the HFile associated with the key,</span>
-<span class="source-line-no">095</span><span id="line-95">   *         {@code false} otherwise</span>
-<span class="source-line-no">096</span><span id="line-96">   * @throws DataTieringException if there is an error retrieving the HFile path or configuration</span>
-<span class="source-line-no">097</span><span id="line-97">   */</span>
-<span class="source-line-no">098</span><span id="line-98">  public boolean isDataTieringEnabled(BlockCacheKey key) throws DataTieringException {</span>
-<span class="source-line-no">099</span><span id="line-99">    Path hFilePath = key.getFilePath();</span>
-<span class="source-line-no">100</span><span id="line-100">    if (hFilePath == null) {</span>
-<span class="source-line-no">101</span><span id="line-101">      throw new DataTieringException("BlockCacheKey Doesn't Contain HFile Path");</span>
-<span class="source-line-no">102</span><span id="line-102">    }</span>
-<span class="source-line-no">103</span><span id="line-103">    return isDataTieringEnabled(hFilePath);</span>
-<span class="source-line-no">104</span><span id="line-104">  }</span>
-<span class="source-line-no">105</span><span id="line-105"></span>
-<span class="source-line-no">106</span><span id="line-106">  /**</span>
-<span class="source-line-no">107</span><span id="line-107">   * Determines whether data tiering is enabled for the given HFile path.</span>
-<span class="source-line-no">108</span><span id="line-108">   * @param hFilePath the path to the HFile</span>
-<span class="source-line-no">109</span><span id="line-109">   * @return {@code true} if data tiering is enabled, {@code false} otherwise</span>
-<span class="source-line-no">110</span><span id="line-110">   * @throws DataTieringException if there is an error retrieving the configuration</span>
-<span class="source-line-no">111</span><span id="line-111">   */</span>
-<span class="source-line-no">112</span><span id="line-112">  public boolean isDataTieringEnabled(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">113</span><span id="line-113">    Configuration configuration = getConfiguration(hFilePath);</span>
-<span class="source-line-no">114</span><span id="line-114">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
-<span class="source-line-no">115</span><span id="line-115">    return !dataTieringType.equals(DataTieringType.NONE);</span>
-<span class="source-line-no">116</span><span id="line-116">  }</span>
-<span class="source-line-no">117</span><span id="line-117"></span>
-<span class="source-line-no">118</span><span id="line-118">  /**</span>
-<span class="source-line-no">119</span><span id="line-119">   * Determines whether the data associated with the given block cache key is considered hot. If the</span>
-<span class="source-line-no">120</span><span id="line-120">   * data tiering type is set to {@link DataTieringType#TIME_RANGE} and maximum timestamp is not</span>
-<span class="source-line-no">121</span><span id="line-121">   * present, it considers {@code Long.MAX_VALUE} as the maximum timestamp, making the data hot by</span>
-<span class="source-line-no">122</span><span id="line-122">   * default.</span>
-<span class="source-line-no">123</span><span id="line-123">   * @param key the block cache key</span>
-<span class="source-line-no">124</span><span id="line-124">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
-<span class="source-line-no">125</span><span id="line-125">   * @throws DataTieringException if there is an error retrieving data tiering information</span>
-<span class="source-line-no">126</span><span id="line-126">   */</span>
-<span class="source-line-no">127</span><span id="line-127">  public boolean isHotData(BlockCacheKey key) throws DataTieringException {</span>
-<span class="source-line-no">128</span><span id="line-128">    Path hFilePath = key.getFilePath();</span>
-<span class="source-line-no">129</span><span id="line-129">    if (hFilePath == null) {</span>
-<span class="source-line-no">130</span><span id="line-130">      throw new DataTieringException("BlockCacheKey Doesn't Contain HFile Path");</span>
-<span class="source-line-no">131</span><span id="line-131">    }</span>
-<span class="source-line-no">132</span><span id="line-132">    return isHotData(hFilePath);</span>
-<span class="source-line-no">133</span><span id="line-133">  }</span>
-<span class="source-line-no">134</span><span id="line-134"></span>
-<span class="source-line-no">135</span><span id="line-135">  /**</span>
-<span class="source-line-no">136</span><span id="line-136">   * Determines whether the data associated with the given time range tracker is considered hot. If</span>
-<span class="source-line-no">137</span><span id="line-137">   * the data tiering type is set to {@link DataTieringType#TIME_RANGE}, it uses the maximum</span>
-<span class="source-line-no">138</span><span id="line-138">   * timestamp from the time range tracker to determine if the data is hot. Otherwise, it considers</span>
-<span class="source-line-no">139</span><span id="line-139">   * the data as hot by default.</span>
-<span class="source-line-no">140</span><span id="line-140">   * @param maxTimestamp the maximum timestamp associated with the data.</span>
-<span class="source-line-no">141</span><span id="line-141">   * @param conf         The configuration object to use for determining hot data criteria.</span>
-<span class="source-line-no">142</span><span id="line-142">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
-<span class="source-line-no">143</span><span id="line-143">   */</span>
-<span class="source-line-no">144</span><span id="line-144">  public boolean isHotData(long maxTimestamp, Configuration conf) {</span>
-<span class="source-line-no">145</span><span id="line-145">    if (isWithinGracePeriod(maxTimestamp, conf)) {</span>
-<span class="source-line-no">146</span><span id="line-146">      return true;</span>
-<span class="source-line-no">147</span><span id="line-147">    }</span>
-<span class="source-line-no">148</span><span id="line-148">    DataTieringType dataTieringType = getDataTieringType(conf);</span>
-<span class="source-line-no">149</span><span id="line-149"></span>
-<span class="source-line-no">150</span><span id="line-150">    if (</span>
-<span class="source-line-no">151</span><span id="line-151">      !dataTieringType.equals(DataTieringType.NONE)</span>
-<span class="source-line-no">152</span><span id="line-152">        &amp;&amp; maxTimestamp != TimeRangeTracker.INITIAL_MAX_TIMESTAMP</span>
-<span class="source-line-no">153</span><span id="line-153">    ) {</span>
-<span class="source-line-no">154</span><span id="line-154">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(conf));</span>
-<span class="source-line-no">155</span><span id="line-155">    }</span>
-<span class="source-line-no">156</span><span id="line-156">    // DataTieringType.NONE or other types are considered hot by default</span>
-<span class="source-line-no">157</span><span id="line-157">    return true;</span>
-<span class="source-line-no">158</span><span id="line-158">  }</span>
-<span class="source-line-no">159</span><span id="line-159"></span>
-<span class="source-line-no">160</span><span id="line-160">  /**</span>
-<span class="source-line-no">161</span><span id="line-161">   * Determines whether the data in the HFile at the given path is considered hot based on the</span>
-<span class="source-line-no">162</span><span id="line-162">   * configured data tiering type and hot data age. If the data tiering type is set to</span>
-<span class="source-line-no">163</span><span id="line-163">   * {@link DataTieringType#TIME_RANGE} and maximum timestamp is not present, it considers</span>
-<span class="source-line-no">164</span><span id="line-164">   * {@code Long.MAX_VALUE} as the maximum timestamp, making the data hot by default.</span>
-<span class="source-line-no">165</span><span id="line-165">   * @param hFilePath the path to the HFile</span>
-<span class="source-line-no">166</span><span id="line-166">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
-<span class="source-line-no">167</span><span id="line-167">   * @throws DataTieringException if there is an error retrieving data tiering information</span>
-<span class="source-line-no">168</span><span id="line-168">   */</span>
-<span class="source-line-no">169</span><span id="line-169">  public boolean isHotData(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">170</span><span id="line-170">    Configuration configuration = getConfiguration(hFilePath);</span>
-<span class="source-line-no">171</span><span id="line-171">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
-<span class="source-line-no">172</span><span id="line-172"></span>
-<span class="source-line-no">173</span><span id="line-173">    if (!dataTieringType.equals(DataTieringType.NONE)) {</span>
-<span class="source-line-no">174</span><span id="line-174">      HStoreFile hStoreFile = getHStoreFile(hFilePath);</span>
-<span class="source-line-no">175</span><span id="line-175">      if (hStoreFile == null) {</span>
-<span class="source-line-no">176</span><span id="line-176">        throw new DataTieringException(</span>
-<span class="source-line-no">177</span><span id="line-177">          "Store file corresponding to " + hFilePath + " doesn't exist");</span>
-<span class="source-line-no">178</span><span id="line-178">      }</span>
-<span class="source-line-no">179</span><span id="line-179">      long maxTimestamp = dataTieringType.getInstance().getTimestamp(hStoreFile);</span>
-<span class="source-line-no">180</span><span id="line-180">      if (isWithinGracePeriod(maxTimestamp, configuration)) {</span>
-<span class="source-line-no">181</span><span id="line-181">        return true;</span>
-<span class="source-line-no">182</span><span id="line-182">      }</span>
-<span class="source-line-no">183</span><span id="line-183">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(configuration));</span>
-<span class="source-line-no">184</span><span id="line-184">    }</span>
-<span class="source-line-no">185</span><span id="line-185">    // DataTieringType.NONE or other types are considered hot by default</span>
-<span class="source-line-no">186</span><span id="line-186">    return true;</span>
-<span class="source-line-no">187</span><span id="line-187">  }</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">  /**</span>
-<span class="source-line-no">190</span><span id="line-190">   * Determines whether the data in the HFile being read is considered hot based on the configured</span>
-<span class="source-line-no">191</span><span id="line-191">   * data tiering type and hot data age. If the data tiering type is set to</span>
-<span class="source-line-no">192</span><span id="line-192">   * {@link DataTieringType#TIME_RANGE} and maximum timestamp is not present, it considers</span>
-<span class="source-line-no">193</span><span id="line-193">   * {@code Long.MAX_VALUE} as the maximum timestamp, making the data hot by default.</span>
-<span class="source-line-no">194</span><span id="line-194">   * @param hFileInfo     Information about the HFile to determine if its data is hot.</span>
-<span class="source-line-no">195</span><span id="line-195">   * @param configuration The configuration object to use for determining hot data criteria.</span>
-<span class="source-line-no">196</span><span id="line-196">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
-<span class="source-line-no">197</span><span id="line-197">   */</span>
-<span class="source-line-no">198</span><span id="line-198">  public boolean isHotData(HFileInfo hFileInfo, Configuration configuration) {</span>
-<span class="source-line-no">199</span><span id="line-199">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
-<span class="source-line-no">200</span><span id="line-200">    if (hFileInfo != null &amp;&amp; !dataTieringType.equals(DataTieringType.NONE)) {</span>
-<span class="source-line-no">201</span><span id="line-201">      long maxTimestamp = dataTieringType.getInstance().getTimestamp(hFileInfo);</span>
-<span class="source-line-no">202</span><span id="line-202">      if (isWithinGracePeriod(maxTimestamp, configuration)) {</span>
-<span class="source-line-no">203</span><span id="line-203">        return true;</span>
-<span class="source-line-no">204</span><span id="line-204">      }</span>
-<span class="source-line-no">205</span><span id="line-205">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(configuration));</span>
-<span class="source-line-no">206</span><span id="line-206">    }</span>
-<span class="source-line-no">207</span><span id="line-207">    // DataTieringType.NONE or other types are considered hot by default</span>
-<span class="source-line-no">208</span><span id="line-208">    return true;</span>
-<span class="source-line-no">209</span><span id="line-209">  }</span>
-<span class="source-line-no">210</span><span id="line-210"></span>
-<span class="source-line-no">211</span><span id="line-211">  private boolean isWithinGracePeriod(long maxTimestamp, Configuration conf) {</span>
-<span class="source-line-no">212</span><span id="line-212">    long gracePeriod = getDataTieringGracePeriod(conf);</span>
-<span class="source-line-no">213</span><span id="line-213">    return gracePeriod &gt; 0 &amp;&amp; (getCurrentTimestamp() - maxTimestamp) &lt; gracePeriod;</span>
-<span class="source-line-no">214</span><span id="line-214">  }</span>
-<span class="source-line-no">215</span><span id="line-215"></span>
-<span class="source-line-no">216</span><span id="line-216">  private boolean hotDataValidator(long maxTimestamp, long hotDataAge) {</span>
-<span class="source-line-no">217</span><span id="line-217">    long currentTimestamp = getCurrentTimestamp();</span>
-<span class="source-line-no">218</span><span id="line-218">    long diff = currentTimestamp - maxTimestamp;</span>
-<span class="source-line-no">219</span><span id="line-219">    return diff &lt;= hotDataAge;</span>
-<span class="source-line-no">220</span><span id="line-220">  }</span>
-<span class="source-line-no">221</span><span id="line-221"></span>
-<span class="source-line-no">222</span><span id="line-222">  private long getCurrentTimestamp() {</span>
-<span class="source-line-no">223</span><span id="line-223">    return EnvironmentEdgeManager.getDelegate().currentTime();</span>
-<span class="source-line-no">224</span><span id="line-224">  }</span>
-<span class="source-line-no">225</span><span id="line-225"></span>
-<span class="source-line-no">226</span><span id="line-226">  /**</span>
-<span class="source-line-no">227</span><span id="line-227">   * Returns a set of cold data filenames from the given set of cached blocks. Cold data is</span>
-<span class="source-line-no">228</span><span id="line-228">   * determined by the configured data tiering type and hot data age.</span>
-<span class="source-line-no">229</span><span id="line-229">   * @param allCachedBlocks a set of all cached block cache keys</span>
-<span class="source-line-no">230</span><span id="line-230">   * @return a set of cold data filenames</span>
-<span class="source-line-no">231</span><span id="line-231">   * @throws DataTieringException if there is an error determining whether a block is hot</span>
-<span class="source-line-no">232</span><span id="line-232">   */</span>
-<span class="source-line-no">233</span><span id="line-233">  public Set&lt;String&gt; getColdDataFiles(Set&lt;BlockCacheKey&gt; allCachedBlocks)</span>
-<span class="source-line-no">234</span><span id="line-234">    throws DataTieringException {</span>
-<span class="source-line-no">235</span><span id="line-235">    Set&lt;String&gt; coldHFiles = new HashSet&lt;&gt;();</span>
-<span class="source-line-no">236</span><span id="line-236">    for (BlockCacheKey key : allCachedBlocks) {</span>
-<span class="source-line-no">237</span><span id="line-237">      if (coldHFiles.contains(key.getHfileName())) {</span>
-<span class="source-line-no">238</span><span id="line-238">        continue;</span>
+<span class="source-line-no">020</span><span id="line-20">import java.util.Date;</span>
+<span class="source-line-no">021</span><span id="line-21">import java.util.HashMap;</span>
+<span class="source-line-no">022</span><span id="line-22">import java.util.HashSet;</span>
+<span class="source-line-no">023</span><span id="line-23">import java.util.Map;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.util.Set;</span>
+<span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.conf.Configuration;</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.fs.Path;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.io.hfile.BlockCacheKey;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.io.hfile.HFileInfo;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.util.Bytes;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.slf4j.Logger;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">034</span><span id="line-34"></span>
+<span class="source-line-no">035</span><span id="line-35">/**</span>
+<span class="source-line-no">036</span><span id="line-36"> * The DataTieringManager class categorizes data into hot data and cold data based on the specified</span>
+<span class="source-line-no">037</span><span id="line-37"> * {@link DataTieringType} when DataTiering is enabled. DataTiering is disabled by default with</span>
+<span class="source-line-no">038</span><span id="line-38"> * {@link DataTieringType} set to {@link DataTieringType#NONE}. The {@link DataTieringType}</span>
+<span class="source-line-no">039</span><span id="line-39"> * determines the logic for distinguishing data into hot or cold. By default, all data is considered</span>
+<span class="source-line-no">040</span><span id="line-40"> * as hot.</span>
+<span class="source-line-no">041</span><span id="line-41"> */</span>
+<span class="source-line-no">042</span><span id="line-42">@InterfaceAudience.Private</span>
+<span class="source-line-no">043</span><span id="line-43">public class DataTieringManager {</span>
+<span class="source-line-no">044</span><span id="line-44">  private static final Logger LOG = LoggerFactory.getLogger(DataTieringManager.class);</span>
+<span class="source-line-no">045</span><span id="line-45">  public static final String GLOBAL_DATA_TIERING_ENABLED_KEY =</span>
+<span class="source-line-no">046</span><span id="line-46">    "hbase.regionserver.datatiering.enable";</span>
+<span class="source-line-no">047</span><span id="line-47">  public static final boolean DEFAULT_GLOBAL_DATA_TIERING_ENABLED = false; // disabled by default</span>
+<span class="source-line-no">048</span><span id="line-48">  public static final String DATATIERING_KEY = "hbase.hstore.datatiering.type";</span>
+<span class="source-line-no">049</span><span id="line-49">  public static final String HSTORE_DATATIERING_GRACE_PERIOD_MILLIS_KEY =</span>
+<span class="source-line-no">050</span><span id="line-50">    "hbase.hstore.datatiering.grace.period.millis";</span>
+<span class="source-line-no">051</span><span id="line-51">  public static final long DEFAULT_DATATIERING_GRACE_PERIOD = 0;</span>
+<span class="source-line-no">052</span><span id="line-52">  public static final String DATATIERING_HOT_DATA_AGE_KEY =</span>
+<span class="source-line-no">053</span><span id="line-53">    "hbase.hstore.datatiering.hot.age.millis";</span>
+<span class="source-line-no">054</span><span id="line-54">  public static final DataTieringType DEFAULT_DATATIERING = DataTieringType.NONE;</span>
+<span class="source-line-no">055</span><span id="line-55">  public static final long DEFAULT_DATATIERING_HOT_DATA_AGE = 7 * 24 * 60 * 60 * 1000; // 7 Days</span>
+<span class="source-line-no">056</span><span id="line-56">  private static DataTieringManager instance;</span>
+<span class="source-line-no">057</span><span id="line-57">  private final Map&lt;String, HRegion&gt; onlineRegions;</span>
+<span class="source-line-no">058</span><span id="line-58"></span>
+<span class="source-line-no">059</span><span id="line-59">  private DataTieringManager(Map&lt;String, HRegion&gt; onlineRegions) {</span>
+<span class="source-line-no">060</span><span id="line-60">    this.onlineRegions = onlineRegions;</span>
+<span class="source-line-no">061</span><span id="line-61">  }</span>
+<span class="source-line-no">062</span><span id="line-62"></span>
+<span class="source-line-no">063</span><span id="line-63">  /**</span>
+<span class="source-line-no">064</span><span id="line-64">   * Initializes the DataTieringManager instance with the provided map of online regions, only if</span>
+<span class="source-line-no">065</span><span id="line-65">   * the configuration "hbase.regionserver.datatiering.enable" is enabled.</span>
+<span class="source-line-no">066</span><span id="line-66">   * @param conf          Configuration object.</span>
+<span class="source-line-no">067</span><span id="line-67">   * @param onlineRegions A map containing online regions.</span>
+<span class="source-line-no">068</span><span id="line-68">   * @return True if the instance is instantiated successfully, false otherwise.</span>
+<span class="source-line-no">069</span><span id="line-69">   */</span>
+<span class="source-line-no">070</span><span id="line-70">  public static synchronized boolean instantiate(Configuration conf,</span>
+<span class="source-line-no">071</span><span id="line-71">    Map&lt;String, HRegion&gt; onlineRegions) {</span>
+<span class="source-line-no">072</span><span id="line-72">    if (isDataTieringFeatureEnabled(conf) &amp;&amp; instance == null) {</span>
+<span class="source-line-no">073</span><span id="line-73">      instance = new DataTieringManager(onlineRegions);</span>
+<span class="source-line-no">074</span><span id="line-74">      LOG.info("DataTieringManager instantiated successfully.");</span>
+<span class="source-line-no">075</span><span id="line-75">      return true;</span>
+<span class="source-line-no">076</span><span id="line-76">    } else {</span>
+<span class="source-line-no">077</span><span id="line-77">      LOG.warn("DataTieringManager is already instantiated.");</span>
+<span class="source-line-no">078</span><span id="line-78">    }</span>
+<span class="source-line-no">079</span><span id="line-79">    return false;</span>
+<span class="source-line-no">080</span><span id="line-80">  }</span>
+<span class="source-line-no">081</span><span id="line-81"></span>
+<span class="source-line-no">082</span><span id="line-82">  /**</span>
+<span class="source-line-no">083</span><span id="line-83">   * Retrieves the instance of DataTieringManager.</span>
+<span class="source-line-no">084</span><span id="line-84">   * @return The instance of DataTieringManager, if instantiated, null otherwise.</span>
+<span class="source-line-no">085</span><span id="line-85">   */</span>
+<span class="source-line-no">086</span><span id="line-86">  public static synchronized DataTieringManager getInstance() {</span>
+<span class="source-line-no">087</span><span id="line-87">    return instance;</span>
+<span class="source-line-no">088</span><span id="line-88">  }</span>
+<span class="source-line-no">089</span><span id="line-89"></span>
+<span class="source-line-no">090</span><span id="line-90">  /**</span>
+<span class="source-line-no">091</span><span id="line-91">   * Determines whether data tiering is enabled for the given block cache key.</span>
+<span class="source-line-no">092</span><span id="line-92">   * @param key the block cache key</span>
+<span class="source-line-no">093</span><span id="line-93">   * @return {@code true} if data tiering is enabled for the HFile associated with the key,</span>
+<span class="source-line-no">094</span><span id="line-94">   *         {@code false} otherwise</span>
+<span class="source-line-no">095</span><span id="line-95">   * @throws DataTieringException if there is an error retrieving the HFile path or configuration</span>
+<span class="source-line-no">096</span><span id="line-96">   */</span>
+<span class="source-line-no">097</span><span id="line-97">  public boolean isDataTieringEnabled(BlockCacheKey key) throws DataTieringException {</span>
+<span class="source-line-no">098</span><span id="line-98">    if (key.getCfName() == null || key.getRegionName() == null) {</span>
+<span class="source-line-no">099</span><span id="line-99">      throw new DataTieringException(</span>
+<span class="source-line-no">100</span><span id="line-100">        "BlockCacheKey doesn't contain Column Family Name or Region Name");</span>
+<span class="source-line-no">101</span><span id="line-101">    }</span>
+<span class="source-line-no">102</span><span id="line-102">    Configuration configuration =</span>
+<span class="source-line-no">103</span><span id="line-103">      getHStore(key.getRegionName(), key.getCfName()).getReadOnlyConfiguration();</span>
+<span class="source-line-no">104</span><span id="line-104">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
+<span class="source-line-no">105</span><span id="line-105">    return !dataTieringType.equals(DataTieringType.NONE);</span>
+<span class="source-line-no">106</span><span id="line-106">  }</span>
+<span class="source-line-no">107</span><span id="line-107"></span>
+<span class="source-line-no">108</span><span id="line-108">  /**</span>
+<span class="source-line-no">109</span><span id="line-109">   * Determines whether data tiering is enabled for the given HFile path.</span>
+<span class="source-line-no">110</span><span id="line-110">   * @param hFilePath the path to the HFile</span>
+<span class="source-line-no">111</span><span id="line-111">   * @return {@code true} if data tiering is enabled, {@code false} otherwise</span>
+<span class="source-line-no">112</span><span id="line-112">   * @throws DataTieringException if there is an error retrieving the configuration</span>
+<span class="source-line-no">113</span><span id="line-113">   */</span>
+<span class="source-line-no">114</span><span id="line-114">  public boolean isDataTieringEnabled(Path hFilePath) throws DataTieringException {</span>
+<span class="source-line-no">115</span><span id="line-115">    Configuration configuration = getConfiguration(hFilePath);</span>
+<span class="source-line-no">116</span><span id="line-116">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
+<span class="source-line-no">117</span><span id="line-117">    return !dataTieringType.equals(DataTieringType.NONE);</span>
+<span class="source-line-no">118</span><span id="line-118">  }</span>
+<span class="source-line-no">119</span><span id="line-119"></span>
+<span class="source-line-no">120</span><span id="line-120">  /**</span>
+<span class="source-line-no">121</span><span id="line-121">   * Determines whether the data associated with the given block cache key is considered hot. If the</span>
+<span class="source-line-no">122</span><span id="line-122">   * data tiering type is set to {@link DataTieringType#TIME_RANGE} and maximum timestamp is not</span>
+<span class="source-line-no">123</span><span id="line-123">   * present, it considers {@code Long.MAX_VALUE} as the maximum timestamp, making the data hot by</span>
+<span class="source-line-no">124</span><span id="line-124">   * default.</span>
+<span class="source-line-no">125</span><span id="line-125">   * @param key the block cache key</span>
+<span class="source-line-no">126</span><span id="line-126">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
+<span class="source-line-no">127</span><span id="line-127">   * @throws DataTieringException if there is an error retrieving data tiering information</span>
+<span class="source-line-no">128</span><span id="line-128">   */</span>
+<span class="source-line-no">129</span><span id="line-129">  public boolean isHotData(BlockCacheKey key) throws DataTieringException {</span>
+<span class="source-line-no">130</span><span id="line-130">    if (key.getRegionName() == null) {</span>
+<span class="source-line-no">131</span><span id="line-131">      throw new DataTieringException("BlockCacheKey doesn't contain Region Name");</span>
+<span class="source-line-no">132</span><span id="line-132">    }</span>
+<span class="source-line-no">133</span><span id="line-133">    if (key.getCfName() == null) {</span>
+<span class="source-line-no">134</span><span id="line-134">      throw new DataTieringException("BlockCacheKey doesn't contain CF Name");</span>
+<span class="source-line-no">135</span><span id="line-135">    }</span>
+<span class="source-line-no">136</span><span id="line-136">    if (key.getHfileName() == null) {</span>
+<span class="source-line-no">137</span><span id="line-137">      throw new DataTieringException("BlockCacheKey doesn't contain File Name");</span>
+<span class="source-line-no">138</span><span id="line-138">    }</span>
+<span class="source-line-no">139</span><span id="line-139">    return isHotData(key.getRegionName(), key.getCfName(), key.getHfileName());</span>
+<span class="source-line-no">140</span><span id="line-140">  }</span>
+<span class="source-line-no">141</span><span id="line-141"></span>
+<span class="source-line-no">142</span><span id="line-142">  /**</span>
+<span class="source-line-no">143</span><span id="line-143">   * Determines whether the data associated with the given time range tracker is considered hot. If</span>
+<span class="source-line-no">144</span><span id="line-144">   * the data tiering type is set to {@link DataTieringType#TIME_RANGE}, it uses the maximum</span>
+<span class="source-line-no">145</span><span id="line-145">   * timestamp from the time range tracker to determine if the data is hot. Otherwise, it considers</span>
+<span class="source-line-no">146</span><span id="line-146">   * the data as hot by default.</span>
+<span class="source-line-no">147</span><span id="line-147">   * @param maxTimestamp the maximum timestamp associated with the data.</span>
+<span class="source-line-no">148</span><span id="line-148">   * @param conf         The configuration object to use for determining hot data criteria.</span>
+<span class="source-line-no">149</span><span id="line-149">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
+<span class="source-line-no">150</span><span id="line-150">   */</span>
+<span class="source-line-no">151</span><span id="line-151">  public boolean isHotData(long maxTimestamp, Configuration conf) {</span>
+<span class="source-line-no">152</span><span id="line-152">    if (isWithinGracePeriod(maxTimestamp, conf)) {</span>
+<span class="source-line-no">153</span><span id="line-153">      return true;</span>
+<span class="source-line-no">154</span><span id="line-154">    }</span>
+<span class="source-line-no">155</span><span id="line-155">    DataTieringType dataTieringType = getDataTieringType(conf);</span>
+<span class="source-line-no">156</span><span id="line-156"></span>
+<span class="source-line-no">157</span><span id="line-157">    if (</span>
+<span class="source-line-no">158</span><span id="line-158">      !dataTieringType.equals(DataTieringType.NONE)</span>
+<span class="source-line-no">159</span><span id="line-159">        &amp;&amp; maxTimestamp != TimeRangeTracker.INITIAL_MAX_TIMESTAMP</span>
+<span class="source-line-no">160</span><span id="line-160">    ) {</span>
+<span class="source-line-no">161</span><span id="line-161">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(conf));</span>
+<span class="source-line-no">162</span><span id="line-162">    }</span>
+<span class="source-line-no">163</span><span id="line-163">    // DataTieringType.NONE or other types are considered hot by default</span>
+<span class="source-line-no">164</span><span id="line-164">    return true;</span>
+<span class="source-line-no">165</span><span id="line-165">  }</span>
+<span class="source-line-no">166</span><span id="line-166"></span>
+<span class="source-line-no">167</span><span id="line-167">  private boolean isHotData(String region, String cf, String fileName) throws DataTieringException {</span>
+<span class="source-line-no">168</span><span id="line-168">    Configuration configuration = getHStore(region, cf).getReadOnlyConfiguration();</span>
+<span class="source-line-no">169</span><span id="line-169">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
+<span class="source-line-no">170</span><span id="line-170">    if (!dataTieringType.equals(DataTieringType.NONE)) {</span>
+<span class="source-line-no">171</span><span id="line-171">      HStoreFile hStoreFile = getHStoreFile(region, cf, fileName);</span>
+<span class="source-line-no">172</span><span id="line-172">      if (hStoreFile == null) {</span>
+<span class="source-line-no">173</span><span id="line-173">        throw new DataTieringException(</span>
+<span class="source-line-no">174</span><span id="line-174">          "Store file corresponding to " + region + "/" + cf + "/" + fileName + " doesn't exist");</span>
+<span class="source-line-no">175</span><span id="line-175">      }</span>
+<span class="source-line-no">176</span><span id="line-176">      long maxTimestamp = dataTieringType.getInstance().getTimestamp(hStoreFile);</span>
+<span class="source-line-no">177</span><span id="line-177">      if (isWithinGracePeriod(maxTimestamp, configuration)) {</span>
+<span class="source-line-no">178</span><span id="line-178">        return true;</span>
+<span class="source-line-no">179</span><span id="line-179">      }</span>
+<span class="source-line-no">180</span><span id="line-180">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(configuration));</span>
+<span class="source-line-no">181</span><span id="line-181">    }</span>
+<span class="source-line-no">182</span><span id="line-182">    // DataTieringType.NONE or other types are considered hot by default</span>
+<span class="source-line-no">183</span><span id="line-183">    return true;</span>
+<span class="source-line-no">184</span><span id="line-184">  }</span>
+<span class="source-line-no">185</span><span id="line-185"></span>
+<span class="source-line-no">186</span><span id="line-186">  /**</span>
+<span class="source-line-no">187</span><span id="line-187">   * Determines whether the data in the HFile being read is considered hot based on the configured</span>
+<span class="source-line-no">188</span><span id="line-188">   * data tiering type and hot data age. If the data tiering type is set to</span>
+<span class="source-line-no">189</span><span id="line-189">   * {@link DataTieringType#TIME_RANGE} and maximum timestamp is not present, it considers</span>
+<span class="source-line-no">190</span><span id="line-190">   * {@code Long.MAX_VALUE} as the maximum timestamp, making the data hot by default.</span>
+<span class="source-line-no">191</span><span id="line-191">   * @param hFileInfo     Information about the HFile to determine if its data is hot.</span>
+<span class="source-line-no">192</span><span id="line-192">   * @param configuration The configuration object to use for determining hot data criteria.</span>
+<span class="source-line-no">193</span><span id="line-193">   * @return {@code true} if the data is hot, {@code false} otherwise</span>
+<span class="source-line-no">194</span><span id="line-194">   */</span>
+<span class="source-line-no">195</span><span id="line-195">  public boolean isHotData(HFileInfo hFileInfo, Configuration configuration) {</span>
+<span class="source-line-no">196</span><span id="line-196">    DataTieringType dataTieringType = getDataTieringType(configuration);</span>
+<span class="source-line-no">197</span><span id="line-197">    if (hFileInfo != null &amp;&amp; !dataTieringType.equals(DataTieringType.NONE)) {</span>
+<span class="source-line-no">198</span><span id="line-198">      long maxTimestamp = dataTieringType.getInstance().getTimestamp(hFileInfo);</span>
+<span class="source-line-no">199</span><span id="line-199">      if (isWithinGracePeriod(maxTimestamp, configuration)) {</span>
+<span class="source-line-no">200</span><span id="line-200">        return true;</span>
+<span class="source-line-no">201</span><span id="line-201">      }</span>
+<span class="source-line-no">202</span><span id="line-202">      return hotDataValidator(maxTimestamp, getDataTieringHotDataAge(configuration));</span>
+<span class="source-line-no">203</span><span id="line-203">    }</span>
+<span class="source-line-no">204</span><span id="line-204">    // DataTieringType.NONE or other types are considered hot by default</span>
+<span class="source-line-no">205</span><span id="line-205">    return true;</span>
+<span class="source-line-no">206</span><span id="line-206">  }</span>
+<span class="source-line-no">207</span><span id="line-207"></span>
+<span class="source-line-no">208</span><span id="line-208">  private boolean isWithinGracePeriod(long maxTimestamp, Configuration conf) {</span>
+<span class="source-line-no">209</span><span id="line-209">    long gracePeriod = getDataTieringGracePeriod(conf);</span>
+<span class="source-line-no">210</span><span id="line-210">    return gracePeriod &gt; 0 &amp;&amp; (getCurrentTimestamp() - maxTimestamp) &lt; gracePeriod;</span>
+<span class="source-line-no">211</span><span id="line-211">  }</span>
+<span class="source-line-no">212</span><span id="line-212"></span>
+<span class="source-line-no">213</span><span id="line-213">  private boolean hotDataValidator(long maxTimestamp, long hotDataAge) {</span>
+<span class="source-line-no">214</span><span id="line-214">    long currentTimestamp = getCurrentTimestamp();</span>
+<span class="source-line-no">215</span><span id="line-215">    long diff = currentTimestamp - maxTimestamp;</span>
+<span class="source-line-no">216</span><span id="line-216">    return diff &lt;= hotDataAge;</span>
+<span class="source-line-no">217</span><span id="line-217">  }</span>
+<span class="source-line-no">218</span><span id="line-218"></span>
+<span class="source-line-no">219</span><span id="line-219">  private long getCurrentTimestamp() {</span>
+<span class="source-line-no">220</span><span id="line-220">    return EnvironmentEdgeManager.getDelegate().currentTime();</span>
+<span class="source-line-no">221</span><span id="line-221">  }</span>
+<span class="source-line-no">222</span><span id="line-222"></span>
+<span class="source-line-no">223</span><span id="line-223">  /**</span>
+<span class="source-line-no">224</span><span id="line-224">   * Returns a set of cold data filenames from the given set of cached blocks. Cold data is</span>
+<span class="source-line-no">225</span><span id="line-225">   * determined by the configured data tiering type and hot data age.</span>
+<span class="source-line-no">226</span><span id="line-226">   * @param allCachedBlocks a set of all cached block cache keys</span>
+<span class="source-line-no">227</span><span id="line-227">   * @return a set of cold data filenames</span>
+<span class="source-line-no">228</span><span id="line-228">   * @throws DataTieringException if there is an error determining whether a block is hot</span>
+<span class="source-line-no">229</span><span id="line-229">   */</span>
+<span class="source-line-no">230</span><span id="line-230">  public Set&lt;String&gt; getColdDataFiles(Set&lt;BlockCacheKey&gt; allCachedBlocks)</span>
+<span class="source-line-no">231</span><span id="line-231">    throws DataTieringException {</span>
+<span class="source-line-no">232</span><span id="line-232">    Set&lt;String&gt; coldHFiles = new HashSet&lt;&gt;();</span>
+<span class="source-line-no">233</span><span id="line-233">    for (BlockCacheKey key : allCachedBlocks) {</span>
+<span class="source-line-no">234</span><span id="line-234">      if (coldHFiles.contains(key.getHfileName())) {</span>
+<span class="source-line-no">235</span><span id="line-235">        continue;</span>
+<span class="source-line-no">236</span><span id="line-236">      }</span>
+<span class="source-line-no">237</span><span id="line-237">      if (!isHotData(key)) {</span>
+<span class="source-line-no">238</span><span id="line-238">        coldHFiles.add(key.getHfileName());</span>
 <span class="source-line-no">239</span><span id="line-239">      }</span>
-<span class="source-line-no">240</span><span id="line-240">      if (!isHotData(key)) {</span>
-<span class="source-line-no">241</span><span id="line-241">        coldHFiles.add(key.getHfileName());</span>
-<span class="source-line-no">242</span><span id="line-242">      }</span>
-<span class="source-line-no">243</span><span id="line-243">    }</span>
-<span class="source-line-no">244</span><span id="line-244">    return coldHFiles;</span>
-<span class="source-line-no">245</span><span id="line-245">  }</span>
-<span class="source-line-no">246</span><span id="line-246"></span>
-<span class="source-line-no">247</span><span id="line-247">  private HRegion getHRegion(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">248</span><span id="line-248">    String regionId;</span>
-<span class="source-line-no">249</span><span id="line-249">    try {</span>
-<span class="source-line-no">250</span><span id="line-250">      regionId = HRegionFileSystem.getRegionId(hFilePath);</span>
-<span class="source-line-no">251</span><span id="line-251">    } catch (IOException e) {</span>
-<span class="source-line-no">252</span><span id="line-252">      throw new DataTieringException(e.getMessage());</span>
-<span class="source-line-no">253</span><span id="line-253">    }</span>
-<span class="source-line-no">254</span><span id="line-254">    HRegion hRegion = this.onlineRegions.get(regionId);</span>
-<span class="source-line-no">255</span><span id="line-255">    if (hRegion == null) {</span>
-<span class="source-line-no">256</span><span id="line-256">      throw new DataTieringException("HRegion corresponding to " + hFilePath + " doesn't exist");</span>
-<span class="source-line-no">257</span><span id="line-257">    }</span>
-<span class="source-line-no">258</span><span id="line-258">    return hRegion;</span>
-<span class="source-line-no">259</span><span id="line-259">  }</span>
-<span class="source-line-no">260</span><span id="line-260"></span>
-<span class="source-line-no">261</span><span id="line-261">  private HStore getHStore(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">262</span><span id="line-262">    HRegion hRegion = getHRegion(hFilePath);</span>
-<span class="source-line-no">263</span><span id="line-263">    String columnFamily = hFilePath.getParent().getName();</span>
-<span class="source-line-no">264</span><span id="line-264">    HStore hStore = hRegion.getStore(Bytes.toBytes(columnFamily));</span>
-<span class="source-line-no">265</span><span id="line-265">    if (hStore == null) {</span>
-<span class="source-line-no">266</span><span id="line-266">      throw new DataTieringException("HStore corresponding to " + hFilePath + " doesn't exist");</span>
-<span class="source-line-no">267</span><span id="line-267">    }</span>
-<span class="source-line-no">268</span><span id="line-268">    return hStore;</span>
-<span class="source-line-no">269</span><span id="line-269">  }</span>
-<span class="source-line-no">270</span><span id="line-270"></span>
-<span class="source-line-no">271</span><span id="line-271">  private HStoreFile getHStoreFile(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">272</span><span id="line-272">    HStore hStore = getHStore(hFilePath);</span>
-<span class="source-line-no">273</span><span id="line-273">    for (HStoreFile file : hStore.getStorefiles()) {</span>
-<span class="source-line-no">274</span><span id="line-274">      if (file.getPath().toUri().getPath().toString().equals(hFilePath.toString())) {</span>
-<span class="source-line-no">275</span><span id="line-275">        return file;</span>
-<span class="source-line-no">276</span><span id="line-276">      }</span>
-<span class="source-line-no">277</span><span id="line-277">    }</span>
-<span class="source-line-no">278</span><span id="line-278">    return null;</span>
-<span class="source-line-no">279</span><span id="line-279">  }</span>
-<span class="source-line-no">280</span><span id="line-280"></span>
-<span class="source-line-no">281</span><span id="line-281">  private Configuration getConfiguration(Path hFilePath) throws DataTieringException {</span>
-<span class="source-line-no">282</span><span id="line-282">    HStore hStore = getHStore(hFilePath);</span>
-<span class="source-line-no">283</span><span id="line-283">    return hStore.getReadOnlyConfiguration();</span>
-<span class="source-line-no">284</span><span id="line-284">  }</span>
-<span class="source-line-no">285</span><span id="line-285"></span>
-<span class="source-line-no">286</span><span id="line-286">  private DataTieringType getDataTieringType(Configuration conf) {</span>
-<span class="source-line-no">287</span><span id="line-287">    return DataTieringType.valueOf(conf.get(DATATIERING_KEY, DEFAULT_DATATIERING.name()));</span>
-<span class="source-line-no">288</span><span id="line-288">  }</span>
-<span class="source-line-no">289</span><span id="line-289"></span>
-<span class="source-line-no">290</span><span id="line-290">  private long getDataTieringHotDataAge(Configuration conf) {</span>
-<span class="source-line-no">291</span><span id="line-291">    return Long.parseLong(</span>
-<span class="source-line-no">292</span><span id="line-292">      conf.get(DATATIERING_HOT_DATA_AGE_KEY, String.valueOf(DEFAULT_DATATIERING_HOT_DATA_AGE)));</span>
-<span class="source-line-no">293</span><span id="line-293">  }</span>
-<span class="source-line-no">294</span><span id="line-294"></span>
-<span class="source-line-no">295</span><span id="line-295">  private long getDataTieringGracePeriod(Configuration conf) {</span>
-<span class="source-line-no">296</span><span id="line-296">    return Long.parseLong(conf.get(HSTORE_DATATIERING_GRACE_PERIOD_MILLIS_KEY,</span>
-<span class="source-line-no">297</span><span id="line-297">      String.valueOf(DEFAULT_DATATIERING_GRACE_PERIOD)));</span>
-<span class="source-line-no">298</span><span id="line-298">  }</span>
-<span class="source-line-no">299</span><span id="line-299"></span>
-<span class="source-line-no">300</span><span id="line-300">  /*</span>
-<span class="source-line-no">301</span><span id="line-301">   * This API traverses through the list of online regions and returns a subset of these files-names</span>
-<span class="source-line-no">302</span><span id="line-302">   * that are cold.</span>
-<span class="source-line-no">303</span><span id="line-303">   * @return List of names of files with cold data as per data-tiering logic.</span>
-<span class="source-line-no">304</span><span id="line-304">   */</span>
-<span class="source-line-no">305</span><span id="line-305">  public Map&lt;String, String&gt; getColdFilesList() {</span>
-<span class="source-line-no">306</span><span id="line-306">    Map&lt;String, String&gt; coldFiles = new HashMap&lt;&gt;();</span>
-<span class="source-line-no">307</span><span id="line-307">    for (HRegion r : this.onlineRegions.values()) {</span>
-<span class="source-line-no">308</span><span id="line-308">      for (HStore hStore : r.getStores()) {</span>
-<span class="source-line-no">309</span><span id="line-309">        Configuration conf = hStore.getReadOnlyConfiguration();</span>
-<span class="source-line-no">310</span><span id="line-310">        DataTieringType dataTieringType = getDataTieringType(conf);</span>
-<span class="source-line-no">311</span><span id="line-311">        if (dataTieringType == DataTieringType.NONE) {</span>
-<span class="source-line-no">312</span><span id="line-312">          // Data-Tiering not enabled for the store. Just skip it.</span>
-<span class="source-line-no">313</span><span id="line-313">          continue;</span>
-<span class="source-line-no">314</span><span id="line-314">        }</span>
-<span class="source-line-no">315</span><span id="line-315">        Long hotDataAge = getDataTieringHotDataAge(conf);</span>
-<span class="source-line-no">316</span><span id="line-316"></span>
-<span class="source-line-no">317</span><span id="line-317">        for (HStoreFile hStoreFile : hStore.getStorefiles()) {</span>
-<span class="source-line-no">318</span><span id="line-318">          String hFileName =</span>
-<span class="source-line-no">319</span><span id="line-319">            hStoreFile.getFileInfo().getHFileInfo().getHFileContext().getHFileName();</span>
-<span class="source-line-no">320</span><span id="line-320">          long maxTimeStamp = dataTieringType.getInstance().getTimestamp(hStoreFile);</span>
-<span class="source-line-no">321</span><span id="line-321">          LOG.debug("Max TS for file {} is {}", hFileName, new Date(maxTimeStamp));</span>
-<span class="source-line-no">322</span><span id="line-322">          long currentTimestamp = EnvironmentEdgeManager.getDelegate().currentTime();</span>
-<span class="source-line-no">323</span><span id="line-323">          long fileAge = currentTimestamp - maxTimeStamp;</span>
-<span class="source-line-no">324</span><span id="line-324">          if (fileAge &gt; hotDataAge) {</span>
-<span class="source-line-no">325</span><span id="line-325">            // Values do not matter.</span>
-<span class="source-line-no">326</span><span id="line-326">            coldFiles.put(hFileName, null);</span>
-<span class="source-line-no">327</span><span id="line-327">          }</span>
-<span class="source-line-no">328</span><span id="line-328">        }</span>
-<span class="source-line-no">329</span><span id="line-329">      }</span>
-<span class="source-line-no">330</span><span id="line-330">    }</span>
-<span class="source-line-no">331</span><span id="line-331">    return coldFiles;</span>
-<span class="source-line-no">332</span><span id="line-332">  }</span>
-<span class="source-line-no">333</span><span id="line-333"></span>
-<span class="source-line-no">334</span><span id="line-334">  private static boolean isDataTieringFeatureEnabled(Configuration conf) {</span>
-<span class="source-line-no">335</span><span id="line-335">    return conf.getBoolean(DataTieringManager.GLOBAL_DATA_TIERING_ENABLED_KEY,</span>
-<span class="source-line-no">336</span><span id="line-336">      DataTieringManager.DEFAULT_GLOBAL_DATA_TIERING_ENABLED);</span>
-<span class="source-line-no">337</span><span id="line-337">  }</span>
-<span class="source-line-no">338</span><span id="line-338"></span>
-<span class="source-line-no">339</span><span id="line-339">  // Resets the instance to null. To be used only for testing.</span>
-<span class="source-line-no">340</span><span id="line-340">  public static void resetForTestingOnly() {</span>
-<span class="source-line-no">341</span><span id="line-341">    instance = null;</span>
-<span class="source-line-no">342</span><span id="line-342">  }</span>
-<span class="source-line-no">343</span><span id="line-343">}</span>
+<span class="source-line-no">240</span><span id="line-240">    }</span>
+<span class="source-line-no">241</span><span id="line-241">    return coldHFiles;</span>
+<span class="source-line-no">242</span><span id="line-242">  }</span>
+<span class="source-line-no">243</span><span id="line-243"></span>
+<span class="source-line-no">244</span><span id="line-244">  private HRegion getHRegion(String region) throws DataTieringException {</span>
+<span class="source-line-no">245</span><span id="line-245">    HRegion hRegion = this.onlineRegions.get(region);</span>
+<span class="source-line-no">246</span><span id="line-246">    if (hRegion == null) {</span>
+<span class="source-line-no">247</span><span id="line-247">      throw new DataTieringException("HRegion corresponding to " + region + " doesn't exist");</span>
+<span class="source-line-no">248</span><span id="line-248">    }</span>
+<span class="source-line-no">249</span><span id="line-249">    return hRegion;</span>
+<span class="source-line-no">250</span><span id="line-250">  }</span>
+<span class="source-line-no">251</span><span id="line-251"></span>
+<span class="source-line-no">252</span><span id="line-252">  private HStore getHStore(String region, String cf) throws DataTieringException {</span>
+<span class="source-line-no">253</span><span id="line-253">    HRegion hRegion = getHRegion(region);</span>
+<span class="source-line-no">254</span><span id="line-254">    HStore hStore = hRegion.getStore(Bytes.toBytes(cf));</span>
+<span class="source-line-no">255</span><span id="line-255">    if (hStore == null) {</span>
+<span class="source-line-no">256</span><span id="line-256">      throw new DataTieringException(</span>
+<span class="source-line-no">257</span><span id="line-257">        "HStore corresponding to " + region + "/" + cf + " doesn't exist");</span>
+<span class="source-line-no">258</span><span id="line-258">    }</span>
+<span class="source-line-no">259</span><span id="line-259">    return hStore;</span>
+<span class="source-line-no">260</span><span id="line-260">  }</span>
+<span class="source-line-no">261</span><span id="line-261"></span>
+<span class="source-line-no">262</span><span id="line-262">  private HStoreFile getHStoreFile(String region, String cf, String fileName)</span>
+<span class="source-line-no">263</span><span id="line-263">    throws DataTieringException {</span>
+<span class="source-line-no">264</span><span id="line-264">    HStore hStore = getHStore(region, cf);</span>
+<span class="source-line-no">265</span><span id="line-265">    for (HStoreFile file : hStore.getStorefiles()) {</span>
+<span class="source-line-no">266</span><span id="line-266">      if (file.getPath().getName().equals(fileName)) {</span>
+<span class="source-line-no">267</span><span id="line-267">        return file;</span>
+<span class="source-line-no">268</span><span id="line-268">      }</span>
+<span class="source-line-no">269</span><span id="line-269">    }</span>
+<span class="source-line-no">270</span><span id="line-270">    return null;</span>
+<span class="source-line-no">271</span><span id="line-271">  }</span>
+<span class="source-line-no">272</span><span id="line-272"></span>
+<span class="source-line-no">273</span><span id="line-273">  private Configuration getConfiguration(Path hFilePath) throws DataTieringException {</span>
+<span class="source-line-no">274</span><span id="line-274">    String regionName = null;</span>
+<span class="source-line-no">275</span><span id="line-275">    String cfName = null;</span>
+<span class="source-line-no">276</span><span id="line-276">    try {</span>
+<span class="source-line-no">277</span><span id="line-277">      regionName = hFilePath.getParent().getParent().getName();</span>
+<span class="source-line-no">278</span><span id="line-278">      cfName = hFilePath.getParent().getName();</span>
+<span class="source-line-no">279</span><span id="line-279">    } catch (Exception e) {</span>
+<span class="source-line-no">280</span><span id="line-280">      throw new DataTieringException("Incorrect HFile Path: " + hFilePath);</span>
+<span class="source-line-no">281</span><span id="line-281">    }</span>
+<span class="source-line-no">282</span><span id="line-282">    if (regionName == null || cfName == null) {</span>
+<span class="source-line-no">283</span><span id="line-283">      throw new DataTieringException("Incorrect HFile Path: " + hFilePath);</span>
+<span class="source-line-no">284</span><span id="line-284">    }</span>
+<span class="source-line-no">285</span><span id="line-285">    HStore hStore = getHStore(regionName, cfName);</span>
+<span class="source-line-no">286</span><span id="line-286">    return hStore.getReadOnlyConfiguration();</span>
+<span class="source-line-no">287</span><span id="line-287">  }</span>
+<span class="source-line-no">288</span><span id="line-288"></span>
+<span class="source-line-no">289</span><span id="line-289">  private DataTieringType getDataTieringType(Configuration conf) {</span>
+<span class="source-line-no">290</span><span id="line-290">    return DataTieringType.valueOf(conf.get(DATATIERING_KEY, DEFAULT_DATATIERING.name()));</span>
+<span class="source-line-no">291</span><span id="line-291">  }</span>
+<span class="source-line-no">292</span><span id="line-292"></span>
+<span class="source-line-no">293</span><span id="line-293">  private long getDataTieringHotDataAge(Configuration conf) {</span>
+<span class="source-line-no">294</span><span id="line-294">    return Long.parseLong(</span>
+<span class="source-line-no">295</span><span id="line-295">      conf.get(DATATIERING_HOT_DATA_AGE_KEY, String.valueOf(DEFAULT_DATATIERING_HOT_DATA_AGE)));</span>
+<span class="source-line-no">296</span><span id="line-296">  }</span>
+<span class="source-line-no">297</span><span id="line-297"></span>
+<span class="source-line-no">298</span><span id="line-298">  private long getDataTieringGracePeriod(Configuration conf) {</span>
+<span class="source-line-no">299</span><span id="line-299">    return Long.parseLong(conf.get(HSTORE_DATATIERING_GRACE_PERIOD_MILLIS_KEY,</span>
+<span class="source-line-no">300</span><span id="line-300">      String.valueOf(DEFAULT_DATATIERING_GRACE_PERIOD)));</span>
+<span class="source-line-no">301</span><span id="line-301">  }</span>
+<span class="source-line-no">302</span><span id="line-302"></span>
+<span class="source-line-no">303</span><span id="line-303">  /*</span>
+<span class="source-line-no">304</span><span id="line-304">   * This API traverses through the list of online regions and returns a subset of these files-names</span>
+<span class="source-line-no">305</span><span id="line-305">   * that are cold.</span>
+<span class="source-line-no">306</span><span id="line-306">   * @return List of names of files with cold data as per data-tiering logic.</span>
+<span class="source-line-no">307</span><span id="line-307">   */</span>
+<span class="source-line-no">308</span><span id="line-308">  public Map&lt;String, String&gt; getColdFilesList() {</span>
+<span class="source-line-no">309</span><span id="line-309">    Map&lt;String, String&gt; coldFiles = new HashMap&lt;&gt;();</span>
+<span class="source-line-no">310</span><span id="line-310">    for (HRegion r : this.onlineRegions.values()) {</span>
+<span class="source-line-no">311</span><span id="line-311">      for (HStore hStore : r.getStores()) {</span>
+<span class="source-line-no">312</span><span id="line-312">        Configuration conf = hStore.getReadOnlyConfiguration();</span>
+<span class="source-line-no">313</span><span id="line-313">        DataTieringType dataTieringType = getDataTieringType(conf);</span>
+<span class="source-line-no">314</span><span id="line-314">        if (dataTieringType == DataTieringType.NONE) {</span>
+<span class="source-line-no">315</span><span id="line-315">          // Data-Tiering not enabled for the store. Just skip it.</span>
+<span class="source-line-no">316</span><span id="line-316">          continue;</span>
+<span class="source-line-no">317</span><span id="line-317">        }</span>
+<span class="source-line-no">318</span><span id="line-318">        Long hotDataAge = getDataTieringHotDataAge(conf);</span>
+<span class="source-line-no">319</span><span id="line-319"></span>
+<span class="source-line-no">320</span><span id="line-320">        for (HStoreFile hStoreFile : hStore.getStorefiles()) {</span>
+<span class="source-line-no">321</span><span id="line-321">          String hFileName =</span>
+<span class="source-line-no">322</span><span id="line-322">            hStoreFile.getFileInfo().getHFileInfo().getHFileContext().getHFileName();</span>
+<span class="source-line-no">323</span><span id="line-323">          long maxTimeStamp = dataTieringType.getInstance().getTimestamp(hStoreFile);</span>
+<span class="source-line-no">324</span><span id="line-324">          LOG.debug("Max TS for file {} is {}", hFileName, new Date(maxTimeStamp));</span>
+<span class="source-line-no">325</span><span id="line-325">          long currentTimestamp = EnvironmentEdgeManager.getDelegate().currentTime();</span>
+<span class="source-line-no">326</span><span id="line-326">          long fileAge = currentTimestamp - maxTimeStamp;</span>
+<span class="source-line-no">327</span><span id="line-327">          if (fileAge &gt; hotDataAge) {</span>
+<span class="source-line-no">328</span><span id="line-328">            // Values do not matter.</span>
+<span class="source-line-no">329</span><span id="line-329">            coldFiles.put(hFileName, null);</span>
+<span class="source-line-no">330</span><span id="line-330">          }</span>
+<span class="source-line-no">331</span><span id="line-331">        }</span>
+<span class="source-line-no">332</span><span id="line-332">      }</span>
+<span class="source-line-no">333</span><span id="line-333">    }</span>
+<span class="source-line-no">334</span><span id="line-334">    return coldFiles;</span>
+<span class="source-line-no">335</span><span id="line-335">  }</span>
+<span class="source-line-no">336</span><span id="line-336"></span>
+<span class="source-line-no">337</span><span id="line-337">  private static boolean isDataTieringFeatureEnabled(Configuration conf) {</span>
+<span class="source-line-no">338</span><span id="line-338">    return conf.getBoolean(DataTieringManager.GLOBAL_DATA_TIERING_ENABLED_KEY,</span>
+<span class="source-line-no">339</span><span id="line-339">      DataTieringManager.DEFAULT_GLOBAL_DATA_TIERING_ENABLED);</span>
+<span class="source-line-no">340</span><span id="line-340">  }</span>
+<span class="source-line-no">341</span><span id="line-341"></span>
+<span class="source-line-no">342</span><span id="line-342">  // Resets the instance to null. To be used only for testing.</span>
+<span class="source-line-no">343</span><span id="line-343">  public static void resetForTestingOnly() {</span>
+<span class="source-line-no">344</span><span id="line-344">    instance = null;</span>
+<span class="source-line-no">345</span><span id="line-345">  }</span>
+<span class="source-line-no">346</span><span id="line-346">}</span>
 
 
 
