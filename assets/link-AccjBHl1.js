@@ -1,0 +1,1 @@
+import{p as s,y as e}from"./chunk-OIYGIGL5-DSpycKhM.js";const h=t=>{const o=(typeof t.to=="string"?t.to:t.to.pathname)?.startsWith("https://hbase.apache.org");return s.jsx(e,{reloadDocument:o,...t})};export{h as L};
