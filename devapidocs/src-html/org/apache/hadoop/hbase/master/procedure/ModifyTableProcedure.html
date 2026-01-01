@@ -32,585 +32,603 @@
 <span class="source-line-no">019</span><span id="line-19"></span>
 <span class="source-line-no">020</span><span id="line-20">import java.io.IOException;</span>
 <span class="source-line-no">021</span><span id="line-21">import java.util.Arrays;</span>
-<span class="source-line-no">022</span><span id="line-22">import java.util.Collections;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.util.HashSet;</span>
-<span class="source-line-no">024</span><span id="line-24">import java.util.List;</span>
-<span class="source-line-no">025</span><span id="line-25">import java.util.Set;</span>
-<span class="source-line-no">026</span><span id="line-26">import java.util.function.Supplier;</span>
-<span class="source-line-no">027</span><span id="line-27">import java.util.stream.Collectors;</span>
-<span class="source-line-no">028</span><span id="line-28">import java.util.stream.IntStream;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.ConcurrentTableModificationException;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.DoNotRetryIOException;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.HBaseIOException;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.HConstants;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.TableNotFoundException;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.client.RegionInfo;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.client.RegionReplicaUtil;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.client.TableDescriptor;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.client.TableDescriptorBuilder;</span>
-<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.fs.ErasureCodingUtils;</span>
-<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.master.MasterCoprocessorHost;</span>
-<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.master.zksyncer.MetaLocationSyncer;</span>
-<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;</span>
-<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.regionserver.compactions.CustomCellTieredUtils;</span>
-<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.regionserver.storefiletracker.StoreFileTrackerValidationUtils;</span>
-<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.rsgroup.RSGroupInfo;</span>
-<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.util.Bytes;</span>
-<span class="source-line-no">047</span><span id="line-47">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">048</span><span id="line-48">import org.slf4j.Logger;</span>
-<span class="source-line-no">049</span><span id="line-49">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">050</span><span id="line-50"></span>
-<span class="source-line-no">051</span><span id="line-51">import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;</span>
-<span class="source-line-no">052</span><span id="line-52">import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos;</span>
-<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.ModifyTableState;</span>
-<span class="source-line-no">054</span><span id="line-54"></span>
-<span class="source-line-no">055</span><span id="line-55">@InterfaceAudience.Private</span>
-<span class="source-line-no">056</span><span id="line-56">public class ModifyTableProcedure extends AbstractStateMachineTableProcedure&lt;ModifyTableState&gt; {</span>
-<span class="source-line-no">057</span><span id="line-57">  private static final Logger LOG = LoggerFactory.getLogger(ModifyTableProcedure.class);</span>
-<span class="source-line-no">058</span><span id="line-58"></span>
-<span class="source-line-no">059</span><span id="line-59">  private TableDescriptor unmodifiedTableDescriptor = null;</span>
-<span class="source-line-no">060</span><span id="line-60">  private TableDescriptor modifiedTableDescriptor;</span>
-<span class="source-line-no">061</span><span id="line-61">  private boolean deleteColumnFamilyInModify;</span>
-<span class="source-line-no">062</span><span id="line-62">  private boolean shouldCheckDescriptor;</span>
-<span class="source-line-no">063</span><span id="line-63">  private boolean reopenRegions;</span>
-<span class="source-line-no">064</span><span id="line-64">  private String recoverySnapshotName;</span>
-<span class="source-line-no">065</span><span id="line-65"></span>
-<span class="source-line-no">066</span><span id="line-66">  /**</span>
-<span class="source-line-no">067</span><span id="line-67">   * List of column families that cannot be deleted from the hbase:meta table. They are critical to</span>
-<span class="source-line-no">068</span><span id="line-68">   * cluster operation. This is a bit of an odd place to keep this list but then this is the tooling</span>
-<span class="source-line-no">069</span><span id="line-69">   * that does add/remove. Keeping it local!</span>
-<span class="source-line-no">070</span><span id="line-70">   */</span>
-<span class="source-line-no">071</span><span id="line-71">  private static final List&lt;byte[]&gt; UNDELETABLE_META_COLUMNFAMILIES =</span>
-<span class="source-line-no">072</span><span id="line-72">    Collections.unmodifiableList(Arrays.asList(HConstants.CATALOG_FAMILY, HConstants.TABLE_FAMILY,</span>
-<span class="source-line-no">073</span><span id="line-73">      HConstants.REPLICATION_BARRIER_FAMILY, HConstants.NAMESPACE_FAMILY));</span>
-<span class="source-line-no">074</span><span id="line-74"></span>
-<span class="source-line-no">075</span><span id="line-75">  public ModifyTableProcedure() {</span>
-<span class="source-line-no">076</span><span id="line-76">    super();</span>
-<span class="source-line-no">077</span><span id="line-77">    initialize(null, false);</span>
-<span class="source-line-no">078</span><span id="line-78">  }</span>
-<span class="source-line-no">079</span><span id="line-79"></span>
-<span class="source-line-no">080</span><span id="line-80">  public ModifyTableProcedure(final MasterProcedureEnv env, final TableDescriptor htd)</span>
-<span class="source-line-no">081</span><span id="line-81">    throws HBaseIOException {</span>
-<span class="source-line-no">082</span><span id="line-82">    this(env, htd, null);</span>
-<span class="source-line-no">083</span><span id="line-83">  }</span>
-<span class="source-line-no">084</span><span id="line-84"></span>
-<span class="source-line-no">085</span><span id="line-85">  public ModifyTableProcedure(final MasterProcedureEnv env, final TableDescriptor htd,</span>
-<span class="source-line-no">086</span><span id="line-86">    final ProcedurePrepareLatch latch) throws HBaseIOException {</span>
-<span class="source-line-no">087</span><span id="line-87">    this(env, htd, latch, null, false, true);</span>
-<span class="source-line-no">088</span><span id="line-88">  }</span>
-<span class="source-line-no">089</span><span id="line-89"></span>
-<span class="source-line-no">090</span><span id="line-90">  public ModifyTableProcedure(final MasterProcedureEnv env,</span>
-<span class="source-line-no">091</span><span id="line-91">    final TableDescriptor newTableDescriptor, final ProcedurePrepareLatch latch,</span>
-<span class="source-line-no">092</span><span id="line-92">    final TableDescriptor oldTableDescriptor, final boolean shouldCheckDescriptor,</span>
-<span class="source-line-no">093</span><span id="line-93">    final boolean reopenRegions) throws HBaseIOException {</span>
-<span class="source-line-no">094</span><span id="line-94">    super(env, latch);</span>
-<span class="source-line-no">095</span><span id="line-95">    this.reopenRegions = reopenRegions;</span>
-<span class="source-line-no">096</span><span id="line-96">    initialize(oldTableDescriptor, shouldCheckDescriptor);</span>
-<span class="source-line-no">097</span><span id="line-97">    this.modifiedTableDescriptor = newTableDescriptor;</span>
-<span class="source-line-no">098</span><span id="line-98">    preflightChecks(env, null/* No table checks; if changing peers, table can be online */);</span>
-<span class="source-line-no">099</span><span id="line-99">  }</span>
-<span class="source-line-no">100</span><span id="line-100"></span>
-<span class="source-line-no">101</span><span id="line-101">  @Override</span>
-<span class="source-line-no">102</span><span id="line-102">  protected void preflightChecks(MasterProcedureEnv env, Boolean enabled) throws HBaseIOException {</span>
-<span class="source-line-no">103</span><span id="line-103">    super.preflightChecks(env, enabled);</span>
-<span class="source-line-no">104</span><span id="line-104">    if (this.modifiedTableDescriptor.isMetaTable()) {</span>
-<span class="source-line-no">105</span><span id="line-105">      // If we are modifying the hbase:meta table, make sure we are not deleting critical</span>
-<span class="source-line-no">106</span><span id="line-106">      // column families else we'll damage the cluster.</span>
-<span class="source-line-no">107</span><span id="line-107">      Set&lt;byte[]&gt; cfs = this.modifiedTableDescriptor.getColumnFamilyNames();</span>
-<span class="source-line-no">108</span><span id="line-108">      for (byte[] family : UNDELETABLE_META_COLUMNFAMILIES) {</span>
-<span class="source-line-no">109</span><span id="line-109">        if (!cfs.contains(family)) {</span>
-<span class="source-line-no">110</span><span id="line-110">          throw new HBaseIOException(</span>
-<span class="source-line-no">111</span><span id="line-111">            "Delete of hbase:meta column family " + Bytes.toString(family));</span>
-<span class="source-line-no">112</span><span id="line-112">        }</span>
-<span class="source-line-no">113</span><span id="line-113">      }</span>
-<span class="source-line-no">114</span><span id="line-114">    }</span>
-<span class="source-line-no">115</span><span id="line-115"></span>
-<span class="source-line-no">116</span><span id="line-116">    if (!reopenRegions) {</span>
-<span class="source-line-no">117</span><span id="line-117">      if (this.unmodifiedTableDescriptor == null) {</span>
-<span class="source-line-no">118</span><span id="line-118">        throw new HBaseIOException(</span>
-<span class="source-line-no">119</span><span id="line-119">          "unmodifiedTableDescriptor cannot be null when this table modification won't reopen regions");</span>
-<span class="source-line-no">120</span><span id="line-120">      }</span>
-<span class="source-line-no">121</span><span id="line-121">      if (</span>
-<span class="source-line-no">122</span><span id="line-122">        !this.unmodifiedTableDescriptor.getTableName()</span>
-<span class="source-line-no">123</span><span id="line-123">          .equals(this.modifiedTableDescriptor.getTableName())</span>
-<span class="source-line-no">124</span><span id="line-124">      ) {</span>
-<span class="source-line-no">125</span><span id="line-125">        throw new HBaseIOException(</span>
-<span class="source-line-no">126</span><span id="line-126">          "Cannot change the table name when this modification won't " + "reopen regions.");</span>
-<span class="source-line-no">127</span><span id="line-127">      }</span>
-<span class="source-line-no">128</span><span id="line-128">      if (</span>
-<span class="source-line-no">129</span><span id="line-129">        this.unmodifiedTableDescriptor.getColumnFamilyCount()</span>
-<span class="source-line-no">130</span><span id="line-130">            != this.modifiedTableDescriptor.getColumnFamilyCount()</span>
-<span class="source-line-no">131</span><span id="line-131">      ) {</span>
-<span class="source-line-no">132</span><span id="line-132">        throw new HBaseIOException(</span>
-<span class="source-line-no">133</span><span id="line-133">          "Cannot add or remove column families when this modification " + "won't reopen regions.");</span>
-<span class="source-line-no">134</span><span id="line-134">      }</span>
-<span class="source-line-no">135</span><span id="line-135">      if (</span>
-<span class="source-line-no">136</span><span id="line-136">        this.unmodifiedTableDescriptor.getCoprocessorDescriptors().hashCode()</span>
-<span class="source-line-no">137</span><span id="line-137">            != this.modifiedTableDescriptor.getCoprocessorDescriptors().hashCode()</span>
-<span class="source-line-no">138</span><span id="line-138">      ) {</span>
-<span class="source-line-no">139</span><span id="line-139">        throw new HBaseIOException(</span>
-<span class="source-line-no">140</span><span id="line-140">          "Can not modify Coprocessor when table modification won't reopen regions");</span>
-<span class="source-line-no">141</span><span id="line-141">      }</span>
-<span class="source-line-no">142</span><span id="line-142">      final Set&lt;String&gt; s = new HashSet&lt;&gt;(Arrays.asList(TableDescriptorBuilder.REGION_REPLICATION,</span>
-<span class="source-line-no">143</span><span id="line-143">        TableDescriptorBuilder.REGION_MEMSTORE_REPLICATION, RSGroupInfo.TABLE_DESC_PROP_GROUP));</span>
-<span class="source-line-no">144</span><span id="line-144">      for (String k : s) {</span>
-<span class="source-line-no">145</span><span id="line-145">        if (</span>
-<span class="source-line-no">146</span><span id="line-146">          isTablePropertyModified(this.unmodifiedTableDescriptor, this.modifiedTableDescriptor, k)</span>
-<span class="source-line-no">147</span><span id="line-147">        ) {</span>
-<span class="source-line-no">148</span><span id="line-148">          throw new HBaseIOException(</span>
-<span class="source-line-no">149</span><span id="line-149">            "Can not modify " + k + " of a table when modification won't reopen regions");</span>
-<span class="source-line-no">150</span><span id="line-150">        }</span>
-<span class="source-line-no">151</span><span id="line-151">      }</span>
-<span class="source-line-no">152</span><span id="line-152">    }</span>
-<span class="source-line-no">153</span><span id="line-153">  }</span>
-<span class="source-line-no">154</span><span id="line-154"></span>
-<span class="source-line-no">155</span><span id="line-155">  /**</span>
-<span class="source-line-no">156</span><span id="line-156">   * Comparing the value associated with a given key across two TableDescriptor instances'</span>
-<span class="source-line-no">157</span><span id="line-157">   * properties.</span>
-<span class="source-line-no">158</span><span id="line-158">   * @return True if the table property &lt;code&gt;key&lt;/code&gt; is the same in both.</span>
-<span class="source-line-no">159</span><span id="line-159">   */</span>
-<span class="source-line-no">160</span><span id="line-160">  private boolean isTablePropertyModified(TableDescriptor oldDescriptor,</span>
-<span class="source-line-no">161</span><span id="line-161">    TableDescriptor newDescriptor, String key) {</span>
-<span class="source-line-no">162</span><span id="line-162">    String oldV = oldDescriptor.getValue(key);</span>
-<span class="source-line-no">163</span><span id="line-163">    String newV = newDescriptor.getValue(key);</span>
-<span class="source-line-no">164</span><span id="line-164">    if (oldV == null &amp;&amp; newV == null) {</span>
-<span class="source-line-no">165</span><span id="line-165">      return false;</span>
-<span class="source-line-no">166</span><span id="line-166">    } else if (oldV != null &amp;&amp; newV != null &amp;&amp; oldV.equals(newV)) {</span>
-<span class="source-line-no">167</span><span id="line-167">      return false;</span>
-<span class="source-line-no">168</span><span id="line-168">    }</span>
-<span class="source-line-no">169</span><span id="line-169">    return true;</span>
-<span class="source-line-no">170</span><span id="line-170">  }</span>
-<span class="source-line-no">171</span><span id="line-171"></span>
-<span class="source-line-no">172</span><span id="line-172">  private void initialize(final TableDescriptor unmodifiedTableDescriptor,</span>
-<span class="source-line-no">173</span><span id="line-173">    final boolean shouldCheckDescriptor) {</span>
-<span class="source-line-no">174</span><span id="line-174">    this.unmodifiedTableDescriptor = unmodifiedTableDescriptor;</span>
-<span class="source-line-no">175</span><span id="line-175">    this.shouldCheckDescriptor = shouldCheckDescriptor;</span>
-<span class="source-line-no">176</span><span id="line-176">    this.deleteColumnFamilyInModify = false;</span>
-<span class="source-line-no">177</span><span id="line-177">  }</span>
-<span class="source-line-no">178</span><span id="line-178"></span>
-<span class="source-line-no">179</span><span id="line-179">  @Override</span>
-<span class="source-line-no">180</span><span id="line-180">  protected Flow executeFromState(final MasterProcedureEnv env, final ModifyTableState state)</span>
-<span class="source-line-no">181</span><span id="line-181">    throws InterruptedException {</span>
-<span class="source-line-no">182</span><span id="line-182">    LOG.trace("{} execute state={}", this, state);</span>
-<span class="source-line-no">183</span><span id="line-183">    try {</span>
-<span class="source-line-no">184</span><span id="line-184">      switch (state) {</span>
-<span class="source-line-no">185</span><span id="line-185">        case MODIFY_TABLE_PREPARE:</span>
-<span class="source-line-no">186</span><span id="line-186">          prepareModify(env);</span>
-<span class="source-line-no">187</span><span id="line-187">          setNextState(ModifyTableState.MODIFY_TABLE_PRE_OPERATION);</span>
-<span class="source-line-no">188</span><span id="line-188">          break;</span>
-<span class="source-line-no">189</span><span id="line-189">        case MODIFY_TABLE_PRE_OPERATION:</span>
-<span class="source-line-no">190</span><span id="line-190">          preModify(env, state);</span>
-<span class="source-line-no">191</span><span id="line-191">          // We cannot allow changes to region replicas when 'reopenRegions==false',</span>
-<span class="source-line-no">192</span><span id="line-192">          // as this mode bypasses the state management required for modifying region replicas.</span>
-<span class="source-line-no">193</span><span id="line-193">          if (reopenRegions) {</span>
-<span class="source-line-no">194</span><span id="line-194">            // Check if we should create a recovery snapshot for column family deletion</span>
-<span class="source-line-no">195</span><span id="line-195">            if (deleteColumnFamilyInModify &amp;&amp; RecoverySnapshotUtils.isRecoveryEnabled(env)) {</span>
-<span class="source-line-no">196</span><span id="line-196">              setNextState(ModifyTableState.MODIFY_TABLE_SNAPSHOT);</span>
-<span class="source-line-no">197</span><span id="line-197">            } else {</span>
-<span class="source-line-no">198</span><span id="line-198">              setNextState(ModifyTableState.MODIFY_TABLE_CLOSE_EXCESS_REPLICAS);</span>
-<span class="source-line-no">199</span><span id="line-199">            }</span>
-<span class="source-line-no">200</span><span id="line-200">          } else {</span>
-<span class="source-line-no">201</span><span id="line-201">            setNextState(ModifyTableState.MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR);</span>
-<span class="source-line-no">202</span><span id="line-202">          }</span>
-<span class="source-line-no">203</span><span id="line-203">          break;</span>
-<span class="source-line-no">204</span><span id="line-204">        case MODIFY_TABLE_SNAPSHOT:</span>
-<span class="source-line-no">205</span><span id="line-205">          // Create recovery snapshot procedure as child procedure</span>
-<span class="source-line-no">206</span><span id="line-206">          recoverySnapshotName = RecoverySnapshotUtils.generateSnapshotName(getTableName());</span>
-<span class="source-line-no">207</span><span id="line-207">          SnapshotProcedure snapshotProcedure = RecoverySnapshotUtils.createSnapshotProcedure(env,</span>
-<span class="source-line-no">208</span><span id="line-208">            getTableName(), recoverySnapshotName, unmodifiedTableDescriptor);</span>
-<span class="source-line-no">209</span><span id="line-209">          // Submit snapshot procedure as child procedure</span>
-<span class="source-line-no">210</span><span id="line-210">          addChildProcedure(snapshotProcedure);</span>
-<span class="source-line-no">211</span><span id="line-211">          LOG.debug("Creating recovery snapshot {} for table {} before column deletion",</span>
-<span class="source-line-no">212</span><span id="line-212">            recoverySnapshotName, getTableName());</span>
-<span class="source-line-no">213</span><span id="line-213">          setNextState(ModifyTableState.MODIFY_TABLE_CLOSE_EXCESS_REPLICAS);</span>
-<span class="source-line-no">214</span><span id="line-214">          break;</span>
-<span class="source-line-no">215</span><span id="line-215">        case MODIFY_TABLE_CLOSE_EXCESS_REPLICAS:</span>
-<span class="source-line-no">216</span><span id="line-216">          if (isTableEnabled(env)) {</span>
-<span class="source-line-no">217</span><span id="line-217">            closeExcessReplicasIfNeeded(env);</span>
-<span class="source-line-no">218</span><span id="line-218">          }</span>
-<span class="source-line-no">219</span><span id="line-219">          setNextState(ModifyTableState.MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR);</span>
-<span class="source-line-no">220</span><span id="line-220">          break;</span>
-<span class="source-line-no">221</span><span id="line-221">        case MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR:</span>
-<span class="source-line-no">222</span><span id="line-222">          updateTableDescriptor(env);</span>
-<span class="source-line-no">223</span><span id="line-223">          if (reopenRegions) {</span>
-<span class="source-line-no">224</span><span id="line-224">            setNextState(ModifyTableState.MODIFY_TABLE_REMOVE_REPLICA_COLUMN);</span>
-<span class="source-line-no">225</span><span id="line-225">          } else {</span>
-<span class="source-line-no">226</span><span id="line-226">            setNextState(ModifyTableState.MODIFY_TABLE_POST_OPERATION);</span>
-<span class="source-line-no">227</span><span id="line-227">          }</span>
-<span class="source-line-no">228</span><span id="line-228">          break;</span>
-<span class="source-line-no">229</span><span id="line-229">        case MODIFY_TABLE_REMOVE_REPLICA_COLUMN:</span>
-<span class="source-line-no">230</span><span id="line-230">          removeReplicaColumnsIfNeeded(env);</span>
-<span class="source-line-no">231</span><span id="line-231">          setNextState(ModifyTableState.MODIFY_TABLE_POST_OPERATION);</span>
+<span class="source-line-no">022</span><span id="line-22">import java.util.Collection;</span>
+<span class="source-line-no">023</span><span id="line-23">import java.util.Collections;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.util.HashSet;</span>
+<span class="source-line-no">025</span><span id="line-25">import java.util.List;</span>
+<span class="source-line-no">026</span><span id="line-26">import java.util.Set;</span>
+<span class="source-line-no">027</span><span id="line-27">import java.util.function.Supplier;</span>
+<span class="source-line-no">028</span><span id="line-28">import java.util.stream.Collectors;</span>
+<span class="source-line-no">029</span><span id="line-29">import java.util.stream.IntStream;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.ConcurrentTableModificationException;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.DoNotRetryIOException;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.HBaseIOException;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.HConstants;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.TableNotFoundException;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.client.CoprocessorDescriptor;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.client.RegionInfo;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.client.RegionReplicaUtil;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.client.TableDescriptor;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.client.TableDescriptorBuilder;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.fs.ErasureCodingUtils;</span>
+<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.master.MasterCoprocessorHost;</span>
+<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.master.zksyncer.MetaLocationSyncer;</span>
+<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.procedure2.ProcedureStateSerializer;</span>
+<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.regionserver.compactions.CustomCellTieredUtils;</span>
+<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.regionserver.storefiletracker.StoreFileTrackerValidationUtils;</span>
+<span class="source-line-no">047</span><span id="line-47">import org.apache.hadoop.hbase.rsgroup.RSGroupInfo;</span>
+<span class="source-line-no">048</span><span id="line-48">import org.apache.hadoop.hbase.util.Bytes;</span>
+<span class="source-line-no">049</span><span id="line-49">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">050</span><span id="line-50">import org.slf4j.Logger;</span>
+<span class="source-line-no">051</span><span id="line-51">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">052</span><span id="line-52"></span>
+<span class="source-line-no">053</span><span id="line-53">import org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil;</span>
+<span class="source-line-no">054</span><span id="line-54">import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos;</span>
+<span class="source-line-no">055</span><span id="line-55">import org.apache.hadoop.hbase.shaded.protobuf.generated.MasterProcedureProtos.ModifyTableState;</span>
+<span class="source-line-no">056</span><span id="line-56"></span>
+<span class="source-line-no">057</span><span id="line-57">@InterfaceAudience.Private</span>
+<span class="source-line-no">058</span><span id="line-58">public class ModifyTableProcedure extends AbstractStateMachineTableProcedure&lt;ModifyTableState&gt; {</span>
+<span class="source-line-no">059</span><span id="line-59">  private static final Logger LOG = LoggerFactory.getLogger(ModifyTableProcedure.class);</span>
+<span class="source-line-no">060</span><span id="line-60"></span>
+<span class="source-line-no">061</span><span id="line-61">  private TableDescriptor unmodifiedTableDescriptor = null;</span>
+<span class="source-line-no">062</span><span id="line-62">  private TableDescriptor modifiedTableDescriptor;</span>
+<span class="source-line-no">063</span><span id="line-63">  private boolean deleteColumnFamilyInModify;</span>
+<span class="source-line-no">064</span><span id="line-64">  private boolean shouldCheckDescriptor;</span>
+<span class="source-line-no">065</span><span id="line-65">  private boolean reopenRegions;</span>
+<span class="source-line-no">066</span><span id="line-66">  private String recoverySnapshotName;</span>
+<span class="source-line-no">067</span><span id="line-67"></span>
+<span class="source-line-no">068</span><span id="line-68">  /**</span>
+<span class="source-line-no">069</span><span id="line-69">   * List of column families that cannot be deleted from the hbase:meta table. They are critical to</span>
+<span class="source-line-no">070</span><span id="line-70">   * cluster operation. This is a bit of an odd place to keep this list but then this is the tooling</span>
+<span class="source-line-no">071</span><span id="line-71">   * that does add/remove. Keeping it local!</span>
+<span class="source-line-no">072</span><span id="line-72">   */</span>
+<span class="source-line-no">073</span><span id="line-73">  private static final List&lt;byte[]&gt; UNDELETABLE_META_COLUMNFAMILIES =</span>
+<span class="source-line-no">074</span><span id="line-74">    Collections.unmodifiableList(Arrays.asList(HConstants.CATALOG_FAMILY, HConstants.TABLE_FAMILY,</span>
+<span class="source-line-no">075</span><span id="line-75">      HConstants.REPLICATION_BARRIER_FAMILY, HConstants.NAMESPACE_FAMILY));</span>
+<span class="source-line-no">076</span><span id="line-76"></span>
+<span class="source-line-no">077</span><span id="line-77">  public ModifyTableProcedure() {</span>
+<span class="source-line-no">078</span><span id="line-78">    super();</span>
+<span class="source-line-no">079</span><span id="line-79">    initialize(null, false);</span>
+<span class="source-line-no">080</span><span id="line-80">  }</span>
+<span class="source-line-no">081</span><span id="line-81"></span>
+<span class="source-line-no">082</span><span id="line-82">  public ModifyTableProcedure(final MasterProcedureEnv env, final TableDescriptor htd)</span>
+<span class="source-line-no">083</span><span id="line-83">    throws HBaseIOException {</span>
+<span class="source-line-no">084</span><span id="line-84">    this(env, htd, null);</span>
+<span class="source-line-no">085</span><span id="line-85">  }</span>
+<span class="source-line-no">086</span><span id="line-86"></span>
+<span class="source-line-no">087</span><span id="line-87">  public ModifyTableProcedure(final MasterProcedureEnv env, final TableDescriptor htd,</span>
+<span class="source-line-no">088</span><span id="line-88">    final ProcedurePrepareLatch latch) throws HBaseIOException {</span>
+<span class="source-line-no">089</span><span id="line-89">    this(env, htd, latch, null, false, true);</span>
+<span class="source-line-no">090</span><span id="line-90">  }</span>
+<span class="source-line-no">091</span><span id="line-91"></span>
+<span class="source-line-no">092</span><span id="line-92">  public ModifyTableProcedure(final MasterProcedureEnv env,</span>
+<span class="source-line-no">093</span><span id="line-93">    final TableDescriptor newTableDescriptor, final ProcedurePrepareLatch latch,</span>
+<span class="source-line-no">094</span><span id="line-94">    final TableDescriptor oldTableDescriptor, final boolean shouldCheckDescriptor,</span>
+<span class="source-line-no">095</span><span id="line-95">    final boolean reopenRegions) throws HBaseIOException {</span>
+<span class="source-line-no">096</span><span id="line-96">    super(env, latch);</span>
+<span class="source-line-no">097</span><span id="line-97">    this.reopenRegions = reopenRegions;</span>
+<span class="source-line-no">098</span><span id="line-98">    initialize(oldTableDescriptor, shouldCheckDescriptor);</span>
+<span class="source-line-no">099</span><span id="line-99">    this.modifiedTableDescriptor = newTableDescriptor;</span>
+<span class="source-line-no">100</span><span id="line-100">    preflightChecks(env, null/* No table checks; if changing peers, table can be online */);</span>
+<span class="source-line-no">101</span><span id="line-101">  }</span>
+<span class="source-line-no">102</span><span id="line-102"></span>
+<span class="source-line-no">103</span><span id="line-103">  @Override</span>
+<span class="source-line-no">104</span><span id="line-104">  protected void preflightChecks(MasterProcedureEnv env, Boolean enabled) throws HBaseIOException {</span>
+<span class="source-line-no">105</span><span id="line-105">    super.preflightChecks(env, enabled);</span>
+<span class="source-line-no">106</span><span id="line-106">    if (this.modifiedTableDescriptor.isMetaTable()) {</span>
+<span class="source-line-no">107</span><span id="line-107">      // If we are modifying the hbase:meta table, make sure we are not deleting critical</span>
+<span class="source-line-no">108</span><span id="line-108">      // column families else we'll damage the cluster.</span>
+<span class="source-line-no">109</span><span id="line-109">      Set&lt;byte[]&gt; cfs = this.modifiedTableDescriptor.getColumnFamilyNames();</span>
+<span class="source-line-no">110</span><span id="line-110">      for (byte[] family : UNDELETABLE_META_COLUMNFAMILIES) {</span>
+<span class="source-line-no">111</span><span id="line-111">        if (!cfs.contains(family)) {</span>
+<span class="source-line-no">112</span><span id="line-112">          throw new HBaseIOException(</span>
+<span class="source-line-no">113</span><span id="line-113">            "Delete of hbase:meta column family " + Bytes.toString(family));</span>
+<span class="source-line-no">114</span><span id="line-114">        }</span>
+<span class="source-line-no">115</span><span id="line-115">      }</span>
+<span class="source-line-no">116</span><span id="line-116">    }</span>
+<span class="source-line-no">117</span><span id="line-117"></span>
+<span class="source-line-no">118</span><span id="line-118">    if (!reopenRegions) {</span>
+<span class="source-line-no">119</span><span id="line-119">      if (this.unmodifiedTableDescriptor == null) {</span>
+<span class="source-line-no">120</span><span id="line-120">        throw new HBaseIOException(</span>
+<span class="source-line-no">121</span><span id="line-121">          "unmodifiedTableDescriptor cannot be null when this table modification won't reopen regions");</span>
+<span class="source-line-no">122</span><span id="line-122">      }</span>
+<span class="source-line-no">123</span><span id="line-123">      if (</span>
+<span class="source-line-no">124</span><span id="line-124">        !this.unmodifiedTableDescriptor.getTableName()</span>
+<span class="source-line-no">125</span><span id="line-125">          .equals(this.modifiedTableDescriptor.getTableName())</span>
+<span class="source-line-no">126</span><span id="line-126">      ) {</span>
+<span class="source-line-no">127</span><span id="line-127">        throw new HBaseIOException(</span>
+<span class="source-line-no">128</span><span id="line-128">          "Cannot change the table name when this modification won't " + "reopen regions.");</span>
+<span class="source-line-no">129</span><span id="line-129">      }</span>
+<span class="source-line-no">130</span><span id="line-130">      if (</span>
+<span class="source-line-no">131</span><span id="line-131">        this.unmodifiedTableDescriptor.getColumnFamilyCount()</span>
+<span class="source-line-no">132</span><span id="line-132">            != this.modifiedTableDescriptor.getColumnFamilyCount()</span>
+<span class="source-line-no">133</span><span id="line-133">      ) {</span>
+<span class="source-line-no">134</span><span id="line-134">        throw new HBaseIOException(</span>
+<span class="source-line-no">135</span><span id="line-135">          "Cannot add or remove column families when this modification " + "won't reopen regions.");</span>
+<span class="source-line-no">136</span><span id="line-136">      }</span>
+<span class="source-line-no">137</span><span id="line-137">      if (isCoprocModified()) {</span>
+<span class="source-line-no">138</span><span id="line-138">        throw new HBaseIOException(</span>
+<span class="source-line-no">139</span><span id="line-139">          "Can not modify Coprocessor when table modification won't reopen regions");</span>
+<span class="source-line-no">140</span><span id="line-140">      }</span>
+<span class="source-line-no">141</span><span id="line-141">      final Set&lt;String&gt; s = new HashSet&lt;&gt;(Arrays.asList(TableDescriptorBuilder.REGION_REPLICATION,</span>
+<span class="source-line-no">142</span><span id="line-142">        TableDescriptorBuilder.REGION_MEMSTORE_REPLICATION, RSGroupInfo.TABLE_DESC_PROP_GROUP));</span>
+<span class="source-line-no">143</span><span id="line-143">      for (String k : s) {</span>
+<span class="source-line-no">144</span><span id="line-144">        if (</span>
+<span class="source-line-no">145</span><span id="line-145">          isTablePropertyModified(this.unmodifiedTableDescriptor, this.modifiedTableDescriptor, k)</span>
+<span class="source-line-no">146</span><span id="line-146">        ) {</span>
+<span class="source-line-no">147</span><span id="line-147">          throw new HBaseIOException(</span>
+<span class="source-line-no">148</span><span id="line-148">            "Can not modify " + k + " of a table when modification won't reopen regions");</span>
+<span class="source-line-no">149</span><span id="line-149">        }</span>
+<span class="source-line-no">150</span><span id="line-150">      }</span>
+<span class="source-line-no">151</span><span id="line-151">    }</span>
+<span class="source-line-no">152</span><span id="line-152">  }</span>
+<span class="source-line-no">153</span><span id="line-153"></span>
+<span class="source-line-no">154</span><span id="line-154">  private boolean isCoprocModified() {</span>
+<span class="source-line-no">155</span><span id="line-155">    final Collection&lt;CoprocessorDescriptor&gt; unmodifiedCoprocs =</span>
+<span class="source-line-no">156</span><span id="line-156">      this.unmodifiedTableDescriptor.getCoprocessorDescriptors();</span>
+<span class="source-line-no">157</span><span id="line-157">    final Collection&lt;CoprocessorDescriptor&gt; modifiedCoprocs =</span>
+<span class="source-line-no">158</span><span id="line-158">      this.modifiedTableDescriptor.getCoprocessorDescriptors();</span>
+<span class="source-line-no">159</span><span id="line-159"></span>
+<span class="source-line-no">160</span><span id="line-160">    if (unmodifiedCoprocs.size() != modifiedCoprocs.size()) {</span>
+<span class="source-line-no">161</span><span id="line-161">      return true;</span>
+<span class="source-line-no">162</span><span id="line-162">    }</span>
+<span class="source-line-no">163</span><span id="line-163"></span>
+<span class="source-line-no">164</span><span id="line-164">    final Set&lt;CoprocessorDescriptor&gt; unmodifiedSet = new HashSet&lt;&gt;(unmodifiedCoprocs);</span>
+<span class="source-line-no">165</span><span id="line-165">    for (CoprocessorDescriptor cp : modifiedCoprocs) {</span>
+<span class="source-line-no">166</span><span id="line-166">      if (!unmodifiedSet.remove(cp)) {</span>
+<span class="source-line-no">167</span><span id="line-167">        return true;</span>
+<span class="source-line-no">168</span><span id="line-168">      }</span>
+<span class="source-line-no">169</span><span id="line-169">    }</span>
+<span class="source-line-no">170</span><span id="line-170">    return !unmodifiedSet.isEmpty();</span>
+<span class="source-line-no">171</span><span id="line-171">  }</span>
+<span class="source-line-no">172</span><span id="line-172"></span>
+<span class="source-line-no">173</span><span id="line-173">  /**</span>
+<span class="source-line-no">174</span><span id="line-174">   * Comparing the value associated with a given key across two TableDescriptor instances'</span>
+<span class="source-line-no">175</span><span id="line-175">   * properties.</span>
+<span class="source-line-no">176</span><span id="line-176">   * @return True if the table property &lt;code&gt;key&lt;/code&gt; is the same in both.</span>
+<span class="source-line-no">177</span><span id="line-177">   */</span>
+<span class="source-line-no">178</span><span id="line-178">  private boolean isTablePropertyModified(TableDescriptor oldDescriptor,</span>
+<span class="source-line-no">179</span><span id="line-179">    TableDescriptor newDescriptor, String key) {</span>
+<span class="source-line-no">180</span><span id="line-180">    String oldV = oldDescriptor.getValue(key);</span>
+<span class="source-line-no">181</span><span id="line-181">    String newV = newDescriptor.getValue(key);</span>
+<span class="source-line-no">182</span><span id="line-182">    if (oldV == null &amp;&amp; newV == null) {</span>
+<span class="source-line-no">183</span><span id="line-183">      return false;</span>
+<span class="source-line-no">184</span><span id="line-184">    } else if (oldV != null &amp;&amp; newV != null &amp;&amp; oldV.equals(newV)) {</span>
+<span class="source-line-no">185</span><span id="line-185">      return false;</span>
+<span class="source-line-no">186</span><span id="line-186">    }</span>
+<span class="source-line-no">187</span><span id="line-187">    return true;</span>
+<span class="source-line-no">188</span><span id="line-188">  }</span>
+<span class="source-line-no">189</span><span id="line-189"></span>
+<span class="source-line-no">190</span><span id="line-190">  private void initialize(final TableDescriptor unmodifiedTableDescriptor,</span>
+<span class="source-line-no">191</span><span id="line-191">    final boolean shouldCheckDescriptor) {</span>
+<span class="source-line-no">192</span><span id="line-192">    this.unmodifiedTableDescriptor = unmodifiedTableDescriptor;</span>
+<span class="source-line-no">193</span><span id="line-193">    this.shouldCheckDescriptor = shouldCheckDescriptor;</span>
+<span class="source-line-no">194</span><span id="line-194">    this.deleteColumnFamilyInModify = false;</span>
+<span class="source-line-no">195</span><span id="line-195">  }</span>
+<span class="source-line-no">196</span><span id="line-196"></span>
+<span class="source-line-no">197</span><span id="line-197">  @Override</span>
+<span class="source-line-no">198</span><span id="line-198">  protected Flow executeFromState(final MasterProcedureEnv env, final ModifyTableState state)</span>
+<span class="source-line-no">199</span><span id="line-199">    throws InterruptedException {</span>
+<span class="source-line-no">200</span><span id="line-200">    LOG.trace("{} execute state={}", this, state);</span>
+<span class="source-line-no">201</span><span id="line-201">    try {</span>
+<span class="source-line-no">202</span><span id="line-202">      switch (state) {</span>
+<span class="source-line-no">203</span><span id="line-203">        case MODIFY_TABLE_PREPARE:</span>
+<span class="source-line-no">204</span><span id="line-204">          prepareModify(env);</span>
+<span class="source-line-no">205</span><span id="line-205">          setNextState(ModifyTableState.MODIFY_TABLE_PRE_OPERATION);</span>
+<span class="source-line-no">206</span><span id="line-206">          break;</span>
+<span class="source-line-no">207</span><span id="line-207">        case MODIFY_TABLE_PRE_OPERATION:</span>
+<span class="source-line-no">208</span><span id="line-208">          preModify(env, state);</span>
+<span class="source-line-no">209</span><span id="line-209">          // We cannot allow changes to region replicas when 'reopenRegions==false',</span>
+<span class="source-line-no">210</span><span id="line-210">          // as this mode bypasses the state management required for modifying region replicas.</span>
+<span class="source-line-no">211</span><span id="line-211">          if (reopenRegions) {</span>
+<span class="source-line-no">212</span><span id="line-212">            // Check if we should create a recovery snapshot for column family deletion</span>
+<span class="source-line-no">213</span><span id="line-213">            if (deleteColumnFamilyInModify &amp;&amp; RecoverySnapshotUtils.isRecoveryEnabled(env)) {</span>
+<span class="source-line-no">214</span><span id="line-214">              setNextState(ModifyTableState.MODIFY_TABLE_SNAPSHOT);</span>
+<span class="source-line-no">215</span><span id="line-215">            } else {</span>
+<span class="source-line-no">216</span><span id="line-216">              setNextState(ModifyTableState.MODIFY_TABLE_CLOSE_EXCESS_REPLICAS);</span>
+<span class="source-line-no">217</span><span id="line-217">            }</span>
+<span class="source-line-no">218</span><span id="line-218">          } else {</span>
+<span class="source-line-no">219</span><span id="line-219">            setNextState(ModifyTableState.MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR);</span>
+<span class="source-line-no">220</span><span id="line-220">          }</span>
+<span class="source-line-no">221</span><span id="line-221">          break;</span>
+<span class="source-line-no">222</span><span id="line-222">        case MODIFY_TABLE_SNAPSHOT:</span>
+<span class="source-line-no">223</span><span id="line-223">          // Create recovery snapshot procedure as child procedure</span>
+<span class="source-line-no">224</span><span id="line-224">          recoverySnapshotName = RecoverySnapshotUtils.generateSnapshotName(getTableName());</span>
+<span class="source-line-no">225</span><span id="line-225">          SnapshotProcedure snapshotProcedure = RecoverySnapshotUtils.createSnapshotProcedure(env,</span>
+<span class="source-line-no">226</span><span id="line-226">            getTableName(), recoverySnapshotName, unmodifiedTableDescriptor);</span>
+<span class="source-line-no">227</span><span id="line-227">          // Submit snapshot procedure as child procedure</span>
+<span class="source-line-no">228</span><span id="line-228">          addChildProcedure(snapshotProcedure);</span>
+<span class="source-line-no">229</span><span id="line-229">          LOG.debug("Creating recovery snapshot {} for table {} before column deletion",</span>
+<span class="source-line-no">230</span><span id="line-230">            recoverySnapshotName, getTableName());</span>
+<span class="source-line-no">231</span><span id="line-231">          setNextState(ModifyTableState.MODIFY_TABLE_CLOSE_EXCESS_REPLICAS);</span>
 <span class="source-line-no">232</span><span id="line-232">          break;</span>
-<span class="source-line-no">233</span><span id="line-233">        case MODIFY_TABLE_POST_OPERATION:</span>
-<span class="source-line-no">234</span><span id="line-234">          postModify(env, state);</span>
-<span class="source-line-no">235</span><span id="line-235">          if (reopenRegions) {</span>
-<span class="source-line-no">236</span><span id="line-236">            setNextState(ModifyTableState.MODIFY_TABLE_REOPEN_ALL_REGIONS);</span>
-<span class="source-line-no">237</span><span id="line-237">          } else</span>
-<span class="source-line-no">238</span><span id="line-238">            if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
-<span class="source-line-no">239</span><span id="line-239">              setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
-<span class="source-line-no">240</span><span id="line-240">            } else {</span>
-<span class="source-line-no">241</span><span id="line-241">              return Flow.NO_MORE_STATE;</span>
-<span class="source-line-no">242</span><span id="line-242">            }</span>
-<span class="source-line-no">243</span><span id="line-243">          break;</span>
-<span class="source-line-no">244</span><span id="line-244">        case MODIFY_TABLE_REOPEN_ALL_REGIONS:</span>
-<span class="source-line-no">245</span><span id="line-245">          if (isTableEnabled(env)) {</span>
-<span class="source-line-no">246</span><span id="line-246">            addChildProcedure(ReopenTableRegionsProcedure.throttled(env.getMasterConfiguration(),</span>
-<span class="source-line-no">247</span><span id="line-247">              env.getMasterServices().getTableDescriptors().get(getTableName())));</span>
-<span class="source-line-no">248</span><span id="line-248">          }</span>
-<span class="source-line-no">249</span><span id="line-249">          setNextState(ModifyTableState.MODIFY_TABLE_ASSIGN_NEW_REPLICAS);</span>
+<span class="source-line-no">233</span><span id="line-233">        case MODIFY_TABLE_CLOSE_EXCESS_REPLICAS:</span>
+<span class="source-line-no">234</span><span id="line-234">          if (isTableEnabled(env)) {</span>
+<span class="source-line-no">235</span><span id="line-235">            closeExcessReplicasIfNeeded(env);</span>
+<span class="source-line-no">236</span><span id="line-236">          }</span>
+<span class="source-line-no">237</span><span id="line-237">          setNextState(ModifyTableState.MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR);</span>
+<span class="source-line-no">238</span><span id="line-238">          break;</span>
+<span class="source-line-no">239</span><span id="line-239">        case MODIFY_TABLE_UPDATE_TABLE_DESCRIPTOR:</span>
+<span class="source-line-no">240</span><span id="line-240">          updateTableDescriptor(env);</span>
+<span class="source-line-no">241</span><span id="line-241">          if (reopenRegions) {</span>
+<span class="source-line-no">242</span><span id="line-242">            setNextState(ModifyTableState.MODIFY_TABLE_REMOVE_REPLICA_COLUMN);</span>
+<span class="source-line-no">243</span><span id="line-243">          } else {</span>
+<span class="source-line-no">244</span><span id="line-244">            setNextState(ModifyTableState.MODIFY_TABLE_POST_OPERATION);</span>
+<span class="source-line-no">245</span><span id="line-245">          }</span>
+<span class="source-line-no">246</span><span id="line-246">          break;</span>
+<span class="source-line-no">247</span><span id="line-247">        case MODIFY_TABLE_REMOVE_REPLICA_COLUMN:</span>
+<span class="source-line-no">248</span><span id="line-248">          removeReplicaColumnsIfNeeded(env);</span>
+<span class="source-line-no">249</span><span id="line-249">          setNextState(ModifyTableState.MODIFY_TABLE_POST_OPERATION);</span>
 <span class="source-line-no">250</span><span id="line-250">          break;</span>
-<span class="source-line-no">251</span><span id="line-251">        case MODIFY_TABLE_ASSIGN_NEW_REPLICAS:</span>
-<span class="source-line-no">252</span><span id="line-252">          assignNewReplicasIfNeeded(env);</span>
-<span class="source-line-no">253</span><span id="line-253">          if (TableName.isMetaTableName(getTableName())) {</span>
-<span class="source-line-no">254</span><span id="line-254">            MetaLocationSyncer syncer = env.getMasterServices().getMetaLocationSyncer();</span>
-<span class="source-line-no">255</span><span id="line-255">            if (syncer != null) {</span>
-<span class="source-line-no">256</span><span id="line-256">              syncer.setMetaReplicaCount(modifiedTableDescriptor.getRegionReplication());</span>
-<span class="source-line-no">257</span><span id="line-257">            }</span>
-<span class="source-line-no">258</span><span id="line-258">          }</span>
-<span class="source-line-no">259</span><span id="line-259">          if (deleteColumnFamilyInModify) {</span>
-<span class="source-line-no">260</span><span id="line-260">            setNextState(ModifyTableState.MODIFY_TABLE_DELETE_FS_LAYOUT);</span>
-<span class="source-line-no">261</span><span id="line-261">          } else</span>
-<span class="source-line-no">262</span><span id="line-262">            if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
-<span class="source-line-no">263</span><span id="line-263">              setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
-<span class="source-line-no">264</span><span id="line-264">            } else {</span>
-<span class="source-line-no">265</span><span id="line-265">              return Flow.NO_MORE_STATE;</span>
-<span class="source-line-no">266</span><span id="line-266">            }</span>
-<span class="source-line-no">267</span><span id="line-267">          break;</span>
-<span class="source-line-no">268</span><span id="line-268">        case MODIFY_TABLE_DELETE_FS_LAYOUT:</span>
-<span class="source-line-no">269</span><span id="line-269">          deleteFromFs(env, unmodifiedTableDescriptor, modifiedTableDescriptor);</span>
-<span class="source-line-no">270</span><span id="line-270">          if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
-<span class="source-line-no">271</span><span id="line-271">            setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
-<span class="source-line-no">272</span><span id="line-272">            break;</span>
-<span class="source-line-no">273</span><span id="line-273">          } else {</span>
-<span class="source-line-no">274</span><span id="line-274">            return Flow.NO_MORE_STATE;</span>
-<span class="source-line-no">275</span><span id="line-275">          }</span>
-<span class="source-line-no">276</span><span id="line-276">        case MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY:</span>
-<span class="source-line-no">277</span><span id="line-277">          ErasureCodingUtils.sync(env.getMasterFileSystem().getFileSystem(),</span>
-<span class="source-line-no">278</span><span id="line-278">            env.getMasterFileSystem().getRootDir(), modifiedTableDescriptor);</span>
-<span class="source-line-no">279</span><span id="line-279">          return Flow.NO_MORE_STATE;</span>
-<span class="source-line-no">280</span><span id="line-280">        default:</span>
-<span class="source-line-no">281</span><span id="line-281">          throw new UnsupportedOperationException("unhandled state=" + state);</span>
-<span class="source-line-no">282</span><span id="line-282">      }</span>
-<span class="source-line-no">283</span><span id="line-283">    } catch (IOException e) {</span>
-<span class="source-line-no">284</span><span id="line-284">      if (isRollbackSupported(state)) {</span>
-<span class="source-line-no">285</span><span id="line-285">        setFailure("master-modify-table", e);</span>
-<span class="source-line-no">286</span><span id="line-286">      } else {</span>
-<span class="source-line-no">287</span><span id="line-287">        LOG.warn("Retriable error trying to modify table={} (in state={})", getTableName(), state,</span>
-<span class="source-line-no">288</span><span id="line-288">          e);</span>
-<span class="source-line-no">289</span><span id="line-289">      }</span>
-<span class="source-line-no">290</span><span id="line-290">    }</span>
-<span class="source-line-no">291</span><span id="line-291">    return Flow.HAS_MORE_STATE;</span>
-<span class="source-line-no">292</span><span id="line-292">  }</span>
-<span class="source-line-no">293</span><span id="line-293"></span>
-<span class="source-line-no">294</span><span id="line-294">  @Override</span>
-<span class="source-line-no">295</span><span id="line-295">  protected void rollbackState(final MasterProcedureEnv env, final ModifyTableState state)</span>
-<span class="source-line-no">296</span><span id="line-296">    throws IOException {</span>
-<span class="source-line-no">297</span><span id="line-297">    switch (state) {</span>
-<span class="source-line-no">298</span><span id="line-298">      case MODIFY_TABLE_PREPARE:</span>
-<span class="source-line-no">299</span><span id="line-299">      case MODIFY_TABLE_PRE_OPERATION:</span>
-<span class="source-line-no">300</span><span id="line-300">        // Nothing to roll back.</span>
-<span class="source-line-no">301</span><span id="line-301">        // TODO: Coprocessor rollback semantic is still undefined.</span>
-<span class="source-line-no">302</span><span id="line-302">        break;</span>
-<span class="source-line-no">303</span><span id="line-303">      case MODIFY_TABLE_SNAPSHOT:</span>
-<span class="source-line-no">304</span><span id="line-304">        // Handle recovery snapshot rollback. There is no DeleteSnapshotProcedure as such to use</span>
-<span class="source-line-no">305</span><span id="line-305">        // here directly as a child procedure, so we call a utility method to delete the snapshot</span>
-<span class="source-line-no">306</span><span id="line-306">        // which uses the SnapshotManager to delete the snapshot.</span>
-<span class="source-line-no">307</span><span id="line-307">        if (recoverySnapshotName != null) {</span>
-<span class="source-line-no">308</span><span id="line-308">          RecoverySnapshotUtils.deleteRecoverySnapshot(env, recoverySnapshotName, getTableName());</span>
-<span class="source-line-no">309</span><span id="line-309">          recoverySnapshotName = null;</span>
-<span class="source-line-no">310</span><span id="line-310">        }</span>
-<span class="source-line-no">311</span><span id="line-311">        break;</span>
-<span class="source-line-no">312</span><span id="line-312">      default:</span>
-<span class="source-line-no">313</span><span id="line-313">        // Modify from other states doesn't have a rollback. The execution will succeed, at some</span>
-<span class="source-line-no">314</span><span id="line-314">        // point.</span>
-<span class="source-line-no">315</span><span id="line-315">        throw new UnsupportedOperationException("unhandled state=" + state);</span>
-<span class="source-line-no">316</span><span id="line-316">    }</span>
-<span class="source-line-no">317</span><span id="line-317">  }</span>
-<span class="source-line-no">318</span><span id="line-318"></span>
-<span class="source-line-no">319</span><span id="line-319">  @Override</span>
-<span class="source-line-no">320</span><span id="line-320">  protected boolean isRollbackSupported(final ModifyTableState state) {</span>
-<span class="source-line-no">321</span><span id="line-321">    switch (state) {</span>
-<span class="source-line-no">322</span><span id="line-322">      case MODIFY_TABLE_PREPARE:</span>
-<span class="source-line-no">323</span><span id="line-323">      case MODIFY_TABLE_PRE_OPERATION:</span>
-<span class="source-line-no">324</span><span id="line-324">      case MODIFY_TABLE_SNAPSHOT:</span>
-<span class="source-line-no">325</span><span id="line-325">      case MODIFY_TABLE_CLOSE_EXCESS_REPLICAS:</span>
-<span class="source-line-no">326</span><span id="line-326">        return true;</span>
-<span class="source-line-no">327</span><span id="line-327">      default:</span>
-<span class="source-line-no">328</span><span id="line-328">        return false;</span>
-<span class="source-line-no">329</span><span id="line-329">    }</span>
-<span class="source-line-no">330</span><span id="line-330">  }</span>
-<span class="source-line-no">331</span><span id="line-331"></span>
-<span class="source-line-no">332</span><span id="line-332">  @Override</span>
-<span class="source-line-no">333</span><span id="line-333">  protected void completionCleanup(final MasterProcedureEnv env) {</span>
-<span class="source-line-no">334</span><span id="line-334">    releaseSyncLatch();</span>
+<span class="source-line-no">251</span><span id="line-251">        case MODIFY_TABLE_POST_OPERATION:</span>
+<span class="source-line-no">252</span><span id="line-252">          postModify(env, state);</span>
+<span class="source-line-no">253</span><span id="line-253">          if (reopenRegions) {</span>
+<span class="source-line-no">254</span><span id="line-254">            setNextState(ModifyTableState.MODIFY_TABLE_REOPEN_ALL_REGIONS);</span>
+<span class="source-line-no">255</span><span id="line-255">          } else</span>
+<span class="source-line-no">256</span><span id="line-256">            if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
+<span class="source-line-no">257</span><span id="line-257">              setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
+<span class="source-line-no">258</span><span id="line-258">            } else {</span>
+<span class="source-line-no">259</span><span id="line-259">              return Flow.NO_MORE_STATE;</span>
+<span class="source-line-no">260</span><span id="line-260">            }</span>
+<span class="source-line-no">261</span><span id="line-261">          break;</span>
+<span class="source-line-no">262</span><span id="line-262">        case MODIFY_TABLE_REOPEN_ALL_REGIONS:</span>
+<span class="source-line-no">263</span><span id="line-263">          if (isTableEnabled(env)) {</span>
+<span class="source-line-no">264</span><span id="line-264">            addChildProcedure(ReopenTableRegionsProcedure.throttled(env.getMasterConfiguration(),</span>
+<span class="source-line-no">265</span><span id="line-265">              env.getMasterServices().getTableDescriptors().get(getTableName())));</span>
+<span class="source-line-no">266</span><span id="line-266">          }</span>
+<span class="source-line-no">267</span><span id="line-267">          setNextState(ModifyTableState.MODIFY_TABLE_ASSIGN_NEW_REPLICAS);</span>
+<span class="source-line-no">268</span><span id="line-268">          break;</span>
+<span class="source-line-no">269</span><span id="line-269">        case MODIFY_TABLE_ASSIGN_NEW_REPLICAS:</span>
+<span class="source-line-no">270</span><span id="line-270">          assignNewReplicasIfNeeded(env);</span>
+<span class="source-line-no">271</span><span id="line-271">          if (TableName.isMetaTableName(getTableName())) {</span>
+<span class="source-line-no">272</span><span id="line-272">            MetaLocationSyncer syncer = env.getMasterServices().getMetaLocationSyncer();</span>
+<span class="source-line-no">273</span><span id="line-273">            if (syncer != null) {</span>
+<span class="source-line-no">274</span><span id="line-274">              syncer.setMetaReplicaCount(modifiedTableDescriptor.getRegionReplication());</span>
+<span class="source-line-no">275</span><span id="line-275">            }</span>
+<span class="source-line-no">276</span><span id="line-276">          }</span>
+<span class="source-line-no">277</span><span id="line-277">          if (deleteColumnFamilyInModify) {</span>
+<span class="source-line-no">278</span><span id="line-278">            setNextState(ModifyTableState.MODIFY_TABLE_DELETE_FS_LAYOUT);</span>
+<span class="source-line-no">279</span><span id="line-279">          } else</span>
+<span class="source-line-no">280</span><span id="line-280">            if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
+<span class="source-line-no">281</span><span id="line-281">              setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
+<span class="source-line-no">282</span><span id="line-282">            } else {</span>
+<span class="source-line-no">283</span><span id="line-283">              return Flow.NO_MORE_STATE;</span>
+<span class="source-line-no">284</span><span id="line-284">            }</span>
+<span class="source-line-no">285</span><span id="line-285">          break;</span>
+<span class="source-line-no">286</span><span id="line-286">        case MODIFY_TABLE_DELETE_FS_LAYOUT:</span>
+<span class="source-line-no">287</span><span id="line-287">          deleteFromFs(env, unmodifiedTableDescriptor, modifiedTableDescriptor);</span>
+<span class="source-line-no">288</span><span id="line-288">          if (ErasureCodingUtils.needsSync(unmodifiedTableDescriptor, modifiedTableDescriptor)) {</span>
+<span class="source-line-no">289</span><span id="line-289">            setNextState(ModifyTableState.MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY);</span>
+<span class="source-line-no">290</span><span id="line-290">            break;</span>
+<span class="source-line-no">291</span><span id="line-291">          } else {</span>
+<span class="source-line-no">292</span><span id="line-292">            return Flow.NO_MORE_STATE;</span>
+<span class="source-line-no">293</span><span id="line-293">          }</span>
+<span class="source-line-no">294</span><span id="line-294">        case MODIFY_TABLE_SYNC_ERASURE_CODING_POLICY:</span>
+<span class="source-line-no">295</span><span id="line-295">          ErasureCodingUtils.sync(env.getMasterFileSystem().getFileSystem(),</span>
+<span class="source-line-no">296</span><span id="line-296">            env.getMasterFileSystem().getRootDir(), modifiedTableDescriptor);</span>
+<span class="source-line-no">297</span><span id="line-297">          return Flow.NO_MORE_STATE;</span>
+<span class="source-line-no">298</span><span id="line-298">        default:</span>
+<span class="source-line-no">299</span><span id="line-299">          throw new UnsupportedOperationException("unhandled state=" + state);</span>
+<span class="source-line-no">300</span><span id="line-300">      }</span>
+<span class="source-line-no">301</span><span id="line-301">    } catch (IOException e) {</span>
+<span class="source-line-no">302</span><span id="line-302">      if (isRollbackSupported(state)) {</span>
+<span class="source-line-no">303</span><span id="line-303">        setFailure("master-modify-table", e);</span>
+<span class="source-line-no">304</span><span id="line-304">      } else {</span>
+<span class="source-line-no">305</span><span id="line-305">        LOG.warn("Retriable error trying to modify table={} (in state={})", getTableName(), state,</span>
+<span class="source-line-no">306</span><span id="line-306">          e);</span>
+<span class="source-line-no">307</span><span id="line-307">      }</span>
+<span class="source-line-no">308</span><span id="line-308">    }</span>
+<span class="source-line-no">309</span><span id="line-309">    return Flow.HAS_MORE_STATE;</span>
+<span class="source-line-no">310</span><span id="line-310">  }</span>
+<span class="source-line-no">311</span><span id="line-311"></span>
+<span class="source-line-no">312</span><span id="line-312">  @Override</span>
+<span class="source-line-no">313</span><span id="line-313">  protected void rollbackState(final MasterProcedureEnv env, final ModifyTableState state)</span>
+<span class="source-line-no">314</span><span id="line-314">    throws IOException {</span>
+<span class="source-line-no">315</span><span id="line-315">    switch (state) {</span>
+<span class="source-line-no">316</span><span id="line-316">      case MODIFY_TABLE_PREPARE:</span>
+<span class="source-line-no">317</span><span id="line-317">      case MODIFY_TABLE_PRE_OPERATION:</span>
+<span class="source-line-no">318</span><span id="line-318">        // Nothing to roll back.</span>
+<span class="source-line-no">319</span><span id="line-319">        // TODO: Coprocessor rollback semantic is still undefined.</span>
+<span class="source-line-no">320</span><span id="line-320">        break;</span>
+<span class="source-line-no">321</span><span id="line-321">      case MODIFY_TABLE_SNAPSHOT:</span>
+<span class="source-line-no">322</span><span id="line-322">        // Handle recovery snapshot rollback. There is no DeleteSnapshotProcedure as such to use</span>
+<span class="source-line-no">323</span><span id="line-323">        // here directly as a child procedure, so we call a utility method to delete the snapshot</span>
+<span class="source-line-no">324</span><span id="line-324">        // which uses the SnapshotManager to delete the snapshot.</span>
+<span class="source-line-no">325</span><span id="line-325">        if (recoverySnapshotName != null) {</span>
+<span class="source-line-no">326</span><span id="line-326">          RecoverySnapshotUtils.deleteRecoverySnapshot(env, recoverySnapshotName, getTableName());</span>
+<span class="source-line-no">327</span><span id="line-327">          recoverySnapshotName = null;</span>
+<span class="source-line-no">328</span><span id="line-328">        }</span>
+<span class="source-line-no">329</span><span id="line-329">        break;</span>
+<span class="source-line-no">330</span><span id="line-330">      default:</span>
+<span class="source-line-no">331</span><span id="line-331">        // Modify from other states doesn't have a rollback. The execution will succeed, at some</span>
+<span class="source-line-no">332</span><span id="line-332">        // point.</span>
+<span class="source-line-no">333</span><span id="line-333">        throw new UnsupportedOperationException("unhandled state=" + state);</span>
+<span class="source-line-no">334</span><span id="line-334">    }</span>
 <span class="source-line-no">335</span><span id="line-335">  }</span>
 <span class="source-line-no">336</span><span id="line-336"></span>
 <span class="source-line-no">337</span><span id="line-337">  @Override</span>
-<span class="source-line-no">338</span><span id="line-338">  protected ModifyTableState getState(final int stateId) {</span>
-<span class="source-line-no">339</span><span id="line-339">    return ModifyTableState.forNumber(stateId);</span>
-<span class="source-line-no">340</span><span id="line-340">  }</span>
-<span class="source-line-no">341</span><span id="line-341"></span>
-<span class="source-line-no">342</span><span id="line-342">  @Override</span>
-<span class="source-line-no">343</span><span id="line-343">  protected int getStateId(final ModifyTableState state) {</span>
-<span class="source-line-no">344</span><span id="line-344">    return state.getNumber();</span>
-<span class="source-line-no">345</span><span id="line-345">  }</span>
-<span class="source-line-no">346</span><span id="line-346"></span>
-<span class="source-line-no">347</span><span id="line-347">  @Override</span>
-<span class="source-line-no">348</span><span id="line-348">  protected ModifyTableState getInitialState() {</span>
-<span class="source-line-no">349</span><span id="line-349">    return ModifyTableState.MODIFY_TABLE_PREPARE;</span>
-<span class="source-line-no">350</span><span id="line-350">  }</span>
-<span class="source-line-no">351</span><span id="line-351"></span>
-<span class="source-line-no">352</span><span id="line-352">  @Override</span>
-<span class="source-line-no">353</span><span id="line-353">  protected void serializeStateData(ProcedureStateSerializer serializer) throws IOException {</span>
-<span class="source-line-no">354</span><span id="line-354">    super.serializeStateData(serializer);</span>
-<span class="source-line-no">355</span><span id="line-355"></span>
-<span class="source-line-no">356</span><span id="line-356">    MasterProcedureProtos.ModifyTableStateData.Builder modifyTableMsg =</span>
-<span class="source-line-no">357</span><span id="line-357">      MasterProcedureProtos.ModifyTableStateData.newBuilder()</span>
-<span class="source-line-no">358</span><span id="line-358">        .setUserInfo(MasterProcedureUtil.toProtoUserInfo(getUser()))</span>
-<span class="source-line-no">359</span><span id="line-359">        .setModifiedTableSchema(ProtobufUtil.toTableSchema(modifiedTableDescriptor))</span>
-<span class="source-line-no">360</span><span id="line-360">        .setDeleteColumnFamilyInModify(deleteColumnFamilyInModify)</span>
-<span class="source-line-no">361</span><span id="line-361">        .setShouldCheckDescriptor(shouldCheckDescriptor).setReopenRegions(reopenRegions);</span>
-<span class="source-line-no">362</span><span id="line-362"></span>
-<span class="source-line-no">363</span><span id="line-363">    if (unmodifiedTableDescriptor != null) {</span>
-<span class="source-line-no">364</span><span id="line-364">      modifyTableMsg</span>
-<span class="source-line-no">365</span><span id="line-365">        .setUnmodifiedTableSchema(ProtobufUtil.toTableSchema(unmodifiedTableDescriptor));</span>
-<span class="source-line-no">366</span><span id="line-366">    }</span>
-<span class="source-line-no">367</span><span id="line-367"></span>
-<span class="source-line-no">368</span><span id="line-368">    if (recoverySnapshotName != null) {</span>
-<span class="source-line-no">369</span><span id="line-369">      modifyTableMsg.setSnapshotName(recoverySnapshotName);</span>
-<span class="source-line-no">370</span><span id="line-370">    }</span>
-<span class="source-line-no">371</span><span id="line-371"></span>
-<span class="source-line-no">372</span><span id="line-372">    serializer.serialize(modifyTableMsg.build());</span>
-<span class="source-line-no">373</span><span id="line-373">  }</span>
-<span class="source-line-no">374</span><span id="line-374"></span>
-<span class="source-line-no">375</span><span id="line-375">  @Override</span>
-<span class="source-line-no">376</span><span id="line-376">  protected void deserializeStateData(ProcedureStateSerializer serializer) throws IOException {</span>
-<span class="source-line-no">377</span><span id="line-377">    super.deserializeStateData(serializer);</span>
-<span class="source-line-no">378</span><span id="line-378"></span>
-<span class="source-line-no">379</span><span id="line-379">    MasterProcedureProtos.ModifyTableStateData modifyTableMsg =</span>
-<span class="source-line-no">380</span><span id="line-380">      serializer.deserialize(MasterProcedureProtos.ModifyTableStateData.class);</span>
-<span class="source-line-no">381</span><span id="line-381">    setUser(MasterProcedureUtil.toUserInfo(modifyTableMsg.getUserInfo()));</span>
-<span class="source-line-no">382</span><span id="line-382">    modifiedTableDescriptor =</span>
-<span class="source-line-no">383</span><span id="line-383">      ProtobufUtil.toTableDescriptor(modifyTableMsg.getModifiedTableSchema());</span>
-<span class="source-line-no">384</span><span id="line-384">    deleteColumnFamilyInModify = modifyTableMsg.getDeleteColumnFamilyInModify();</span>
-<span class="source-line-no">385</span><span id="line-385">    shouldCheckDescriptor =</span>
-<span class="source-line-no">386</span><span id="line-386">      modifyTableMsg.hasShouldCheckDescriptor() ? modifyTableMsg.getShouldCheckDescriptor() : false;</span>
-<span class="source-line-no">387</span><span id="line-387">    reopenRegions = modifyTableMsg.hasReopenRegions() ? modifyTableMsg.getReopenRegions() : true;</span>
-<span class="source-line-no">388</span><span id="line-388"></span>
-<span class="source-line-no">389</span><span id="line-389">    if (modifyTableMsg.hasUnmodifiedTableSchema()) {</span>
-<span class="source-line-no">390</span><span id="line-390">      unmodifiedTableDescriptor =</span>
-<span class="source-line-no">391</span><span id="line-391">        ProtobufUtil.toTableDescriptor(modifyTableMsg.getUnmodifiedTableSchema());</span>
-<span class="source-line-no">392</span><span id="line-392">    }</span>
-<span class="source-line-no">393</span><span id="line-393"></span>
-<span class="source-line-no">394</span><span id="line-394">    if (modifyTableMsg.hasSnapshotName()) {</span>
-<span class="source-line-no">395</span><span id="line-395">      recoverySnapshotName = modifyTableMsg.getSnapshotName();</span>
-<span class="source-line-no">396</span><span id="line-396">    }</span>
-<span class="source-line-no">397</span><span id="line-397">  }</span>
-<span class="source-line-no">398</span><span id="line-398"></span>
-<span class="source-line-no">399</span><span id="line-399">  @Override</span>
-<span class="source-line-no">400</span><span id="line-400">  public TableName getTableName() {</span>
-<span class="source-line-no">401</span><span id="line-401">    return modifiedTableDescriptor.getTableName();</span>
-<span class="source-line-no">402</span><span id="line-402">  }</span>
-<span class="source-line-no">403</span><span id="line-403"></span>
-<span class="source-line-no">404</span><span id="line-404">  @Override</span>
-<span class="source-line-no">405</span><span id="line-405">  public TableOperationType getTableOperationType() {</span>
-<span class="source-line-no">406</span><span id="line-406">    return TableOperationType.EDIT;</span>
-<span class="source-line-no">407</span><span id="line-407">  }</span>
-<span class="source-line-no">408</span><span id="line-408"></span>
-<span class="source-line-no">409</span><span id="line-409">  /**</span>
-<span class="source-line-no">410</span><span id="line-410">   * Check conditions before any real action of modifying a table.</span>
-<span class="source-line-no">411</span><span id="line-411">   */</span>
-<span class="source-line-no">412</span><span id="line-412">  private void prepareModify(final MasterProcedureEnv env) throws IOException {</span>
-<span class="source-line-no">413</span><span id="line-413">    // Checks whether the table exists</span>
-<span class="source-line-no">414</span><span id="line-414">    if (!env.getMasterServices().getTableDescriptors().exists(getTableName())) {</span>
-<span class="source-line-no">415</span><span id="line-415">      throw new TableNotFoundException(getTableName());</span>
-<span class="source-line-no">416</span><span id="line-416">    }</span>
-<span class="source-line-no">417</span><span id="line-417"></span>
-<span class="source-line-no">418</span><span id="line-418">    // check that we have at least 1 CF</span>
-<span class="source-line-no">419</span><span id="line-419">    if (modifiedTableDescriptor.getColumnFamilyCount() == 0) {</span>
-<span class="source-line-no">420</span><span id="line-420">      throw new DoNotRetryIOException(</span>
-<span class="source-line-no">421</span><span id="line-421">        "Table " + getTableName().toString() + " should have at least one column family.");</span>
-<span class="source-line-no">422</span><span id="line-422">    }</span>
-<span class="source-line-no">423</span><span id="line-423"></span>
-<span class="source-line-no">424</span><span id="line-424">    // If descriptor check is enabled, check whether the table descriptor when procedure was</span>
-<span class="source-line-no">425</span><span id="line-425">    // submitted matches with the current</span>
-<span class="source-line-no">426</span><span id="line-426">    // table descriptor of the table, else retrieve the old descriptor</span>
-<span class="source-line-no">427</span><span id="line-427">    // for comparison in order to update the descriptor.</span>
-<span class="source-line-no">428</span><span id="line-428">    if (shouldCheckDescriptor) {</span>
-<span class="source-line-no">429</span><span id="line-429">      if (</span>
-<span class="source-line-no">430</span><span id="line-430">        TableDescriptor.COMPARATOR.compare(unmodifiedTableDescriptor,</span>
-<span class="source-line-no">431</span><span id="line-431">          env.getMasterServices().getTableDescriptors().get(getTableName())) != 0</span>
-<span class="source-line-no">432</span><span id="line-432">      ) {</span>
-<span class="source-line-no">433</span><span id="line-433">        LOG.error("Error while modifying table '" + getTableName().toString()</span>
-<span class="source-line-no">434</span><span id="line-434">          + "' Skipping procedure : " + this);</span>
-<span class="source-line-no">435</span><span id="line-435">        throw new ConcurrentTableModificationException(</span>
-<span class="source-line-no">436</span><span id="line-436">          "Skipping modify table operation on table '" + getTableName().toString()</span>
-<span class="source-line-no">437</span><span id="line-437">            + "' as it has already been modified by some other concurrent operation, "</span>
-<span class="source-line-no">438</span><span id="line-438">            + "Please retry.");</span>
-<span class="source-line-no">439</span><span id="line-439">      }</span>
-<span class="source-line-no">440</span><span id="line-440">    } else {</span>
-<span class="source-line-no">441</span><span id="line-441">      this.unmodifiedTableDescriptor =</span>
-<span class="source-line-no">442</span><span id="line-442">        env.getMasterServices().getTableDescriptors().get(getTableName());</span>
-<span class="source-line-no">443</span><span id="line-443">    }</span>
-<span class="source-line-no">444</span><span id="line-444"></span>
-<span class="source-line-no">445</span><span id="line-445">    this.deleteColumnFamilyInModify =</span>
-<span class="source-line-no">446</span><span id="line-446">      isDeleteColumnFamily(unmodifiedTableDescriptor, modifiedTableDescriptor);</span>
-<span class="source-line-no">447</span><span id="line-447">    if (</span>
-<span class="source-line-no">448</span><span id="line-448">      !unmodifiedTableDescriptor.getRegionServerGroup()</span>
-<span class="source-line-no">449</span><span id="line-449">        .equals(modifiedTableDescriptor.getRegionServerGroup())</span>
-<span class="source-line-no">450</span><span id="line-450">    ) {</span>
-<span class="source-line-no">451</span><span id="line-451">      Supplier&lt;String&gt; forWhom = () -&gt; "table " + getTableName();</span>
-<span class="source-line-no">452</span><span id="line-452">      RSGroupInfo rsGroupInfo = MasterProcedureUtil.checkGroupExists(</span>
-<span class="source-line-no">453</span><span id="line-453">        env.getMasterServices().getRSGroupInfoManager()::getRSGroup,</span>
-<span class="source-line-no">454</span><span id="line-454">        modifiedTableDescriptor.getRegionServerGroup(), forWhom);</span>
-<span class="source-line-no">455</span><span id="line-455">      MasterProcedureUtil.checkGroupNotEmpty(rsGroupInfo, forWhom);</span>
-<span class="source-line-no">456</span><span id="line-456">    }</span>
-<span class="source-line-no">457</span><span id="line-457"></span>
-<span class="source-line-no">458</span><span id="line-458">    // check for store file tracker configurations</span>
-<span class="source-line-no">459</span><span id="line-459">    StoreFileTrackerValidationUtils.checkForModifyTable(env.getMasterConfiguration(),</span>
-<span class="source-line-no">460</span><span id="line-460">      unmodifiedTableDescriptor, modifiedTableDescriptor, !isTableEnabled(env));</span>
-<span class="source-line-no">461</span><span id="line-461">    CustomCellTieredUtils.checkForModifyTable(modifiedTableDescriptor);</span>
-<span class="source-line-no">462</span><span id="line-462">  }</span>
-<span class="source-line-no">463</span><span id="line-463"></span>
-<span class="source-line-no">464</span><span id="line-464">  /**</span>
-<span class="source-line-no">465</span><span id="line-465">   * Find out whether all column families in unmodifiedTableDescriptor also exists in the</span>
-<span class="source-line-no">466</span><span id="line-466">   * modifiedTableDescriptor.</span>
-<span class="source-line-no">467</span><span id="line-467">   * @return True if we are deleting a column family.</span>
-<span class="source-line-no">468</span><span id="line-468">   */</span>
-<span class="source-line-no">469</span><span id="line-469">  private static boolean isDeleteColumnFamily(TableDescriptor originalDescriptor,</span>
-<span class="source-line-no">470</span><span id="line-470">    TableDescriptor newDescriptor) {</span>
-<span class="source-line-no">471</span><span id="line-471">    boolean result = false;</span>
-<span class="source-line-no">472</span><span id="line-472">    final Set&lt;byte[]&gt; originalFamilies = originalDescriptor.getColumnFamilyNames();</span>
-<span class="source-line-no">473</span><span id="line-473">    final Set&lt;byte[]&gt; newFamilies = newDescriptor.getColumnFamilyNames();</span>
-<span class="source-line-no">474</span><span id="line-474">    for (byte[] familyName : originalFamilies) {</span>
-<span class="source-line-no">475</span><span id="line-475">      if (!newFamilies.contains(familyName)) {</span>
-<span class="source-line-no">476</span><span id="line-476">        result = true;</span>
-<span class="source-line-no">477</span><span id="line-477">        break;</span>
-<span class="source-line-no">478</span><span id="line-478">      }</span>
-<span class="source-line-no">479</span><span id="line-479">    }</span>
-<span class="source-line-no">480</span><span id="line-480">    return result;</span>
-<span class="source-line-no">481</span><span id="line-481">  }</span>
-<span class="source-line-no">482</span><span id="line-482"></span>
-<span class="source-line-no">483</span><span id="line-483">  /**</span>
-<span class="source-line-no">484</span><span id="line-484">   * Action before modifying table.</span>
-<span class="source-line-no">485</span><span id="line-485">   * @param env   MasterProcedureEnv</span>
-<span class="source-line-no">486</span><span id="line-486">   * @param state the procedure state</span>
-<span class="source-line-no">487</span><span id="line-487">   */</span>
-<span class="source-line-no">488</span><span id="line-488">  private void preModify(final MasterProcedureEnv env, final ModifyTableState state)</span>
-<span class="source-line-no">489</span><span id="line-489">    throws IOException, InterruptedException {</span>
-<span class="source-line-no">490</span><span id="line-490">    runCoprocessorAction(env, state);</span>
-<span class="source-line-no">491</span><span id="line-491">  }</span>
-<span class="source-line-no">492</span><span id="line-492"></span>
-<span class="source-line-no">493</span><span id="line-493">  /**</span>
-<span class="source-line-no">494</span><span id="line-494">   * Update descriptor</span>
-<span class="source-line-no">495</span><span id="line-495">   * @param env MasterProcedureEnv</span>
-<span class="source-line-no">496</span><span id="line-496">   **/</span>
-<span class="source-line-no">497</span><span id="line-497">  private void updateTableDescriptor(final MasterProcedureEnv env) throws IOException {</span>
-<span class="source-line-no">498</span><span id="line-498">    env.getMasterServices().getTableDescriptors().update(modifiedTableDescriptor);</span>
+<span class="source-line-no">338</span><span id="line-338">  protected boolean isRollbackSupported(final ModifyTableState state) {</span>
+<span class="source-line-no">339</span><span id="line-339">    switch (state) {</span>
+<span class="source-line-no">340</span><span id="line-340">      case MODIFY_TABLE_PREPARE:</span>
+<span class="source-line-no">341</span><span id="line-341">      case MODIFY_TABLE_PRE_OPERATION:</span>
+<span class="source-line-no">342</span><span id="line-342">      case MODIFY_TABLE_SNAPSHOT:</span>
+<span class="source-line-no">343</span><span id="line-343">      case MODIFY_TABLE_CLOSE_EXCESS_REPLICAS:</span>
+<span class="source-line-no">344</span><span id="line-344">        return true;</span>
+<span class="source-line-no">345</span><span id="line-345">      default:</span>
+<span class="source-line-no">346</span><span id="line-346">        return false;</span>
+<span class="source-line-no">347</span><span id="line-347">    }</span>
+<span class="source-line-no">348</span><span id="line-348">  }</span>
+<span class="source-line-no">349</span><span id="line-349"></span>
+<span class="source-line-no">350</span><span id="line-350">  @Override</span>
+<span class="source-line-no">351</span><span id="line-351">  protected void completionCleanup(final MasterProcedureEnv env) {</span>
+<span class="source-line-no">352</span><span id="line-352">    releaseSyncLatch();</span>
+<span class="source-line-no">353</span><span id="line-353">  }</span>
+<span class="source-line-no">354</span><span id="line-354"></span>
+<span class="source-line-no">355</span><span id="line-355">  @Override</span>
+<span class="source-line-no">356</span><span id="line-356">  protected ModifyTableState getState(final int stateId) {</span>
+<span class="source-line-no">357</span><span id="line-357">    return ModifyTableState.forNumber(stateId);</span>
+<span class="source-line-no">358</span><span id="line-358">  }</span>
+<span class="source-line-no">359</span><span id="line-359"></span>
+<span class="source-line-no">360</span><span id="line-360">  @Override</span>
+<span class="source-line-no">361</span><span id="line-361">  protected int getStateId(final ModifyTableState state) {</span>
+<span class="source-line-no">362</span><span id="line-362">    return state.getNumber();</span>
+<span class="source-line-no">363</span><span id="line-363">  }</span>
+<span class="source-line-no">364</span><span id="line-364"></span>
+<span class="source-line-no">365</span><span id="line-365">  @Override</span>
+<span class="source-line-no">366</span><span id="line-366">  protected ModifyTableState getInitialState() {</span>
+<span class="source-line-no">367</span><span id="line-367">    return ModifyTableState.MODIFY_TABLE_PREPARE;</span>
+<span class="source-line-no">368</span><span id="line-368">  }</span>
+<span class="source-line-no">369</span><span id="line-369"></span>
+<span class="source-line-no">370</span><span id="line-370">  @Override</span>
+<span class="source-line-no">371</span><span id="line-371">  protected void serializeStateData(ProcedureStateSerializer serializer) throws IOException {</span>
+<span class="source-line-no">372</span><span id="line-372">    super.serializeStateData(serializer);</span>
+<span class="source-line-no">373</span><span id="line-373"></span>
+<span class="source-line-no">374</span><span id="line-374">    MasterProcedureProtos.ModifyTableStateData.Builder modifyTableMsg =</span>
+<span class="source-line-no">375</span><span id="line-375">      MasterProcedureProtos.ModifyTableStateData.newBuilder()</span>
+<span class="source-line-no">376</span><span id="line-376">        .setUserInfo(MasterProcedureUtil.toProtoUserInfo(getUser()))</span>
+<span class="source-line-no">377</span><span id="line-377">        .setModifiedTableSchema(ProtobufUtil.toTableSchema(modifiedTableDescriptor))</span>
+<span class="source-line-no">378</span><span id="line-378">        .setDeleteColumnFamilyInModify(deleteColumnFamilyInModify)</span>
+<span class="source-line-no">379</span><span id="line-379">        .setShouldCheckDescriptor(shouldCheckDescriptor).setReopenRegions(reopenRegions);</span>
+<span class="source-line-no">380</span><span id="line-380"></span>
+<span class="source-line-no">381</span><span id="line-381">    if (unmodifiedTableDescriptor != null) {</span>
+<span class="source-line-no">382</span><span id="line-382">      modifyTableMsg</span>
+<span class="source-line-no">383</span><span id="line-383">        .setUnmodifiedTableSchema(ProtobufUtil.toTableSchema(unmodifiedTableDescriptor));</span>
+<span class="source-line-no">384</span><span id="line-384">    }</span>
+<span class="source-line-no">385</span><span id="line-385"></span>
+<span class="source-line-no">386</span><span id="line-386">    if (recoverySnapshotName != null) {</span>
+<span class="source-line-no">387</span><span id="line-387">      modifyTableMsg.setSnapshotName(recoverySnapshotName);</span>
+<span class="source-line-no">388</span><span id="line-388">    }</span>
+<span class="source-line-no">389</span><span id="line-389"></span>
+<span class="source-line-no">390</span><span id="line-390">    serializer.serialize(modifyTableMsg.build());</span>
+<span class="source-line-no">391</span><span id="line-391">  }</span>
+<span class="source-line-no">392</span><span id="line-392"></span>
+<span class="source-line-no">393</span><span id="line-393">  @Override</span>
+<span class="source-line-no">394</span><span id="line-394">  protected void deserializeStateData(ProcedureStateSerializer serializer) throws IOException {</span>
+<span class="source-line-no">395</span><span id="line-395">    super.deserializeStateData(serializer);</span>
+<span class="source-line-no">396</span><span id="line-396"></span>
+<span class="source-line-no">397</span><span id="line-397">    MasterProcedureProtos.ModifyTableStateData modifyTableMsg =</span>
+<span class="source-line-no">398</span><span id="line-398">      serializer.deserialize(MasterProcedureProtos.ModifyTableStateData.class);</span>
+<span class="source-line-no">399</span><span id="line-399">    setUser(MasterProcedureUtil.toUserInfo(modifyTableMsg.getUserInfo()));</span>
+<span class="source-line-no">400</span><span id="line-400">    modifiedTableDescriptor =</span>
+<span class="source-line-no">401</span><span id="line-401">      ProtobufUtil.toTableDescriptor(modifyTableMsg.getModifiedTableSchema());</span>
+<span class="source-line-no">402</span><span id="line-402">    deleteColumnFamilyInModify = modifyTableMsg.getDeleteColumnFamilyInModify();</span>
+<span class="source-line-no">403</span><span id="line-403">    shouldCheckDescriptor =</span>
+<span class="source-line-no">404</span><span id="line-404">      modifyTableMsg.hasShouldCheckDescriptor() ? modifyTableMsg.getShouldCheckDescriptor() : false;</span>
+<span class="source-line-no">405</span><span id="line-405">    reopenRegions = modifyTableMsg.hasReopenRegions() ? modifyTableMsg.getReopenRegions() : true;</span>
+<span class="source-line-no">406</span><span id="line-406"></span>
+<span class="source-line-no">407</span><span id="line-407">    if (modifyTableMsg.hasUnmodifiedTableSchema()) {</span>
+<span class="source-line-no">408</span><span id="line-408">      unmodifiedTableDescriptor =</span>
+<span class="source-line-no">409</span><span id="line-409">        ProtobufUtil.toTableDescriptor(modifyTableMsg.getUnmodifiedTableSchema());</span>
+<span class="source-line-no">410</span><span id="line-410">    }</span>
+<span class="source-line-no">411</span><span id="line-411"></span>
+<span class="source-line-no">412</span><span id="line-412">    if (modifyTableMsg.hasSnapshotName()) {</span>
+<span class="source-line-no">413</span><span id="line-413">      recoverySnapshotName = modifyTableMsg.getSnapshotName();</span>
+<span class="source-line-no">414</span><span id="line-414">    }</span>
+<span class="source-line-no">415</span><span id="line-415">  }</span>
+<span class="source-line-no">416</span><span id="line-416"></span>
+<span class="source-line-no">417</span><span id="line-417">  @Override</span>
+<span class="source-line-no">418</span><span id="line-418">  public TableName getTableName() {</span>
+<span class="source-line-no">419</span><span id="line-419">    return modifiedTableDescriptor.getTableName();</span>
+<span class="source-line-no">420</span><span id="line-420">  }</span>
+<span class="source-line-no">421</span><span id="line-421"></span>
+<span class="source-line-no">422</span><span id="line-422">  @Override</span>
+<span class="source-line-no">423</span><span id="line-423">  public TableOperationType getTableOperationType() {</span>
+<span class="source-line-no">424</span><span id="line-424">    return TableOperationType.EDIT;</span>
+<span class="source-line-no">425</span><span id="line-425">  }</span>
+<span class="source-line-no">426</span><span id="line-426"></span>
+<span class="source-line-no">427</span><span id="line-427">  /**</span>
+<span class="source-line-no">428</span><span id="line-428">   * Check conditions before any real action of modifying a table.</span>
+<span class="source-line-no">429</span><span id="line-429">   */</span>
+<span class="source-line-no">430</span><span id="line-430">  private void prepareModify(final MasterProcedureEnv env) throws IOException {</span>
+<span class="source-line-no">431</span><span id="line-431">    // Checks whether the table exists</span>
+<span class="source-line-no">432</span><span id="line-432">    if (!env.getMasterServices().getTableDescriptors().exists(getTableName())) {</span>
+<span class="source-line-no">433</span><span id="line-433">      throw new TableNotFoundException(getTableName());</span>
+<span class="source-line-no">434</span><span id="line-434">    }</span>
+<span class="source-line-no">435</span><span id="line-435"></span>
+<span class="source-line-no">436</span><span id="line-436">    // check that we have at least 1 CF</span>
+<span class="source-line-no">437</span><span id="line-437">    if (modifiedTableDescriptor.getColumnFamilyCount() == 0) {</span>
+<span class="source-line-no">438</span><span id="line-438">      throw new DoNotRetryIOException(</span>
+<span class="source-line-no">439</span><span id="line-439">        "Table " + getTableName().toString() + " should have at least one column family.");</span>
+<span class="source-line-no">440</span><span id="line-440">    }</span>
+<span class="source-line-no">441</span><span id="line-441"></span>
+<span class="source-line-no">442</span><span id="line-442">    // If descriptor check is enabled, check whether the table descriptor when procedure was</span>
+<span class="source-line-no">443</span><span id="line-443">    // submitted matches with the current</span>
+<span class="source-line-no">444</span><span id="line-444">    // table descriptor of the table, else retrieve the old descriptor</span>
+<span class="source-line-no">445</span><span id="line-445">    // for comparison in order to update the descriptor.</span>
+<span class="source-line-no">446</span><span id="line-446">    if (shouldCheckDescriptor) {</span>
+<span class="source-line-no">447</span><span id="line-447">      if (</span>
+<span class="source-line-no">448</span><span id="line-448">        TableDescriptor.COMPARATOR.compare(unmodifiedTableDescriptor,</span>
+<span class="source-line-no">449</span><span id="line-449">          env.getMasterServices().getTableDescriptors().get(getTableName())) != 0</span>
+<span class="source-line-no">450</span><span id="line-450">      ) {</span>
+<span class="source-line-no">451</span><span id="line-451">        LOG.error("Error while modifying table '" + getTableName().toString()</span>
+<span class="source-line-no">452</span><span id="line-452">          + "' Skipping procedure : " + this);</span>
+<span class="source-line-no">453</span><span id="line-453">        throw new ConcurrentTableModificationException(</span>
+<span class="source-line-no">454</span><span id="line-454">          "Skipping modify table operation on table '" + getTableName().toString()</span>
+<span class="source-line-no">455</span><span id="line-455">            + "' as it has already been modified by some other concurrent operation, "</span>
+<span class="source-line-no">456</span><span id="line-456">            + "Please retry.");</span>
+<span class="source-line-no">457</span><span id="line-457">      }</span>
+<span class="source-line-no">458</span><span id="line-458">    } else {</span>
+<span class="source-line-no">459</span><span id="line-459">      this.unmodifiedTableDescriptor =</span>
+<span class="source-line-no">460</span><span id="line-460">        env.getMasterServices().getTableDescriptors().get(getTableName());</span>
+<span class="source-line-no">461</span><span id="line-461">    }</span>
+<span class="source-line-no">462</span><span id="line-462"></span>
+<span class="source-line-no">463</span><span id="line-463">    this.deleteColumnFamilyInModify =</span>
+<span class="source-line-no">464</span><span id="line-464">      isDeleteColumnFamily(unmodifiedTableDescriptor, modifiedTableDescriptor);</span>
+<span class="source-line-no">465</span><span id="line-465">    if (</span>
+<span class="source-line-no">466</span><span id="line-466">      !unmodifiedTableDescriptor.getRegionServerGroup()</span>
+<span class="source-line-no">467</span><span id="line-467">        .equals(modifiedTableDescriptor.getRegionServerGroup())</span>
+<span class="source-line-no">468</span><span id="line-468">    ) {</span>
+<span class="source-line-no">469</span><span id="line-469">      Supplier&lt;String&gt; forWhom = () -&gt; "table " + getTableName();</span>
+<span class="source-line-no">470</span><span id="line-470">      RSGroupInfo rsGroupInfo = MasterProcedureUtil.checkGroupExists(</span>
+<span class="source-line-no">471</span><span id="line-471">        env.getMasterServices().getRSGroupInfoManager()::getRSGroup,</span>
+<span class="source-line-no">472</span><span id="line-472">        modifiedTableDescriptor.getRegionServerGroup(), forWhom);</span>
+<span class="source-line-no">473</span><span id="line-473">      MasterProcedureUtil.checkGroupNotEmpty(rsGroupInfo, forWhom);</span>
+<span class="source-line-no">474</span><span id="line-474">    }</span>
+<span class="source-line-no">475</span><span id="line-475"></span>
+<span class="source-line-no">476</span><span id="line-476">    // check for store file tracker configurations</span>
+<span class="source-line-no">477</span><span id="line-477">    StoreFileTrackerValidationUtils.checkForModifyTable(env.getMasterConfiguration(),</span>
+<span class="source-line-no">478</span><span id="line-478">      unmodifiedTableDescriptor, modifiedTableDescriptor, !isTableEnabled(env));</span>
+<span class="source-line-no">479</span><span id="line-479">    CustomCellTieredUtils.checkForModifyTable(modifiedTableDescriptor);</span>
+<span class="source-line-no">480</span><span id="line-480">  }</span>
+<span class="source-line-no">481</span><span id="line-481"></span>
+<span class="source-line-no">482</span><span id="line-482">  /**</span>
+<span class="source-line-no">483</span><span id="line-483">   * Find out whether all column families in unmodifiedTableDescriptor also exists in the</span>
+<span class="source-line-no">484</span><span id="line-484">   * modifiedTableDescriptor.</span>
+<span class="source-line-no">485</span><span id="line-485">   * @return True if we are deleting a column family.</span>
+<span class="source-line-no">486</span><span id="line-486">   */</span>
+<span class="source-line-no">487</span><span id="line-487">  private static boolean isDeleteColumnFamily(TableDescriptor originalDescriptor,</span>
+<span class="source-line-no">488</span><span id="line-488">    TableDescriptor newDescriptor) {</span>
+<span class="source-line-no">489</span><span id="line-489">    boolean result = false;</span>
+<span class="source-line-no">490</span><span id="line-490">    final Set&lt;byte[]&gt; originalFamilies = originalDescriptor.getColumnFamilyNames();</span>
+<span class="source-line-no">491</span><span id="line-491">    final Set&lt;byte[]&gt; newFamilies = newDescriptor.getColumnFamilyNames();</span>
+<span class="source-line-no">492</span><span id="line-492">    for (byte[] familyName : originalFamilies) {</span>
+<span class="source-line-no">493</span><span id="line-493">      if (!newFamilies.contains(familyName)) {</span>
+<span class="source-line-no">494</span><span id="line-494">        result = true;</span>
+<span class="source-line-no">495</span><span id="line-495">        break;</span>
+<span class="source-line-no">496</span><span id="line-496">      }</span>
+<span class="source-line-no">497</span><span id="line-497">    }</span>
+<span class="source-line-no">498</span><span id="line-498">    return result;</span>
 <span class="source-line-no">499</span><span id="line-499">  }</span>
 <span class="source-line-no">500</span><span id="line-500"></span>
 <span class="source-line-no">501</span><span id="line-501">  /**</span>
-<span class="source-line-no">502</span><span id="line-502">   * Removes from hdfs the families that are not longer present in the new table descriptor.</span>
-<span class="source-line-no">503</span><span id="line-503">   * @param env MasterProcedureEnv</span>
-<span class="source-line-no">504</span><span id="line-504">   */</span>
-<span class="source-line-no">505</span><span id="line-505">  private void deleteFromFs(final MasterProcedureEnv env, final TableDescriptor oldTableDescriptor,</span>
-<span class="source-line-no">506</span><span id="line-506">    final TableDescriptor newTableDescriptor) throws IOException {</span>
-<span class="source-line-no">507</span><span id="line-507">    final Set&lt;byte[]&gt; oldFamilies = oldTableDescriptor.getColumnFamilyNames();</span>
-<span class="source-line-no">508</span><span id="line-508">    final Set&lt;byte[]&gt; newFamilies = newTableDescriptor.getColumnFamilyNames();</span>
-<span class="source-line-no">509</span><span id="line-509">    for (byte[] familyName : oldFamilies) {</span>
-<span class="source-line-no">510</span><span id="line-510">      if (!newFamilies.contains(familyName)) {</span>
-<span class="source-line-no">511</span><span id="line-511">        MasterDDLOperationHelper.deleteColumnFamilyFromFileSystem(env, getTableName(),</span>
-<span class="source-line-no">512</span><span id="line-512">          getRegionInfoList(env), familyName,</span>
-<span class="source-line-no">513</span><span id="line-513">          oldTableDescriptor.getColumnFamily(familyName).isMobEnabled());</span>
-<span class="source-line-no">514</span><span id="line-514">      }</span>
-<span class="source-line-no">515</span><span id="line-515">    }</span>
-<span class="source-line-no">516</span><span id="line-516">  }</span>
-<span class="source-line-no">517</span><span id="line-517"></span>
-<span class="source-line-no">518</span><span id="line-518">  /**</span>
-<span class="source-line-no">519</span><span id="line-519">   * remove replica columns if necessary.</span>
-<span class="source-line-no">520</span><span id="line-520">   */</span>
-<span class="source-line-no">521</span><span id="line-521">  private void removeReplicaColumnsIfNeeded(MasterProcedureEnv env) throws IOException {</span>
-<span class="source-line-no">522</span><span id="line-522">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">523</span><span id="line-523">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">524</span><span id="line-524">    if (newReplicaCount &gt;= oldReplicaCount) {</span>
-<span class="source-line-no">525</span><span id="line-525">      return;</span>
-<span class="source-line-no">526</span><span id="line-526">    }</span>
-<span class="source-line-no">527</span><span id="line-527">    env.getAssignmentManager().getRegionStateStore().removeRegionReplicas(getTableName(),</span>
-<span class="source-line-no">528</span><span id="line-528">      oldReplicaCount, newReplicaCount);</span>
-<span class="source-line-no">529</span><span id="line-529">    env.getAssignmentManager().getRegionStates().getRegionsOfTable(getTableName()).stream()</span>
-<span class="source-line-no">530</span><span id="line-530">      .filter(r -&gt; r.getReplicaId() &gt;= newReplicaCount)</span>
-<span class="source-line-no">531</span><span id="line-531">      .forEach(env.getAssignmentManager().getRegionStates()::deleteRegion);</span>
-<span class="source-line-no">532</span><span id="line-532">  }</span>
-<span class="source-line-no">533</span><span id="line-533"></span>
-<span class="source-line-no">534</span><span id="line-534">  private void assignNewReplicasIfNeeded(MasterProcedureEnv env) throws IOException {</span>
-<span class="source-line-no">535</span><span id="line-535">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">536</span><span id="line-536">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">537</span><span id="line-537">    if (newReplicaCount &lt;= oldReplicaCount) {</span>
-<span class="source-line-no">538</span><span id="line-538">      return;</span>
-<span class="source-line-no">539</span><span id="line-539">    }</span>
-<span class="source-line-no">540</span><span id="line-540">    if (isTableEnabled(env)) {</span>
-<span class="source-line-no">541</span><span id="line-541">      List&lt;RegionInfo&gt; newReplicas = env.getAssignmentManager().getRegionStates()</span>
-<span class="source-line-no">542</span><span id="line-542">        .getRegionsOfTable(getTableName()).stream().filter(RegionReplicaUtil::isDefaultReplica)</span>
-<span class="source-line-no">543</span><span id="line-543">        .flatMap(primaryRegion -&gt; IntStream.range(oldReplicaCount, newReplicaCount).mapToObj(</span>
-<span class="source-line-no">544</span><span id="line-544">          replicaId -&gt; RegionReplicaUtil.getRegionInfoForReplica(primaryRegion, replicaId)))</span>
-<span class="source-line-no">545</span><span id="line-545">        .collect(Collectors.toList());</span>
-<span class="source-line-no">546</span><span id="line-546">      addChildProcedure(env.getAssignmentManager().createAssignProcedures(newReplicas));</span>
-<span class="source-line-no">547</span><span id="line-547">    }</span>
-<span class="source-line-no">548</span><span id="line-548">  }</span>
-<span class="source-line-no">549</span><span id="line-549"></span>
-<span class="source-line-no">550</span><span id="line-550">  private void closeExcessReplicasIfNeeded(MasterProcedureEnv env) {</span>
-<span class="source-line-no">551</span><span id="line-551">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">552</span><span id="line-552">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
-<span class="source-line-no">553</span><span id="line-553">    if (newReplicaCount &gt;= oldReplicaCount) {</span>
-<span class="source-line-no">554</span><span id="line-554">      return;</span>
-<span class="source-line-no">555</span><span id="line-555">    }</span>
-<span class="source-line-no">556</span><span id="line-556">    addChildProcedure(new CloseExcessRegionReplicasProcedure(getTableName(), newReplicaCount));</span>
-<span class="source-line-no">557</span><span id="line-557">  }</span>
-<span class="source-line-no">558</span><span id="line-558"></span>
-<span class="source-line-no">559</span><span id="line-559">  /**</span>
-<span class="source-line-no">560</span><span id="line-560">   * Action after modifying table.</span>
-<span class="source-line-no">561</span><span id="line-561">   * @param env   MasterProcedureEnv</span>
-<span class="source-line-no">562</span><span id="line-562">   * @param state the procedure state</span>
-<span class="source-line-no">563</span><span id="line-563">   */</span>
-<span class="source-line-no">564</span><span id="line-564">  private void postModify(final MasterProcedureEnv env, final ModifyTableState state)</span>
-<span class="source-line-no">565</span><span id="line-565">    throws IOException, InterruptedException {</span>
-<span class="source-line-no">566</span><span id="line-566">    runCoprocessorAction(env, state);</span>
-<span class="source-line-no">567</span><span id="line-567">  }</span>
-<span class="source-line-no">568</span><span id="line-568"></span>
-<span class="source-line-no">569</span><span id="line-569">  /**</span>
-<span class="source-line-no">570</span><span id="line-570">   * Coprocessor Action.</span>
-<span class="source-line-no">571</span><span id="line-571">   * @param env   MasterProcedureEnv</span>
-<span class="source-line-no">572</span><span id="line-572">   * @param state the procedure state</span>
-<span class="source-line-no">573</span><span id="line-573">   */</span>
-<span class="source-line-no">574</span><span id="line-574">  private void runCoprocessorAction(final MasterProcedureEnv env, final ModifyTableState state)</span>
-<span class="source-line-no">575</span><span id="line-575">    throws IOException, InterruptedException {</span>
-<span class="source-line-no">576</span><span id="line-576">    final MasterCoprocessorHost cpHost = env.getMasterCoprocessorHost();</span>
-<span class="source-line-no">577</span><span id="line-577">    if (cpHost != null) {</span>
-<span class="source-line-no">578</span><span id="line-578">      switch (state) {</span>
-<span class="source-line-no">579</span><span id="line-579">        case MODIFY_TABLE_PRE_OPERATION:</span>
-<span class="source-line-no">580</span><span id="line-580">          cpHost.preModifyTableAction(getTableName(), unmodifiedTableDescriptor,</span>
-<span class="source-line-no">581</span><span id="line-581">            modifiedTableDescriptor, getUser());</span>
-<span class="source-line-no">582</span><span id="line-582">          break;</span>
-<span class="source-line-no">583</span><span id="line-583">        case MODIFY_TABLE_POST_OPERATION:</span>
-<span class="source-line-no">584</span><span id="line-584">          cpHost.postCompletedModifyTableAction(getTableName(), unmodifiedTableDescriptor,</span>
-<span class="source-line-no">585</span><span id="line-585">            modifiedTableDescriptor, getUser());</span>
-<span class="source-line-no">586</span><span id="line-586">          break;</span>
-<span class="source-line-no">587</span><span id="line-587">        default:</span>
-<span class="source-line-no">588</span><span id="line-588">          throw new UnsupportedOperationException(this + " unhandled state=" + state);</span>
-<span class="source-line-no">589</span><span id="line-589">      }</span>
-<span class="source-line-no">590</span><span id="line-590">    }</span>
-<span class="source-line-no">591</span><span id="line-591">  }</span>
-<span class="source-line-no">592</span><span id="line-592"></span>
-<span class="source-line-no">593</span><span id="line-593">  /**</span>
-<span class="source-line-no">594</span><span id="line-594">   * Fetches all Regions for a table. Cache the result of this method if you need to use it multiple</span>
-<span class="source-line-no">595</span><span id="line-595">   * times. Be aware that it may change over in between calls to this procedure.</span>
-<span class="source-line-no">596</span><span id="line-596">   */</span>
-<span class="source-line-no">597</span><span id="line-597">  private List&lt;RegionInfo&gt; getRegionInfoList(final MasterProcedureEnv env) throws IOException {</span>
-<span class="source-line-no">598</span><span id="line-598">    return env.getAssignmentManager().getRegionStates().getRegionsOfTable(getTableName());</span>
-<span class="source-line-no">599</span><span id="line-599">  }</span>
-<span class="source-line-no">600</span><span id="line-600">}</span>
+<span class="source-line-no">502</span><span id="line-502">   * Action before modifying table.</span>
+<span class="source-line-no">503</span><span id="line-503">   * @param env   MasterProcedureEnv</span>
+<span class="source-line-no">504</span><span id="line-504">   * @param state the procedure state</span>
+<span class="source-line-no">505</span><span id="line-505">   */</span>
+<span class="source-line-no">506</span><span id="line-506">  private void preModify(final MasterProcedureEnv env, final ModifyTableState state)</span>
+<span class="source-line-no">507</span><span id="line-507">    throws IOException, InterruptedException {</span>
+<span class="source-line-no">508</span><span id="line-508">    runCoprocessorAction(env, state);</span>
+<span class="source-line-no">509</span><span id="line-509">  }</span>
+<span class="source-line-no">510</span><span id="line-510"></span>
+<span class="source-line-no">511</span><span id="line-511">  /**</span>
+<span class="source-line-no">512</span><span id="line-512">   * Update descriptor</span>
+<span class="source-line-no">513</span><span id="line-513">   * @param env MasterProcedureEnv</span>
+<span class="source-line-no">514</span><span id="line-514">   **/</span>
+<span class="source-line-no">515</span><span id="line-515">  private void updateTableDescriptor(final MasterProcedureEnv env) throws IOException {</span>
+<span class="source-line-no">516</span><span id="line-516">    env.getMasterServices().getTableDescriptors().update(modifiedTableDescriptor);</span>
+<span class="source-line-no">517</span><span id="line-517">  }</span>
+<span class="source-line-no">518</span><span id="line-518"></span>
+<span class="source-line-no">519</span><span id="line-519">  /**</span>
+<span class="source-line-no">520</span><span id="line-520">   * Removes from hdfs the families that are not longer present in the new table descriptor.</span>
+<span class="source-line-no">521</span><span id="line-521">   * @param env MasterProcedureEnv</span>
+<span class="source-line-no">522</span><span id="line-522">   */</span>
+<span class="source-line-no">523</span><span id="line-523">  private void deleteFromFs(final MasterProcedureEnv env, final TableDescriptor oldTableDescriptor,</span>
+<span class="source-line-no">524</span><span id="line-524">    final TableDescriptor newTableDescriptor) throws IOException {</span>
+<span class="source-line-no">525</span><span id="line-525">    final Set&lt;byte[]&gt; oldFamilies = oldTableDescriptor.getColumnFamilyNames();</span>
+<span class="source-line-no">526</span><span id="line-526">    final Set&lt;byte[]&gt; newFamilies = newTableDescriptor.getColumnFamilyNames();</span>
+<span class="source-line-no">527</span><span id="line-527">    for (byte[] familyName : oldFamilies) {</span>
+<span class="source-line-no">528</span><span id="line-528">      if (!newFamilies.contains(familyName)) {</span>
+<span class="source-line-no">529</span><span id="line-529">        MasterDDLOperationHelper.deleteColumnFamilyFromFileSystem(env, getTableName(),</span>
+<span class="source-line-no">530</span><span id="line-530">          getRegionInfoList(env), familyName,</span>
+<span class="source-line-no">531</span><span id="line-531">          oldTableDescriptor.getColumnFamily(familyName).isMobEnabled());</span>
+<span class="source-line-no">532</span><span id="line-532">      }</span>
+<span class="source-line-no">533</span><span id="line-533">    }</span>
+<span class="source-line-no">534</span><span id="line-534">  }</span>
+<span class="source-line-no">535</span><span id="line-535"></span>
+<span class="source-line-no">536</span><span id="line-536">  /**</span>
+<span class="source-line-no">537</span><span id="line-537">   * remove replica columns if necessary.</span>
+<span class="source-line-no">538</span><span id="line-538">   */</span>
+<span class="source-line-no">539</span><span id="line-539">  private void removeReplicaColumnsIfNeeded(MasterProcedureEnv env) throws IOException {</span>
+<span class="source-line-no">540</span><span id="line-540">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">541</span><span id="line-541">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">542</span><span id="line-542">    if (newReplicaCount &gt;= oldReplicaCount) {</span>
+<span class="source-line-no">543</span><span id="line-543">      return;</span>
+<span class="source-line-no">544</span><span id="line-544">    }</span>
+<span class="source-line-no">545</span><span id="line-545">    env.getAssignmentManager().getRegionStateStore().removeRegionReplicas(getTableName(),</span>
+<span class="source-line-no">546</span><span id="line-546">      oldReplicaCount, newReplicaCount);</span>
+<span class="source-line-no">547</span><span id="line-547">    env.getAssignmentManager().getRegionStates().getRegionsOfTable(getTableName()).stream()</span>
+<span class="source-line-no">548</span><span id="line-548">      .filter(r -&gt; r.getReplicaId() &gt;= newReplicaCount)</span>
+<span class="source-line-no">549</span><span id="line-549">      .forEach(env.getAssignmentManager().getRegionStates()::deleteRegion);</span>
+<span class="source-line-no">550</span><span id="line-550">  }</span>
+<span class="source-line-no">551</span><span id="line-551"></span>
+<span class="source-line-no">552</span><span id="line-552">  private void assignNewReplicasIfNeeded(MasterProcedureEnv env) throws IOException {</span>
+<span class="source-line-no">553</span><span id="line-553">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">554</span><span id="line-554">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">555</span><span id="line-555">    if (newReplicaCount &lt;= oldReplicaCount) {</span>
+<span class="source-line-no">556</span><span id="line-556">      return;</span>
+<span class="source-line-no">557</span><span id="line-557">    }</span>
+<span class="source-line-no">558</span><span id="line-558">    if (isTableEnabled(env)) {</span>
+<span class="source-line-no">559</span><span id="line-559">      List&lt;RegionInfo&gt; newReplicas = env.getAssignmentManager().getRegionStates()</span>
+<span class="source-line-no">560</span><span id="line-560">        .getRegionsOfTable(getTableName()).stream().filter(RegionReplicaUtil::isDefaultReplica)</span>
+<span class="source-line-no">561</span><span id="line-561">        .flatMap(primaryRegion -&gt; IntStream.range(oldReplicaCount, newReplicaCount).mapToObj(</span>
+<span class="source-line-no">562</span><span id="line-562">          replicaId -&gt; RegionReplicaUtil.getRegionInfoForReplica(primaryRegion, replicaId)))</span>
+<span class="source-line-no">563</span><span id="line-563">        .collect(Collectors.toList());</span>
+<span class="source-line-no">564</span><span id="line-564">      addChildProcedure(env.getAssignmentManager().createAssignProcedures(newReplicas));</span>
+<span class="source-line-no">565</span><span id="line-565">    }</span>
+<span class="source-line-no">566</span><span id="line-566">  }</span>
+<span class="source-line-no">567</span><span id="line-567"></span>
+<span class="source-line-no">568</span><span id="line-568">  private void closeExcessReplicasIfNeeded(MasterProcedureEnv env) {</span>
+<span class="source-line-no">569</span><span id="line-569">    final int oldReplicaCount = unmodifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">570</span><span id="line-570">    final int newReplicaCount = modifiedTableDescriptor.getRegionReplication();</span>
+<span class="source-line-no">571</span><span id="line-571">    if (newReplicaCount &gt;= oldReplicaCount) {</span>
+<span class="source-line-no">572</span><span id="line-572">      return;</span>
+<span class="source-line-no">573</span><span id="line-573">    }</span>
+<span class="source-line-no">574</span><span id="line-574">    addChildProcedure(new CloseExcessRegionReplicasProcedure(getTableName(), newReplicaCount));</span>
+<span class="source-line-no">575</span><span id="line-575">  }</span>
+<span class="source-line-no">576</span><span id="line-576"></span>
+<span class="source-line-no">577</span><span id="line-577">  /**</span>
+<span class="source-line-no">578</span><span id="line-578">   * Action after modifying table.</span>
+<span class="source-line-no">579</span><span id="line-579">   * @param env   MasterProcedureEnv</span>
+<span class="source-line-no">580</span><span id="line-580">   * @param state the procedure state</span>
+<span class="source-line-no">581</span><span id="line-581">   */</span>
+<span class="source-line-no">582</span><span id="line-582">  private void postModify(final MasterProcedureEnv env, final ModifyTableState state)</span>
+<span class="source-line-no">583</span><span id="line-583">    throws IOException, InterruptedException {</span>
+<span class="source-line-no">584</span><span id="line-584">    runCoprocessorAction(env, state);</span>
+<span class="source-line-no">585</span><span id="line-585">  }</span>
+<span class="source-line-no">586</span><span id="line-586"></span>
+<span class="source-line-no">587</span><span id="line-587">  /**</span>
+<span class="source-line-no">588</span><span id="line-588">   * Coprocessor Action.</span>
+<span class="source-line-no">589</span><span id="line-589">   * @param env   MasterProcedureEnv</span>
+<span class="source-line-no">590</span><span id="line-590">   * @param state the procedure state</span>
+<span class="source-line-no">591</span><span id="line-591">   */</span>
+<span class="source-line-no">592</span><span id="line-592">  private void runCoprocessorAction(final MasterProcedureEnv env, final ModifyTableState state)</span>
+<span class="source-line-no">593</span><span id="line-593">    throws IOException, InterruptedException {</span>
+<span class="source-line-no">594</span><span id="line-594">    final MasterCoprocessorHost cpHost = env.getMasterCoprocessorHost();</span>
+<span class="source-line-no">595</span><span id="line-595">    if (cpHost != null) {</span>
+<span class="source-line-no">596</span><span id="line-596">      switch (state) {</span>
+<span class="source-line-no">597</span><span id="line-597">        case MODIFY_TABLE_PRE_OPERATION:</span>
+<span class="source-line-no">598</span><span id="line-598">          cpHost.preModifyTableAction(getTableName(), unmodifiedTableDescriptor,</span>
+<span class="source-line-no">599</span><span id="line-599">            modifiedTableDescriptor, getUser());</span>
+<span class="source-line-no">600</span><span id="line-600">          break;</span>
+<span class="source-line-no">601</span><span id="line-601">        case MODIFY_TABLE_POST_OPERATION:</span>
+<span class="source-line-no">602</span><span id="line-602">          cpHost.postCompletedModifyTableAction(getTableName(), unmodifiedTableDescriptor,</span>
+<span class="source-line-no">603</span><span id="line-603">            modifiedTableDescriptor, getUser());</span>
+<span class="source-line-no">604</span><span id="line-604">          break;</span>
+<span class="source-line-no">605</span><span id="line-605">        default:</span>
+<span class="source-line-no">606</span><span id="line-606">          throw new UnsupportedOperationException(this + " unhandled state=" + state);</span>
+<span class="source-line-no">607</span><span id="line-607">      }</span>
+<span class="source-line-no">608</span><span id="line-608">    }</span>
+<span class="source-line-no">609</span><span id="line-609">  }</span>
+<span class="source-line-no">610</span><span id="line-610"></span>
+<span class="source-line-no">611</span><span id="line-611">  /**</span>
+<span class="source-line-no">612</span><span id="line-612">   * Fetches all Regions for a table. Cache the result of this method if you need to use it multiple</span>
+<span class="source-line-no">613</span><span id="line-613">   * times. Be aware that it may change over in between calls to this procedure.</span>
+<span class="source-line-no">614</span><span id="line-614">   */</span>
+<span class="source-line-no">615</span><span id="line-615">  private List&lt;RegionInfo&gt; getRegionInfoList(final MasterProcedureEnv env) throws IOException {</span>
+<span class="source-line-no">616</span><span id="line-616">    return env.getAssignmentManager().getRegionStates().getRegionsOfTable(getTableName());</span>
+<span class="source-line-no">617</span><span id="line-617">  }</span>
+<span class="source-line-no">618</span><span id="line-618">}</span>
 
 
 
