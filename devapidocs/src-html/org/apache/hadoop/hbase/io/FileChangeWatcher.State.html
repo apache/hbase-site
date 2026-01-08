@@ -30,242 +30,245 @@
 <span class="source-line-no">017</span><span id="line-17"> */</span>
 <span class="source-line-no">018</span><span id="line-18">package org.apache.hadoop.hbase.io;</span>
 <span class="source-line-no">019</span><span id="line-19"></span>
-<span class="source-line-no">020</span><span id="line-20">import java.io.IOException;</span>
-<span class="source-line-no">021</span><span id="line-21">import java.nio.file.Files;</span>
-<span class="source-line-no">022</span><span id="line-22">import java.nio.file.Path;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.nio.file.attribute.BasicFileAttributes;</span>
-<span class="source-line-no">024</span><span id="line-24">import java.nio.file.attribute.FileTime;</span>
-<span class="source-line-no">025</span><span id="line-25">import java.time.Duration;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.slf4j.Logger;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">029</span><span id="line-29"></span>
-<span class="source-line-no">030</span><span id="line-30">/**</span>
-<span class="source-line-no">031</span><span id="line-31"> * Instances of this class can be used to watch a file for changes. When a file's modification time</span>
-<span class="source-line-no">032</span><span id="line-32"> * changes, the callback provided by the user will be called from a background thread. Modification</span>
-<span class="source-line-no">033</span><span id="line-33"> * are detected by checking the file's attributes every polling interval. Some things to keep in</span>
-<span class="source-line-no">034</span><span id="line-34"> * mind:</span>
-<span class="source-line-no">035</span><span id="line-35"> * &lt;ul&gt;</span>
-<span class="source-line-no">036</span><span id="line-36"> * &lt;li&gt;The callback should be thread-safe.&lt;/li&gt;</span>
-<span class="source-line-no">037</span><span id="line-37"> * &lt;li&gt;Changes that happen around the time the thread is started may be missed.&lt;/li&gt;</span>
-<span class="source-line-no">038</span><span id="line-38"> * &lt;li&gt;There is a delay between a file changing and the callback firing.&lt;/li&gt;</span>
-<span class="source-line-no">039</span><span id="line-39"> * &lt;/ul&gt;</span>
-<span class="source-line-no">040</span><span id="line-40"> * &lt;p/&gt;</span>
-<span class="source-line-no">041</span><span id="line-41"> * This file was originally copied from the Apache ZooKeeper project, and then modified.</span>
-<span class="source-line-no">042</span><span id="line-42"> * @see &lt;a href=</span>
-<span class="source-line-no">043</span><span id="line-43"> *      "https://github.com/apache/zookeeper/blob/8148f966947d3ecf3db0b756d93c9ffa88174af9/zookeeper-server/src/main/java/org/apache/zookeeper/common/FileChangeWatcher.java"&gt;Base</span>
-<span class="source-line-no">044</span><span id="line-44"> *      revision&lt;/a&gt;</span>
-<span class="source-line-no">045</span><span id="line-45"> */</span>
-<span class="source-line-no">046</span><span id="line-46">@InterfaceAudience.Private</span>
-<span class="source-line-no">047</span><span id="line-47">public final class FileChangeWatcher {</span>
-<span class="source-line-no">048</span><span id="line-48"></span>
-<span class="source-line-no">049</span><span id="line-49">  public interface FileChangeWatcherCallback {</span>
-<span class="source-line-no">050</span><span id="line-50">    void callback(Path path);</span>
-<span class="source-line-no">051</span><span id="line-51">  }</span>
-<span class="source-line-no">052</span><span id="line-52"></span>
-<span class="source-line-no">053</span><span id="line-53">  private static final Logger LOG = LoggerFactory.getLogger(FileChangeWatcher.class);</span>
-<span class="source-line-no">054</span><span id="line-54"></span>
-<span class="source-line-no">055</span><span id="line-55">  enum State {</span>
-<span class="source-line-no">056</span><span id="line-56">    NEW, // object created but start() not called yet</span>
-<span class="source-line-no">057</span><span id="line-57">    STARTING, // start() called but background thread has not entered main loop</span>
-<span class="source-line-no">058</span><span id="line-58">    RUNNING, // background thread is running</span>
-<span class="source-line-no">059</span><span id="line-59">    STOPPING, // stop() called but background thread has not exited main loop</span>
-<span class="source-line-no">060</span><span id="line-60">    STOPPED // stop() called and background thread has exited, or background thread crashed</span>
-<span class="source-line-no">061</span><span id="line-61">  }</span>
-<span class="source-line-no">062</span><span id="line-62"></span>
-<span class="source-line-no">063</span><span id="line-63">  private final WatcherThread watcherThread;</span>
-<span class="source-line-no">064</span><span id="line-64">  private State state; // protected by synchronized(this)</span>
-<span class="source-line-no">065</span><span id="line-65">  private FileTime lastModifiedTime;</span>
-<span class="source-line-no">066</span><span id="line-66">  private final Object lastModifiedTimeLock;</span>
-<span class="source-line-no">067</span><span id="line-67">  private final Path filePath;</span>
-<span class="source-line-no">068</span><span id="line-68">  private final Duration pollInterval;</span>
-<span class="source-line-no">069</span><span id="line-69"></span>
-<span class="source-line-no">070</span><span id="line-70">  /**</span>
-<span class="source-line-no">071</span><span id="line-71">   * Creates a watcher that watches &lt;code&gt;filePath&lt;/code&gt; and invokes &lt;code&gt;callback&lt;/code&gt; on</span>
-<span class="source-line-no">072</span><span id="line-72">   * changes.</span>
-<span class="source-line-no">073</span><span id="line-73">   * @param filePath the file to watch.</span>
-<span class="source-line-no">074</span><span id="line-74">   * @param callback the callback to invoke with events. &lt;code&gt;event.kind()&lt;/code&gt; will return the</span>
-<span class="source-line-no">075</span><span id="line-75">   *                 type of event, and &lt;code&gt;event.context()&lt;/code&gt; will return the filename</span>
-<span class="source-line-no">076</span><span id="line-76">   *                 relative to &lt;code&gt;dirPath&lt;/code&gt;.</span>
-<span class="source-line-no">077</span><span id="line-77">   * @throws IOException if there is an error creating the WatchService.</span>
-<span class="source-line-no">078</span><span id="line-78">   */</span>
-<span class="source-line-no">079</span><span id="line-79">  public FileChangeWatcher(Path filePath, String threadNameSuffix, Duration pollInterval,</span>
-<span class="source-line-no">080</span><span id="line-80">    FileChangeWatcherCallback callback) throws IOException {</span>
-<span class="source-line-no">081</span><span id="line-81">    this.filePath = filePath;</span>
-<span class="source-line-no">082</span><span id="line-82">    this.pollInterval = pollInterval;</span>
-<span class="source-line-no">083</span><span id="line-83"></span>
-<span class="source-line-no">084</span><span id="line-84">    state = State.NEW;</span>
-<span class="source-line-no">085</span><span id="line-85">    lastModifiedTimeLock = new Object();</span>
-<span class="source-line-no">086</span><span id="line-86">    lastModifiedTime = Files.readAttributes(filePath, BasicFileAttributes.class).lastModifiedTime();</span>
-<span class="source-line-no">087</span><span id="line-87">    this.watcherThread = new WatcherThread(threadNameSuffix, callback);</span>
-<span class="source-line-no">088</span><span id="line-88">    this.watcherThread.setDaemon(true);</span>
-<span class="source-line-no">089</span><span id="line-89">  }</span>
-<span class="source-line-no">090</span><span id="line-90"></span>
-<span class="source-line-no">091</span><span id="line-91">  /**</span>
-<span class="source-line-no">092</span><span id="line-92">   * Returns the current {@link FileChangeWatcher.State}.</span>
-<span class="source-line-no">093</span><span id="line-93">   * @return the current state.</span>
-<span class="source-line-no">094</span><span id="line-94">   */</span>
-<span class="source-line-no">095</span><span id="line-95">  private synchronized State getState() {</span>
-<span class="source-line-no">096</span><span id="line-96">    return state;</span>
-<span class="source-line-no">097</span><span id="line-97">  }</span>
-<span class="source-line-no">098</span><span id="line-98"></span>
-<span class="source-line-no">099</span><span id="line-99">  /**</span>
-<span class="source-line-no">100</span><span id="line-100">   * Blocks until the current state becomes &lt;code&gt;desiredState&lt;/code&gt;. Currently only used by tests,</span>
-<span class="source-line-no">101</span><span id="line-101">   * thus package-private.</span>
-<span class="source-line-no">102</span><span id="line-102">   * @param desiredState the desired state.</span>
-<span class="source-line-no">103</span><span id="line-103">   * @throws InterruptedException if the current thread gets interrupted.</span>
-<span class="source-line-no">104</span><span id="line-104">   */</span>
-<span class="source-line-no">105</span><span id="line-105">  synchronized void waitForState(State desiredState) throws InterruptedException {</span>
-<span class="source-line-no">106</span><span id="line-106">    while (this.state != desiredState) {</span>
-<span class="source-line-no">107</span><span id="line-107">      this.wait();</span>
-<span class="source-line-no">108</span><span id="line-108">    }</span>
-<span class="source-line-no">109</span><span id="line-109">  }</span>
-<span class="source-line-no">110</span><span id="line-110"></span>
-<span class="source-line-no">111</span><span id="line-111">  /**</span>
-<span class="source-line-no">112</span><span id="line-112">   * Sets the state to &lt;code&gt;newState&lt;/code&gt;.</span>
-<span class="source-line-no">113</span><span id="line-113">   * @param newState the new state.</span>
-<span class="source-line-no">114</span><span id="line-114">   */</span>
-<span class="source-line-no">115</span><span id="line-115">  private synchronized void setState(State newState) {</span>
-<span class="source-line-no">116</span><span id="line-116">    state = newState;</span>
-<span class="source-line-no">117</span><span id="line-117">    this.notifyAll();</span>
-<span class="source-line-no">118</span><span id="line-118">  }</span>
-<span class="source-line-no">119</span><span id="line-119"></span>
-<span class="source-line-no">120</span><span id="line-120">  /**</span>
-<span class="source-line-no">121</span><span id="line-121">   * Atomically sets the state to &lt;code&gt;update&lt;/code&gt; if and only if the state is currently</span>
-<span class="source-line-no">122</span><span id="line-122">   * &lt;code&gt;expected&lt;/code&gt;.</span>
-<span class="source-line-no">123</span><span id="line-123">   * @param expected the expected state.</span>
-<span class="source-line-no">124</span><span id="line-124">   * @param update   the new state.</span>
-<span class="source-line-no">125</span><span id="line-125">   * @return true if the update succeeds, or false if the current state does not equal</span>
-<span class="source-line-no">126</span><span id="line-126">   *         &lt;code&gt;expected&lt;/code&gt;.</span>
-<span class="source-line-no">127</span><span id="line-127">   */</span>
-<span class="source-line-no">128</span><span id="line-128">  private synchronized boolean compareAndSetState(State expected, State update) {</span>
-<span class="source-line-no">129</span><span id="line-129">    if (state == expected) {</span>
-<span class="source-line-no">130</span><span id="line-130">      setState(update);</span>
-<span class="source-line-no">131</span><span id="line-131">      return true;</span>
-<span class="source-line-no">132</span><span id="line-132">    } else {</span>
-<span class="source-line-no">133</span><span id="line-133">      return false;</span>
-<span class="source-line-no">134</span><span id="line-134">    }</span>
-<span class="source-line-no">135</span><span id="line-135">  }</span>
-<span class="source-line-no">136</span><span id="line-136"></span>
-<span class="source-line-no">137</span><span id="line-137">  /**</span>
-<span class="source-line-no">138</span><span id="line-138">   * Atomically sets the state to &lt;code&gt;update&lt;/code&gt; if and only if the state is currently one of</span>
-<span class="source-line-no">139</span><span id="line-139">   * &lt;code&gt;expectedStates&lt;/code&gt;.</span>
-<span class="source-line-no">140</span><span id="line-140">   * @param expectedStates the expected states.</span>
-<span class="source-line-no">141</span><span id="line-141">   * @param update         the new state.</span>
-<span class="source-line-no">142</span><span id="line-142">   * @return true if the update succeeds, or false if the current state does not equal any of the</span>
-<span class="source-line-no">143</span><span id="line-143">   *         &lt;code&gt;expectedStates&lt;/code&gt;.</span>
-<span class="source-line-no">144</span><span id="line-144">   */</span>
-<span class="source-line-no">145</span><span id="line-145">  private synchronized boolean compareAndSetState(State[] expectedStates, State update) {</span>
-<span class="source-line-no">146</span><span id="line-146">    for (State expected : expectedStates) {</span>
-<span class="source-line-no">147</span><span id="line-147">      if (state == expected) {</span>
-<span class="source-line-no">148</span><span id="line-148">        setState(update);</span>
-<span class="source-line-no">149</span><span id="line-149">        return true;</span>
-<span class="source-line-no">150</span><span id="line-150">      }</span>
-<span class="source-line-no">151</span><span id="line-151">    }</span>
-<span class="source-line-no">152</span><span id="line-152">    return false;</span>
-<span class="source-line-no">153</span><span id="line-153">  }</span>
-<span class="source-line-no">154</span><span id="line-154"></span>
-<span class="source-line-no">155</span><span id="line-155">  /**</span>
-<span class="source-line-no">156</span><span id="line-156">   * Tells the background thread to start. Does not wait for it to be running. Calling this method</span>
-<span class="source-line-no">157</span><span id="line-157">   * more than once has no effect.</span>
-<span class="source-line-no">158</span><span id="line-158">   */</span>
-<span class="source-line-no">159</span><span id="line-159">  public void start() {</span>
-<span class="source-line-no">160</span><span id="line-160">    if (!compareAndSetState(State.NEW, State.STARTING)) {</span>
-<span class="source-line-no">161</span><span id="line-161">      // If previous state was not NEW, start() has already been called.</span>
-<span class="source-line-no">162</span><span id="line-162">      return;</span>
-<span class="source-line-no">163</span><span id="line-163">    }</span>
-<span class="source-line-no">164</span><span id="line-164">    this.watcherThread.start();</span>
-<span class="source-line-no">165</span><span id="line-165">  }</span>
-<span class="source-line-no">166</span><span id="line-166"></span>
-<span class="source-line-no">167</span><span id="line-167">  /**</span>
-<span class="source-line-no">168</span><span id="line-168">   * Tells the background thread to stop. Does not wait for it to exit.</span>
-<span class="source-line-no">169</span><span id="line-169">   */</span>
-<span class="source-line-no">170</span><span id="line-170">  public void stop() {</span>
-<span class="source-line-no">171</span><span id="line-171">    if (compareAndSetState(new State[] { State.RUNNING, State.STARTING }, State.STOPPING)) {</span>
-<span class="source-line-no">172</span><span id="line-172">      watcherThread.interrupt();</span>
-<span class="source-line-no">173</span><span id="line-173">    }</span>
-<span class="source-line-no">174</span><span id="line-174">  }</span>
-<span class="source-line-no">175</span><span id="line-175"></span>
-<span class="source-line-no">176</span><span id="line-176">  String getWatcherThreadName() {</span>
-<span class="source-line-no">177</span><span id="line-177">    return watcherThread.getName();</span>
-<span class="source-line-no">178</span><span id="line-178">  }</span>
-<span class="source-line-no">179</span><span id="line-179"></span>
-<span class="source-line-no">180</span><span id="line-180">  private static void handleException(Thread thread, Throwable e) {</span>
-<span class="source-line-no">181</span><span id="line-181">    LOG.warn("Exception occurred from thread {}", thread.getName(), e);</span>
-<span class="source-line-no">182</span><span id="line-182">  }</span>
-<span class="source-line-no">183</span><span id="line-183"></span>
-<span class="source-line-no">184</span><span id="line-184">  /**</span>
-<span class="source-line-no">185</span><span id="line-185">   * Inner class that implements the watcher thread logic.</span>
-<span class="source-line-no">186</span><span id="line-186">   */</span>
-<span class="source-line-no">187</span><span id="line-187">  private class WatcherThread extends Thread {</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">    private static final String THREAD_NAME_PREFIX = "FileChangeWatcher-";</span>
-<span class="source-line-no">190</span><span id="line-190"></span>
-<span class="source-line-no">191</span><span id="line-191">    final FileChangeWatcherCallback callback;</span>
-<span class="source-line-no">192</span><span id="line-192"></span>
-<span class="source-line-no">193</span><span id="line-193">    WatcherThread(String threadNameSuffix, FileChangeWatcherCallback callback) {</span>
-<span class="source-line-no">194</span><span id="line-194">      super(THREAD_NAME_PREFIX + threadNameSuffix);</span>
-<span class="source-line-no">195</span><span id="line-195">      this.callback = callback;</span>
-<span class="source-line-no">196</span><span id="line-196">      setUncaughtExceptionHandler(FileChangeWatcher::handleException);</span>
-<span class="source-line-no">197</span><span id="line-197">    }</span>
-<span class="source-line-no">198</span><span id="line-198"></span>
-<span class="source-line-no">199</span><span id="line-199">    @Override</span>
-<span class="source-line-no">200</span><span id="line-200">    public void run() {</span>
-<span class="source-line-no">201</span><span id="line-201">      try {</span>
-<span class="source-line-no">202</span><span id="line-202">        LOG.debug("{} thread started", getName());</span>
-<span class="source-line-no">203</span><span id="line-203">        if (</span>
-<span class="source-line-no">204</span><span id="line-204">          !compareAndSetState(FileChangeWatcher.State.STARTING, FileChangeWatcher.State.RUNNING)</span>
-<span class="source-line-no">205</span><span id="line-205">        ) {</span>
-<span class="source-line-no">206</span><span id="line-206">          // stop() called shortly after start(), before</span>
-<span class="source-line-no">207</span><span id="line-207">          // this thread started running.</span>
-<span class="source-line-no">208</span><span id="line-208">          FileChangeWatcher.State state = FileChangeWatcher.this.getState();</span>
-<span class="source-line-no">209</span><span id="line-209">          if (state != FileChangeWatcher.State.STOPPING) {</span>
-<span class="source-line-no">210</span><span id="line-210">            throw new IllegalStateException("Unexpected state: " + state);</span>
-<span class="source-line-no">211</span><span id="line-211">          }</span>
-<span class="source-line-no">212</span><span id="line-212">          return;</span>
-<span class="source-line-no">213</span><span id="line-213">        }</span>
-<span class="source-line-no">214</span><span id="line-214">        runLoop();</span>
-<span class="source-line-no">215</span><span id="line-215">      } catch (Exception e) {</span>
-<span class="source-line-no">216</span><span id="line-216">        LOG.warn("Error in runLoop()", e);</span>
-<span class="source-line-no">217</span><span id="line-217">        throw new RuntimeException(e);</span>
-<span class="source-line-no">218</span><span id="line-218">      } finally {</span>
-<span class="source-line-no">219</span><span id="line-219">        LOG.debug("{} thread finished", getName());</span>
-<span class="source-line-no">220</span><span id="line-220">        FileChangeWatcher.this.setState(FileChangeWatcher.State.STOPPED);</span>
-<span class="source-line-no">221</span><span id="line-221">      }</span>
-<span class="source-line-no">222</span><span id="line-222">    }</span>
-<span class="source-line-no">223</span><span id="line-223"></span>
-<span class="source-line-no">224</span><span id="line-224">    private void runLoop() throws IOException {</span>
-<span class="source-line-no">225</span><span id="line-225">      while (FileChangeWatcher.this.getState() == FileChangeWatcher.State.RUNNING) {</span>
-<span class="source-line-no">226</span><span id="line-226">        BasicFileAttributes attributes = Files.readAttributes(filePath, BasicFileAttributes.class);</span>
-<span class="source-line-no">227</span><span id="line-227">        boolean modified = false;</span>
-<span class="source-line-no">228</span><span id="line-228">        synchronized (lastModifiedTimeLock) {</span>
-<span class="source-line-no">229</span><span id="line-229">          FileTime maybeNewLastModifiedTime = attributes.lastModifiedTime();</span>
-<span class="source-line-no">230</span><span id="line-230">          if (!lastModifiedTime.equals(maybeNewLastModifiedTime)) {</span>
-<span class="source-line-no">231</span><span id="line-231">            modified = true;</span>
-<span class="source-line-no">232</span><span id="line-232">            lastModifiedTime = maybeNewLastModifiedTime;</span>
-<span class="source-line-no">233</span><span id="line-233">          }</span>
-<span class="source-line-no">234</span><span id="line-234">        }</span>
-<span class="source-line-no">235</span><span id="line-235"></span>
-<span class="source-line-no">236</span><span id="line-236">        // avoid calling callback while holding lock</span>
-<span class="source-line-no">237</span><span id="line-237">        if (modified) {</span>
-<span class="source-line-no">238</span><span id="line-238">          try {</span>
-<span class="source-line-no">239</span><span id="line-239">            callback.callback(filePath);</span>
-<span class="source-line-no">240</span><span id="line-240">          } catch (Throwable e) {</span>
-<span class="source-line-no">241</span><span id="line-241">            LOG.error("Error from callback", e);</span>
-<span class="source-line-no">242</span><span id="line-242">          }</span>
-<span class="source-line-no">243</span><span id="line-243">        }</span>
-<span class="source-line-no">244</span><span id="line-244"></span>
-<span class="source-line-no">245</span><span id="line-245">        try {</span>
-<span class="source-line-no">246</span><span id="line-246">          Thread.sleep(pollInterval.toMillis());</span>
-<span class="source-line-no">247</span><span id="line-247">        } catch (InterruptedException e) {</span>
-<span class="source-line-no">248</span><span id="line-248">          LOG.debug("Interrupted", e);</span>
-<span class="source-line-no">249</span><span id="line-249">          Thread.currentThread().interrupt();</span>
-<span class="source-line-no">250</span><span id="line-250">          return;</span>
-<span class="source-line-no">251</span><span id="line-251">        }</span>
-<span class="source-line-no">252</span><span id="line-252">      }</span>
-<span class="source-line-no">253</span><span id="line-253">    }</span>
-<span class="source-line-no">254</span><span id="line-254">  }</span>
-<span class="source-line-no">255</span><span id="line-255">}</span>
+<span class="source-line-no">020</span><span id="line-20">import com.google.errorprone.annotations.RestrictedApi;</span>
+<span class="source-line-no">021</span><span id="line-21">import java.io.IOException;</span>
+<span class="source-line-no">022</span><span id="line-22">import java.nio.file.Files;</span>
+<span class="source-line-no">023</span><span id="line-23">import java.nio.file.Path;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.nio.file.attribute.BasicFileAttributes;</span>
+<span class="source-line-no">025</span><span id="line-25">import java.nio.file.attribute.FileTime;</span>
+<span class="source-line-no">026</span><span id="line-26">import java.time.Duration;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.slf4j.Logger;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">030</span><span id="line-30"></span>
+<span class="source-line-no">031</span><span id="line-31">/**</span>
+<span class="source-line-no">032</span><span id="line-32"> * Instances of this class can be used to watch a file for changes. When a file's modification time</span>
+<span class="source-line-no">033</span><span id="line-33"> * changes, the callback provided by the user will be called from a background thread. Modification</span>
+<span class="source-line-no">034</span><span id="line-34"> * are detected by checking the file's attributes every polling interval. Some things to keep in</span>
+<span class="source-line-no">035</span><span id="line-35"> * mind:</span>
+<span class="source-line-no">036</span><span id="line-36"> * &lt;ul&gt;</span>
+<span class="source-line-no">037</span><span id="line-37"> * &lt;li&gt;The callback should be thread-safe.&lt;/li&gt;</span>
+<span class="source-line-no">038</span><span id="line-38"> * &lt;li&gt;Changes that happen around the time the thread is started may be missed.&lt;/li&gt;</span>
+<span class="source-line-no">039</span><span id="line-39"> * &lt;li&gt;There is a delay between a file changing and the callback firing.&lt;/li&gt;</span>
+<span class="source-line-no">040</span><span id="line-40"> * &lt;/ul&gt;</span>
+<span class="source-line-no">041</span><span id="line-41"> * &lt;p/&gt;</span>
+<span class="source-line-no">042</span><span id="line-42"> * This file was originally copied from the Apache ZooKeeper project, and then modified.</span>
+<span class="source-line-no">043</span><span id="line-43"> * @see &lt;a href=</span>
+<span class="source-line-no">044</span><span id="line-44"> *      "https://github.com/apache/zookeeper/blob/8148f966947d3ecf3db0b756d93c9ffa88174af9/zookeeper-server/src/main/java/org/apache/zookeeper/common/FileChangeWatcher.java"&gt;Base</span>
+<span class="source-line-no">045</span><span id="line-45"> *      revision&lt;/a&gt;</span>
+<span class="source-line-no">046</span><span id="line-46"> */</span>
+<span class="source-line-no">047</span><span id="line-47">@InterfaceAudience.Private</span>
+<span class="source-line-no">048</span><span id="line-48">public final class FileChangeWatcher {</span>
+<span class="source-line-no">049</span><span id="line-49"></span>
+<span class="source-line-no">050</span><span id="line-50">  public interface FileChangeWatcherCallback {</span>
+<span class="source-line-no">051</span><span id="line-51">    void callback(Path path);</span>
+<span class="source-line-no">052</span><span id="line-52">  }</span>
+<span class="source-line-no">053</span><span id="line-53"></span>
+<span class="source-line-no">054</span><span id="line-54">  private static final Logger LOG = LoggerFactory.getLogger(FileChangeWatcher.class);</span>
+<span class="source-line-no">055</span><span id="line-55"></span>
+<span class="source-line-no">056</span><span id="line-56">  enum State {</span>
+<span class="source-line-no">057</span><span id="line-57">    NEW, // object created but start() not called yet</span>
+<span class="source-line-no">058</span><span id="line-58">    STARTING, // start() called but background thread has not entered main loop</span>
+<span class="source-line-no">059</span><span id="line-59">    RUNNING, // background thread is running</span>
+<span class="source-line-no">060</span><span id="line-60">    STOPPING, // stop() called but background thread has not exited main loop</span>
+<span class="source-line-no">061</span><span id="line-61">    STOPPED // stop() called and background thread has exited, or background thread crashed</span>
+<span class="source-line-no">062</span><span id="line-62">  }</span>
+<span class="source-line-no">063</span><span id="line-63"></span>
+<span class="source-line-no">064</span><span id="line-64">  private final WatcherThread watcherThread;</span>
+<span class="source-line-no">065</span><span id="line-65">  private State state; // protected by synchronized(this)</span>
+<span class="source-line-no">066</span><span id="line-66">  private FileTime lastModifiedTime;</span>
+<span class="source-line-no">067</span><span id="line-67">  private final Object lastModifiedTimeLock;</span>
+<span class="source-line-no">068</span><span id="line-68">  private final Path filePath;</span>
+<span class="source-line-no">069</span><span id="line-69">  private final Duration pollInterval;</span>
+<span class="source-line-no">070</span><span id="line-70"></span>
+<span class="source-line-no">071</span><span id="line-71">  /**</span>
+<span class="source-line-no">072</span><span id="line-72">   * Creates a watcher that watches &lt;code&gt;filePath&lt;/code&gt; and invokes &lt;code&gt;callback&lt;/code&gt; on</span>
+<span class="source-line-no">073</span><span id="line-73">   * changes.</span>
+<span class="source-line-no">074</span><span id="line-74">   * @param filePath the file to watch.</span>
+<span class="source-line-no">075</span><span id="line-75">   * @param callback the callback to invoke with events. &lt;code&gt;event.kind()&lt;/code&gt; will return the</span>
+<span class="source-line-no">076</span><span id="line-76">   *                 type of event, and &lt;code&gt;event.context()&lt;/code&gt; will return the filename</span>
+<span class="source-line-no">077</span><span id="line-77">   *                 relative to &lt;code&gt;dirPath&lt;/code&gt;.</span>
+<span class="source-line-no">078</span><span id="line-78">   * @throws IOException if there is an error creating the WatchService.</span>
+<span class="source-line-no">079</span><span id="line-79">   */</span>
+<span class="source-line-no">080</span><span id="line-80">  public FileChangeWatcher(Path filePath, String threadNameSuffix, Duration pollInterval,</span>
+<span class="source-line-no">081</span><span id="line-81">    FileChangeWatcherCallback callback) throws IOException {</span>
+<span class="source-line-no">082</span><span id="line-82">    this.filePath = filePath;</span>
+<span class="source-line-no">083</span><span id="line-83">    this.pollInterval = pollInterval;</span>
+<span class="source-line-no">084</span><span id="line-84"></span>
+<span class="source-line-no">085</span><span id="line-85">    state = State.NEW;</span>
+<span class="source-line-no">086</span><span id="line-86">    lastModifiedTimeLock = new Object();</span>
+<span class="source-line-no">087</span><span id="line-87">    lastModifiedTime = Files.readAttributes(filePath, BasicFileAttributes.class).lastModifiedTime();</span>
+<span class="source-line-no">088</span><span id="line-88">    this.watcherThread = new WatcherThread(threadNameSuffix, callback);</span>
+<span class="source-line-no">089</span><span id="line-89">    this.watcherThread.setDaemon(true);</span>
+<span class="source-line-no">090</span><span id="line-90">  }</span>
+<span class="source-line-no">091</span><span id="line-91"></span>
+<span class="source-line-no">092</span><span id="line-92">  /**</span>
+<span class="source-line-no">093</span><span id="line-93">   * Returns the current {@link FileChangeWatcher.State}.</span>
+<span class="source-line-no">094</span><span id="line-94">   * @return the current state.</span>
+<span class="source-line-no">095</span><span id="line-95">   */</span>
+<span class="source-line-no">096</span><span id="line-96">  private synchronized State getState() {</span>
+<span class="source-line-no">097</span><span id="line-97">    return state;</span>
+<span class="source-line-no">098</span><span id="line-98">  }</span>
+<span class="source-line-no">099</span><span id="line-99"></span>
+<span class="source-line-no">100</span><span id="line-100">  /**</span>
+<span class="source-line-no">101</span><span id="line-101">   * Blocks until the current state becomes &lt;code&gt;desiredState&lt;/code&gt;. Currently only used by tests,</span>
+<span class="source-line-no">102</span><span id="line-102">   * thus package-private.</span>
+<span class="source-line-no">103</span><span id="line-103">   * @param desiredState the desired state.</span>
+<span class="source-line-no">104</span><span id="line-104">   * @throws InterruptedException if the current thread gets interrupted.</span>
+<span class="source-line-no">105</span><span id="line-105">   */</span>
+<span class="source-line-no">106</span><span id="line-106">  synchronized void waitForState(State desiredState) throws InterruptedException {</span>
+<span class="source-line-no">107</span><span id="line-107">    while (this.state != desiredState) {</span>
+<span class="source-line-no">108</span><span id="line-108">      this.wait();</span>
+<span class="source-line-no">109</span><span id="line-109">    }</span>
+<span class="source-line-no">110</span><span id="line-110">  }</span>
+<span class="source-line-no">111</span><span id="line-111"></span>
+<span class="source-line-no">112</span><span id="line-112">  /**</span>
+<span class="source-line-no">113</span><span id="line-113">   * Sets the state to &lt;code&gt;newState&lt;/code&gt;.</span>
+<span class="source-line-no">114</span><span id="line-114">   * @param newState the new state.</span>
+<span class="source-line-no">115</span><span id="line-115">   */</span>
+<span class="source-line-no">116</span><span id="line-116">  private synchronized void setState(State newState) {</span>
+<span class="source-line-no">117</span><span id="line-117">    state = newState;</span>
+<span class="source-line-no">118</span><span id="line-118">    this.notifyAll();</span>
+<span class="source-line-no">119</span><span id="line-119">  }</span>
+<span class="source-line-no">120</span><span id="line-120"></span>
+<span class="source-line-no">121</span><span id="line-121">  /**</span>
+<span class="source-line-no">122</span><span id="line-122">   * Atomically sets the state to &lt;code&gt;update&lt;/code&gt; if and only if the state is currently</span>
+<span class="source-line-no">123</span><span id="line-123">   * &lt;code&gt;expected&lt;/code&gt;.</span>
+<span class="source-line-no">124</span><span id="line-124">   * @param expected the expected state.</span>
+<span class="source-line-no">125</span><span id="line-125">   * @param update   the new state.</span>
+<span class="source-line-no">126</span><span id="line-126">   * @return true if the update succeeds, or false if the current state does not equal</span>
+<span class="source-line-no">127</span><span id="line-127">   *         &lt;code&gt;expected&lt;/code&gt;.</span>
+<span class="source-line-no">128</span><span id="line-128">   */</span>
+<span class="source-line-no">129</span><span id="line-129">  private synchronized boolean compareAndSetState(State expected, State update) {</span>
+<span class="source-line-no">130</span><span id="line-130">    if (state == expected) {</span>
+<span class="source-line-no">131</span><span id="line-131">      setState(update);</span>
+<span class="source-line-no">132</span><span id="line-132">      return true;</span>
+<span class="source-line-no">133</span><span id="line-133">    } else {</span>
+<span class="source-line-no">134</span><span id="line-134">      return false;</span>
+<span class="source-line-no">135</span><span id="line-135">    }</span>
+<span class="source-line-no">136</span><span id="line-136">  }</span>
+<span class="source-line-no">137</span><span id="line-137"></span>
+<span class="source-line-no">138</span><span id="line-138">  /**</span>
+<span class="source-line-no">139</span><span id="line-139">   * Atomically sets the state to &lt;code&gt;update&lt;/code&gt; if and only if the state is currently one of</span>
+<span class="source-line-no">140</span><span id="line-140">   * &lt;code&gt;expectedStates&lt;/code&gt;.</span>
+<span class="source-line-no">141</span><span id="line-141">   * @param expectedStates the expected states.</span>
+<span class="source-line-no">142</span><span id="line-142">   * @param update         the new state.</span>
+<span class="source-line-no">143</span><span id="line-143">   * @return true if the update succeeds, or false if the current state does not equal any of the</span>
+<span class="source-line-no">144</span><span id="line-144">   *         &lt;code&gt;expectedStates&lt;/code&gt;.</span>
+<span class="source-line-no">145</span><span id="line-145">   */</span>
+<span class="source-line-no">146</span><span id="line-146">  private synchronized boolean compareAndSetState(State[] expectedStates, State update) {</span>
+<span class="source-line-no">147</span><span id="line-147">    for (State expected : expectedStates) {</span>
+<span class="source-line-no">148</span><span id="line-148">      if (state == expected) {</span>
+<span class="source-line-no">149</span><span id="line-149">        setState(update);</span>
+<span class="source-line-no">150</span><span id="line-150">        return true;</span>
+<span class="source-line-no">151</span><span id="line-151">      }</span>
+<span class="source-line-no">152</span><span id="line-152">    }</span>
+<span class="source-line-no">153</span><span id="line-153">    return false;</span>
+<span class="source-line-no">154</span><span id="line-154">  }</span>
+<span class="source-line-no">155</span><span id="line-155"></span>
+<span class="source-line-no">156</span><span id="line-156">  /**</span>
+<span class="source-line-no">157</span><span id="line-157">   * Tells the background thread to start. Does not wait for it to be running. Calling this method</span>
+<span class="source-line-no">158</span><span id="line-158">   * more than once has no effect.</span>
+<span class="source-line-no">159</span><span id="line-159">   */</span>
+<span class="source-line-no">160</span><span id="line-160">  public void start() {</span>
+<span class="source-line-no">161</span><span id="line-161">    if (!compareAndSetState(State.NEW, State.STARTING)) {</span>
+<span class="source-line-no">162</span><span id="line-162">      // If previous state was not NEW, start() has already been called.</span>
+<span class="source-line-no">163</span><span id="line-163">      return;</span>
+<span class="source-line-no">164</span><span id="line-164">    }</span>
+<span class="source-line-no">165</span><span id="line-165">    this.watcherThread.start();</span>
+<span class="source-line-no">166</span><span id="line-166">  }</span>
+<span class="source-line-no">167</span><span id="line-167"></span>
+<span class="source-line-no">168</span><span id="line-168">  /**</span>
+<span class="source-line-no">169</span><span id="line-169">   * Tells the background thread to stop. Does not wait for it to exit.</span>
+<span class="source-line-no">170</span><span id="line-170">   */</span>
+<span class="source-line-no">171</span><span id="line-171">  public void stop() {</span>
+<span class="source-line-no">172</span><span id="line-172">    if (compareAndSetState(new State[] { State.RUNNING, State.STARTING }, State.STOPPING)) {</span>
+<span class="source-line-no">173</span><span id="line-173">      watcherThread.interrupt();</span>
+<span class="source-line-no">174</span><span id="line-174">    }</span>
+<span class="source-line-no">175</span><span id="line-175">  }</span>
+<span class="source-line-no">176</span><span id="line-176"></span>
+<span class="source-line-no">177</span><span id="line-177">  @RestrictedApi(explanation = "Should only be called in tests", link = "",</span>
+<span class="source-line-no">178</span><span id="line-178">      allowedOnPath = ".*/src/test/.*")</span>
+<span class="source-line-no">179</span><span id="line-179">  Thread getWatcherThread() {</span>
+<span class="source-line-no">180</span><span id="line-180">    return watcherThread;</span>
+<span class="source-line-no">181</span><span id="line-181">  }</span>
+<span class="source-line-no">182</span><span id="line-182"></span>
+<span class="source-line-no">183</span><span id="line-183">  private static void handleException(Thread thread, Throwable e) {</span>
+<span class="source-line-no">184</span><span id="line-184">    LOG.warn("Exception occurred from thread {}", thread.getName(), e);</span>
+<span class="source-line-no">185</span><span id="line-185">  }</span>
+<span class="source-line-no">186</span><span id="line-186"></span>
+<span class="source-line-no">187</span><span id="line-187">  /**</span>
+<span class="source-line-no">188</span><span id="line-188">   * Inner class that implements the watcher thread logic.</span>
+<span class="source-line-no">189</span><span id="line-189">   */</span>
+<span class="source-line-no">190</span><span id="line-190">  private class WatcherThread extends Thread {</span>
+<span class="source-line-no">191</span><span id="line-191"></span>
+<span class="source-line-no">192</span><span id="line-192">    private static final String THREAD_NAME_PREFIX = "FileChangeWatcher-";</span>
+<span class="source-line-no">193</span><span id="line-193"></span>
+<span class="source-line-no">194</span><span id="line-194">    final FileChangeWatcherCallback callback;</span>
+<span class="source-line-no">195</span><span id="line-195"></span>
+<span class="source-line-no">196</span><span id="line-196">    WatcherThread(String threadNameSuffix, FileChangeWatcherCallback callback) {</span>
+<span class="source-line-no">197</span><span id="line-197">      super(THREAD_NAME_PREFIX + threadNameSuffix);</span>
+<span class="source-line-no">198</span><span id="line-198">      this.callback = callback;</span>
+<span class="source-line-no">199</span><span id="line-199">      setUncaughtExceptionHandler(FileChangeWatcher::handleException);</span>
+<span class="source-line-no">200</span><span id="line-200">    }</span>
+<span class="source-line-no">201</span><span id="line-201"></span>
+<span class="source-line-no">202</span><span id="line-202">    @Override</span>
+<span class="source-line-no">203</span><span id="line-203">    public void run() {</span>
+<span class="source-line-no">204</span><span id="line-204">      try {</span>
+<span class="source-line-no">205</span><span id="line-205">        LOG.debug("{} thread started", getName());</span>
+<span class="source-line-no">206</span><span id="line-206">        if (</span>
+<span class="source-line-no">207</span><span id="line-207">          !compareAndSetState(FileChangeWatcher.State.STARTING, FileChangeWatcher.State.RUNNING)</span>
+<span class="source-line-no">208</span><span id="line-208">        ) {</span>
+<span class="source-line-no">209</span><span id="line-209">          // stop() called shortly after start(), before</span>
+<span class="source-line-no">210</span><span id="line-210">          // this thread started running.</span>
+<span class="source-line-no">211</span><span id="line-211">          FileChangeWatcher.State state = FileChangeWatcher.this.getState();</span>
+<span class="source-line-no">212</span><span id="line-212">          if (state != FileChangeWatcher.State.STOPPING) {</span>
+<span class="source-line-no">213</span><span id="line-213">            throw new IllegalStateException("Unexpected state: " + state);</span>
+<span class="source-line-no">214</span><span id="line-214">          }</span>
+<span class="source-line-no">215</span><span id="line-215">          return;</span>
+<span class="source-line-no">216</span><span id="line-216">        }</span>
+<span class="source-line-no">217</span><span id="line-217">        runLoop();</span>
+<span class="source-line-no">218</span><span id="line-218">      } catch (Exception e) {</span>
+<span class="source-line-no">219</span><span id="line-219">        LOG.warn("Error in runLoop()", e);</span>
+<span class="source-line-no">220</span><span id="line-220">        throw new RuntimeException(e);</span>
+<span class="source-line-no">221</span><span id="line-221">      } finally {</span>
+<span class="source-line-no">222</span><span id="line-222">        LOG.debug("{} thread finished", getName());</span>
+<span class="source-line-no">223</span><span id="line-223">        FileChangeWatcher.this.setState(FileChangeWatcher.State.STOPPED);</span>
+<span class="source-line-no">224</span><span id="line-224">      }</span>
+<span class="source-line-no">225</span><span id="line-225">    }</span>
+<span class="source-line-no">226</span><span id="line-226"></span>
+<span class="source-line-no">227</span><span id="line-227">    private void runLoop() throws IOException {</span>
+<span class="source-line-no">228</span><span id="line-228">      while (FileChangeWatcher.this.getState() == FileChangeWatcher.State.RUNNING) {</span>
+<span class="source-line-no">229</span><span id="line-229">        BasicFileAttributes attributes = Files.readAttributes(filePath, BasicFileAttributes.class);</span>
+<span class="source-line-no">230</span><span id="line-230">        boolean modified = false;</span>
+<span class="source-line-no">231</span><span id="line-231">        synchronized (lastModifiedTimeLock) {</span>
+<span class="source-line-no">232</span><span id="line-232">          FileTime maybeNewLastModifiedTime = attributes.lastModifiedTime();</span>
+<span class="source-line-no">233</span><span id="line-233">          if (!lastModifiedTime.equals(maybeNewLastModifiedTime)) {</span>
+<span class="source-line-no">234</span><span id="line-234">            modified = true;</span>
+<span class="source-line-no">235</span><span id="line-235">            lastModifiedTime = maybeNewLastModifiedTime;</span>
+<span class="source-line-no">236</span><span id="line-236">          }</span>
+<span class="source-line-no">237</span><span id="line-237">        }</span>
+<span class="source-line-no">238</span><span id="line-238"></span>
+<span class="source-line-no">239</span><span id="line-239">        // avoid calling callback while holding lock</span>
+<span class="source-line-no">240</span><span id="line-240">        if (modified) {</span>
+<span class="source-line-no">241</span><span id="line-241">          try {</span>
+<span class="source-line-no">242</span><span id="line-242">            callback.callback(filePath);</span>
+<span class="source-line-no">243</span><span id="line-243">          } catch (Throwable e) {</span>
+<span class="source-line-no">244</span><span id="line-244">            LOG.error("Error from callback", e);</span>
+<span class="source-line-no">245</span><span id="line-245">          }</span>
+<span class="source-line-no">246</span><span id="line-246">        }</span>
+<span class="source-line-no">247</span><span id="line-247"></span>
+<span class="source-line-no">248</span><span id="line-248">        try {</span>
+<span class="source-line-no">249</span><span id="line-249">          Thread.sleep(pollInterval.toMillis());</span>
+<span class="source-line-no">250</span><span id="line-250">        } catch (InterruptedException e) {</span>
+<span class="source-line-no">251</span><span id="line-251">          LOG.debug("Interrupted", e);</span>
+<span class="source-line-no">252</span><span id="line-252">          Thread.currentThread().interrupt();</span>
+<span class="source-line-no">253</span><span id="line-253">          return;</span>
+<span class="source-line-no">254</span><span id="line-254">        }</span>
+<span class="source-line-no">255</span><span id="line-255">      }</span>
+<span class="source-line-no">256</span><span id="line-256">    }</span>
+<span class="source-line-no">257</span><span id="line-257">  }</span>
+<span class="source-line-no">258</span><span id="line-258">}</span>
 
 
 
