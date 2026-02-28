@@ -1972,581 +1972,604 @@
 <span class="source-line-no">1959</span><span id="line-1959">  }</span>
 <span class="source-line-no">1960</span><span id="line-1960"></span>
 <span class="source-line-no">1961</span><span id="line-1961">  private Set&lt;BlockCacheKey&gt; getAllCacheKeysForFile(String hfileName, long init, long end) {</span>
-<span class="source-line-no">1962</span><span id="line-1962">    // These keys are just for comparison and are short lived, so we need only file name and offset</span>
-<span class="source-line-no">1963</span><span id="line-1963">    return blocksByHFile.subSet(new BlockCacheKey(hfileName, init), true,</span>
-<span class="source-line-no">1964</span><span id="line-1964">      new BlockCacheKey(hfileName, end), true);</span>
-<span class="source-line-no">1965</span><span id="line-1965">  }</span>
-<span class="source-line-no">1966</span><span id="line-1966"></span>
-<span class="source-line-no">1967</span><span id="line-1967">  /**</span>
-<span class="source-line-no">1968</span><span id="line-1968">   * Used to group bucket entries into priority buckets. There will be a BucketEntryGroup for each</span>
-<span class="source-line-no">1969</span><span id="line-1969">   * priority (single, multi, memory). Once bucketed, the eviction algorithm takes the appropriate</span>
-<span class="source-line-no">1970</span><span id="line-1970">   * number of elements out of each according to configuration parameters and their relative sizes.</span>
-<span class="source-line-no">1971</span><span id="line-1971">   */</span>
-<span class="source-line-no">1972</span><span id="line-1972">  private class BucketEntryGroup {</span>
+<span class="source-line-no">1962</span><span id="line-1962">    Set&lt;BlockCacheKey&gt; cacheKeys = new HashSet&lt;&gt;();</span>
+<span class="source-line-no">1963</span><span id="line-1963">    // At this moment, Some Bucket Entries may be in the WriterThread queue, and not yet put into</span>
+<span class="source-line-no">1964</span><span id="line-1964">    // the backingMap. So, when executing this method, we should check both the RAMCache and</span>
+<span class="source-line-no">1965</span><span id="line-1965">    // backingMap to ensure all CacheKeys are obtained.</span>
+<span class="source-line-no">1966</span><span id="line-1966">    // For more details, please refer to HBASE-29862.</span>
+<span class="source-line-no">1967</span><span id="line-1967">    Set&lt;BlockCacheKey&gt; ramCacheKeySet = ramCache.getRamBlockCacheKeysForHFile(hfileName);</span>
+<span class="source-line-no">1968</span><span id="line-1968">    for (BlockCacheKey key : ramCacheKeySet) {</span>
+<span class="source-line-no">1969</span><span id="line-1969">      if (key.getOffset() &gt;= init &amp;&amp; key.getOffset() &lt;= end) {</span>
+<span class="source-line-no">1970</span><span id="line-1970">        cacheKeys.add(key);</span>
+<span class="source-line-no">1971</span><span id="line-1971">      }</span>
+<span class="source-line-no">1972</span><span id="line-1972">    }</span>
 <span class="source-line-no">1973</span><span id="line-1973"></span>
-<span class="source-line-no">1974</span><span id="line-1974">    private CachedEntryQueue queue;</span>
-<span class="source-line-no">1975</span><span id="line-1975">    private long totalSize = 0;</span>
-<span class="source-line-no">1976</span><span id="line-1976">    private long bucketSize;</span>
-<span class="source-line-no">1977</span><span id="line-1977"></span>
-<span class="source-line-no">1978</span><span id="line-1978">    public BucketEntryGroup(long bytesToFree, long blockSize, long bucketSize) {</span>
-<span class="source-line-no">1979</span><span id="line-1979">      this.bucketSize = bucketSize;</span>
-<span class="source-line-no">1980</span><span id="line-1980">      queue = new CachedEntryQueue(bytesToFree, blockSize);</span>
-<span class="source-line-no">1981</span><span id="line-1981">      totalSize = 0;</span>
-<span class="source-line-no">1982</span><span id="line-1982">    }</span>
-<span class="source-line-no">1983</span><span id="line-1983"></span>
-<span class="source-line-no">1984</span><span id="line-1984">    public void add(Map.Entry&lt;BlockCacheKey, BucketEntry&gt; block) {</span>
-<span class="source-line-no">1985</span><span id="line-1985">      totalSize += block.getValue().getLength();</span>
-<span class="source-line-no">1986</span><span id="line-1986">      queue.add(block);</span>
-<span class="source-line-no">1987</span><span id="line-1987">    }</span>
-<span class="source-line-no">1988</span><span id="line-1988"></span>
-<span class="source-line-no">1989</span><span id="line-1989">    public long free(long toFree) {</span>
-<span class="source-line-no">1990</span><span id="line-1990">      Map.Entry&lt;BlockCacheKey, BucketEntry&gt; entry;</span>
-<span class="source-line-no">1991</span><span id="line-1991">      long freedBytes = 0;</span>
-<span class="source-line-no">1992</span><span id="line-1992">      // TODO avoid a cycling siutation. We find no block which is not in use and so no way to free</span>
-<span class="source-line-no">1993</span><span id="line-1993">      // What to do then? Caching attempt fail? Need some changes in cacheBlock API?</span>
-<span class="source-line-no">1994</span><span id="line-1994">      while ((entry = queue.pollLast()) != null) {</span>
-<span class="source-line-no">1995</span><span id="line-1995">        BlockCacheKey blockCacheKey = entry.getKey();</span>
-<span class="source-line-no">1996</span><span id="line-1996">        BucketEntry be = entry.getValue();</span>
-<span class="source-line-no">1997</span><span id="line-1997">        if (evictBucketEntryIfNoRpcReferenced(blockCacheKey, be)) {</span>
-<span class="source-line-no">1998</span><span id="line-1998">          freedBytes += be.getLength();</span>
-<span class="source-line-no">1999</span><span id="line-1999">        }</span>
-<span class="source-line-no">2000</span><span id="line-2000">        if (freedBytes &gt;= toFree) {</span>
-<span class="source-line-no">2001</span><span id="line-2001">          return freedBytes;</span>
-<span class="source-line-no">2002</span><span id="line-2002">        }</span>
-<span class="source-line-no">2003</span><span id="line-2003">      }</span>
-<span class="source-line-no">2004</span><span id="line-2004">      return freedBytes;</span>
-<span class="source-line-no">2005</span><span id="line-2005">    }</span>
-<span class="source-line-no">2006</span><span id="line-2006"></span>
-<span class="source-line-no">2007</span><span id="line-2007">    public long overflow() {</span>
-<span class="source-line-no">2008</span><span id="line-2008">      return totalSize - bucketSize;</span>
-<span class="source-line-no">2009</span><span id="line-2009">    }</span>
-<span class="source-line-no">2010</span><span id="line-2010"></span>
-<span class="source-line-no">2011</span><span id="line-2011">    public long totalSize() {</span>
-<span class="source-line-no">2012</span><span id="line-2012">      return totalSize;</span>
-<span class="source-line-no">2013</span><span id="line-2013">    }</span>
-<span class="source-line-no">2014</span><span id="line-2014">  }</span>
-<span class="source-line-no">2015</span><span id="line-2015"></span>
-<span class="source-line-no">2016</span><span id="line-2016">  /**</span>
-<span class="source-line-no">2017</span><span id="line-2017">   * Block Entry stored in the memory with key,data and so on</span>
-<span class="source-line-no">2018</span><span id="line-2018">   */</span>
-<span class="source-line-no">2019</span><span id="line-2019">  static class RAMQueueEntry {</span>
-<span class="source-line-no">2020</span><span id="line-2020">    private final BlockCacheKey key;</span>
-<span class="source-line-no">2021</span><span id="line-2021">    private final Cacheable data;</span>
-<span class="source-line-no">2022</span><span id="line-2022">    private long accessCounter;</span>
-<span class="source-line-no">2023</span><span id="line-2023">    private boolean inMemory;</span>
-<span class="source-line-no">2024</span><span id="line-2024">    private boolean isCachePersistent;</span>
-<span class="source-line-no">2025</span><span id="line-2025"></span>
-<span class="source-line-no">2026</span><span id="line-2026">    private boolean isPrefetch;</span>
-<span class="source-line-no">2027</span><span id="line-2027"></span>
-<span class="source-line-no">2028</span><span id="line-2028">    RAMQueueEntry(BlockCacheKey bck, Cacheable data, long accessCounter, boolean inMemory,</span>
-<span class="source-line-no">2029</span><span id="line-2029">      boolean isCachePersistent, boolean isPrefetch) {</span>
-<span class="source-line-no">2030</span><span id="line-2030">      this.key = bck;</span>
-<span class="source-line-no">2031</span><span id="line-2031">      this.data = data;</span>
-<span class="source-line-no">2032</span><span id="line-2032">      this.accessCounter = accessCounter;</span>
-<span class="source-line-no">2033</span><span id="line-2033">      this.inMemory = inMemory;</span>
-<span class="source-line-no">2034</span><span id="line-2034">      this.isCachePersistent = isCachePersistent;</span>
-<span class="source-line-no">2035</span><span id="line-2035">      this.isPrefetch = isPrefetch;</span>
-<span class="source-line-no">2036</span><span id="line-2036">    }</span>
-<span class="source-line-no">2037</span><span id="line-2037"></span>
-<span class="source-line-no">2038</span><span id="line-2038">    public Cacheable getData() {</span>
-<span class="source-line-no">2039</span><span id="line-2039">      return data;</span>
-<span class="source-line-no">2040</span><span id="line-2040">    }</span>
-<span class="source-line-no">2041</span><span id="line-2041"></span>
-<span class="source-line-no">2042</span><span id="line-2042">    public BlockCacheKey getKey() {</span>
-<span class="source-line-no">2043</span><span id="line-2043">      return key;</span>
-<span class="source-line-no">2044</span><span id="line-2044">    }</span>
-<span class="source-line-no">2045</span><span id="line-2045"></span>
-<span class="source-line-no">2046</span><span id="line-2046">    public boolean isPrefetch() {</span>
-<span class="source-line-no">2047</span><span id="line-2047">      return isPrefetch;</span>
-<span class="source-line-no">2048</span><span id="line-2048">    }</span>
-<span class="source-line-no">2049</span><span id="line-2049"></span>
-<span class="source-line-no">2050</span><span id="line-2050">    public void access(long accessCounter) {</span>
-<span class="source-line-no">2051</span><span id="line-2051">      this.accessCounter = accessCounter;</span>
-<span class="source-line-no">2052</span><span id="line-2052">    }</span>
-<span class="source-line-no">2053</span><span id="line-2053"></span>
-<span class="source-line-no">2054</span><span id="line-2054">    private ByteBuffAllocator getByteBuffAllocator() {</span>
-<span class="source-line-no">2055</span><span id="line-2055">      if (data instanceof HFileBlock) {</span>
-<span class="source-line-no">2056</span><span id="line-2056">        return ((HFileBlock) data).getByteBuffAllocator();</span>
-<span class="source-line-no">2057</span><span id="line-2057">      }</span>
-<span class="source-line-no">2058</span><span id="line-2058">      return ByteBuffAllocator.HEAP;</span>
-<span class="source-line-no">2059</span><span id="line-2059">    }</span>
-<span class="source-line-no">2060</span><span id="line-2060"></span>
-<span class="source-line-no">2061</span><span id="line-2061">    public BucketEntry writeToCache(final IOEngine ioEngine, final BucketAllocator alloc,</span>
-<span class="source-line-no">2062</span><span id="line-2062">      final LongAdder realCacheSize, Function&lt;BucketEntry, Recycler&gt; createRecycler,</span>
-<span class="source-line-no">2063</span><span id="line-2063">      ByteBuffer metaBuff, final Long acceptableSize) throws IOException {</span>
-<span class="source-line-no">2064</span><span id="line-2064">      int len = data.getSerializedLength();</span>
-<span class="source-line-no">2065</span><span id="line-2065">      // This cacheable thing can't be serialized</span>
-<span class="source-line-no">2066</span><span id="line-2066">      if (len == 0) {</span>
-<span class="source-line-no">2067</span><span id="line-2067">        return null;</span>
-<span class="source-line-no">2068</span><span id="line-2068">      }</span>
-<span class="source-line-no">2069</span><span id="line-2069">      if (isCachePersistent &amp;&amp; data instanceof HFileBlock) {</span>
-<span class="source-line-no">2070</span><span id="line-2070">        len += Long.BYTES; // we need to record the cache time for consistency check in case of</span>
-<span class="source-line-no">2071</span><span id="line-2071">                           // recovery</span>
-<span class="source-line-no">2072</span><span id="line-2072">      }</span>
-<span class="source-line-no">2073</span><span id="line-2073">      long offset = alloc.allocateBlock(len);</span>
-<span class="source-line-no">2074</span><span id="line-2074">      // In the case of prefetch, we want to avoid freeSpace runs when the cache is full.</span>
-<span class="source-line-no">2075</span><span id="line-2075">      // this makes the cache allocation more predictable, and is particularly important</span>
-<span class="source-line-no">2076</span><span id="line-2076">      // when persistent cache is enabled, as it won't trigger evictions of the recovered blocks,</span>
-<span class="source-line-no">2077</span><span id="line-2077">      // which are likely the most accessed and relevant blocks in the cache.</span>
-<span class="source-line-no">2078</span><span id="line-2078">      if (isPrefetch() &amp;&amp; alloc.getUsedSize() &gt; acceptableSize) {</span>
-<span class="source-line-no">2079</span><span id="line-2079">        alloc.freeBlock(offset, len);</span>
+<span class="source-line-no">1974</span><span id="line-1974">    // These keys are just for comparison and are short lived, so we need only file name and offset</span>
+<span class="source-line-no">1975</span><span id="line-1975">    cacheKeys.addAll(blocksByHFile.subSet(new BlockCacheKey(hfileName, init), true,</span>
+<span class="source-line-no">1976</span><span id="line-1976">      new BlockCacheKey(hfileName, end), true));</span>
+<span class="source-line-no">1977</span><span id="line-1977">    return cacheKeys;</span>
+<span class="source-line-no">1978</span><span id="line-1978">  }</span>
+<span class="source-line-no">1979</span><span id="line-1979"></span>
+<span class="source-line-no">1980</span><span id="line-1980">  /**</span>
+<span class="source-line-no">1981</span><span id="line-1981">   * Used to group bucket entries into priority buckets. There will be a BucketEntryGroup for each</span>
+<span class="source-line-no">1982</span><span id="line-1982">   * priority (single, multi, memory). Once bucketed, the eviction algorithm takes the appropriate</span>
+<span class="source-line-no">1983</span><span id="line-1983">   * number of elements out of each according to configuration parameters and their relative sizes.</span>
+<span class="source-line-no">1984</span><span id="line-1984">   */</span>
+<span class="source-line-no">1985</span><span id="line-1985">  private class BucketEntryGroup {</span>
+<span class="source-line-no">1986</span><span id="line-1986"></span>
+<span class="source-line-no">1987</span><span id="line-1987">    private CachedEntryQueue queue;</span>
+<span class="source-line-no">1988</span><span id="line-1988">    private long totalSize = 0;</span>
+<span class="source-line-no">1989</span><span id="line-1989">    private long bucketSize;</span>
+<span class="source-line-no">1990</span><span id="line-1990"></span>
+<span class="source-line-no">1991</span><span id="line-1991">    public BucketEntryGroup(long bytesToFree, long blockSize, long bucketSize) {</span>
+<span class="source-line-no">1992</span><span id="line-1992">      this.bucketSize = bucketSize;</span>
+<span class="source-line-no">1993</span><span id="line-1993">      queue = new CachedEntryQueue(bytesToFree, blockSize);</span>
+<span class="source-line-no">1994</span><span id="line-1994">      totalSize = 0;</span>
+<span class="source-line-no">1995</span><span id="line-1995">    }</span>
+<span class="source-line-no">1996</span><span id="line-1996"></span>
+<span class="source-line-no">1997</span><span id="line-1997">    public void add(Map.Entry&lt;BlockCacheKey, BucketEntry&gt; block) {</span>
+<span class="source-line-no">1998</span><span id="line-1998">      totalSize += block.getValue().getLength();</span>
+<span class="source-line-no">1999</span><span id="line-1999">      queue.add(block);</span>
+<span class="source-line-no">2000</span><span id="line-2000">    }</span>
+<span class="source-line-no">2001</span><span id="line-2001"></span>
+<span class="source-line-no">2002</span><span id="line-2002">    public long free(long toFree) {</span>
+<span class="source-line-no">2003</span><span id="line-2003">      Map.Entry&lt;BlockCacheKey, BucketEntry&gt; entry;</span>
+<span class="source-line-no">2004</span><span id="line-2004">      long freedBytes = 0;</span>
+<span class="source-line-no">2005</span><span id="line-2005">      // TODO avoid a cycling siutation. We find no block which is not in use and so no way to free</span>
+<span class="source-line-no">2006</span><span id="line-2006">      // What to do then? Caching attempt fail? Need some changes in cacheBlock API?</span>
+<span class="source-line-no">2007</span><span id="line-2007">      while ((entry = queue.pollLast()) != null) {</span>
+<span class="source-line-no">2008</span><span id="line-2008">        BlockCacheKey blockCacheKey = entry.getKey();</span>
+<span class="source-line-no">2009</span><span id="line-2009">        BucketEntry be = entry.getValue();</span>
+<span class="source-line-no">2010</span><span id="line-2010">        if (evictBucketEntryIfNoRpcReferenced(blockCacheKey, be)) {</span>
+<span class="source-line-no">2011</span><span id="line-2011">          freedBytes += be.getLength();</span>
+<span class="source-line-no">2012</span><span id="line-2012">        }</span>
+<span class="source-line-no">2013</span><span id="line-2013">        if (freedBytes &gt;= toFree) {</span>
+<span class="source-line-no">2014</span><span id="line-2014">          return freedBytes;</span>
+<span class="source-line-no">2015</span><span id="line-2015">        }</span>
+<span class="source-line-no">2016</span><span id="line-2016">      }</span>
+<span class="source-line-no">2017</span><span id="line-2017">      return freedBytes;</span>
+<span class="source-line-no">2018</span><span id="line-2018">    }</span>
+<span class="source-line-no">2019</span><span id="line-2019"></span>
+<span class="source-line-no">2020</span><span id="line-2020">    public long overflow() {</span>
+<span class="source-line-no">2021</span><span id="line-2021">      return totalSize - bucketSize;</span>
+<span class="source-line-no">2022</span><span id="line-2022">    }</span>
+<span class="source-line-no">2023</span><span id="line-2023"></span>
+<span class="source-line-no">2024</span><span id="line-2024">    public long totalSize() {</span>
+<span class="source-line-no">2025</span><span id="line-2025">      return totalSize;</span>
+<span class="source-line-no">2026</span><span id="line-2026">    }</span>
+<span class="source-line-no">2027</span><span id="line-2027">  }</span>
+<span class="source-line-no">2028</span><span id="line-2028"></span>
+<span class="source-line-no">2029</span><span id="line-2029">  /**</span>
+<span class="source-line-no">2030</span><span id="line-2030">   * Block Entry stored in the memory with key,data and so on</span>
+<span class="source-line-no">2031</span><span id="line-2031">   */</span>
+<span class="source-line-no">2032</span><span id="line-2032">  static class RAMQueueEntry {</span>
+<span class="source-line-no">2033</span><span id="line-2033">    private final BlockCacheKey key;</span>
+<span class="source-line-no">2034</span><span id="line-2034">    private final Cacheable data;</span>
+<span class="source-line-no">2035</span><span id="line-2035">    private long accessCounter;</span>
+<span class="source-line-no">2036</span><span id="line-2036">    private boolean inMemory;</span>
+<span class="source-line-no">2037</span><span id="line-2037">    private boolean isCachePersistent;</span>
+<span class="source-line-no">2038</span><span id="line-2038"></span>
+<span class="source-line-no">2039</span><span id="line-2039">    private boolean isPrefetch;</span>
+<span class="source-line-no">2040</span><span id="line-2040"></span>
+<span class="source-line-no">2041</span><span id="line-2041">    RAMQueueEntry(BlockCacheKey bck, Cacheable data, long accessCounter, boolean inMemory,</span>
+<span class="source-line-no">2042</span><span id="line-2042">      boolean isCachePersistent, boolean isPrefetch) {</span>
+<span class="source-line-no">2043</span><span id="line-2043">      this.key = bck;</span>
+<span class="source-line-no">2044</span><span id="line-2044">      this.data = data;</span>
+<span class="source-line-no">2045</span><span id="line-2045">      this.accessCounter = accessCounter;</span>
+<span class="source-line-no">2046</span><span id="line-2046">      this.inMemory = inMemory;</span>
+<span class="source-line-no">2047</span><span id="line-2047">      this.isCachePersistent = isCachePersistent;</span>
+<span class="source-line-no">2048</span><span id="line-2048">      this.isPrefetch = isPrefetch;</span>
+<span class="source-line-no">2049</span><span id="line-2049">    }</span>
+<span class="source-line-no">2050</span><span id="line-2050"></span>
+<span class="source-line-no">2051</span><span id="line-2051">    public Cacheable getData() {</span>
+<span class="source-line-no">2052</span><span id="line-2052">      return data;</span>
+<span class="source-line-no">2053</span><span id="line-2053">    }</span>
+<span class="source-line-no">2054</span><span id="line-2054"></span>
+<span class="source-line-no">2055</span><span id="line-2055">    public BlockCacheKey getKey() {</span>
+<span class="source-line-no">2056</span><span id="line-2056">      return key;</span>
+<span class="source-line-no">2057</span><span id="line-2057">    }</span>
+<span class="source-line-no">2058</span><span id="line-2058"></span>
+<span class="source-line-no">2059</span><span id="line-2059">    public boolean isPrefetch() {</span>
+<span class="source-line-no">2060</span><span id="line-2060">      return isPrefetch;</span>
+<span class="source-line-no">2061</span><span id="line-2061">    }</span>
+<span class="source-line-no">2062</span><span id="line-2062"></span>
+<span class="source-line-no">2063</span><span id="line-2063">    public void access(long accessCounter) {</span>
+<span class="source-line-no">2064</span><span id="line-2064">      this.accessCounter = accessCounter;</span>
+<span class="source-line-no">2065</span><span id="line-2065">    }</span>
+<span class="source-line-no">2066</span><span id="line-2066"></span>
+<span class="source-line-no">2067</span><span id="line-2067">    private ByteBuffAllocator getByteBuffAllocator() {</span>
+<span class="source-line-no">2068</span><span id="line-2068">      if (data instanceof HFileBlock) {</span>
+<span class="source-line-no">2069</span><span id="line-2069">        return ((HFileBlock) data).getByteBuffAllocator();</span>
+<span class="source-line-no">2070</span><span id="line-2070">      }</span>
+<span class="source-line-no">2071</span><span id="line-2071">      return ByteBuffAllocator.HEAP;</span>
+<span class="source-line-no">2072</span><span id="line-2072">    }</span>
+<span class="source-line-no">2073</span><span id="line-2073"></span>
+<span class="source-line-no">2074</span><span id="line-2074">    public BucketEntry writeToCache(final IOEngine ioEngine, final BucketAllocator alloc,</span>
+<span class="source-line-no">2075</span><span id="line-2075">      final LongAdder realCacheSize, Function&lt;BucketEntry, Recycler&gt; createRecycler,</span>
+<span class="source-line-no">2076</span><span id="line-2076">      ByteBuffer metaBuff, final Long acceptableSize) throws IOException {</span>
+<span class="source-line-no">2077</span><span id="line-2077">      int len = data.getSerializedLength();</span>
+<span class="source-line-no">2078</span><span id="line-2078">      // This cacheable thing can't be serialized</span>
+<span class="source-line-no">2079</span><span id="line-2079">      if (len == 0) {</span>
 <span class="source-line-no">2080</span><span id="line-2080">        return null;</span>
 <span class="source-line-no">2081</span><span id="line-2081">      }</span>
-<span class="source-line-no">2082</span><span id="line-2082">      boolean succ = false;</span>
-<span class="source-line-no">2083</span><span id="line-2083">      BucketEntry bucketEntry = null;</span>
-<span class="source-line-no">2084</span><span id="line-2084">      try {</span>
-<span class="source-line-no">2085</span><span id="line-2085">        int diskSizeWithHeader = (data instanceof HFileBlock)</span>
-<span class="source-line-no">2086</span><span id="line-2086">          ? ((HFileBlock) data).getOnDiskSizeWithHeader()</span>
-<span class="source-line-no">2087</span><span id="line-2087">          : data.getSerializedLength();</span>
-<span class="source-line-no">2088</span><span id="line-2088">        bucketEntry = new BucketEntry(offset, len, diskSizeWithHeader, accessCounter, inMemory,</span>
-<span class="source-line-no">2089</span><span id="line-2089">          createRecycler, getByteBuffAllocator());</span>
-<span class="source-line-no">2090</span><span id="line-2090">        bucketEntry.setDeserializerReference(data.getDeserializer());</span>
-<span class="source-line-no">2091</span><span id="line-2091">        if (data instanceof HFileBlock) {</span>
-<span class="source-line-no">2092</span><span id="line-2092">          // If an instance of HFileBlock, save on some allocations.</span>
-<span class="source-line-no">2093</span><span id="line-2093">          HFileBlock block = (HFileBlock) data;</span>
-<span class="source-line-no">2094</span><span id="line-2094">          ByteBuff sliceBuf = block.getBufferReadOnly();</span>
-<span class="source-line-no">2095</span><span id="line-2095">          block.getMetaData(metaBuff);</span>
-<span class="source-line-no">2096</span><span id="line-2096">          // adds the cache time prior to the block and metadata part</span>
-<span class="source-line-no">2097</span><span id="line-2097">          if (isCachePersistent) {</span>
-<span class="source-line-no">2098</span><span id="line-2098">            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES);</span>
-<span class="source-line-no">2099</span><span id="line-2099">            buffer.putLong(bucketEntry.getCachedTime());</span>
-<span class="source-line-no">2100</span><span id="line-2100">            buffer.rewind();</span>
-<span class="source-line-no">2101</span><span id="line-2101">            ioEngine.write(buffer, offset);</span>
-<span class="source-line-no">2102</span><span id="line-2102">            ioEngine.write(sliceBuf, (offset + Long.BYTES));</span>
-<span class="source-line-no">2103</span><span id="line-2103">          } else {</span>
-<span class="source-line-no">2104</span><span id="line-2104">            ioEngine.write(sliceBuf, offset);</span>
-<span class="source-line-no">2105</span><span id="line-2105">          }</span>
-<span class="source-line-no">2106</span><span id="line-2106">          ioEngine.write(metaBuff, offset + len - metaBuff.limit());</span>
-<span class="source-line-no">2107</span><span id="line-2107">        } else {</span>
-<span class="source-line-no">2108</span><span id="line-2108">          // Only used for testing.</span>
-<span class="source-line-no">2109</span><span id="line-2109">          ByteBuffer bb = ByteBuffer.allocate(len);</span>
-<span class="source-line-no">2110</span><span id="line-2110">          data.serialize(bb, true);</span>
-<span class="source-line-no">2111</span><span id="line-2111">          ioEngine.write(bb, offset);</span>
-<span class="source-line-no">2112</span><span id="line-2112">        }</span>
-<span class="source-line-no">2113</span><span id="line-2113">        succ = true;</span>
-<span class="source-line-no">2114</span><span id="line-2114">      } finally {</span>
-<span class="source-line-no">2115</span><span id="line-2115">        if (!succ) {</span>
-<span class="source-line-no">2116</span><span id="line-2116">          alloc.freeBlock(offset, len);</span>
-<span class="source-line-no">2117</span><span id="line-2117">        }</span>
-<span class="source-line-no">2118</span><span id="line-2118">      }</span>
-<span class="source-line-no">2119</span><span id="line-2119">      realCacheSize.add(len);</span>
-<span class="source-line-no">2120</span><span id="line-2120">      return bucketEntry;</span>
-<span class="source-line-no">2121</span><span id="line-2121">    }</span>
-<span class="source-line-no">2122</span><span id="line-2122">  }</span>
-<span class="source-line-no">2123</span><span id="line-2123"></span>
-<span class="source-line-no">2124</span><span id="line-2124">  /**</span>
-<span class="source-line-no">2125</span><span id="line-2125">   * Only used in test</span>
-<span class="source-line-no">2126</span><span id="line-2126">   */</span>
-<span class="source-line-no">2127</span><span id="line-2127">  void stopWriterThreads() throws InterruptedException {</span>
-<span class="source-line-no">2128</span><span id="line-2128">    for (WriterThread writerThread : writerThreads) {</span>
-<span class="source-line-no">2129</span><span id="line-2129">      writerThread.disableWriter();</span>
-<span class="source-line-no">2130</span><span id="line-2130">      writerThread.interrupt();</span>
-<span class="source-line-no">2131</span><span id="line-2131">      writerThread.join();</span>
-<span class="source-line-no">2132</span><span id="line-2132">    }</span>
-<span class="source-line-no">2133</span><span id="line-2133">  }</span>
-<span class="source-line-no">2134</span><span id="line-2134"></span>
-<span class="source-line-no">2135</span><span id="line-2135">  @Override</span>
-<span class="source-line-no">2136</span><span id="line-2136">  public Iterator&lt;CachedBlock&gt; iterator() {</span>
-<span class="source-line-no">2137</span><span id="line-2137">    // Don't bother with ramcache since stuff is in here only a little while.</span>
-<span class="source-line-no">2138</span><span id="line-2138">    final Iterator&lt;Map.Entry&lt;BlockCacheKey, BucketEntry&gt;&gt; i = this.backingMap.entrySet().iterator();</span>
-<span class="source-line-no">2139</span><span id="line-2139">    return new Iterator&lt;CachedBlock&gt;() {</span>
-<span class="source-line-no">2140</span><span id="line-2140">      private final long now = System.nanoTime();</span>
-<span class="source-line-no">2141</span><span id="line-2141"></span>
-<span class="source-line-no">2142</span><span id="line-2142">      @Override</span>
-<span class="source-line-no">2143</span><span id="line-2143">      public boolean hasNext() {</span>
-<span class="source-line-no">2144</span><span id="line-2144">        return i.hasNext();</span>
-<span class="source-line-no">2145</span><span id="line-2145">      }</span>
-<span class="source-line-no">2146</span><span id="line-2146"></span>
-<span class="source-line-no">2147</span><span id="line-2147">      @Override</span>
-<span class="source-line-no">2148</span><span id="line-2148">      public CachedBlock next() {</span>
-<span class="source-line-no">2149</span><span id="line-2149">        final Map.Entry&lt;BlockCacheKey, BucketEntry&gt; e = i.next();</span>
-<span class="source-line-no">2150</span><span id="line-2150">        return new CachedBlock() {</span>
-<span class="source-line-no">2151</span><span id="line-2151">          @Override</span>
-<span class="source-line-no">2152</span><span id="line-2152">          public String toString() {</span>
-<span class="source-line-no">2153</span><span id="line-2153">            return BlockCacheUtil.toString(this, now);</span>
-<span class="source-line-no">2154</span><span id="line-2154">          }</span>
-<span class="source-line-no">2155</span><span id="line-2155"></span>
-<span class="source-line-no">2156</span><span id="line-2156">          @Override</span>
-<span class="source-line-no">2157</span><span id="line-2157">          public BlockPriority getBlockPriority() {</span>
-<span class="source-line-no">2158</span><span id="line-2158">            return e.getValue().getPriority();</span>
-<span class="source-line-no">2159</span><span id="line-2159">          }</span>
-<span class="source-line-no">2160</span><span id="line-2160"></span>
-<span class="source-line-no">2161</span><span id="line-2161">          @Override</span>
-<span class="source-line-no">2162</span><span id="line-2162">          public BlockType getBlockType() {</span>
-<span class="source-line-no">2163</span><span id="line-2163">            // Not held by BucketEntry. Could add it if wanted on BucketEntry creation.</span>
-<span class="source-line-no">2164</span><span id="line-2164">            return null;</span>
-<span class="source-line-no">2165</span><span id="line-2165">          }</span>
-<span class="source-line-no">2166</span><span id="line-2166"></span>
-<span class="source-line-no">2167</span><span id="line-2167">          @Override</span>
-<span class="source-line-no">2168</span><span id="line-2168">          public long getOffset() {</span>
-<span class="source-line-no">2169</span><span id="line-2169">            return e.getKey().getOffset();</span>
-<span class="source-line-no">2170</span><span id="line-2170">          }</span>
-<span class="source-line-no">2171</span><span id="line-2171"></span>
-<span class="source-line-no">2172</span><span id="line-2172">          @Override</span>
-<span class="source-line-no">2173</span><span id="line-2173">          public long getSize() {</span>
-<span class="source-line-no">2174</span><span id="line-2174">            return e.getValue().getLength();</span>
-<span class="source-line-no">2175</span><span id="line-2175">          }</span>
-<span class="source-line-no">2176</span><span id="line-2176"></span>
-<span class="source-line-no">2177</span><span id="line-2177">          @Override</span>
-<span class="source-line-no">2178</span><span id="line-2178">          public long getCachedTime() {</span>
-<span class="source-line-no">2179</span><span id="line-2179">            return e.getValue().getCachedTime();</span>
-<span class="source-line-no">2180</span><span id="line-2180">          }</span>
-<span class="source-line-no">2181</span><span id="line-2181"></span>
-<span class="source-line-no">2182</span><span id="line-2182">          @Override</span>
-<span class="source-line-no">2183</span><span id="line-2183">          public String getFilename() {</span>
-<span class="source-line-no">2184</span><span id="line-2184">            return e.getKey().getHfileName();</span>
-<span class="source-line-no">2185</span><span id="line-2185">          }</span>
-<span class="source-line-no">2186</span><span id="line-2186"></span>
-<span class="source-line-no">2187</span><span id="line-2187">          @Override</span>
-<span class="source-line-no">2188</span><span id="line-2188">          public int compareTo(CachedBlock other) {</span>
-<span class="source-line-no">2189</span><span id="line-2189">            int diff = this.getFilename().compareTo(other.getFilename());</span>
-<span class="source-line-no">2190</span><span id="line-2190">            if (diff != 0) return diff;</span>
-<span class="source-line-no">2191</span><span id="line-2191"></span>
-<span class="source-line-no">2192</span><span id="line-2192">            diff = Long.compare(this.getOffset(), other.getOffset());</span>
-<span class="source-line-no">2193</span><span id="line-2193">            if (diff != 0) return diff;</span>
-<span class="source-line-no">2194</span><span id="line-2194">            if (other.getCachedTime() &lt; 0 || this.getCachedTime() &lt; 0) {</span>
-<span class="source-line-no">2195</span><span id="line-2195">              throw new IllegalStateException(</span>
-<span class="source-line-no">2196</span><span id="line-2196">                "" + this.getCachedTime() + ", " + other.getCachedTime());</span>
-<span class="source-line-no">2197</span><span id="line-2197">            }</span>
-<span class="source-line-no">2198</span><span id="line-2198">            return Long.compare(other.getCachedTime(), this.getCachedTime());</span>
-<span class="source-line-no">2199</span><span id="line-2199">          }</span>
-<span class="source-line-no">2200</span><span id="line-2200"></span>
-<span class="source-line-no">2201</span><span id="line-2201">          @Override</span>
-<span class="source-line-no">2202</span><span id="line-2202">          public int hashCode() {</span>
-<span class="source-line-no">2203</span><span id="line-2203">            return e.getKey().hashCode();</span>
-<span class="source-line-no">2204</span><span id="line-2204">          }</span>
-<span class="source-line-no">2205</span><span id="line-2205"></span>
-<span class="source-line-no">2206</span><span id="line-2206">          @Override</span>
-<span class="source-line-no">2207</span><span id="line-2207">          public boolean equals(Object obj) {</span>
-<span class="source-line-no">2208</span><span id="line-2208">            if (obj instanceof CachedBlock) {</span>
-<span class="source-line-no">2209</span><span id="line-2209">              CachedBlock cb = (CachedBlock) obj;</span>
-<span class="source-line-no">2210</span><span id="line-2210">              return compareTo(cb) == 0;</span>
-<span class="source-line-no">2211</span><span id="line-2211">            } else {</span>
-<span class="source-line-no">2212</span><span id="line-2212">              return false;</span>
-<span class="source-line-no">2213</span><span id="line-2213">            }</span>
-<span class="source-line-no">2214</span><span id="line-2214">          }</span>
-<span class="source-line-no">2215</span><span id="line-2215">        };</span>
-<span class="source-line-no">2216</span><span id="line-2216">      }</span>
-<span class="source-line-no">2217</span><span id="line-2217"></span>
-<span class="source-line-no">2218</span><span id="line-2218">      @Override</span>
-<span class="source-line-no">2219</span><span id="line-2219">      public void remove() {</span>
-<span class="source-line-no">2220</span><span id="line-2220">        throw new UnsupportedOperationException();</span>
-<span class="source-line-no">2221</span><span id="line-2221">      }</span>
-<span class="source-line-no">2222</span><span id="line-2222">    };</span>
-<span class="source-line-no">2223</span><span id="line-2223">  }</span>
-<span class="source-line-no">2224</span><span id="line-2224"></span>
-<span class="source-line-no">2225</span><span id="line-2225">  @Override</span>
-<span class="source-line-no">2226</span><span id="line-2226">  public BlockCache[] getBlockCaches() {</span>
-<span class="source-line-no">2227</span><span id="line-2227">    return null;</span>
-<span class="source-line-no">2228</span><span id="line-2228">  }</span>
-<span class="source-line-no">2229</span><span id="line-2229"></span>
-<span class="source-line-no">2230</span><span id="line-2230">  public int getRpcRefCount(BlockCacheKey cacheKey) {</span>
-<span class="source-line-no">2231</span><span id="line-2231">    BucketEntry bucketEntry = backingMap.get(cacheKey);</span>
-<span class="source-line-no">2232</span><span id="line-2232">    if (bucketEntry != null) {</span>
-<span class="source-line-no">2233</span><span id="line-2233">      return bucketEntry.refCnt() - (bucketEntry.markedAsEvicted.get() ? 0 : 1);</span>
-<span class="source-line-no">2234</span><span id="line-2234">    }</span>
-<span class="source-line-no">2235</span><span id="line-2235">    return 0;</span>
+<span class="source-line-no">2082</span><span id="line-2082">      if (isCachePersistent &amp;&amp; data instanceof HFileBlock) {</span>
+<span class="source-line-no">2083</span><span id="line-2083">        len += Long.BYTES; // we need to record the cache time for consistency check in case of</span>
+<span class="source-line-no">2084</span><span id="line-2084">                           // recovery</span>
+<span class="source-line-no">2085</span><span id="line-2085">      }</span>
+<span class="source-line-no">2086</span><span id="line-2086">      long offset = alloc.allocateBlock(len);</span>
+<span class="source-line-no">2087</span><span id="line-2087">      // In the case of prefetch, we want to avoid freeSpace runs when the cache is full.</span>
+<span class="source-line-no">2088</span><span id="line-2088">      // this makes the cache allocation more predictable, and is particularly important</span>
+<span class="source-line-no">2089</span><span id="line-2089">      // when persistent cache is enabled, as it won't trigger evictions of the recovered blocks,</span>
+<span class="source-line-no">2090</span><span id="line-2090">      // which are likely the most accessed and relevant blocks in the cache.</span>
+<span class="source-line-no">2091</span><span id="line-2091">      if (isPrefetch() &amp;&amp; alloc.getUsedSize() &gt; acceptableSize) {</span>
+<span class="source-line-no">2092</span><span id="line-2092">        alloc.freeBlock(offset, len);</span>
+<span class="source-line-no">2093</span><span id="line-2093">        return null;</span>
+<span class="source-line-no">2094</span><span id="line-2094">      }</span>
+<span class="source-line-no">2095</span><span id="line-2095">      boolean succ = false;</span>
+<span class="source-line-no">2096</span><span id="line-2096">      BucketEntry bucketEntry = null;</span>
+<span class="source-line-no">2097</span><span id="line-2097">      try {</span>
+<span class="source-line-no">2098</span><span id="line-2098">        int diskSizeWithHeader = (data instanceof HFileBlock)</span>
+<span class="source-line-no">2099</span><span id="line-2099">          ? ((HFileBlock) data).getOnDiskSizeWithHeader()</span>
+<span class="source-line-no">2100</span><span id="line-2100">          : data.getSerializedLength();</span>
+<span class="source-line-no">2101</span><span id="line-2101">        bucketEntry = new BucketEntry(offset, len, diskSizeWithHeader, accessCounter, inMemory,</span>
+<span class="source-line-no">2102</span><span id="line-2102">          createRecycler, getByteBuffAllocator());</span>
+<span class="source-line-no">2103</span><span id="line-2103">        bucketEntry.setDeserializerReference(data.getDeserializer());</span>
+<span class="source-line-no">2104</span><span id="line-2104">        if (data instanceof HFileBlock) {</span>
+<span class="source-line-no">2105</span><span id="line-2105">          // If an instance of HFileBlock, save on some allocations.</span>
+<span class="source-line-no">2106</span><span id="line-2106">          HFileBlock block = (HFileBlock) data;</span>
+<span class="source-line-no">2107</span><span id="line-2107">          ByteBuff sliceBuf = block.getBufferReadOnly();</span>
+<span class="source-line-no">2108</span><span id="line-2108">          block.getMetaData(metaBuff);</span>
+<span class="source-line-no">2109</span><span id="line-2109">          // adds the cache time prior to the block and metadata part</span>
+<span class="source-line-no">2110</span><span id="line-2110">          if (isCachePersistent) {</span>
+<span class="source-line-no">2111</span><span id="line-2111">            ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES);</span>
+<span class="source-line-no">2112</span><span id="line-2112">            buffer.putLong(bucketEntry.getCachedTime());</span>
+<span class="source-line-no">2113</span><span id="line-2113">            buffer.rewind();</span>
+<span class="source-line-no">2114</span><span id="line-2114">            ioEngine.write(buffer, offset);</span>
+<span class="source-line-no">2115</span><span id="line-2115">            ioEngine.write(sliceBuf, (offset + Long.BYTES));</span>
+<span class="source-line-no">2116</span><span id="line-2116">          } else {</span>
+<span class="source-line-no">2117</span><span id="line-2117">            ioEngine.write(sliceBuf, offset);</span>
+<span class="source-line-no">2118</span><span id="line-2118">          }</span>
+<span class="source-line-no">2119</span><span id="line-2119">          ioEngine.write(metaBuff, offset + len - metaBuff.limit());</span>
+<span class="source-line-no">2120</span><span id="line-2120">        } else {</span>
+<span class="source-line-no">2121</span><span id="line-2121">          // Only used for testing.</span>
+<span class="source-line-no">2122</span><span id="line-2122">          ByteBuffer bb = ByteBuffer.allocate(len);</span>
+<span class="source-line-no">2123</span><span id="line-2123">          data.serialize(bb, true);</span>
+<span class="source-line-no">2124</span><span id="line-2124">          ioEngine.write(bb, offset);</span>
+<span class="source-line-no">2125</span><span id="line-2125">        }</span>
+<span class="source-line-no">2126</span><span id="line-2126">        succ = true;</span>
+<span class="source-line-no">2127</span><span id="line-2127">      } finally {</span>
+<span class="source-line-no">2128</span><span id="line-2128">        if (!succ) {</span>
+<span class="source-line-no">2129</span><span id="line-2129">          alloc.freeBlock(offset, len);</span>
+<span class="source-line-no">2130</span><span id="line-2130">        }</span>
+<span class="source-line-no">2131</span><span id="line-2131">      }</span>
+<span class="source-line-no">2132</span><span id="line-2132">      realCacheSize.add(len);</span>
+<span class="source-line-no">2133</span><span id="line-2133">      return bucketEntry;</span>
+<span class="source-line-no">2134</span><span id="line-2134">    }</span>
+<span class="source-line-no">2135</span><span id="line-2135">  }</span>
+<span class="source-line-no">2136</span><span id="line-2136"></span>
+<span class="source-line-no">2137</span><span id="line-2137">  /**</span>
+<span class="source-line-no">2138</span><span id="line-2138">   * Only used in test</span>
+<span class="source-line-no">2139</span><span id="line-2139">   */</span>
+<span class="source-line-no">2140</span><span id="line-2140">  void stopWriterThreads() throws InterruptedException {</span>
+<span class="source-line-no">2141</span><span id="line-2141">    for (WriterThread writerThread : writerThreads) {</span>
+<span class="source-line-no">2142</span><span id="line-2142">      writerThread.disableWriter();</span>
+<span class="source-line-no">2143</span><span id="line-2143">      writerThread.interrupt();</span>
+<span class="source-line-no">2144</span><span id="line-2144">      writerThread.join();</span>
+<span class="source-line-no">2145</span><span id="line-2145">    }</span>
+<span class="source-line-no">2146</span><span id="line-2146">  }</span>
+<span class="source-line-no">2147</span><span id="line-2147"></span>
+<span class="source-line-no">2148</span><span id="line-2148">  @Override</span>
+<span class="source-line-no">2149</span><span id="line-2149">  public Iterator&lt;CachedBlock&gt; iterator() {</span>
+<span class="source-line-no">2150</span><span id="line-2150">    // Don't bother with ramcache since stuff is in here only a little while.</span>
+<span class="source-line-no">2151</span><span id="line-2151">    final Iterator&lt;Map.Entry&lt;BlockCacheKey, BucketEntry&gt;&gt; i = this.backingMap.entrySet().iterator();</span>
+<span class="source-line-no">2152</span><span id="line-2152">    return new Iterator&lt;CachedBlock&gt;() {</span>
+<span class="source-line-no">2153</span><span id="line-2153">      private final long now = System.nanoTime();</span>
+<span class="source-line-no">2154</span><span id="line-2154"></span>
+<span class="source-line-no">2155</span><span id="line-2155">      @Override</span>
+<span class="source-line-no">2156</span><span id="line-2156">      public boolean hasNext() {</span>
+<span class="source-line-no">2157</span><span id="line-2157">        return i.hasNext();</span>
+<span class="source-line-no">2158</span><span id="line-2158">      }</span>
+<span class="source-line-no">2159</span><span id="line-2159"></span>
+<span class="source-line-no">2160</span><span id="line-2160">      @Override</span>
+<span class="source-line-no">2161</span><span id="line-2161">      public CachedBlock next() {</span>
+<span class="source-line-no">2162</span><span id="line-2162">        final Map.Entry&lt;BlockCacheKey, BucketEntry&gt; e = i.next();</span>
+<span class="source-line-no">2163</span><span id="line-2163">        return new CachedBlock() {</span>
+<span class="source-line-no">2164</span><span id="line-2164">          @Override</span>
+<span class="source-line-no">2165</span><span id="line-2165">          public String toString() {</span>
+<span class="source-line-no">2166</span><span id="line-2166">            return BlockCacheUtil.toString(this, now);</span>
+<span class="source-line-no">2167</span><span id="line-2167">          }</span>
+<span class="source-line-no">2168</span><span id="line-2168"></span>
+<span class="source-line-no">2169</span><span id="line-2169">          @Override</span>
+<span class="source-line-no">2170</span><span id="line-2170">          public BlockPriority getBlockPriority() {</span>
+<span class="source-line-no">2171</span><span id="line-2171">            return e.getValue().getPriority();</span>
+<span class="source-line-no">2172</span><span id="line-2172">          }</span>
+<span class="source-line-no">2173</span><span id="line-2173"></span>
+<span class="source-line-no">2174</span><span id="line-2174">          @Override</span>
+<span class="source-line-no">2175</span><span id="line-2175">          public BlockType getBlockType() {</span>
+<span class="source-line-no">2176</span><span id="line-2176">            // Not held by BucketEntry. Could add it if wanted on BucketEntry creation.</span>
+<span class="source-line-no">2177</span><span id="line-2177">            return null;</span>
+<span class="source-line-no">2178</span><span id="line-2178">          }</span>
+<span class="source-line-no">2179</span><span id="line-2179"></span>
+<span class="source-line-no">2180</span><span id="line-2180">          @Override</span>
+<span class="source-line-no">2181</span><span id="line-2181">          public long getOffset() {</span>
+<span class="source-line-no">2182</span><span id="line-2182">            return e.getKey().getOffset();</span>
+<span class="source-line-no">2183</span><span id="line-2183">          }</span>
+<span class="source-line-no">2184</span><span id="line-2184"></span>
+<span class="source-line-no">2185</span><span id="line-2185">          @Override</span>
+<span class="source-line-no">2186</span><span id="line-2186">          public long getSize() {</span>
+<span class="source-line-no">2187</span><span id="line-2187">            return e.getValue().getLength();</span>
+<span class="source-line-no">2188</span><span id="line-2188">          }</span>
+<span class="source-line-no">2189</span><span id="line-2189"></span>
+<span class="source-line-no">2190</span><span id="line-2190">          @Override</span>
+<span class="source-line-no">2191</span><span id="line-2191">          public long getCachedTime() {</span>
+<span class="source-line-no">2192</span><span id="line-2192">            return e.getValue().getCachedTime();</span>
+<span class="source-line-no">2193</span><span id="line-2193">          }</span>
+<span class="source-line-no">2194</span><span id="line-2194"></span>
+<span class="source-line-no">2195</span><span id="line-2195">          @Override</span>
+<span class="source-line-no">2196</span><span id="line-2196">          public String getFilename() {</span>
+<span class="source-line-no">2197</span><span id="line-2197">            return e.getKey().getHfileName();</span>
+<span class="source-line-no">2198</span><span id="line-2198">          }</span>
+<span class="source-line-no">2199</span><span id="line-2199"></span>
+<span class="source-line-no">2200</span><span id="line-2200">          @Override</span>
+<span class="source-line-no">2201</span><span id="line-2201">          public int compareTo(CachedBlock other) {</span>
+<span class="source-line-no">2202</span><span id="line-2202">            int diff = this.getFilename().compareTo(other.getFilename());</span>
+<span class="source-line-no">2203</span><span id="line-2203">            if (diff != 0) return diff;</span>
+<span class="source-line-no">2204</span><span id="line-2204"></span>
+<span class="source-line-no">2205</span><span id="line-2205">            diff = Long.compare(this.getOffset(), other.getOffset());</span>
+<span class="source-line-no">2206</span><span id="line-2206">            if (diff != 0) return diff;</span>
+<span class="source-line-no">2207</span><span id="line-2207">            if (other.getCachedTime() &lt; 0 || this.getCachedTime() &lt; 0) {</span>
+<span class="source-line-no">2208</span><span id="line-2208">              throw new IllegalStateException(</span>
+<span class="source-line-no">2209</span><span id="line-2209">                "" + this.getCachedTime() + ", " + other.getCachedTime());</span>
+<span class="source-line-no">2210</span><span id="line-2210">            }</span>
+<span class="source-line-no">2211</span><span id="line-2211">            return Long.compare(other.getCachedTime(), this.getCachedTime());</span>
+<span class="source-line-no">2212</span><span id="line-2212">          }</span>
+<span class="source-line-no">2213</span><span id="line-2213"></span>
+<span class="source-line-no">2214</span><span id="line-2214">          @Override</span>
+<span class="source-line-no">2215</span><span id="line-2215">          public int hashCode() {</span>
+<span class="source-line-no">2216</span><span id="line-2216">            return e.getKey().hashCode();</span>
+<span class="source-line-no">2217</span><span id="line-2217">          }</span>
+<span class="source-line-no">2218</span><span id="line-2218"></span>
+<span class="source-line-no">2219</span><span id="line-2219">          @Override</span>
+<span class="source-line-no">2220</span><span id="line-2220">          public boolean equals(Object obj) {</span>
+<span class="source-line-no">2221</span><span id="line-2221">            if (obj instanceof CachedBlock) {</span>
+<span class="source-line-no">2222</span><span id="line-2222">              CachedBlock cb = (CachedBlock) obj;</span>
+<span class="source-line-no">2223</span><span id="line-2223">              return compareTo(cb) == 0;</span>
+<span class="source-line-no">2224</span><span id="line-2224">            } else {</span>
+<span class="source-line-no">2225</span><span id="line-2225">              return false;</span>
+<span class="source-line-no">2226</span><span id="line-2226">            }</span>
+<span class="source-line-no">2227</span><span id="line-2227">          }</span>
+<span class="source-line-no">2228</span><span id="line-2228">        };</span>
+<span class="source-line-no">2229</span><span id="line-2229">      }</span>
+<span class="source-line-no">2230</span><span id="line-2230"></span>
+<span class="source-line-no">2231</span><span id="line-2231">      @Override</span>
+<span class="source-line-no">2232</span><span id="line-2232">      public void remove() {</span>
+<span class="source-line-no">2233</span><span id="line-2233">        throw new UnsupportedOperationException();</span>
+<span class="source-line-no">2234</span><span id="line-2234">      }</span>
+<span class="source-line-no">2235</span><span id="line-2235">    };</span>
 <span class="source-line-no">2236</span><span id="line-2236">  }</span>
 <span class="source-line-no">2237</span><span id="line-2237"></span>
-<span class="source-line-no">2238</span><span id="line-2238">  float getAcceptableFactor() {</span>
-<span class="source-line-no">2239</span><span id="line-2239">    return acceptableFactor;</span>
-<span class="source-line-no">2240</span><span id="line-2240">  }</span>
-<span class="source-line-no">2241</span><span id="line-2241"></span>
-<span class="source-line-no">2242</span><span id="line-2242">  float getMinFactor() {</span>
-<span class="source-line-no">2243</span><span id="line-2243">    return minFactor;</span>
-<span class="source-line-no">2244</span><span id="line-2244">  }</span>
-<span class="source-line-no">2245</span><span id="line-2245"></span>
-<span class="source-line-no">2246</span><span id="line-2246">  float getExtraFreeFactor() {</span>
-<span class="source-line-no">2247</span><span id="line-2247">    return extraFreeFactor;</span>
-<span class="source-line-no">2248</span><span id="line-2248">  }</span>
-<span class="source-line-no">2249</span><span id="line-2249"></span>
-<span class="source-line-no">2250</span><span id="line-2250">  float getSingleFactor() {</span>
-<span class="source-line-no">2251</span><span id="line-2251">    return singleFactor;</span>
-<span class="source-line-no">2252</span><span id="line-2252">  }</span>
-<span class="source-line-no">2253</span><span id="line-2253"></span>
-<span class="source-line-no">2254</span><span id="line-2254">  float getMultiFactor() {</span>
-<span class="source-line-no">2255</span><span id="line-2255">    return multiFactor;</span>
-<span class="source-line-no">2256</span><span id="line-2256">  }</span>
-<span class="source-line-no">2257</span><span id="line-2257"></span>
-<span class="source-line-no">2258</span><span id="line-2258">  float getMemoryFactor() {</span>
-<span class="source-line-no">2259</span><span id="line-2259">    return memoryFactor;</span>
-<span class="source-line-no">2260</span><span id="line-2260">  }</span>
-<span class="source-line-no">2261</span><span id="line-2261"></span>
-<span class="source-line-no">2262</span><span id="line-2262">  long getQueueAdditionWaitTime() {</span>
-<span class="source-line-no">2263</span><span id="line-2263">    return queueAdditionWaitTime;</span>
-<span class="source-line-no">2264</span><span id="line-2264">  }</span>
-<span class="source-line-no">2265</span><span id="line-2265"></span>
-<span class="source-line-no">2266</span><span id="line-2266">  long getPersistenceChunkSize() {</span>
-<span class="source-line-no">2267</span><span id="line-2267">    return persistenceChunkSize;</span>
-<span class="source-line-no">2268</span><span id="line-2268">  }</span>
-<span class="source-line-no">2269</span><span id="line-2269"></span>
-<span class="source-line-no">2270</span><span id="line-2270">  long getBucketcachePersistInterval() {</span>
-<span class="source-line-no">2271</span><span id="line-2271">    return bucketcachePersistInterval;</span>
-<span class="source-line-no">2272</span><span id="line-2272">  }</span>
-<span class="source-line-no">2273</span><span id="line-2273"></span>
-<span class="source-line-no">2274</span><span id="line-2274">  public String getPersistencePath() {</span>
-<span class="source-line-no">2275</span><span id="line-2275">    return persistencePath;</span>
-<span class="source-line-no">2276</span><span id="line-2276">  }</span>
-<span class="source-line-no">2277</span><span id="line-2277"></span>
-<span class="source-line-no">2278</span><span id="line-2278">  /**</span>
-<span class="source-line-no">2279</span><span id="line-2279">   * Wrapped the delegate ConcurrentMap with maintaining its block's reference count.</span>
-<span class="source-line-no">2280</span><span id="line-2280">   */</span>
-<span class="source-line-no">2281</span><span id="line-2281">  static class RAMCache {</span>
-<span class="source-line-no">2282</span><span id="line-2282">    /**</span>
-<span class="source-line-no">2283</span><span id="line-2283">     * Defined the map as {@link ConcurrentHashMap} explicitly here, because in</span>
-<span class="source-line-no">2284</span><span id="line-2284">     * {@link RAMCache#get(BlockCacheKey)} and</span>
-<span class="source-line-no">2285</span><span id="line-2285">     * {@link RAMCache#putIfAbsent(BlockCacheKey, BucketCache.RAMQueueEntry)} , we need to guarantee</span>
-<span class="source-line-no">2286</span><span id="line-2286">     * the atomicity of map#computeIfPresent(key, func) and map#putIfAbsent(key, func). Besides, the</span>
-<span class="source-line-no">2287</span><span id="line-2287">     * func method can execute exactly once only when the key is present(or absent) and under the</span>
-<span class="source-line-no">2288</span><span id="line-2288">     * lock context. Otherwise, the reference count of block will be messed up. Notice that the</span>
-<span class="source-line-no">2289</span><span id="line-2289">     * {@link java.util.concurrent.ConcurrentSkipListMap} can not guarantee that.</span>
-<span class="source-line-no">2290</span><span id="line-2290">     */</span>
-<span class="source-line-no">2291</span><span id="line-2291">    final ConcurrentHashMap&lt;BlockCacheKey, RAMQueueEntry&gt; delegate = new ConcurrentHashMap&lt;&gt;();</span>
-<span class="source-line-no">2292</span><span id="line-2292"></span>
-<span class="source-line-no">2293</span><span id="line-2293">    public boolean containsKey(BlockCacheKey key) {</span>
-<span class="source-line-no">2294</span><span id="line-2294">      return delegate.containsKey(key);</span>
-<span class="source-line-no">2295</span><span id="line-2295">    }</span>
-<span class="source-line-no">2296</span><span id="line-2296"></span>
-<span class="source-line-no">2297</span><span id="line-2297">    public RAMQueueEntry get(BlockCacheKey key) {</span>
-<span class="source-line-no">2298</span><span id="line-2298">      return delegate.computeIfPresent(key, (k, re) -&gt; {</span>
-<span class="source-line-no">2299</span><span id="line-2299">        // It'll be referenced by RPC, so retain atomically here. if the get and retain is not</span>
-<span class="source-line-no">2300</span><span id="line-2300">        // atomic, another thread may remove and release the block, when retaining in this thread we</span>
-<span class="source-line-no">2301</span><span id="line-2301">        // may retain a block with refCnt=0 which is disallowed. (see HBASE-22422)</span>
-<span class="source-line-no">2302</span><span id="line-2302">        re.getData().retain();</span>
-<span class="source-line-no">2303</span><span id="line-2303">        return re;</span>
-<span class="source-line-no">2304</span><span id="line-2304">      });</span>
-<span class="source-line-no">2305</span><span id="line-2305">    }</span>
-<span class="source-line-no">2306</span><span id="line-2306"></span>
-<span class="source-line-no">2307</span><span id="line-2307">    /**</span>
-<span class="source-line-no">2308</span><span id="line-2308">     * Return the previous associated value, or null if absent. It has the same meaning as</span>
-<span class="source-line-no">2309</span><span id="line-2309">     * {@link ConcurrentMap#putIfAbsent(Object, Object)}</span>
-<span class="source-line-no">2310</span><span id="line-2310">     */</span>
-<span class="source-line-no">2311</span><span id="line-2311">    public RAMQueueEntry putIfAbsent(BlockCacheKey key, RAMQueueEntry entry) {</span>
-<span class="source-line-no">2312</span><span id="line-2312">      AtomicBoolean absent = new AtomicBoolean(false);</span>
-<span class="source-line-no">2313</span><span id="line-2313">      RAMQueueEntry re = delegate.computeIfAbsent(key, k -&gt; {</span>
-<span class="source-line-no">2314</span><span id="line-2314">        // The RAMCache reference to this entry, so reference count should be increment.</span>
-<span class="source-line-no">2315</span><span id="line-2315">        entry.getData().retain();</span>
-<span class="source-line-no">2316</span><span id="line-2316">        absent.set(true);</span>
-<span class="source-line-no">2317</span><span id="line-2317">        return entry;</span>
-<span class="source-line-no">2318</span><span id="line-2318">      });</span>
-<span class="source-line-no">2319</span><span id="line-2319">      return absent.get() ? null : re;</span>
-<span class="source-line-no">2320</span><span id="line-2320">    }</span>
-<span class="source-line-no">2321</span><span id="line-2321"></span>
-<span class="source-line-no">2322</span><span id="line-2322">    public boolean remove(BlockCacheKey key) {</span>
-<span class="source-line-no">2323</span><span id="line-2323">      return remove(key, re -&gt; {</span>
-<span class="source-line-no">2324</span><span id="line-2324">      });</span>
-<span class="source-line-no">2325</span><span id="line-2325">    }</span>
-<span class="source-line-no">2326</span><span id="line-2326"></span>
-<span class="source-line-no">2327</span><span id="line-2327">    /**</span>
-<span class="source-line-no">2328</span><span id="line-2328">     * Defined an {@link Consumer} here, because once the removed entry release its reference count,</span>
-<span class="source-line-no">2329</span><span id="line-2329">     * then it's ByteBuffers may be recycled and accessing it outside this method will be thrown an</span>
-<span class="source-line-no">2330</span><span id="line-2330">     * exception. the consumer will access entry to remove before release its reference count.</span>
-<span class="source-line-no">2331</span><span id="line-2331">     * Notice, don't change its reference count in the {@link Consumer}</span>
-<span class="source-line-no">2332</span><span id="line-2332">     */</span>
-<span class="source-line-no">2333</span><span id="line-2333">    public boolean remove(BlockCacheKey key, Consumer&lt;RAMQueueEntry&gt; action) {</span>
-<span class="source-line-no">2334</span><span id="line-2334">      RAMQueueEntry previous = delegate.remove(key);</span>
-<span class="source-line-no">2335</span><span id="line-2335">      action.accept(previous);</span>
-<span class="source-line-no">2336</span><span id="line-2336">      if (previous != null) {</span>
-<span class="source-line-no">2337</span><span id="line-2337">        previous.getData().release();</span>
-<span class="source-line-no">2338</span><span id="line-2338">      }</span>
-<span class="source-line-no">2339</span><span id="line-2339">      return previous != null;</span>
-<span class="source-line-no">2340</span><span id="line-2340">    }</span>
-<span class="source-line-no">2341</span><span id="line-2341"></span>
-<span class="source-line-no">2342</span><span id="line-2342">    public boolean isEmpty() {</span>
-<span class="source-line-no">2343</span><span id="line-2343">      return delegate.isEmpty();</span>
-<span class="source-line-no">2344</span><span id="line-2344">    }</span>
-<span class="source-line-no">2345</span><span id="line-2345"></span>
-<span class="source-line-no">2346</span><span id="line-2346">    public void clear() {</span>
-<span class="source-line-no">2347</span><span id="line-2347">      Iterator&lt;Map.Entry&lt;BlockCacheKey, RAMQueueEntry&gt;&gt; it = delegate.entrySet().iterator();</span>
-<span class="source-line-no">2348</span><span id="line-2348">      while (it.hasNext()) {</span>
-<span class="source-line-no">2349</span><span id="line-2349">        RAMQueueEntry re = it.next().getValue();</span>
-<span class="source-line-no">2350</span><span id="line-2350">        it.remove();</span>
-<span class="source-line-no">2351</span><span id="line-2351">        re.getData().release();</span>
-<span class="source-line-no">2352</span><span id="line-2352">      }</span>
+<span class="source-line-no">2238</span><span id="line-2238">  @Override</span>
+<span class="source-line-no">2239</span><span id="line-2239">  public BlockCache[] getBlockCaches() {</span>
+<span class="source-line-no">2240</span><span id="line-2240">    return null;</span>
+<span class="source-line-no">2241</span><span id="line-2241">  }</span>
+<span class="source-line-no">2242</span><span id="line-2242"></span>
+<span class="source-line-no">2243</span><span id="line-2243">  public int getRpcRefCount(BlockCacheKey cacheKey) {</span>
+<span class="source-line-no">2244</span><span id="line-2244">    BucketEntry bucketEntry = backingMap.get(cacheKey);</span>
+<span class="source-line-no">2245</span><span id="line-2245">    if (bucketEntry != null) {</span>
+<span class="source-line-no">2246</span><span id="line-2246">      return bucketEntry.refCnt() - (bucketEntry.markedAsEvicted.get() ? 0 : 1);</span>
+<span class="source-line-no">2247</span><span id="line-2247">    }</span>
+<span class="source-line-no">2248</span><span id="line-2248">    return 0;</span>
+<span class="source-line-no">2249</span><span id="line-2249">  }</span>
+<span class="source-line-no">2250</span><span id="line-2250"></span>
+<span class="source-line-no">2251</span><span id="line-2251">  float getAcceptableFactor() {</span>
+<span class="source-line-no">2252</span><span id="line-2252">    return acceptableFactor;</span>
+<span class="source-line-no">2253</span><span id="line-2253">  }</span>
+<span class="source-line-no">2254</span><span id="line-2254"></span>
+<span class="source-line-no">2255</span><span id="line-2255">  float getMinFactor() {</span>
+<span class="source-line-no">2256</span><span id="line-2256">    return minFactor;</span>
+<span class="source-line-no">2257</span><span id="line-2257">  }</span>
+<span class="source-line-no">2258</span><span id="line-2258"></span>
+<span class="source-line-no">2259</span><span id="line-2259">  float getExtraFreeFactor() {</span>
+<span class="source-line-no">2260</span><span id="line-2260">    return extraFreeFactor;</span>
+<span class="source-line-no">2261</span><span id="line-2261">  }</span>
+<span class="source-line-no">2262</span><span id="line-2262"></span>
+<span class="source-line-no">2263</span><span id="line-2263">  float getSingleFactor() {</span>
+<span class="source-line-no">2264</span><span id="line-2264">    return singleFactor;</span>
+<span class="source-line-no">2265</span><span id="line-2265">  }</span>
+<span class="source-line-no">2266</span><span id="line-2266"></span>
+<span class="source-line-no">2267</span><span id="line-2267">  float getMultiFactor() {</span>
+<span class="source-line-no">2268</span><span id="line-2268">    return multiFactor;</span>
+<span class="source-line-no">2269</span><span id="line-2269">  }</span>
+<span class="source-line-no">2270</span><span id="line-2270"></span>
+<span class="source-line-no">2271</span><span id="line-2271">  float getMemoryFactor() {</span>
+<span class="source-line-no">2272</span><span id="line-2272">    return memoryFactor;</span>
+<span class="source-line-no">2273</span><span id="line-2273">  }</span>
+<span class="source-line-no">2274</span><span id="line-2274"></span>
+<span class="source-line-no">2275</span><span id="line-2275">  long getQueueAdditionWaitTime() {</span>
+<span class="source-line-no">2276</span><span id="line-2276">    return queueAdditionWaitTime;</span>
+<span class="source-line-no">2277</span><span id="line-2277">  }</span>
+<span class="source-line-no">2278</span><span id="line-2278"></span>
+<span class="source-line-no">2279</span><span id="line-2279">  long getPersistenceChunkSize() {</span>
+<span class="source-line-no">2280</span><span id="line-2280">    return persistenceChunkSize;</span>
+<span class="source-line-no">2281</span><span id="line-2281">  }</span>
+<span class="source-line-no">2282</span><span id="line-2282"></span>
+<span class="source-line-no">2283</span><span id="line-2283">  long getBucketcachePersistInterval() {</span>
+<span class="source-line-no">2284</span><span id="line-2284">    return bucketcachePersistInterval;</span>
+<span class="source-line-no">2285</span><span id="line-2285">  }</span>
+<span class="source-line-no">2286</span><span id="line-2286"></span>
+<span class="source-line-no">2287</span><span id="line-2287">  public String getPersistencePath() {</span>
+<span class="source-line-no">2288</span><span id="line-2288">    return persistencePath;</span>
+<span class="source-line-no">2289</span><span id="line-2289">  }</span>
+<span class="source-line-no">2290</span><span id="line-2290"></span>
+<span class="source-line-no">2291</span><span id="line-2291">  /**</span>
+<span class="source-line-no">2292</span><span id="line-2292">   * Wrapped the delegate ConcurrentMap with maintaining its block's reference count.</span>
+<span class="source-line-no">2293</span><span id="line-2293">   */</span>
+<span class="source-line-no">2294</span><span id="line-2294">  static class RAMCache {</span>
+<span class="source-line-no">2295</span><span id="line-2295">    /**</span>
+<span class="source-line-no">2296</span><span id="line-2296">     * Defined the map as {@link ConcurrentHashMap} explicitly here, because in</span>
+<span class="source-line-no">2297</span><span id="line-2297">     * {@link RAMCache#get(BlockCacheKey)} and</span>
+<span class="source-line-no">2298</span><span id="line-2298">     * {@link RAMCache#putIfAbsent(BlockCacheKey, BucketCache.RAMQueueEntry)} , we need to guarantee</span>
+<span class="source-line-no">2299</span><span id="line-2299">     * the atomicity of map#computeIfPresent(key, func) and map#putIfAbsent(key, func). Besides, the</span>
+<span class="source-line-no">2300</span><span id="line-2300">     * func method can execute exactly once only when the key is present(or absent) and under the</span>
+<span class="source-line-no">2301</span><span id="line-2301">     * lock context. Otherwise, the reference count of block will be messed up. Notice that the</span>
+<span class="source-line-no">2302</span><span id="line-2302">     * {@link java.util.concurrent.ConcurrentSkipListMap} can not guarantee that.</span>
+<span class="source-line-no">2303</span><span id="line-2303">     */</span>
+<span class="source-line-no">2304</span><span id="line-2304">    final ConcurrentHashMap&lt;BlockCacheKey, RAMQueueEntry&gt; delegate = new ConcurrentHashMap&lt;&gt;();</span>
+<span class="source-line-no">2305</span><span id="line-2305"></span>
+<span class="source-line-no">2306</span><span id="line-2306">    public boolean containsKey(BlockCacheKey key) {</span>
+<span class="source-line-no">2307</span><span id="line-2307">      return delegate.containsKey(key);</span>
+<span class="source-line-no">2308</span><span id="line-2308">    }</span>
+<span class="source-line-no">2309</span><span id="line-2309"></span>
+<span class="source-line-no">2310</span><span id="line-2310">    public RAMQueueEntry get(BlockCacheKey key) {</span>
+<span class="source-line-no">2311</span><span id="line-2311">      return delegate.computeIfPresent(key, (k, re) -&gt; {</span>
+<span class="source-line-no">2312</span><span id="line-2312">        // It'll be referenced by RPC, so retain atomically here. if the get and retain is not</span>
+<span class="source-line-no">2313</span><span id="line-2313">        // atomic, another thread may remove and release the block, when retaining in this thread we</span>
+<span class="source-line-no">2314</span><span id="line-2314">        // may retain a block with refCnt=0 which is disallowed. (see HBASE-22422)</span>
+<span class="source-line-no">2315</span><span id="line-2315">        re.getData().retain();</span>
+<span class="source-line-no">2316</span><span id="line-2316">        return re;</span>
+<span class="source-line-no">2317</span><span id="line-2317">      });</span>
+<span class="source-line-no">2318</span><span id="line-2318">    }</span>
+<span class="source-line-no">2319</span><span id="line-2319"></span>
+<span class="source-line-no">2320</span><span id="line-2320">    /**</span>
+<span class="source-line-no">2321</span><span id="line-2321">     * Return the previous associated value, or null if absent. It has the same meaning as</span>
+<span class="source-line-no">2322</span><span id="line-2322">     * {@link ConcurrentMap#putIfAbsent(Object, Object)}</span>
+<span class="source-line-no">2323</span><span id="line-2323">     */</span>
+<span class="source-line-no">2324</span><span id="line-2324">    public RAMQueueEntry putIfAbsent(BlockCacheKey key, RAMQueueEntry entry) {</span>
+<span class="source-line-no">2325</span><span id="line-2325">      AtomicBoolean absent = new AtomicBoolean(false);</span>
+<span class="source-line-no">2326</span><span id="line-2326">      RAMQueueEntry re = delegate.computeIfAbsent(key, k -&gt; {</span>
+<span class="source-line-no">2327</span><span id="line-2327">        // The RAMCache reference to this entry, so reference count should be increment.</span>
+<span class="source-line-no">2328</span><span id="line-2328">        entry.getData().retain();</span>
+<span class="source-line-no">2329</span><span id="line-2329">        absent.set(true);</span>
+<span class="source-line-no">2330</span><span id="line-2330">        return entry;</span>
+<span class="source-line-no">2331</span><span id="line-2331">      });</span>
+<span class="source-line-no">2332</span><span id="line-2332">      return absent.get() ? null : re;</span>
+<span class="source-line-no">2333</span><span id="line-2333">    }</span>
+<span class="source-line-no">2334</span><span id="line-2334"></span>
+<span class="source-line-no">2335</span><span id="line-2335">    public boolean remove(BlockCacheKey key) {</span>
+<span class="source-line-no">2336</span><span id="line-2336">      return remove(key, re -&gt; {</span>
+<span class="source-line-no">2337</span><span id="line-2337">      });</span>
+<span class="source-line-no">2338</span><span id="line-2338">    }</span>
+<span class="source-line-no">2339</span><span id="line-2339"></span>
+<span class="source-line-no">2340</span><span id="line-2340">    /**</span>
+<span class="source-line-no">2341</span><span id="line-2341">     * Defined an {@link Consumer} here, because once the removed entry release its reference count,</span>
+<span class="source-line-no">2342</span><span id="line-2342">     * then it's ByteBuffers may be recycled and accessing it outside this method will be thrown an</span>
+<span class="source-line-no">2343</span><span id="line-2343">     * exception. the consumer will access entry to remove before release its reference count.</span>
+<span class="source-line-no">2344</span><span id="line-2344">     * Notice, don't change its reference count in the {@link Consumer}</span>
+<span class="source-line-no">2345</span><span id="line-2345">     */</span>
+<span class="source-line-no">2346</span><span id="line-2346">    public boolean remove(BlockCacheKey key, Consumer&lt;RAMQueueEntry&gt; action) {</span>
+<span class="source-line-no">2347</span><span id="line-2347">      RAMQueueEntry previous = delegate.remove(key);</span>
+<span class="source-line-no">2348</span><span id="line-2348">      action.accept(previous);</span>
+<span class="source-line-no">2349</span><span id="line-2349">      if (previous != null) {</span>
+<span class="source-line-no">2350</span><span id="line-2350">        previous.getData().release();</span>
+<span class="source-line-no">2351</span><span id="line-2351">      }</span>
+<span class="source-line-no">2352</span><span id="line-2352">      return previous != null;</span>
 <span class="source-line-no">2353</span><span id="line-2353">    }</span>
 <span class="source-line-no">2354</span><span id="line-2354"></span>
-<span class="source-line-no">2355</span><span id="line-2355">    public boolean hasBlocksForFile(String fileName) {</span>
-<span class="source-line-no">2356</span><span id="line-2356">      return delegate.keySet().stream().filter(key -&gt; key.getHfileName().equals(fileName))</span>
-<span class="source-line-no">2357</span><span id="line-2357">        .findFirst().isPresent();</span>
-<span class="source-line-no">2358</span><span id="line-2358">    }</span>
-<span class="source-line-no">2359</span><span id="line-2359">  }</span>
-<span class="source-line-no">2360</span><span id="line-2360"></span>
-<span class="source-line-no">2361</span><span id="line-2361">  public Map&lt;BlockCacheKey, BucketEntry&gt; getBackingMap() {</span>
-<span class="source-line-no">2362</span><span id="line-2362">    return backingMap;</span>
-<span class="source-line-no">2363</span><span id="line-2363">  }</span>
-<span class="source-line-no">2364</span><span id="line-2364"></span>
-<span class="source-line-no">2365</span><span id="line-2365">  public AtomicBoolean getBackingMapValidated() {</span>
-<span class="source-line-no">2366</span><span id="line-2366">    return backingMapValidated;</span>
-<span class="source-line-no">2367</span><span id="line-2367">  }</span>
-<span class="source-line-no">2368</span><span id="line-2368"></span>
-<span class="source-line-no">2369</span><span id="line-2369">  @Override</span>
-<span class="source-line-no">2370</span><span id="line-2370">  public Optional&lt;Map&lt;String, Pair&lt;String, Long&gt;&gt;&gt; getFullyCachedFiles() {</span>
-<span class="source-line-no">2371</span><span id="line-2371">    return Optional.of(fullyCachedFiles);</span>
-<span class="source-line-no">2372</span><span id="line-2372">  }</span>
-<span class="source-line-no">2373</span><span id="line-2373"></span>
-<span class="source-line-no">2374</span><span id="line-2374">  public static Optional&lt;BucketCache&gt; getBucketCacheFromCacheConfig(CacheConfig cacheConf) {</span>
-<span class="source-line-no">2375</span><span id="line-2375">    if (cacheConf.getBlockCache().isPresent()) {</span>
-<span class="source-line-no">2376</span><span id="line-2376">      BlockCache bc = cacheConf.getBlockCache().get();</span>
-<span class="source-line-no">2377</span><span id="line-2377">      if (bc instanceof CombinedBlockCache) {</span>
-<span class="source-line-no">2378</span><span id="line-2378">        BlockCache l2 = ((CombinedBlockCache) bc).getSecondLevelCache();</span>
-<span class="source-line-no">2379</span><span id="line-2379">        if (l2 instanceof BucketCache) {</span>
-<span class="source-line-no">2380</span><span id="line-2380">          return Optional.of((BucketCache) l2);</span>
-<span class="source-line-no">2381</span><span id="line-2381">        }</span>
-<span class="source-line-no">2382</span><span id="line-2382">      } else if (bc instanceof BucketCache) {</span>
-<span class="source-line-no">2383</span><span id="line-2383">        return Optional.of((BucketCache) bc);</span>
-<span class="source-line-no">2384</span><span id="line-2384">      }</span>
-<span class="source-line-no">2385</span><span id="line-2385">    }</span>
-<span class="source-line-no">2386</span><span id="line-2386">    return Optional.empty();</span>
-<span class="source-line-no">2387</span><span id="line-2387">  }</span>
-<span class="source-line-no">2388</span><span id="line-2388"></span>
-<span class="source-line-no">2389</span><span id="line-2389">  @Override</span>
-<span class="source-line-no">2390</span><span id="line-2390">  public void notifyFileCachingCompleted(Path fileName, int totalBlockCount, int dataBlockCount,</span>
-<span class="source-line-no">2391</span><span id="line-2391">    long size) {</span>
-<span class="source-line-no">2392</span><span id="line-2392">    // block eviction may be happening in the background as prefetch runs,</span>
-<span class="source-line-no">2393</span><span id="line-2393">    // so we need to count all blocks for this file in the backing map under</span>
-<span class="source-line-no">2394</span><span id="line-2394">    // a read lock for the block offset</span>
-<span class="source-line-no">2395</span><span id="line-2395">    final List&lt;ReentrantReadWriteLock&gt; locks = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">2396</span><span id="line-2396">    LOG.debug("Notifying caching completed for file {}, with total blocks {}, and data blocks {}",</span>
-<span class="source-line-no">2397</span><span id="line-2397">      fileName, totalBlockCount, dataBlockCount);</span>
-<span class="source-line-no">2398</span><span id="line-2398">    try {</span>
-<span class="source-line-no">2399</span><span id="line-2399">      int count = 0;</span>
-<span class="source-line-no">2400</span><span id="line-2400">      LOG.debug("iterating over {} entries in the backing map", backingMap.size());</span>
-<span class="source-line-no">2401</span><span id="line-2401">      Set&lt;BlockCacheKey&gt; result = getAllCacheKeysForFile(fileName.getName(), 0, Long.MAX_VALUE);</span>
-<span class="source-line-no">2402</span><span id="line-2402">      if (result.isEmpty() &amp;&amp; StoreFileInfo.isReference(fileName)) {</span>
-<span class="source-line-no">2403</span><span id="line-2403">        result = getAllCacheKeysForFile(</span>
-<span class="source-line-no">2404</span><span id="line-2404">          StoreFileInfo.getReferredToRegionAndFile(fileName.getName()).getSecond(), 0,</span>
-<span class="source-line-no">2405</span><span id="line-2405">          Long.MAX_VALUE);</span>
-<span class="source-line-no">2406</span><span id="line-2406">      }</span>
-<span class="source-line-no">2407</span><span id="line-2407">      for (BlockCacheKey entry : result) {</span>
-<span class="source-line-no">2408</span><span id="line-2408">        LOG.debug("found block for file {} in the backing map. Acquiring read lock for offset {}",</span>
-<span class="source-line-no">2409</span><span id="line-2409">          fileName.getName(), entry.getOffset());</span>
-<span class="source-line-no">2410</span><span id="line-2410">        ReentrantReadWriteLock lock = offsetLock.getLock(entry.getOffset());</span>
-<span class="source-line-no">2411</span><span id="line-2411">        lock.readLock().lock();</span>
-<span class="source-line-no">2412</span><span id="line-2412">        locks.add(lock);</span>
-<span class="source-line-no">2413</span><span id="line-2413">        if (backingMap.containsKey(entry) &amp;&amp; entry.getBlockType().isData()) {</span>
-<span class="source-line-no">2414</span><span id="line-2414">          count++;</span>
-<span class="source-line-no">2415</span><span id="line-2415">        }</span>
-<span class="source-line-no">2416</span><span id="line-2416">      }</span>
-<span class="source-line-no">2417</span><span id="line-2417">      // BucketCache would only have data blocks</span>
-<span class="source-line-no">2418</span><span id="line-2418">      if (dataBlockCount == count) {</span>
-<span class="source-line-no">2419</span><span id="line-2419">        LOG.debug("File {} has now been fully cached.", fileName);</span>
-<span class="source-line-no">2420</span><span id="line-2420">        fileCacheCompleted(fileName, size);</span>
-<span class="source-line-no">2421</span><span id="line-2421">      } else {</span>
-<span class="source-line-no">2422</span><span id="line-2422">        LOG.debug(</span>
-<span class="source-line-no">2423</span><span id="line-2423">          "Prefetch executor completed for {}, but only {} data blocks were cached. "</span>
-<span class="source-line-no">2424</span><span id="line-2424">            + "Total data blocks for file: {}. "</span>
-<span class="source-line-no">2425</span><span id="line-2425">            + "Checking for blocks pending cache in cache writer queue.",</span>
-<span class="source-line-no">2426</span><span id="line-2426">          fileName, count, dataBlockCount);</span>
-<span class="source-line-no">2427</span><span id="line-2427">        if (ramCache.hasBlocksForFile(fileName.getName())) {</span>
-<span class="source-line-no">2428</span><span id="line-2428">          for (ReentrantReadWriteLock lock : locks) {</span>
-<span class="source-line-no">2429</span><span id="line-2429">            lock.readLock().unlock();</span>
-<span class="source-line-no">2430</span><span id="line-2430">          }</span>
-<span class="source-line-no">2431</span><span id="line-2431">          locks.clear();</span>
-<span class="source-line-no">2432</span><span id="line-2432">          LOG.debug("There are still blocks pending caching for file {}. Will sleep 100ms "</span>
-<span class="source-line-no">2433</span><span id="line-2433">            + "and try the verification again.", fileName);</span>
-<span class="source-line-no">2434</span><span id="line-2434">          Thread.sleep(100);</span>
-<span class="source-line-no">2435</span><span id="line-2435">          notifyFileCachingCompleted(fileName, totalBlockCount, dataBlockCount, size);</span>
-<span class="source-line-no">2436</span><span id="line-2436">        } else {</span>
-<span class="source-line-no">2437</span><span id="line-2437">          LOG.info(</span>
-<span class="source-line-no">2438</span><span id="line-2438">            "The total block count was {}. We found only {} data blocks cached from "</span>
-<span class="source-line-no">2439</span><span id="line-2439">              + "a total of {} data blocks for file {}, "</span>
-<span class="source-line-no">2440</span><span id="line-2440">              + "but no blocks pending caching. Maybe cache is full or evictions "</span>
-<span class="source-line-no">2441</span><span id="line-2441">              + "happened concurrently to cache prefetch.",</span>
-<span class="source-line-no">2442</span><span id="line-2442">            totalBlockCount, count, dataBlockCount, fileName);</span>
-<span class="source-line-no">2443</span><span id="line-2443">        }</span>
-<span class="source-line-no">2444</span><span id="line-2444">      }</span>
-<span class="source-line-no">2445</span><span id="line-2445">    } catch (InterruptedException e) {</span>
-<span class="source-line-no">2446</span><span id="line-2446">      throw new RuntimeException(e);</span>
-<span class="source-line-no">2447</span><span id="line-2447">    } finally {</span>
-<span class="source-line-no">2448</span><span id="line-2448">      for (ReentrantReadWriteLock lock : locks) {</span>
-<span class="source-line-no">2449</span><span id="line-2449">        lock.readLock().unlock();</span>
-<span class="source-line-no">2450</span><span id="line-2450">      }</span>
-<span class="source-line-no">2451</span><span id="line-2451">    }</span>
-<span class="source-line-no">2452</span><span id="line-2452">  }</span>
-<span class="source-line-no">2453</span><span id="line-2453"></span>
-<span class="source-line-no">2454</span><span id="line-2454">  @Override</span>
-<span class="source-line-no">2455</span><span id="line-2455">  public Optional&lt;Boolean&gt; blockFitsIntoTheCache(HFileBlock block) {</span>
-<span class="source-line-no">2456</span><span id="line-2456">    if (!isCacheInitialized("blockFitsIntoTheCache")) {</span>
-<span class="source-line-no">2457</span><span id="line-2457">      return Optional.of(false);</span>
-<span class="source-line-no">2458</span><span id="line-2458">    }</span>
-<span class="source-line-no">2459</span><span id="line-2459"></span>
-<span class="source-line-no">2460</span><span id="line-2460">    long currentUsed = bucketAllocator.getUsedSize();</span>
-<span class="source-line-no">2461</span><span id="line-2461">    boolean result = (currentUsed + block.getOnDiskSizeWithHeader()) &lt; acceptableSize();</span>
-<span class="source-line-no">2462</span><span id="line-2462">    return Optional.of(result);</span>
-<span class="source-line-no">2463</span><span id="line-2463">  }</span>
-<span class="source-line-no">2464</span><span id="line-2464"></span>
-<span class="source-line-no">2465</span><span id="line-2465">  @Override</span>
-<span class="source-line-no">2466</span><span id="line-2466">  public Optional&lt;Boolean&gt; shouldCacheFile(HFileInfo hFileInfo, Configuration conf) {</span>
-<span class="source-line-no">2467</span><span id="line-2467">    String fileName = hFileInfo.getHFileContext().getHFileName();</span>
-<span class="source-line-no">2468</span><span id="line-2468">    DataTieringManager dataTieringManager = DataTieringManager.getInstance();</span>
-<span class="source-line-no">2469</span><span id="line-2469">    if (dataTieringManager != null &amp;&amp; !dataTieringManager.isHotData(hFileInfo, conf)) {</span>
-<span class="source-line-no">2470</span><span id="line-2470">      LOG.debug("Data tiering is enabled for file: '{}' and it is not hot data", fileName);</span>
-<span class="source-line-no">2471</span><span id="line-2471">      return Optional.of(false);</span>
-<span class="source-line-no">2472</span><span id="line-2472">    }</span>
-<span class="source-line-no">2473</span><span id="line-2473">    // if we don't have the file in fullyCachedFiles, we should cache it</span>
-<span class="source-line-no">2474</span><span id="line-2474">    return Optional.of(!fullyCachedFiles.containsKey(fileName));</span>
+<span class="source-line-no">2355</span><span id="line-2355">    public boolean isEmpty() {</span>
+<span class="source-line-no">2356</span><span id="line-2356">      return delegate.isEmpty();</span>
+<span class="source-line-no">2357</span><span id="line-2357">    }</span>
+<span class="source-line-no">2358</span><span id="line-2358"></span>
+<span class="source-line-no">2359</span><span id="line-2359">    public void clear() {</span>
+<span class="source-line-no">2360</span><span id="line-2360">      Iterator&lt;Map.Entry&lt;BlockCacheKey, RAMQueueEntry&gt;&gt; it = delegate.entrySet().iterator();</span>
+<span class="source-line-no">2361</span><span id="line-2361">      while (it.hasNext()) {</span>
+<span class="source-line-no">2362</span><span id="line-2362">        RAMQueueEntry re = it.next().getValue();</span>
+<span class="source-line-no">2363</span><span id="line-2363">        it.remove();</span>
+<span class="source-line-no">2364</span><span id="line-2364">        re.getData().release();</span>
+<span class="source-line-no">2365</span><span id="line-2365">      }</span>
+<span class="source-line-no">2366</span><span id="line-2366">    }</span>
+<span class="source-line-no">2367</span><span id="line-2367"></span>
+<span class="source-line-no">2368</span><span id="line-2368">    public boolean hasBlocksForFile(String fileName) {</span>
+<span class="source-line-no">2369</span><span id="line-2369">      return delegate.keySet().stream().filter(key -&gt; key.getHfileName().equals(fileName))</span>
+<span class="source-line-no">2370</span><span id="line-2370">        .findFirst().isPresent();</span>
+<span class="source-line-no">2371</span><span id="line-2371">    }</span>
+<span class="source-line-no">2372</span><span id="line-2372"></span>
+<span class="source-line-no">2373</span><span id="line-2373">    public Set&lt;BlockCacheKey&gt; getRamBlockCacheKeysForHFile(String fileName) {</span>
+<span class="source-line-no">2374</span><span id="line-2374">      Set&lt;BlockCacheKey&gt; ramCacheKeySet = new HashSet&lt;&gt;();</span>
+<span class="source-line-no">2375</span><span id="line-2375">      for (BlockCacheKey blockCacheKey : delegate.keySet()) {</span>
+<span class="source-line-no">2376</span><span id="line-2376">        if (blockCacheKey.getHfileName().equals(fileName)) {</span>
+<span class="source-line-no">2377</span><span id="line-2377">          ramCacheKeySet.add(blockCacheKey);</span>
+<span class="source-line-no">2378</span><span id="line-2378">        }</span>
+<span class="source-line-no">2379</span><span id="line-2379">      }</span>
+<span class="source-line-no">2380</span><span id="line-2380">      return ramCacheKeySet;</span>
+<span class="source-line-no">2381</span><span id="line-2381">    }</span>
+<span class="source-line-no">2382</span><span id="line-2382">  }</span>
+<span class="source-line-no">2383</span><span id="line-2383"></span>
+<span class="source-line-no">2384</span><span id="line-2384">  public Map&lt;BlockCacheKey, BucketEntry&gt; getBackingMap() {</span>
+<span class="source-line-no">2385</span><span id="line-2385">    return backingMap;</span>
+<span class="source-line-no">2386</span><span id="line-2386">  }</span>
+<span class="source-line-no">2387</span><span id="line-2387"></span>
+<span class="source-line-no">2388</span><span id="line-2388">  public AtomicBoolean getBackingMapValidated() {</span>
+<span class="source-line-no">2389</span><span id="line-2389">    return backingMapValidated;</span>
+<span class="source-line-no">2390</span><span id="line-2390">  }</span>
+<span class="source-line-no">2391</span><span id="line-2391"></span>
+<span class="source-line-no">2392</span><span id="line-2392">  @Override</span>
+<span class="source-line-no">2393</span><span id="line-2393">  public Optional&lt;Map&lt;String, Pair&lt;String, Long&gt;&gt;&gt; getFullyCachedFiles() {</span>
+<span class="source-line-no">2394</span><span id="line-2394">    return Optional.of(fullyCachedFiles);</span>
+<span class="source-line-no">2395</span><span id="line-2395">  }</span>
+<span class="source-line-no">2396</span><span id="line-2396"></span>
+<span class="source-line-no">2397</span><span id="line-2397">  public static Optional&lt;BucketCache&gt; getBucketCacheFromCacheConfig(CacheConfig cacheConf) {</span>
+<span class="source-line-no">2398</span><span id="line-2398">    if (cacheConf.getBlockCache().isPresent()) {</span>
+<span class="source-line-no">2399</span><span id="line-2399">      BlockCache bc = cacheConf.getBlockCache().get();</span>
+<span class="source-line-no">2400</span><span id="line-2400">      if (bc instanceof CombinedBlockCache) {</span>
+<span class="source-line-no">2401</span><span id="line-2401">        BlockCache l2 = ((CombinedBlockCache) bc).getSecondLevelCache();</span>
+<span class="source-line-no">2402</span><span id="line-2402">        if (l2 instanceof BucketCache) {</span>
+<span class="source-line-no">2403</span><span id="line-2403">          return Optional.of((BucketCache) l2);</span>
+<span class="source-line-no">2404</span><span id="line-2404">        }</span>
+<span class="source-line-no">2405</span><span id="line-2405">      } else if (bc instanceof BucketCache) {</span>
+<span class="source-line-no">2406</span><span id="line-2406">        return Optional.of((BucketCache) bc);</span>
+<span class="source-line-no">2407</span><span id="line-2407">      }</span>
+<span class="source-line-no">2408</span><span id="line-2408">    }</span>
+<span class="source-line-no">2409</span><span id="line-2409">    return Optional.empty();</span>
+<span class="source-line-no">2410</span><span id="line-2410">  }</span>
+<span class="source-line-no">2411</span><span id="line-2411"></span>
+<span class="source-line-no">2412</span><span id="line-2412">  @Override</span>
+<span class="source-line-no">2413</span><span id="line-2413">  public void notifyFileCachingCompleted(Path fileName, int totalBlockCount, int dataBlockCount,</span>
+<span class="source-line-no">2414</span><span id="line-2414">    long size) {</span>
+<span class="source-line-no">2415</span><span id="line-2415">    // block eviction may be happening in the background as prefetch runs,</span>
+<span class="source-line-no">2416</span><span id="line-2416">    // so we need to count all blocks for this file in the backing map under</span>
+<span class="source-line-no">2417</span><span id="line-2417">    // a read lock for the block offset</span>
+<span class="source-line-no">2418</span><span id="line-2418">    final List&lt;ReentrantReadWriteLock&gt; locks = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">2419</span><span id="line-2419">    LOG.debug("Notifying caching completed for file {}, with total blocks {}, and data blocks {}",</span>
+<span class="source-line-no">2420</span><span id="line-2420">      fileName, totalBlockCount, dataBlockCount);</span>
+<span class="source-line-no">2421</span><span id="line-2421">    try {</span>
+<span class="source-line-no">2422</span><span id="line-2422">      int count = 0;</span>
+<span class="source-line-no">2423</span><span id="line-2423">      LOG.debug("iterating over {} entries in the backing map", backingMap.size());</span>
+<span class="source-line-no">2424</span><span id="line-2424">      Set&lt;BlockCacheKey&gt; result = getAllCacheKeysForFile(fileName.getName(), 0, Long.MAX_VALUE);</span>
+<span class="source-line-no">2425</span><span id="line-2425">      if (result.isEmpty() &amp;&amp; StoreFileInfo.isReference(fileName)) {</span>
+<span class="source-line-no">2426</span><span id="line-2426">        result = getAllCacheKeysForFile(</span>
+<span class="source-line-no">2427</span><span id="line-2427">          StoreFileInfo.getReferredToRegionAndFile(fileName.getName()).getSecond(), 0,</span>
+<span class="source-line-no">2428</span><span id="line-2428">          Long.MAX_VALUE);</span>
+<span class="source-line-no">2429</span><span id="line-2429">      }</span>
+<span class="source-line-no">2430</span><span id="line-2430">      for (BlockCacheKey entry : result) {</span>
+<span class="source-line-no">2431</span><span id="line-2431">        LOG.debug("found block for file {} in the backing map. Acquiring read lock for offset {}",</span>
+<span class="source-line-no">2432</span><span id="line-2432">          fileName.getName(), entry.getOffset());</span>
+<span class="source-line-no">2433</span><span id="line-2433">        ReentrantReadWriteLock lock = offsetLock.getLock(entry.getOffset());</span>
+<span class="source-line-no">2434</span><span id="line-2434">        lock.readLock().lock();</span>
+<span class="source-line-no">2435</span><span id="line-2435">        locks.add(lock);</span>
+<span class="source-line-no">2436</span><span id="line-2436">        if (backingMap.containsKey(entry) &amp;&amp; entry.getBlockType().isData()) {</span>
+<span class="source-line-no">2437</span><span id="line-2437">          count++;</span>
+<span class="source-line-no">2438</span><span id="line-2438">        }</span>
+<span class="source-line-no">2439</span><span id="line-2439">      }</span>
+<span class="source-line-no">2440</span><span id="line-2440">      // BucketCache would only have data blocks</span>
+<span class="source-line-no">2441</span><span id="line-2441">      if (dataBlockCount == count) {</span>
+<span class="source-line-no">2442</span><span id="line-2442">        LOG.debug("File {} has now been fully cached.", fileName);</span>
+<span class="source-line-no">2443</span><span id="line-2443">        fileCacheCompleted(fileName, size);</span>
+<span class="source-line-no">2444</span><span id="line-2444">      } else {</span>
+<span class="source-line-no">2445</span><span id="line-2445">        LOG.debug(</span>
+<span class="source-line-no">2446</span><span id="line-2446">          "Prefetch executor completed for {}, but only {} data blocks were cached. "</span>
+<span class="source-line-no">2447</span><span id="line-2447">            + "Total data blocks for file: {}. "</span>
+<span class="source-line-no">2448</span><span id="line-2448">            + "Checking for blocks pending cache in cache writer queue.",</span>
+<span class="source-line-no">2449</span><span id="line-2449">          fileName, count, dataBlockCount);</span>
+<span class="source-line-no">2450</span><span id="line-2450">        if (ramCache.hasBlocksForFile(fileName.getName())) {</span>
+<span class="source-line-no">2451</span><span id="line-2451">          for (ReentrantReadWriteLock lock : locks) {</span>
+<span class="source-line-no">2452</span><span id="line-2452">            lock.readLock().unlock();</span>
+<span class="source-line-no">2453</span><span id="line-2453">          }</span>
+<span class="source-line-no">2454</span><span id="line-2454">          locks.clear();</span>
+<span class="source-line-no">2455</span><span id="line-2455">          LOG.debug("There are still blocks pending caching for file {}. Will sleep 100ms "</span>
+<span class="source-line-no">2456</span><span id="line-2456">            + "and try the verification again.", fileName);</span>
+<span class="source-line-no">2457</span><span id="line-2457">          Thread.sleep(100);</span>
+<span class="source-line-no">2458</span><span id="line-2458">          notifyFileCachingCompleted(fileName, totalBlockCount, dataBlockCount, size);</span>
+<span class="source-line-no">2459</span><span id="line-2459">        } else {</span>
+<span class="source-line-no">2460</span><span id="line-2460">          LOG.info(</span>
+<span class="source-line-no">2461</span><span id="line-2461">            "The total block count was {}. We found only {} data blocks cached from "</span>
+<span class="source-line-no">2462</span><span id="line-2462">              + "a total of {} data blocks for file {}, "</span>
+<span class="source-line-no">2463</span><span id="line-2463">              + "but no blocks pending caching. Maybe cache is full or evictions "</span>
+<span class="source-line-no">2464</span><span id="line-2464">              + "happened concurrently to cache prefetch.",</span>
+<span class="source-line-no">2465</span><span id="line-2465">            totalBlockCount, count, dataBlockCount, fileName);</span>
+<span class="source-line-no">2466</span><span id="line-2466">        }</span>
+<span class="source-line-no">2467</span><span id="line-2467">      }</span>
+<span class="source-line-no">2468</span><span id="line-2468">    } catch (InterruptedException e) {</span>
+<span class="source-line-no">2469</span><span id="line-2469">      throw new RuntimeException(e);</span>
+<span class="source-line-no">2470</span><span id="line-2470">    } finally {</span>
+<span class="source-line-no">2471</span><span id="line-2471">      for (ReentrantReadWriteLock lock : locks) {</span>
+<span class="source-line-no">2472</span><span id="line-2472">        lock.readLock().unlock();</span>
+<span class="source-line-no">2473</span><span id="line-2473">      }</span>
+<span class="source-line-no">2474</span><span id="line-2474">    }</span>
 <span class="source-line-no">2475</span><span id="line-2475">  }</span>
 <span class="source-line-no">2476</span><span id="line-2476"></span>
 <span class="source-line-no">2477</span><span id="line-2477">  @Override</span>
-<span class="source-line-no">2478</span><span id="line-2478">  public Optional&lt;Boolean&gt; shouldCacheBlock(BlockCacheKey key, long maxTimestamp,</span>
-<span class="source-line-no">2479</span><span id="line-2479">    Configuration conf) {</span>
-<span class="source-line-no">2480</span><span id="line-2480">    DataTieringManager dataTieringManager = DataTieringManager.getInstance();</span>
-<span class="source-line-no">2481</span><span id="line-2481">    if (dataTieringManager != null &amp;&amp; !dataTieringManager.isHotData(maxTimestamp, conf)) {</span>
-<span class="source-line-no">2482</span><span id="line-2482">      LOG.debug("Data tiering is enabled for file: '{}' and it is not hot data",</span>
-<span class="source-line-no">2483</span><span id="line-2483">        key.getHfileName());</span>
-<span class="source-line-no">2484</span><span id="line-2484">      return Optional.of(false);</span>
-<span class="source-line-no">2485</span><span id="line-2485">    }</span>
-<span class="source-line-no">2486</span><span id="line-2486">    return Optional.of(true);</span>
-<span class="source-line-no">2487</span><span id="line-2487">  }</span>
-<span class="source-line-no">2488</span><span id="line-2488"></span>
-<span class="source-line-no">2489</span><span id="line-2489">  @Override</span>
-<span class="source-line-no">2490</span><span id="line-2490">  public Optional&lt;Boolean&gt; isAlreadyCached(BlockCacheKey key) {</span>
-<span class="source-line-no">2491</span><span id="line-2491">    boolean foundKey = backingMap.containsKey(key);</span>
-<span class="source-line-no">2492</span><span id="line-2492">    // if there's no entry for the key itself, we need to check if this key is for a reference,</span>
-<span class="source-line-no">2493</span><span id="line-2493">    // and if so, look for a block from the referenced file using this getBlockForReference method.</span>
-<span class="source-line-no">2494</span><span id="line-2494">    return Optional.of(foundKey ? true : getBlockForReference(key) != null);</span>
-<span class="source-line-no">2495</span><span id="line-2495">  }</span>
-<span class="source-line-no">2496</span><span id="line-2496"></span>
-<span class="source-line-no">2497</span><span id="line-2497">  @Override</span>
-<span class="source-line-no">2498</span><span id="line-2498">  public Optional&lt;Integer&gt; getBlockSize(BlockCacheKey key) {</span>
-<span class="source-line-no">2499</span><span id="line-2499">    BucketEntry entry = backingMap.get(key);</span>
-<span class="source-line-no">2500</span><span id="line-2500">    if (entry == null) {</span>
-<span class="source-line-no">2501</span><span id="line-2501">      // the key might be for a reference tha we had found the block from the referenced file in</span>
-<span class="source-line-no">2502</span><span id="line-2502">      // the cache when we first tried to cache it.</span>
-<span class="source-line-no">2503</span><span id="line-2503">      entry = getBlockForReference(key);</span>
-<span class="source-line-no">2504</span><span id="line-2504">      return entry == null ? Optional.empty() : Optional.of(entry.getOnDiskSizeWithHeader());</span>
-<span class="source-line-no">2505</span><span id="line-2505">    } else {</span>
-<span class="source-line-no">2506</span><span id="line-2506">      return Optional.of(entry.getOnDiskSizeWithHeader());</span>
-<span class="source-line-no">2507</span><span id="line-2507">    }</span>
-<span class="source-line-no">2508</span><span id="line-2508"></span>
-<span class="source-line-no">2509</span><span id="line-2509">  }</span>
-<span class="source-line-no">2510</span><span id="line-2510"></span>
-<span class="source-line-no">2511</span><span id="line-2511">  boolean isCacheInitialized(String api) {</span>
-<span class="source-line-no">2512</span><span id="line-2512">    if (cacheState == CacheState.INITIALIZING) {</span>
-<span class="source-line-no">2513</span><span id="line-2513">      LOG.warn("Bucket initialisation pending at {}", api);</span>
-<span class="source-line-no">2514</span><span id="line-2514">      return false;</span>
-<span class="source-line-no">2515</span><span id="line-2515">    }</span>
-<span class="source-line-no">2516</span><span id="line-2516">    return true;</span>
-<span class="source-line-no">2517</span><span id="line-2517">  }</span>
-<span class="source-line-no">2518</span><span id="line-2518"></span>
-<span class="source-line-no">2519</span><span id="line-2519">  @Override</span>
-<span class="source-line-no">2520</span><span id="line-2520">  public boolean waitForCacheInitialization(long timeout) {</span>
-<span class="source-line-no">2521</span><span id="line-2521">    while (cacheState == CacheState.INITIALIZING) {</span>
-<span class="source-line-no">2522</span><span id="line-2522">      if (timeout &lt;= 0) {</span>
-<span class="source-line-no">2523</span><span id="line-2523">        break;</span>
-<span class="source-line-no">2524</span><span id="line-2524">      }</span>
-<span class="source-line-no">2525</span><span id="line-2525">      try {</span>
-<span class="source-line-no">2526</span><span id="line-2526">        Thread.sleep(100);</span>
-<span class="source-line-no">2527</span><span id="line-2527">      } catch (InterruptedException e) {</span>
-<span class="source-line-no">2528</span><span id="line-2528">        LOG.warn("Interrupted while waiting for cache initialization", e);</span>
-<span class="source-line-no">2529</span><span id="line-2529">        Thread.currentThread().interrupt();</span>
-<span class="source-line-no">2530</span><span id="line-2530">        break;</span>
-<span class="source-line-no">2531</span><span id="line-2531">      }</span>
-<span class="source-line-no">2532</span><span id="line-2532">      timeout -= 100;</span>
-<span class="source-line-no">2533</span><span id="line-2533">    }</span>
-<span class="source-line-no">2534</span><span id="line-2534">    return isCacheEnabled();</span>
-<span class="source-line-no">2535</span><span id="line-2535">  }</span>
-<span class="source-line-no">2536</span><span id="line-2536">}</span>
+<span class="source-line-no">2478</span><span id="line-2478">  public Optional&lt;Boolean&gt; blockFitsIntoTheCache(HFileBlock block) {</span>
+<span class="source-line-no">2479</span><span id="line-2479">    if (!isCacheInitialized("blockFitsIntoTheCache")) {</span>
+<span class="source-line-no">2480</span><span id="line-2480">      return Optional.of(false);</span>
+<span class="source-line-no">2481</span><span id="line-2481">    }</span>
+<span class="source-line-no">2482</span><span id="line-2482"></span>
+<span class="source-line-no">2483</span><span id="line-2483">    long currentUsed = bucketAllocator.getUsedSize();</span>
+<span class="source-line-no">2484</span><span id="line-2484">    boolean result = (currentUsed + block.getOnDiskSizeWithHeader()) &lt; acceptableSize();</span>
+<span class="source-line-no">2485</span><span id="line-2485">    return Optional.of(result);</span>
+<span class="source-line-no">2486</span><span id="line-2486">  }</span>
+<span class="source-line-no">2487</span><span id="line-2487"></span>
+<span class="source-line-no">2488</span><span id="line-2488">  @Override</span>
+<span class="source-line-no">2489</span><span id="line-2489">  public Optional&lt;Boolean&gt; shouldCacheFile(HFileInfo hFileInfo, Configuration conf) {</span>
+<span class="source-line-no">2490</span><span id="line-2490">    String fileName = hFileInfo.getHFileContext().getHFileName();</span>
+<span class="source-line-no">2491</span><span id="line-2491">    DataTieringManager dataTieringManager = DataTieringManager.getInstance();</span>
+<span class="source-line-no">2492</span><span id="line-2492">    if (dataTieringManager != null &amp;&amp; !dataTieringManager.isHotData(hFileInfo, conf)) {</span>
+<span class="source-line-no">2493</span><span id="line-2493">      LOG.debug("Data tiering is enabled for file: '{}' and it is not hot data", fileName);</span>
+<span class="source-line-no">2494</span><span id="line-2494">      return Optional.of(false);</span>
+<span class="source-line-no">2495</span><span id="line-2495">    }</span>
+<span class="source-line-no">2496</span><span id="line-2496">    // if we don't have the file in fullyCachedFiles, we should cache it</span>
+<span class="source-line-no">2497</span><span id="line-2497">    return Optional.of(!fullyCachedFiles.containsKey(fileName));</span>
+<span class="source-line-no">2498</span><span id="line-2498">  }</span>
+<span class="source-line-no">2499</span><span id="line-2499"></span>
+<span class="source-line-no">2500</span><span id="line-2500">  @Override</span>
+<span class="source-line-no">2501</span><span id="line-2501">  public Optional&lt;Boolean&gt; shouldCacheBlock(BlockCacheKey key, long maxTimestamp,</span>
+<span class="source-line-no">2502</span><span id="line-2502">    Configuration conf) {</span>
+<span class="source-line-no">2503</span><span id="line-2503">    DataTieringManager dataTieringManager = DataTieringManager.getInstance();</span>
+<span class="source-line-no">2504</span><span id="line-2504">    if (dataTieringManager != null &amp;&amp; !dataTieringManager.isHotData(maxTimestamp, conf)) {</span>
+<span class="source-line-no">2505</span><span id="line-2505">      LOG.debug("Data tiering is enabled for file: '{}' and it is not hot data",</span>
+<span class="source-line-no">2506</span><span id="line-2506">        key.getHfileName());</span>
+<span class="source-line-no">2507</span><span id="line-2507">      return Optional.of(false);</span>
+<span class="source-line-no">2508</span><span id="line-2508">    }</span>
+<span class="source-line-no">2509</span><span id="line-2509">    return Optional.of(true);</span>
+<span class="source-line-no">2510</span><span id="line-2510">  }</span>
+<span class="source-line-no">2511</span><span id="line-2511"></span>
+<span class="source-line-no">2512</span><span id="line-2512">  @Override</span>
+<span class="source-line-no">2513</span><span id="line-2513">  public Optional&lt;Boolean&gt; isAlreadyCached(BlockCacheKey key) {</span>
+<span class="source-line-no">2514</span><span id="line-2514">    boolean foundKey = backingMap.containsKey(key);</span>
+<span class="source-line-no">2515</span><span id="line-2515">    // if there's no entry for the key itself, we need to check if this key is for a reference,</span>
+<span class="source-line-no">2516</span><span id="line-2516">    // and if so, look for a block from the referenced file using this getBlockForReference method.</span>
+<span class="source-line-no">2517</span><span id="line-2517">    return Optional.of(foundKey ? true : getBlockForReference(key) != null);</span>
+<span class="source-line-no">2518</span><span id="line-2518">  }</span>
+<span class="source-line-no">2519</span><span id="line-2519"></span>
+<span class="source-line-no">2520</span><span id="line-2520">  @Override</span>
+<span class="source-line-no">2521</span><span id="line-2521">  public Optional&lt;Integer&gt; getBlockSize(BlockCacheKey key) {</span>
+<span class="source-line-no">2522</span><span id="line-2522">    BucketEntry entry = backingMap.get(key);</span>
+<span class="source-line-no">2523</span><span id="line-2523">    if (entry == null) {</span>
+<span class="source-line-no">2524</span><span id="line-2524">      // the key might be for a reference tha we had found the block from the referenced file in</span>
+<span class="source-line-no">2525</span><span id="line-2525">      // the cache when we first tried to cache it.</span>
+<span class="source-line-no">2526</span><span id="line-2526">      entry = getBlockForReference(key);</span>
+<span class="source-line-no">2527</span><span id="line-2527">      return entry == null ? Optional.empty() : Optional.of(entry.getOnDiskSizeWithHeader());</span>
+<span class="source-line-no">2528</span><span id="line-2528">    } else {</span>
+<span class="source-line-no">2529</span><span id="line-2529">      return Optional.of(entry.getOnDiskSizeWithHeader());</span>
+<span class="source-line-no">2530</span><span id="line-2530">    }</span>
+<span class="source-line-no">2531</span><span id="line-2531"></span>
+<span class="source-line-no">2532</span><span id="line-2532">  }</span>
+<span class="source-line-no">2533</span><span id="line-2533"></span>
+<span class="source-line-no">2534</span><span id="line-2534">  boolean isCacheInitialized(String api) {</span>
+<span class="source-line-no">2535</span><span id="line-2535">    if (cacheState == CacheState.INITIALIZING) {</span>
+<span class="source-line-no">2536</span><span id="line-2536">      LOG.warn("Bucket initialisation pending at {}", api);</span>
+<span class="source-line-no">2537</span><span id="line-2537">      return false;</span>
+<span class="source-line-no">2538</span><span id="line-2538">    }</span>
+<span class="source-line-no">2539</span><span id="line-2539">    return true;</span>
+<span class="source-line-no">2540</span><span id="line-2540">  }</span>
+<span class="source-line-no">2541</span><span id="line-2541"></span>
+<span class="source-line-no">2542</span><span id="line-2542">  @Override</span>
+<span class="source-line-no">2543</span><span id="line-2543">  public boolean waitForCacheInitialization(long timeout) {</span>
+<span class="source-line-no">2544</span><span id="line-2544">    while (cacheState == CacheState.INITIALIZING) {</span>
+<span class="source-line-no">2545</span><span id="line-2545">      if (timeout &lt;= 0) {</span>
+<span class="source-line-no">2546</span><span id="line-2546">        break;</span>
+<span class="source-line-no">2547</span><span id="line-2547">      }</span>
+<span class="source-line-no">2548</span><span id="line-2548">      try {</span>
+<span class="source-line-no">2549</span><span id="line-2549">        Thread.sleep(100);</span>
+<span class="source-line-no">2550</span><span id="line-2550">      } catch (InterruptedException e) {</span>
+<span class="source-line-no">2551</span><span id="line-2551">        LOG.warn("Interrupted while waiting for cache initialization", e);</span>
+<span class="source-line-no">2552</span><span id="line-2552">        Thread.currentThread().interrupt();</span>
+<span class="source-line-no">2553</span><span id="line-2553">        break;</span>
+<span class="source-line-no">2554</span><span id="line-2554">      }</span>
+<span class="source-line-no">2555</span><span id="line-2555">      timeout -= 100;</span>
+<span class="source-line-no">2556</span><span id="line-2556">    }</span>
+<span class="source-line-no">2557</span><span id="line-2557">    return isCacheEnabled();</span>
+<span class="source-line-no">2558</span><span id="line-2558">  }</span>
+<span class="source-line-no">2559</span><span id="line-2559">}</span>
 
 
 
