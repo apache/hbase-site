@@ -406,266 +406,273 @@
 <span class="source-line-no">393</span><span id="line-393">    scanMetrics.addToCounter(ScanMetrics.REGIONS_SCANNED_METRIC_NAME, 1);</span>
 <span class="source-line-no">394</span><span id="line-394">  }</span>
 <span class="source-line-no">395</span><span id="line-395"></span>
-<span class="source-line-no">396</span><span id="line-396">  /**</span>
-<span class="source-line-no">397</span><span id="line-397">   * Connect the two futures, if the src future is done, then mark the dst future as done. And if</span>
-<span class="source-line-no">398</span><span id="line-398">   * the dst future is done, then cancel the src future. This is used for timeline consistent read.</span>
-<span class="source-line-no">399</span><span id="line-399">   * &lt;p/&gt;</span>
-<span class="source-line-no">400</span><span id="line-400">   * Pass empty metrics if you want to link the primary future and the dst future so we will not</span>
-<span class="source-line-no">401</span><span id="line-401">   * increase the hedge read related metrics.</span>
-<span class="source-line-no">402</span><span id="line-402">   */</span>
-<span class="source-line-no">403</span><span id="line-403">  private static &lt;T&gt; void connect(CompletableFuture&lt;T&gt; srcFuture, CompletableFuture&lt;T&gt; dstFuture,</span>
-<span class="source-line-no">404</span><span id="line-404">    Optional&lt;MetricsConnection&gt; metrics) {</span>
-<span class="source-line-no">405</span><span id="line-405">    addListener(srcFuture, (r, e) -&gt; {</span>
-<span class="source-line-no">406</span><span id="line-406">      if (e != null) {</span>
-<span class="source-line-no">407</span><span id="line-407">        dstFuture.completeExceptionally(e);</span>
-<span class="source-line-no">408</span><span id="line-408">      } else {</span>
-<span class="source-line-no">409</span><span id="line-409">        if (dstFuture.complete(r)) {</span>
-<span class="source-line-no">410</span><span id="line-410">          metrics.ifPresent(MetricsConnection::incrHedgedReadWin);</span>
-<span class="source-line-no">411</span><span id="line-411">        }</span>
-<span class="source-line-no">412</span><span id="line-412">      }</span>
-<span class="source-line-no">413</span><span id="line-413">    });</span>
-<span class="source-line-no">414</span><span id="line-414">    // The cancellation may be a dummy one as the dstFuture may be completed by this srcFuture.</span>
-<span class="source-line-no">415</span><span id="line-415">    // Notice that this is a bit tricky, as the execution chain maybe 'complete src -&gt; complete dst</span>
-<span class="source-line-no">416</span><span id="line-416">    // -&gt; cancel src', for now it seems to be fine, as the will use CAS to set the result first in</span>
-<span class="source-line-no">417</span><span id="line-417">    // CompletableFuture. If later this causes problems, we could use whenCompleteAsync to break the</span>
-<span class="source-line-no">418</span><span id="line-418">    // tie.</span>
-<span class="source-line-no">419</span><span id="line-419">    addListener(dstFuture, (r, e) -&gt; srcFuture.cancel(false));</span>
-<span class="source-line-no">420</span><span id="line-420">  }</span>
-<span class="source-line-no">421</span><span id="line-421"></span>
-<span class="source-line-no">422</span><span id="line-422">  private static &lt;T&gt; void sendRequestsToSecondaryReplicas(</span>
-<span class="source-line-no">423</span><span id="line-423">    Function&lt;Integer, CompletableFuture&lt;T&gt;&gt; requestReplica, RegionLocations locs,</span>
-<span class="source-line-no">424</span><span id="line-424">    CompletableFuture&lt;T&gt; future, Optional&lt;MetricsConnection&gt; metrics) {</span>
-<span class="source-line-no">425</span><span id="line-425">    if (future.isDone()) {</span>
-<span class="source-line-no">426</span><span id="line-426">      // do not send requests to secondary replicas if the future is done, i.e, the primary request</span>
-<span class="source-line-no">427</span><span id="line-427">      // has already been finished.</span>
-<span class="source-line-no">428</span><span id="line-428">      return;</span>
-<span class="source-line-no">429</span><span id="line-429">    }</span>
-<span class="source-line-no">430</span><span id="line-430">    for (int replicaId = 1, n = locs.size(); replicaId &lt; n; replicaId++) {</span>
-<span class="source-line-no">431</span><span id="line-431">      CompletableFuture&lt;T&gt; secondaryFuture = requestReplica.apply(replicaId);</span>
-<span class="source-line-no">432</span><span id="line-432">      metrics.ifPresent(MetricsConnection::incrHedgedReadOps);</span>
-<span class="source-line-no">433</span><span id="line-433">      connect(secondaryFuture, future, metrics);</span>
-<span class="source-line-no">434</span><span id="line-434">    }</span>
-<span class="source-line-no">435</span><span id="line-435">  }</span>
-<span class="source-line-no">436</span><span id="line-436"></span>
-<span class="source-line-no">437</span><span id="line-437">  static &lt;T&gt; CompletableFuture&lt;T&gt; timelineConsistentRead(AsyncRegionLocator locator,</span>
-<span class="source-line-no">438</span><span id="line-438">    TableName tableName, Query query, byte[] row, RegionLocateType locateType,</span>
-<span class="source-line-no">439</span><span id="line-439">    Function&lt;Integer, CompletableFuture&lt;T&gt;&gt; requestReplica, long rpcTimeoutNs,</span>
-<span class="source-line-no">440</span><span id="line-440">    long primaryCallTimeoutNs, Timer retryTimer, Optional&lt;MetricsConnection&gt; metrics) {</span>
-<span class="source-line-no">441</span><span id="line-441">    if (query.getConsistency() != Consistency.TIMELINE) {</span>
-<span class="source-line-no">442</span><span id="line-442">      return requestReplica.apply(RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
-<span class="source-line-no">443</span><span id="line-443">    }</span>
-<span class="source-line-no">444</span><span id="line-444">    // user specifies a replica id explicitly, just send request to the specific replica</span>
-<span class="source-line-no">445</span><span id="line-445">    if (query.getReplicaId() &gt;= 0) {</span>
-<span class="source-line-no">446</span><span id="line-446">      return requestReplica.apply(query.getReplicaId());</span>
-<span class="source-line-no">447</span><span id="line-447">    }</span>
-<span class="source-line-no">448</span><span id="line-448">    // Timeline consistent read, where we may send requests to other region replicas</span>
-<span class="source-line-no">449</span><span id="line-449">    CompletableFuture&lt;T&gt; primaryFuture = requestReplica.apply(RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
-<span class="source-line-no">450</span><span id="line-450">    CompletableFuture&lt;T&gt; future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">451</span><span id="line-451">    connect(primaryFuture, future, Optional.empty());</span>
-<span class="source-line-no">452</span><span id="line-452">    long startNs = System.nanoTime();</span>
-<span class="source-line-no">453</span><span id="line-453">    // after the getRegionLocations, all the locations for the replicas of this region should have</span>
-<span class="source-line-no">454</span><span id="line-454">    // been cached, so it is not big deal to locate them again when actually sending requests to</span>
-<span class="source-line-no">455</span><span id="line-455">    // these replicas.</span>
-<span class="source-line-no">456</span><span id="line-456">    addListener(locator.getRegionLocations(tableName, row, locateType, false, rpcTimeoutNs),</span>
-<span class="source-line-no">457</span><span id="line-457">      (locs, error) -&gt; {</span>
-<span class="source-line-no">458</span><span id="line-458">        if (error != null) {</span>
-<span class="source-line-no">459</span><span id="line-459">          LOG.warn(</span>
-<span class="source-line-no">460</span><span id="line-460">            "Failed to locate all the replicas for table={}, row='{}', locateType={}"</span>
-<span class="source-line-no">461</span><span id="line-461">              + " give up timeline consistent read",</span>
-<span class="source-line-no">462</span><span id="line-462">            tableName, Bytes.toStringBinary(row), locateType, error);</span>
-<span class="source-line-no">463</span><span id="line-463">          return;</span>
-<span class="source-line-no">464</span><span id="line-464">        }</span>
-<span class="source-line-no">465</span><span id="line-465">        if (locs.size() &lt;= 1) {</span>
+<span class="source-line-no">396</span><span id="line-396">  static void incMillisBetweenNextsMetrics(ScanMetrics scanMetrics, long millis) {</span>
+<span class="source-line-no">397</span><span id="line-397">    if (scanMetrics == null) {</span>
+<span class="source-line-no">398</span><span id="line-398">      return;</span>
+<span class="source-line-no">399</span><span id="line-399">    }</span>
+<span class="source-line-no">400</span><span id="line-400">    scanMetrics.addToCounter(ScanMetrics.MILLIS_BETWEEN_NEXTS_METRIC_NAME, millis);</span>
+<span class="source-line-no">401</span><span id="line-401">  }</span>
+<span class="source-line-no">402</span><span id="line-402"></span>
+<span class="source-line-no">403</span><span id="line-403">  /**</span>
+<span class="source-line-no">404</span><span id="line-404">   * Connect the two futures, if the src future is done, then mark the dst future as done. And if</span>
+<span class="source-line-no">405</span><span id="line-405">   * the dst future is done, then cancel the src future. This is used for timeline consistent read.</span>
+<span class="source-line-no">406</span><span id="line-406">   * &lt;p/&gt;</span>
+<span class="source-line-no">407</span><span id="line-407">   * Pass empty metrics if you want to link the primary future and the dst future so we will not</span>
+<span class="source-line-no">408</span><span id="line-408">   * increase the hedge read related metrics.</span>
+<span class="source-line-no">409</span><span id="line-409">   */</span>
+<span class="source-line-no">410</span><span id="line-410">  private static &lt;T&gt; void connect(CompletableFuture&lt;T&gt; srcFuture, CompletableFuture&lt;T&gt; dstFuture,</span>
+<span class="source-line-no">411</span><span id="line-411">    Optional&lt;MetricsConnection&gt; metrics) {</span>
+<span class="source-line-no">412</span><span id="line-412">    addListener(srcFuture, (r, e) -&gt; {</span>
+<span class="source-line-no">413</span><span id="line-413">      if (e != null) {</span>
+<span class="source-line-no">414</span><span id="line-414">        dstFuture.completeExceptionally(e);</span>
+<span class="source-line-no">415</span><span id="line-415">      } else {</span>
+<span class="source-line-no">416</span><span id="line-416">        if (dstFuture.complete(r)) {</span>
+<span class="source-line-no">417</span><span id="line-417">          metrics.ifPresent(MetricsConnection::incrHedgedReadWin);</span>
+<span class="source-line-no">418</span><span id="line-418">        }</span>
+<span class="source-line-no">419</span><span id="line-419">      }</span>
+<span class="source-line-no">420</span><span id="line-420">    });</span>
+<span class="source-line-no">421</span><span id="line-421">    // The cancellation may be a dummy one as the dstFuture may be completed by this srcFuture.</span>
+<span class="source-line-no">422</span><span id="line-422">    // Notice that this is a bit tricky, as the execution chain maybe 'complete src -&gt; complete dst</span>
+<span class="source-line-no">423</span><span id="line-423">    // -&gt; cancel src', for now it seems to be fine, as the will use CAS to set the result first in</span>
+<span class="source-line-no">424</span><span id="line-424">    // CompletableFuture. If later this causes problems, we could use whenCompleteAsync to break the</span>
+<span class="source-line-no">425</span><span id="line-425">    // tie.</span>
+<span class="source-line-no">426</span><span id="line-426">    addListener(dstFuture, (r, e) -&gt; srcFuture.cancel(false));</span>
+<span class="source-line-no">427</span><span id="line-427">  }</span>
+<span class="source-line-no">428</span><span id="line-428"></span>
+<span class="source-line-no">429</span><span id="line-429">  private static &lt;T&gt; void sendRequestsToSecondaryReplicas(</span>
+<span class="source-line-no">430</span><span id="line-430">    Function&lt;Integer, CompletableFuture&lt;T&gt;&gt; requestReplica, RegionLocations locs,</span>
+<span class="source-line-no">431</span><span id="line-431">    CompletableFuture&lt;T&gt; future, Optional&lt;MetricsConnection&gt; metrics) {</span>
+<span class="source-line-no">432</span><span id="line-432">    if (future.isDone()) {</span>
+<span class="source-line-no">433</span><span id="line-433">      // do not send requests to secondary replicas if the future is done, i.e, the primary request</span>
+<span class="source-line-no">434</span><span id="line-434">      // has already been finished.</span>
+<span class="source-line-no">435</span><span id="line-435">      return;</span>
+<span class="source-line-no">436</span><span id="line-436">    }</span>
+<span class="source-line-no">437</span><span id="line-437">    for (int replicaId = 1, n = locs.size(); replicaId &lt; n; replicaId++) {</span>
+<span class="source-line-no">438</span><span id="line-438">      CompletableFuture&lt;T&gt; secondaryFuture = requestReplica.apply(replicaId);</span>
+<span class="source-line-no">439</span><span id="line-439">      metrics.ifPresent(MetricsConnection::incrHedgedReadOps);</span>
+<span class="source-line-no">440</span><span id="line-440">      connect(secondaryFuture, future, metrics);</span>
+<span class="source-line-no">441</span><span id="line-441">    }</span>
+<span class="source-line-no">442</span><span id="line-442">  }</span>
+<span class="source-line-no">443</span><span id="line-443"></span>
+<span class="source-line-no">444</span><span id="line-444">  static &lt;T&gt; CompletableFuture&lt;T&gt; timelineConsistentRead(AsyncRegionLocator locator,</span>
+<span class="source-line-no">445</span><span id="line-445">    TableName tableName, Query query, byte[] row, RegionLocateType locateType,</span>
+<span class="source-line-no">446</span><span id="line-446">    Function&lt;Integer, CompletableFuture&lt;T&gt;&gt; requestReplica, long rpcTimeoutNs,</span>
+<span class="source-line-no">447</span><span id="line-447">    long primaryCallTimeoutNs, Timer retryTimer, Optional&lt;MetricsConnection&gt; metrics) {</span>
+<span class="source-line-no">448</span><span id="line-448">    if (query.getConsistency() != Consistency.TIMELINE) {</span>
+<span class="source-line-no">449</span><span id="line-449">      return requestReplica.apply(RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
+<span class="source-line-no">450</span><span id="line-450">    }</span>
+<span class="source-line-no">451</span><span id="line-451">    // user specifies a replica id explicitly, just send request to the specific replica</span>
+<span class="source-line-no">452</span><span id="line-452">    if (query.getReplicaId() &gt;= 0) {</span>
+<span class="source-line-no">453</span><span id="line-453">      return requestReplica.apply(query.getReplicaId());</span>
+<span class="source-line-no">454</span><span id="line-454">    }</span>
+<span class="source-line-no">455</span><span id="line-455">    // Timeline consistent read, where we may send requests to other region replicas</span>
+<span class="source-line-no">456</span><span id="line-456">    CompletableFuture&lt;T&gt; primaryFuture = requestReplica.apply(RegionReplicaUtil.DEFAULT_REPLICA_ID);</span>
+<span class="source-line-no">457</span><span id="line-457">    CompletableFuture&lt;T&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">458</span><span id="line-458">    connect(primaryFuture, future, Optional.empty());</span>
+<span class="source-line-no">459</span><span id="line-459">    long startNs = System.nanoTime();</span>
+<span class="source-line-no">460</span><span id="line-460">    // after the getRegionLocations, all the locations for the replicas of this region should have</span>
+<span class="source-line-no">461</span><span id="line-461">    // been cached, so it is not big deal to locate them again when actually sending requests to</span>
+<span class="source-line-no">462</span><span id="line-462">    // these replicas.</span>
+<span class="source-line-no">463</span><span id="line-463">    addListener(locator.getRegionLocations(tableName, row, locateType, false, rpcTimeoutNs),</span>
+<span class="source-line-no">464</span><span id="line-464">      (locs, error) -&gt; {</span>
+<span class="source-line-no">465</span><span id="line-465">        if (error != null) {</span>
 <span class="source-line-no">466</span><span id="line-466">          LOG.warn(</span>
-<span class="source-line-no">467</span><span id="line-467">            "There are no secondary replicas for region {}, give up timeline consistent read",</span>
-<span class="source-line-no">468</span><span id="line-468">            locs.getDefaultRegionLocation().getRegion());</span>
-<span class="source-line-no">469</span><span id="line-469">          return;</span>
-<span class="source-line-no">470</span><span id="line-470">        }</span>
-<span class="source-line-no">471</span><span id="line-471">        long delayNs = primaryCallTimeoutNs - (System.nanoTime() - startNs);</span>
-<span class="source-line-no">472</span><span id="line-472">        if (delayNs &lt;= 0) {</span>
-<span class="source-line-no">473</span><span id="line-473">          sendRequestsToSecondaryReplicas(requestReplica, locs, future, metrics);</span>
-<span class="source-line-no">474</span><span id="line-474">        } else {</span>
-<span class="source-line-no">475</span><span id="line-475">          retryTimer.newTimeout(</span>
-<span class="source-line-no">476</span><span id="line-476">            timeout -&gt; sendRequestsToSecondaryReplicas(requestReplica, locs, future, metrics),</span>
-<span class="source-line-no">477</span><span id="line-477">            delayNs, TimeUnit.NANOSECONDS);</span>
-<span class="source-line-no">478</span><span id="line-478">        }</span>
-<span class="source-line-no">479</span><span id="line-479">      });</span>
-<span class="source-line-no">480</span><span id="line-480">    return future;</span>
-<span class="source-line-no">481</span><span id="line-481">  }</span>
-<span class="source-line-no">482</span><span id="line-482"></span>
-<span class="source-line-no">483</span><span id="line-483">  // Validate individual Mutation</span>
-<span class="source-line-no">484</span><span id="line-484">  static void validateMutation(Mutation mutation, int maxKeyValueSize) {</span>
-<span class="source-line-no">485</span><span id="line-485">    // Skip Delete</span>
-<span class="source-line-no">486</span><span id="line-486">    if (mutation instanceof Delete) return;</span>
-<span class="source-line-no">487</span><span id="line-487"></span>
-<span class="source-line-no">488</span><span id="line-488">    // 1. Check if empty</span>
-<span class="source-line-no">489</span><span id="line-489">    if (mutation.isEmpty()) {</span>
-<span class="source-line-no">490</span><span id="line-490">      throw new IllegalArgumentException(</span>
-<span class="source-line-no">491</span><span id="line-491">        "No columns to " + mutation.getClass().getSimpleName().toLowerCase());</span>
-<span class="source-line-no">492</span><span id="line-492">    }</span>
-<span class="source-line-no">493</span><span id="line-493"></span>
-<span class="source-line-no">494</span><span id="line-494">    // 2. Check if size exceeds maxKeyValueSize</span>
-<span class="source-line-no">495</span><span id="line-495">    if (maxKeyValueSize &gt; 0) {</span>
-<span class="source-line-no">496</span><span id="line-496">      for (List&lt;Cell&gt; list : mutation.getFamilyCellMap().values()) {</span>
-<span class="source-line-no">497</span><span id="line-497">        for (Cell cell : list) {</span>
-<span class="source-line-no">498</span><span id="line-498">          if (cell.getSerializedSize() &gt; maxKeyValueSize) {</span>
-<span class="source-line-no">499</span><span id="line-499">            throw new IllegalArgumentException("KeyValue size too large");</span>
-<span class="source-line-no">500</span><span id="line-500">          }</span>
-<span class="source-line-no">501</span><span id="line-501">        }</span>
-<span class="source-line-no">502</span><span id="line-502">      }</span>
-<span class="source-line-no">503</span><span id="line-503">    }</span>
-<span class="source-line-no">504</span><span id="line-504">  }</span>
-<span class="source-line-no">505</span><span id="line-505"></span>
-<span class="source-line-no">506</span><span id="line-506">  // Validate RowMutations</span>
-<span class="source-line-no">507</span><span id="line-507">  static void validateRowMutations(RowMutations rowMutations, int maxKeyValueSize) {</span>
-<span class="source-line-no">508</span><span id="line-508">    for (Mutation mutation : rowMutations.getMutations()) {</span>
-<span class="source-line-no">509</span><span id="line-509">      validateMutation(mutation, maxKeyValueSize);</span>
+<span class="source-line-no">467</span><span id="line-467">            "Failed to locate all the replicas for table={}, row='{}', locateType={}"</span>
+<span class="source-line-no">468</span><span id="line-468">              + " give up timeline consistent read",</span>
+<span class="source-line-no">469</span><span id="line-469">            tableName, Bytes.toStringBinary(row), locateType, error);</span>
+<span class="source-line-no">470</span><span id="line-470">          return;</span>
+<span class="source-line-no">471</span><span id="line-471">        }</span>
+<span class="source-line-no">472</span><span id="line-472">        if (locs.size() &lt;= 1) {</span>
+<span class="source-line-no">473</span><span id="line-473">          LOG.warn(</span>
+<span class="source-line-no">474</span><span id="line-474">            "There are no secondary replicas for region {}, give up timeline consistent read",</span>
+<span class="source-line-no">475</span><span id="line-475">            locs.getDefaultRegionLocation().getRegion());</span>
+<span class="source-line-no">476</span><span id="line-476">          return;</span>
+<span class="source-line-no">477</span><span id="line-477">        }</span>
+<span class="source-line-no">478</span><span id="line-478">        long delayNs = primaryCallTimeoutNs - (System.nanoTime() - startNs);</span>
+<span class="source-line-no">479</span><span id="line-479">        if (delayNs &lt;= 0) {</span>
+<span class="source-line-no">480</span><span id="line-480">          sendRequestsToSecondaryReplicas(requestReplica, locs, future, metrics);</span>
+<span class="source-line-no">481</span><span id="line-481">        } else {</span>
+<span class="source-line-no">482</span><span id="line-482">          retryTimer.newTimeout(</span>
+<span class="source-line-no">483</span><span id="line-483">            timeout -&gt; sendRequestsToSecondaryReplicas(requestReplica, locs, future, metrics),</span>
+<span class="source-line-no">484</span><span id="line-484">            delayNs, TimeUnit.NANOSECONDS);</span>
+<span class="source-line-no">485</span><span id="line-485">        }</span>
+<span class="source-line-no">486</span><span id="line-486">      });</span>
+<span class="source-line-no">487</span><span id="line-487">    return future;</span>
+<span class="source-line-no">488</span><span id="line-488">  }</span>
+<span class="source-line-no">489</span><span id="line-489"></span>
+<span class="source-line-no">490</span><span id="line-490">  // Validate individual Mutation</span>
+<span class="source-line-no">491</span><span id="line-491">  static void validateMutation(Mutation mutation, int maxKeyValueSize) {</span>
+<span class="source-line-no">492</span><span id="line-492">    // Skip Delete</span>
+<span class="source-line-no">493</span><span id="line-493">    if (mutation instanceof Delete) return;</span>
+<span class="source-line-no">494</span><span id="line-494"></span>
+<span class="source-line-no">495</span><span id="line-495">    // 1. Check if empty</span>
+<span class="source-line-no">496</span><span id="line-496">    if (mutation.isEmpty()) {</span>
+<span class="source-line-no">497</span><span id="line-497">      throw new IllegalArgumentException(</span>
+<span class="source-line-no">498</span><span id="line-498">        "No columns to " + mutation.getClass().getSimpleName().toLowerCase());</span>
+<span class="source-line-no">499</span><span id="line-499">    }</span>
+<span class="source-line-no">500</span><span id="line-500"></span>
+<span class="source-line-no">501</span><span id="line-501">    // 2. Check if size exceeds maxKeyValueSize</span>
+<span class="source-line-no">502</span><span id="line-502">    if (maxKeyValueSize &gt; 0) {</span>
+<span class="source-line-no">503</span><span id="line-503">      for (List&lt;Cell&gt; list : mutation.getFamilyCellMap().values()) {</span>
+<span class="source-line-no">504</span><span id="line-504">        for (Cell cell : list) {</span>
+<span class="source-line-no">505</span><span id="line-505">          if (cell.getSerializedSize() &gt; maxKeyValueSize) {</span>
+<span class="source-line-no">506</span><span id="line-506">            throw new IllegalArgumentException("KeyValue size too large");</span>
+<span class="source-line-no">507</span><span id="line-507">          }</span>
+<span class="source-line-no">508</span><span id="line-508">        }</span>
+<span class="source-line-no">509</span><span id="line-509">      }</span>
 <span class="source-line-no">510</span><span id="line-510">    }</span>
 <span class="source-line-no">511</span><span id="line-511">  }</span>
 <span class="source-line-no">512</span><span id="line-512"></span>
-<span class="source-line-no">513</span><span id="line-513">  static &lt;T&gt; CompletableFuture&lt;T&gt; getOrFetch(AtomicReference&lt;T&gt; cacheRef,</span>
-<span class="source-line-no">514</span><span id="line-514">    AtomicReference&lt;CompletableFuture&lt;T&gt;&gt; futureRef, boolean reload,</span>
-<span class="source-line-no">515</span><span id="line-515">    Supplier&lt;CompletableFuture&lt;T&gt;&gt; fetch, Predicate&lt;T&gt; validator, String type) {</span>
-<span class="source-line-no">516</span><span id="line-516">    for (;;) {</span>
-<span class="source-line-no">517</span><span id="line-517">      if (!reload) {</span>
-<span class="source-line-no">518</span><span id="line-518">        T value = cacheRef.get();</span>
-<span class="source-line-no">519</span><span id="line-519">        if (value != null &amp;&amp; validator.test(value)) {</span>
-<span class="source-line-no">520</span><span id="line-520">          return CompletableFuture.completedFuture(value);</span>
-<span class="source-line-no">521</span><span id="line-521">        }</span>
-<span class="source-line-no">522</span><span id="line-522">      }</span>
-<span class="source-line-no">523</span><span id="line-523">      LOG.trace("{} cache is null, try fetching from registry", type);</span>
-<span class="source-line-no">524</span><span id="line-524">      if (futureRef.compareAndSet(null, new CompletableFuture&lt;&gt;())) {</span>
-<span class="source-line-no">525</span><span id="line-525">        LOG.debug("Start fetching {} from registry", type);</span>
-<span class="source-line-no">526</span><span id="line-526">        CompletableFuture&lt;T&gt; future = futureRef.get();</span>
-<span class="source-line-no">527</span><span id="line-527">        addListener(fetch.get(), (value, error) -&gt; {</span>
-<span class="source-line-no">528</span><span id="line-528">          if (error != null) {</span>
-<span class="source-line-no">529</span><span id="line-529">            LOG.debug("Failed to fetch {} from registry", type, error);</span>
-<span class="source-line-no">530</span><span id="line-530">            futureRef.getAndSet(null).completeExceptionally(error);</span>
-<span class="source-line-no">531</span><span id="line-531">            return;</span>
-<span class="source-line-no">532</span><span id="line-532">          }</span>
-<span class="source-line-no">533</span><span id="line-533">          LOG.debug("The fetched {} is {}", type, value);</span>
-<span class="source-line-no">534</span><span id="line-534">          // Here we update cache before reset future, so it is possible that someone can get a</span>
-<span class="source-line-no">535</span><span id="line-535">          // stale value. Consider this:</span>
-<span class="source-line-no">536</span><span id="line-536">          // 1. update cacheRef</span>
-<span class="source-line-no">537</span><span id="line-537">          // 2. someone clears the cache and relocates again</span>
-<span class="source-line-no">538</span><span id="line-538">          // 3. the futureRef is not null so the old future is used.</span>
-<span class="source-line-no">539</span><span id="line-539">          // 4. we clear futureRef and complete the future in it with the value being</span>
-<span class="source-line-no">540</span><span id="line-540">          // cleared in step 2.</span>
-<span class="source-line-no">541</span><span id="line-541">          // But we do not think it is a big deal as it rarely happens, and even if it happens, the</span>
-<span class="source-line-no">542</span><span id="line-542">          // caller will retry again later, no correctness problems.</span>
-<span class="source-line-no">543</span><span id="line-543">          cacheRef.set(value);</span>
-<span class="source-line-no">544</span><span id="line-544">          futureRef.set(null);</span>
-<span class="source-line-no">545</span><span id="line-545">          future.complete(value);</span>
-<span class="source-line-no">546</span><span id="line-546">        });</span>
-<span class="source-line-no">547</span><span id="line-547">        return future;</span>
-<span class="source-line-no">548</span><span id="line-548">      } else {</span>
-<span class="source-line-no">549</span><span id="line-549">        CompletableFuture&lt;T&gt; future = futureRef.get();</span>
-<span class="source-line-no">550</span><span id="line-550">        if (future != null) {</span>
-<span class="source-line-no">551</span><span id="line-551">          return future;</span>
-<span class="source-line-no">552</span><span id="line-552">        }</span>
-<span class="source-line-no">553</span><span id="line-553">      }</span>
-<span class="source-line-no">554</span><span id="line-554">    }</span>
-<span class="source-line-no">555</span><span id="line-555">  }</span>
-<span class="source-line-no">556</span><span id="line-556"></span>
-<span class="source-line-no">557</span><span id="line-557">  static void updateStats(Optional&lt;ServerStatisticTracker&gt; optStats,</span>
-<span class="source-line-no">558</span><span id="line-558">    Optional&lt;MetricsConnection&gt; optMetrics, ServerName serverName, MultiResponse resp) {</span>
-<span class="source-line-no">559</span><span id="line-559">    if (!optStats.isPresent() &amp;&amp; !optMetrics.isPresent()) {</span>
-<span class="source-line-no">560</span><span id="line-560">      // ServerStatisticTracker and MetricsConnection are both not present, just return</span>
-<span class="source-line-no">561</span><span id="line-561">      return;</span>
-<span class="source-line-no">562</span><span id="line-562">    }</span>
-<span class="source-line-no">563</span><span id="line-563">    resp.getResults().forEach((regionName, regionResult) -&gt; {</span>
-<span class="source-line-no">564</span><span id="line-564">      ClientProtos.RegionLoadStats stat = regionResult.getStat();</span>
-<span class="source-line-no">565</span><span id="line-565">      if (stat == null) {</span>
-<span class="source-line-no">566</span><span id="line-566">        if (LOG.isDebugEnabled()) {</span>
-<span class="source-line-no">567</span><span id="line-567">          LOG.debug("No ClientProtos.RegionLoadStats found for server={}, region={}", serverName,</span>
-<span class="source-line-no">568</span><span id="line-568">            Bytes.toStringBinary(regionName));</span>
-<span class="source-line-no">569</span><span id="line-569">        }</span>
-<span class="source-line-no">570</span><span id="line-570">        return;</span>
-<span class="source-line-no">571</span><span id="line-571">      }</span>
-<span class="source-line-no">572</span><span id="line-572">      RegionLoadStats regionLoadStats = ProtobufUtil.createRegionLoadStats(stat);</span>
-<span class="source-line-no">573</span><span id="line-573">      optStats.ifPresent(</span>
-<span class="source-line-no">574</span><span id="line-574">        stats -&gt; ResultStatsUtil.updateStats(stats, serverName, regionName, regionLoadStats));</span>
-<span class="source-line-no">575</span><span id="line-575">      optMetrics.ifPresent(</span>
-<span class="source-line-no">576</span><span id="line-576">        metrics -&gt; ResultStatsUtil.updateStats(metrics, serverName, regionName, regionLoadStats));</span>
-<span class="source-line-no">577</span><span id="line-577">    });</span>
-<span class="source-line-no">578</span><span id="line-578">  }</span>
-<span class="source-line-no">579</span><span id="line-579"></span>
-<span class="source-line-no">580</span><span id="line-580">  @FunctionalInterface</span>
-<span class="source-line-no">581</span><span id="line-581">  interface Converter&lt;D, I, S&gt; {</span>
-<span class="source-line-no">582</span><span id="line-582">    D convert(I info, S src) throws IOException;</span>
-<span class="source-line-no">583</span><span id="line-583">  }</span>
-<span class="source-line-no">584</span><span id="line-584"></span>
-<span class="source-line-no">585</span><span id="line-585">  @FunctionalInterface</span>
-<span class="source-line-no">586</span><span id="line-586">  interface RpcCall&lt;RESP, REQ&gt; {</span>
-<span class="source-line-no">587</span><span id="line-587">    void call(ClientService.Interface stub, HBaseRpcController controller, REQ req,</span>
-<span class="source-line-no">588</span><span id="line-588">      RpcCallback&lt;RESP&gt; done);</span>
-<span class="source-line-no">589</span><span id="line-589">  }</span>
-<span class="source-line-no">590</span><span id="line-590"></span>
-<span class="source-line-no">591</span><span id="line-591">  static &lt;REQ, PREQ, PRESP, RESP&gt; CompletableFuture&lt;RESP&gt; call(HBaseRpcController controller,</span>
-<span class="source-line-no">592</span><span id="line-592">    HRegionLocation loc, ClientService.Interface stub, REQ req,</span>
-<span class="source-line-no">593</span><span id="line-593">    Converter&lt;PREQ, byte[], REQ&gt; reqConvert, RpcCall&lt;PRESP, PREQ&gt; rpcCall,</span>
-<span class="source-line-no">594</span><span id="line-594">    Converter&lt;RESP, HBaseRpcController, PRESP&gt; respConverter) {</span>
-<span class="source-line-no">595</span><span id="line-595">    CompletableFuture&lt;RESP&gt; future = new CompletableFuture&lt;&gt;();</span>
-<span class="source-line-no">596</span><span id="line-596">    try {</span>
-<span class="source-line-no">597</span><span id="line-597">      rpcCall.call(stub, controller, reqConvert.convert(loc.getRegion().getRegionName(), req),</span>
-<span class="source-line-no">598</span><span id="line-598">        new RpcCallback&lt;PRESP&gt;() {</span>
-<span class="source-line-no">599</span><span id="line-599"></span>
-<span class="source-line-no">600</span><span id="line-600">          @Override</span>
-<span class="source-line-no">601</span><span id="line-601">          public void run(PRESP resp) {</span>
-<span class="source-line-no">602</span><span id="line-602">            if (controller.failed()) {</span>
-<span class="source-line-no">603</span><span id="line-603">              future.completeExceptionally(controller.getFailed());</span>
-<span class="source-line-no">604</span><span id="line-604">            } else {</span>
-<span class="source-line-no">605</span><span id="line-605">              try {</span>
-<span class="source-line-no">606</span><span id="line-606">                future.complete(respConverter.convert(controller, resp));</span>
-<span class="source-line-no">607</span><span id="line-607">              } catch (IOException e) {</span>
-<span class="source-line-no">608</span><span id="line-608">                future.completeExceptionally(e);</span>
-<span class="source-line-no">609</span><span id="line-609">              }</span>
-<span class="source-line-no">610</span><span id="line-610">            }</span>
-<span class="source-line-no">611</span><span id="line-611">          }</span>
-<span class="source-line-no">612</span><span id="line-612">        });</span>
-<span class="source-line-no">613</span><span id="line-613">    } catch (IOException e) {</span>
-<span class="source-line-no">614</span><span id="line-614">      future.completeExceptionally(e);</span>
-<span class="source-line-no">615</span><span id="line-615">    }</span>
-<span class="source-line-no">616</span><span id="line-616">    return future;</span>
-<span class="source-line-no">617</span><span id="line-617">  }</span>
-<span class="source-line-no">618</span><span id="line-618"></span>
-<span class="source-line-no">619</span><span id="line-619">  static void shutdownPool(ExecutorService pool) {</span>
-<span class="source-line-no">620</span><span id="line-620">    pool.shutdown();</span>
-<span class="source-line-no">621</span><span id="line-621">    try {</span>
-<span class="source-line-no">622</span><span id="line-622">      if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {</span>
-<span class="source-line-no">623</span><span id="line-623">        pool.shutdownNow();</span>
-<span class="source-line-no">624</span><span id="line-624">      }</span>
-<span class="source-line-no">625</span><span id="line-625">    } catch (InterruptedException e) {</span>
-<span class="source-line-no">626</span><span id="line-626">      pool.shutdownNow();</span>
-<span class="source-line-no">627</span><span id="line-627">    }</span>
-<span class="source-line-no">628</span><span id="line-628">  }</span>
-<span class="source-line-no">629</span><span id="line-629"></span>
-<span class="source-line-no">630</span><span id="line-630">  static void setCoprocessorError(RpcController controller, Throwable error) {</span>
-<span class="source-line-no">631</span><span id="line-631">    if (controller == null) {</span>
-<span class="source-line-no">632</span><span id="line-632">      return;</span>
-<span class="source-line-no">633</span><span id="line-633">    }</span>
-<span class="source-line-no">634</span><span id="line-634">    if (controller instanceof ServerRpcController) {</span>
-<span class="source-line-no">635</span><span id="line-635">      if (error instanceof IOException) {</span>
-<span class="source-line-no">636</span><span id="line-636">        ((ServerRpcController) controller).setFailedOn((IOException) error);</span>
-<span class="source-line-no">637</span><span id="line-637">      } else {</span>
-<span class="source-line-no">638</span><span id="line-638">        ((ServerRpcController) controller).setFailedOn(new IOException(error));</span>
-<span class="source-line-no">639</span><span id="line-639">      }</span>
-<span class="source-line-no">640</span><span id="line-640">    } else if (controller instanceof ClientCoprocessorRpcController) {</span>
-<span class="source-line-no">641</span><span id="line-641">      ((ClientCoprocessorRpcController) controller).setFailed(error);</span>
-<span class="source-line-no">642</span><span id="line-642">    } else {</span>
-<span class="source-line-no">643</span><span id="line-643">      controller.setFailed(error.toString());</span>
-<span class="source-line-no">644</span><span id="line-644">    }</span>
-<span class="source-line-no">645</span><span id="line-645">  }</span>
-<span class="source-line-no">646</span><span id="line-646"></span>
-<span class="source-line-no">647</span><span id="line-647">  public static boolean isUnexpectedPreambleHeaderException(IOException e) {</span>
-<span class="source-line-no">648</span><span id="line-648">    if (!(e instanceof RemoteException)) {</span>
-<span class="source-line-no">649</span><span id="line-649">      return false;</span>
-<span class="source-line-no">650</span><span id="line-650">    }</span>
-<span class="source-line-no">651</span><span id="line-651">    RemoteException re = (RemoteException) e;</span>
-<span class="source-line-no">652</span><span id="line-652">    return FatalConnectionException.class.getName().equals(re.getClassName())</span>
-<span class="source-line-no">653</span><span id="line-653">      &amp;&amp; re.getMessage().startsWith("Expected HEADER=");</span>
-<span class="source-line-no">654</span><span id="line-654">  }</span>
-<span class="source-line-no">655</span><span id="line-655">}</span>
+<span class="source-line-no">513</span><span id="line-513">  // Validate RowMutations</span>
+<span class="source-line-no">514</span><span id="line-514">  static void validateRowMutations(RowMutations rowMutations, int maxKeyValueSize) {</span>
+<span class="source-line-no">515</span><span id="line-515">    for (Mutation mutation : rowMutations.getMutations()) {</span>
+<span class="source-line-no">516</span><span id="line-516">      validateMutation(mutation, maxKeyValueSize);</span>
+<span class="source-line-no">517</span><span id="line-517">    }</span>
+<span class="source-line-no">518</span><span id="line-518">  }</span>
+<span class="source-line-no">519</span><span id="line-519"></span>
+<span class="source-line-no">520</span><span id="line-520">  static &lt;T&gt; CompletableFuture&lt;T&gt; getOrFetch(AtomicReference&lt;T&gt; cacheRef,</span>
+<span class="source-line-no">521</span><span id="line-521">    AtomicReference&lt;CompletableFuture&lt;T&gt;&gt; futureRef, boolean reload,</span>
+<span class="source-line-no">522</span><span id="line-522">    Supplier&lt;CompletableFuture&lt;T&gt;&gt; fetch, Predicate&lt;T&gt; validator, String type) {</span>
+<span class="source-line-no">523</span><span id="line-523">    for (;;) {</span>
+<span class="source-line-no">524</span><span id="line-524">      if (!reload) {</span>
+<span class="source-line-no">525</span><span id="line-525">        T value = cacheRef.get();</span>
+<span class="source-line-no">526</span><span id="line-526">        if (value != null &amp;&amp; validator.test(value)) {</span>
+<span class="source-line-no">527</span><span id="line-527">          return CompletableFuture.completedFuture(value);</span>
+<span class="source-line-no">528</span><span id="line-528">        }</span>
+<span class="source-line-no">529</span><span id="line-529">      }</span>
+<span class="source-line-no">530</span><span id="line-530">      LOG.trace("{} cache is null, try fetching from registry", type);</span>
+<span class="source-line-no">531</span><span id="line-531">      if (futureRef.compareAndSet(null, new CompletableFuture&lt;&gt;())) {</span>
+<span class="source-line-no">532</span><span id="line-532">        LOG.debug("Start fetching {} from registry", type);</span>
+<span class="source-line-no">533</span><span id="line-533">        CompletableFuture&lt;T&gt; future = futureRef.get();</span>
+<span class="source-line-no">534</span><span id="line-534">        addListener(fetch.get(), (value, error) -&gt; {</span>
+<span class="source-line-no">535</span><span id="line-535">          if (error != null) {</span>
+<span class="source-line-no">536</span><span id="line-536">            LOG.debug("Failed to fetch {} from registry", type, error);</span>
+<span class="source-line-no">537</span><span id="line-537">            futureRef.getAndSet(null).completeExceptionally(error);</span>
+<span class="source-line-no">538</span><span id="line-538">            return;</span>
+<span class="source-line-no">539</span><span id="line-539">          }</span>
+<span class="source-line-no">540</span><span id="line-540">          LOG.debug("The fetched {} is {}", type, value);</span>
+<span class="source-line-no">541</span><span id="line-541">          // Here we update cache before reset future, so it is possible that someone can get a</span>
+<span class="source-line-no">542</span><span id="line-542">          // stale value. Consider this:</span>
+<span class="source-line-no">543</span><span id="line-543">          // 1. update cacheRef</span>
+<span class="source-line-no">544</span><span id="line-544">          // 2. someone clears the cache and relocates again</span>
+<span class="source-line-no">545</span><span id="line-545">          // 3. the futureRef is not null so the old future is used.</span>
+<span class="source-line-no">546</span><span id="line-546">          // 4. we clear futureRef and complete the future in it with the value being</span>
+<span class="source-line-no">547</span><span id="line-547">          // cleared in step 2.</span>
+<span class="source-line-no">548</span><span id="line-548">          // But we do not think it is a big deal as it rarely happens, and even if it happens, the</span>
+<span class="source-line-no">549</span><span id="line-549">          // caller will retry again later, no correctness problems.</span>
+<span class="source-line-no">550</span><span id="line-550">          cacheRef.set(value);</span>
+<span class="source-line-no">551</span><span id="line-551">          futureRef.set(null);</span>
+<span class="source-line-no">552</span><span id="line-552">          future.complete(value);</span>
+<span class="source-line-no">553</span><span id="line-553">        });</span>
+<span class="source-line-no">554</span><span id="line-554">        return future;</span>
+<span class="source-line-no">555</span><span id="line-555">      } else {</span>
+<span class="source-line-no">556</span><span id="line-556">        CompletableFuture&lt;T&gt; future = futureRef.get();</span>
+<span class="source-line-no">557</span><span id="line-557">        if (future != null) {</span>
+<span class="source-line-no">558</span><span id="line-558">          return future;</span>
+<span class="source-line-no">559</span><span id="line-559">        }</span>
+<span class="source-line-no">560</span><span id="line-560">      }</span>
+<span class="source-line-no">561</span><span id="line-561">    }</span>
+<span class="source-line-no">562</span><span id="line-562">  }</span>
+<span class="source-line-no">563</span><span id="line-563"></span>
+<span class="source-line-no">564</span><span id="line-564">  static void updateStats(Optional&lt;ServerStatisticTracker&gt; optStats,</span>
+<span class="source-line-no">565</span><span id="line-565">    Optional&lt;MetricsConnection&gt; optMetrics, ServerName serverName, MultiResponse resp) {</span>
+<span class="source-line-no">566</span><span id="line-566">    if (!optStats.isPresent() &amp;&amp; !optMetrics.isPresent()) {</span>
+<span class="source-line-no">567</span><span id="line-567">      // ServerStatisticTracker and MetricsConnection are both not present, just return</span>
+<span class="source-line-no">568</span><span id="line-568">      return;</span>
+<span class="source-line-no">569</span><span id="line-569">    }</span>
+<span class="source-line-no">570</span><span id="line-570">    resp.getResults().forEach((regionName, regionResult) -&gt; {</span>
+<span class="source-line-no">571</span><span id="line-571">      ClientProtos.RegionLoadStats stat = regionResult.getStat();</span>
+<span class="source-line-no">572</span><span id="line-572">      if (stat == null) {</span>
+<span class="source-line-no">573</span><span id="line-573">        if (LOG.isDebugEnabled()) {</span>
+<span class="source-line-no">574</span><span id="line-574">          LOG.debug("No ClientProtos.RegionLoadStats found for server={}, region={}", serverName,</span>
+<span class="source-line-no">575</span><span id="line-575">            Bytes.toStringBinary(regionName));</span>
+<span class="source-line-no">576</span><span id="line-576">        }</span>
+<span class="source-line-no">577</span><span id="line-577">        return;</span>
+<span class="source-line-no">578</span><span id="line-578">      }</span>
+<span class="source-line-no">579</span><span id="line-579">      RegionLoadStats regionLoadStats = ProtobufUtil.createRegionLoadStats(stat);</span>
+<span class="source-line-no">580</span><span id="line-580">      optStats.ifPresent(</span>
+<span class="source-line-no">581</span><span id="line-581">        stats -&gt; ResultStatsUtil.updateStats(stats, serverName, regionName, regionLoadStats));</span>
+<span class="source-line-no">582</span><span id="line-582">      optMetrics.ifPresent(</span>
+<span class="source-line-no">583</span><span id="line-583">        metrics -&gt; ResultStatsUtil.updateStats(metrics, serverName, regionName, regionLoadStats));</span>
+<span class="source-line-no">584</span><span id="line-584">    });</span>
+<span class="source-line-no">585</span><span id="line-585">  }</span>
+<span class="source-line-no">586</span><span id="line-586"></span>
+<span class="source-line-no">587</span><span id="line-587">  @FunctionalInterface</span>
+<span class="source-line-no">588</span><span id="line-588">  interface Converter&lt;D, I, S&gt; {</span>
+<span class="source-line-no">589</span><span id="line-589">    D convert(I info, S src) throws IOException;</span>
+<span class="source-line-no">590</span><span id="line-590">  }</span>
+<span class="source-line-no">591</span><span id="line-591"></span>
+<span class="source-line-no">592</span><span id="line-592">  @FunctionalInterface</span>
+<span class="source-line-no">593</span><span id="line-593">  interface RpcCall&lt;RESP, REQ&gt; {</span>
+<span class="source-line-no">594</span><span id="line-594">    void call(ClientService.Interface stub, HBaseRpcController controller, REQ req,</span>
+<span class="source-line-no">595</span><span id="line-595">      RpcCallback&lt;RESP&gt; done);</span>
+<span class="source-line-no">596</span><span id="line-596">  }</span>
+<span class="source-line-no">597</span><span id="line-597"></span>
+<span class="source-line-no">598</span><span id="line-598">  static &lt;REQ, PREQ, PRESP, RESP&gt; CompletableFuture&lt;RESP&gt; call(HBaseRpcController controller,</span>
+<span class="source-line-no">599</span><span id="line-599">    HRegionLocation loc, ClientService.Interface stub, REQ req,</span>
+<span class="source-line-no">600</span><span id="line-600">    Converter&lt;PREQ, byte[], REQ&gt; reqConvert, RpcCall&lt;PRESP, PREQ&gt; rpcCall,</span>
+<span class="source-line-no">601</span><span id="line-601">    Converter&lt;RESP, HBaseRpcController, PRESP&gt; respConverter) {</span>
+<span class="source-line-no">602</span><span id="line-602">    CompletableFuture&lt;RESP&gt; future = new CompletableFuture&lt;&gt;();</span>
+<span class="source-line-no">603</span><span id="line-603">    try {</span>
+<span class="source-line-no">604</span><span id="line-604">      rpcCall.call(stub, controller, reqConvert.convert(loc.getRegion().getRegionName(), req),</span>
+<span class="source-line-no">605</span><span id="line-605">        new RpcCallback&lt;PRESP&gt;() {</span>
+<span class="source-line-no">606</span><span id="line-606"></span>
+<span class="source-line-no">607</span><span id="line-607">          @Override</span>
+<span class="source-line-no">608</span><span id="line-608">          public void run(PRESP resp) {</span>
+<span class="source-line-no">609</span><span id="line-609">            if (controller.failed()) {</span>
+<span class="source-line-no">610</span><span id="line-610">              future.completeExceptionally(controller.getFailed());</span>
+<span class="source-line-no">611</span><span id="line-611">            } else {</span>
+<span class="source-line-no">612</span><span id="line-612">              try {</span>
+<span class="source-line-no">613</span><span id="line-613">                future.complete(respConverter.convert(controller, resp));</span>
+<span class="source-line-no">614</span><span id="line-614">              } catch (IOException e) {</span>
+<span class="source-line-no">615</span><span id="line-615">                future.completeExceptionally(e);</span>
+<span class="source-line-no">616</span><span id="line-616">              }</span>
+<span class="source-line-no">617</span><span id="line-617">            }</span>
+<span class="source-line-no">618</span><span id="line-618">          }</span>
+<span class="source-line-no">619</span><span id="line-619">        });</span>
+<span class="source-line-no">620</span><span id="line-620">    } catch (IOException e) {</span>
+<span class="source-line-no">621</span><span id="line-621">      future.completeExceptionally(e);</span>
+<span class="source-line-no">622</span><span id="line-622">    }</span>
+<span class="source-line-no">623</span><span id="line-623">    return future;</span>
+<span class="source-line-no">624</span><span id="line-624">  }</span>
+<span class="source-line-no">625</span><span id="line-625"></span>
+<span class="source-line-no">626</span><span id="line-626">  static void shutdownPool(ExecutorService pool) {</span>
+<span class="source-line-no">627</span><span id="line-627">    pool.shutdown();</span>
+<span class="source-line-no">628</span><span id="line-628">    try {</span>
+<span class="source-line-no">629</span><span id="line-629">      if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {</span>
+<span class="source-line-no">630</span><span id="line-630">        pool.shutdownNow();</span>
+<span class="source-line-no">631</span><span id="line-631">      }</span>
+<span class="source-line-no">632</span><span id="line-632">    } catch (InterruptedException e) {</span>
+<span class="source-line-no">633</span><span id="line-633">      pool.shutdownNow();</span>
+<span class="source-line-no">634</span><span id="line-634">    }</span>
+<span class="source-line-no">635</span><span id="line-635">  }</span>
+<span class="source-line-no">636</span><span id="line-636"></span>
+<span class="source-line-no">637</span><span id="line-637">  static void setCoprocessorError(RpcController controller, Throwable error) {</span>
+<span class="source-line-no">638</span><span id="line-638">    if (controller == null) {</span>
+<span class="source-line-no">639</span><span id="line-639">      return;</span>
+<span class="source-line-no">640</span><span id="line-640">    }</span>
+<span class="source-line-no">641</span><span id="line-641">    if (controller instanceof ServerRpcController) {</span>
+<span class="source-line-no">642</span><span id="line-642">      if (error instanceof IOException) {</span>
+<span class="source-line-no">643</span><span id="line-643">        ((ServerRpcController) controller).setFailedOn((IOException) error);</span>
+<span class="source-line-no">644</span><span id="line-644">      } else {</span>
+<span class="source-line-no">645</span><span id="line-645">        ((ServerRpcController) controller).setFailedOn(new IOException(error));</span>
+<span class="source-line-no">646</span><span id="line-646">      }</span>
+<span class="source-line-no">647</span><span id="line-647">    } else if (controller instanceof ClientCoprocessorRpcController) {</span>
+<span class="source-line-no">648</span><span id="line-648">      ((ClientCoprocessorRpcController) controller).setFailed(error);</span>
+<span class="source-line-no">649</span><span id="line-649">    } else {</span>
+<span class="source-line-no">650</span><span id="line-650">      controller.setFailed(error.toString());</span>
+<span class="source-line-no">651</span><span id="line-651">    }</span>
+<span class="source-line-no">652</span><span id="line-652">  }</span>
+<span class="source-line-no">653</span><span id="line-653"></span>
+<span class="source-line-no">654</span><span id="line-654">  public static boolean isUnexpectedPreambleHeaderException(IOException e) {</span>
+<span class="source-line-no">655</span><span id="line-655">    if (!(e instanceof RemoteException)) {</span>
+<span class="source-line-no">656</span><span id="line-656">      return false;</span>
+<span class="source-line-no">657</span><span id="line-657">    }</span>
+<span class="source-line-no">658</span><span id="line-658">    RemoteException re = (RemoteException) e;</span>
+<span class="source-line-no">659</span><span id="line-659">    return FatalConnectionException.class.getName().equals(re.getClassName())</span>
+<span class="source-line-no">660</span><span id="line-660">      &amp;&amp; re.getMessage().startsWith("Expected HEADER=");</span>
+<span class="source-line-no">661</span><span id="line-661">  }</span>
+<span class="source-line-no">662</span><span id="line-662">}</span>
 
 
 

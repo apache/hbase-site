@@ -39,430 +39,506 @@
 <span class="source-line-no">026</span><span id="line-26">import java.util.Map;</span>
 <span class="source-line-no">027</span><span id="line-27">import java.util.Set;</span>
 <span class="source-line-no">028</span><span id="line-28">import java.util.TreeMap;</span>
-<span class="source-line-no">029</span><span id="line-29">import java.util.stream.Collectors;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.conf.Configuration;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.ClusterMetrics;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.HBaseIOException;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.HConstants;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.ServerName;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.client.RegionInfo;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.constraint.ConstraintException;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.favored.FavoredNodesManager;</span>
-<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.favored.FavoredNodesPromoter;</span>
-<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.master.LoadBalancer;</span>
-<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.master.MasterServices;</span>
-<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.master.RegionPlan;</span>
-<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.master.balancer.ClusterInfoProvider;</span>
-<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.master.balancer.LoadBalancerFactory;</span>
-<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.master.balancer.MasterClusterInfoProvider;</span>
-<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.net.Address;</span>
-<span class="source-line-no">047</span><span id="line-47">import org.apache.hadoop.hbase.util.Pair;</span>
-<span class="source-line-no">048</span><span id="line-48">import org.apache.hadoop.hbase.util.ReflectionUtils;</span>
-<span class="source-line-no">049</span><span id="line-49">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">050</span><span id="line-50">import org.slf4j.Logger;</span>
-<span class="source-line-no">051</span><span id="line-51">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">052</span><span id="line-52"></span>
-<span class="source-line-no">053</span><span id="line-53">import org.apache.hbase.thirdparty.com.google.common.collect.ArrayListMultimap;</span>
-<span class="source-line-no">054</span><span id="line-54">import org.apache.hbase.thirdparty.com.google.common.collect.ListMultimap;</span>
-<span class="source-line-no">055</span><span id="line-55">import org.apache.hbase.thirdparty.com.google.common.collect.Lists;</span>
-<span class="source-line-no">056</span><span id="line-56">import org.apache.hbase.thirdparty.com.google.common.collect.Maps;</span>
-<span class="source-line-no">057</span><span id="line-57"></span>
-<span class="source-line-no">058</span><span id="line-58">/**</span>
-<span class="source-line-no">059</span><span id="line-59"> * GroupBasedLoadBalancer, used when Region Server Grouping is configured (HBase-6721) It does</span>
-<span class="source-line-no">060</span><span id="line-60"> * region balance based on a table's group membership.</span>
-<span class="source-line-no">061</span><span id="line-61"> * &lt;p/&gt;</span>
-<span class="source-line-no">062</span><span id="line-62"> * Most assignment methods contain two exclusive code paths: Online - when the group table is online</span>
-<span class="source-line-no">063</span><span id="line-63"> * and Offline - when it is unavailable.</span>
-<span class="source-line-no">064</span><span id="line-64"> * &lt;p/&gt;</span>
-<span class="source-line-no">065</span><span id="line-65"> * During Offline, assignments are assigned based on cached information in zookeeper. If unavailable</span>
-<span class="source-line-no">066</span><span id="line-66"> * (ie bootstrap) then regions are assigned randomly.</span>
-<span class="source-line-no">067</span><span id="line-67"> * &lt;p/&gt;</span>
-<span class="source-line-no">068</span><span id="line-68"> * Once the GROUP table has been assigned, the balancer switches to Online and will then start</span>
-<span class="source-line-no">069</span><span id="line-69"> * providing appropriate assignments for user tables.</span>
-<span class="source-line-no">070</span><span id="line-70"> */</span>
-<span class="source-line-no">071</span><span id="line-71">@InterfaceAudience.Private</span>
-<span class="source-line-no">072</span><span id="line-72">public class RSGroupBasedLoadBalancer implements LoadBalancer {</span>
-<span class="source-line-no">073</span><span id="line-73">  private static final Logger LOG = LoggerFactory.getLogger(RSGroupBasedLoadBalancer.class);</span>
-<span class="source-line-no">074</span><span id="line-74"></span>
-<span class="source-line-no">075</span><span id="line-75">  private MasterServices masterServices;</span>
-<span class="source-line-no">076</span><span id="line-76">  private ClusterInfoProvider provider;</span>
-<span class="source-line-no">077</span><span id="line-77">  private FavoredNodesManager favoredNodesManager;</span>
-<span class="source-line-no">078</span><span id="line-78">  private volatile RSGroupInfoManager rsGroupInfoManager;</span>
-<span class="source-line-no">079</span><span id="line-79">  private volatile LoadBalancer internalBalancer;</span>
-<span class="source-line-no">080</span><span id="line-80"></span>
-<span class="source-line-no">081</span><span id="line-81">  /**</span>
-<span class="source-line-no">082</span><span id="line-82">   * Set this key to {@code true} to allow region fallback. Fallback to the default rsgroup first,</span>
-<span class="source-line-no">083</span><span id="line-83">   * then fallback to any group if no online servers in default rsgroup. Please keep balancer switch</span>
-<span class="source-line-no">084</span><span id="line-84">   * on at the same time, which is relied on to correct misplaced regions</span>
+<span class="source-line-no">029</span><span id="line-29">import java.util.concurrent.atomic.AtomicBoolean;</span>
+<span class="source-line-no">030</span><span id="line-30">import java.util.concurrent.atomic.AtomicReference;</span>
+<span class="source-line-no">031</span><span id="line-31">import java.util.stream.Collectors;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.conf.Configuration;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.ClusterMetrics;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.HBaseIOException;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.HConstants;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.ServerName;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.client.RegionInfo;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.constraint.ConstraintException;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.favored.FavoredNodesManager;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.favored.FavoredNodesPromoter;</span>
+<span class="source-line-no">042</span><span id="line-42">import org.apache.hadoop.hbase.master.LoadBalancer;</span>
+<span class="source-line-no">043</span><span id="line-43">import org.apache.hadoop.hbase.master.MasterServices;</span>
+<span class="source-line-no">044</span><span id="line-44">import org.apache.hadoop.hbase.master.RegionPlan;</span>
+<span class="source-line-no">045</span><span id="line-45">import org.apache.hadoop.hbase.master.balancer.ClusterInfoProvider;</span>
+<span class="source-line-no">046</span><span id="line-46">import org.apache.hadoop.hbase.master.balancer.LoadBalancerFactory;</span>
+<span class="source-line-no">047</span><span id="line-47">import org.apache.hadoop.hbase.master.balancer.MasterClusterInfoProvider;</span>
+<span class="source-line-no">048</span><span id="line-48">import org.apache.hadoop.hbase.net.Address;</span>
+<span class="source-line-no">049</span><span id="line-49">import org.apache.hadoop.hbase.util.Pair;</span>
+<span class="source-line-no">050</span><span id="line-50">import org.apache.hadoop.hbase.util.ReflectionUtils;</span>
+<span class="source-line-no">051</span><span id="line-51">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">052</span><span id="line-52">import org.slf4j.Logger;</span>
+<span class="source-line-no">053</span><span id="line-53">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">054</span><span id="line-54"></span>
+<span class="source-line-no">055</span><span id="line-55">import org.apache.hbase.thirdparty.com.google.common.collect.ArrayListMultimap;</span>
+<span class="source-line-no">056</span><span id="line-56">import org.apache.hbase.thirdparty.com.google.common.collect.ListMultimap;</span>
+<span class="source-line-no">057</span><span id="line-57">import org.apache.hbase.thirdparty.com.google.common.collect.Lists;</span>
+<span class="source-line-no">058</span><span id="line-58">import org.apache.hbase.thirdparty.com.google.common.collect.Maps;</span>
+<span class="source-line-no">059</span><span id="line-59"></span>
+<span class="source-line-no">060</span><span id="line-60">/**</span>
+<span class="source-line-no">061</span><span id="line-61"> * GroupBasedLoadBalancer, used when Region Server Grouping is configured (HBase-6721) It does</span>
+<span class="source-line-no">062</span><span id="line-62"> * region balance based on a table's group membership.</span>
+<span class="source-line-no">063</span><span id="line-63"> * &lt;p/&gt;</span>
+<span class="source-line-no">064</span><span id="line-64"> * Most assignment methods contain two exclusive code paths: Online - when the group table is online</span>
+<span class="source-line-no">065</span><span id="line-65"> * and Offline - when it is unavailable.</span>
+<span class="source-line-no">066</span><span id="line-66"> * &lt;p/&gt;</span>
+<span class="source-line-no">067</span><span id="line-67"> * During Offline, assignments are assigned based on cached information in zookeeper. If unavailable</span>
+<span class="source-line-no">068</span><span id="line-68"> * (ie bootstrap) then regions are assigned randomly.</span>
+<span class="source-line-no">069</span><span id="line-69"> * &lt;p/&gt;</span>
+<span class="source-line-no">070</span><span id="line-70"> * Once the GROUP table has been assigned, the balancer switches to Online and will then start</span>
+<span class="source-line-no">071</span><span id="line-71"> * providing appropriate assignments for user tables.</span>
+<span class="source-line-no">072</span><span id="line-72"> */</span>
+<span class="source-line-no">073</span><span id="line-73">@InterfaceAudience.Private</span>
+<span class="source-line-no">074</span><span id="line-74">public class RSGroupBasedLoadBalancer implements LoadBalancer {</span>
+<span class="source-line-no">075</span><span id="line-75">  private static final Logger LOG = LoggerFactory.getLogger(RSGroupBasedLoadBalancer.class);</span>
+<span class="source-line-no">076</span><span id="line-76"></span>
+<span class="source-line-no">077</span><span id="line-77">  private MasterServices masterServices;</span>
+<span class="source-line-no">078</span><span id="line-78">  private ClusterInfoProvider provider;</span>
+<span class="source-line-no">079</span><span id="line-79">  private FavoredNodesManager favoredNodesManager;</span>
+<span class="source-line-no">080</span><span id="line-80">  private volatile RSGroupInfoManager rsGroupInfoManager;</span>
+<span class="source-line-no">081</span><span id="line-81">  private volatile LoadBalancer internalBalancer;</span>
+<span class="source-line-no">082</span><span id="line-82"></span>
+<span class="source-line-no">083</span><span id="line-83">  /**</span>
+<span class="source-line-no">084</span><span id="line-84">   * Tracks whether a balance run is currently in progress.</span>
 <span class="source-line-no">085</span><span id="line-85">   */</span>
-<span class="source-line-no">086</span><span id="line-86">  public static final String FALLBACK_GROUP_ENABLE_KEY = "hbase.rsgroup.fallback.enable";</span>
+<span class="source-line-no">086</span><span id="line-86">  private final AtomicBoolean isBalancing = new AtomicBoolean(false);</span>
 <span class="source-line-no">087</span><span id="line-87"></span>
-<span class="source-line-no">088</span><span id="line-88">  private volatile boolean fallbackEnabled = false;</span>
-<span class="source-line-no">089</span><span id="line-89"></span>
-<span class="source-line-no">090</span><span id="line-90">  /**</span>
-<span class="source-line-no">091</span><span id="line-91">   * Used by reflection in {@link org.apache.hadoop.hbase.master.balancer.LoadBalancerFactory}.</span>
-<span class="source-line-no">092</span><span id="line-92">   */</span>
-<span class="source-line-no">093</span><span id="line-93">  @InterfaceAudience.Private</span>
-<span class="source-line-no">094</span><span id="line-94">  public RSGroupBasedLoadBalancer() {</span>
-<span class="source-line-no">095</span><span id="line-95">  }</span>
-<span class="source-line-no">096</span><span id="line-96"></span>
-<span class="source-line-no">097</span><span id="line-97">  // must be called after calling initialize</span>
-<span class="source-line-no">098</span><span id="line-98">  @Override</span>
-<span class="source-line-no">099</span><span id="line-99">  public synchronized void updateClusterMetrics(ClusterMetrics sm) {</span>
-<span class="source-line-no">100</span><span id="line-100">    assert internalBalancer != null;</span>
-<span class="source-line-no">101</span><span id="line-101">    internalBalancer.updateClusterMetrics(sm);</span>
-<span class="source-line-no">102</span><span id="line-102">  }</span>
-<span class="source-line-no">103</span><span id="line-103"></span>
-<span class="source-line-no">104</span><span id="line-104">  @Override</span>
-<span class="source-line-no">105</span><span id="line-105">  public synchronized void</span>
-<span class="source-line-no">106</span><span id="line-106">    updateBalancerLoadInfo(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) {</span>
-<span class="source-line-no">107</span><span id="line-107">    internalBalancer.updateBalancerLoadInfo(loadOfAllTable);</span>
-<span class="source-line-no">108</span><span id="line-108">  }</span>
-<span class="source-line-no">109</span><span id="line-109"></span>
-<span class="source-line-no">110</span><span id="line-110">  public void setMasterServices(MasterServices masterServices) {</span>
-<span class="source-line-no">111</span><span id="line-111">    this.masterServices = masterServices;</span>
-<span class="source-line-no">112</span><span id="line-112">  }</span>
-<span class="source-line-no">113</span><span id="line-113"></span>
-<span class="source-line-no">114</span><span id="line-114">  /**</span>
-<span class="source-line-no">115</span><span id="line-115">   * Balance by RSGroup.</span>
-<span class="source-line-no">116</span><span id="line-116">   */</span>
-<span class="source-line-no">117</span><span id="line-117">  @Override</span>
-<span class="source-line-no">118</span><span id="line-118">  public synchronized List&lt;RegionPlan&gt; balanceCluster(</span>
-<span class="source-line-no">119</span><span id="line-119">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) throws IOException {</span>
-<span class="source-line-no">120</span><span id="line-120">    if (!isOnline()) {</span>
-<span class="source-line-no">121</span><span id="line-121">      throw new ConstraintException(</span>
-<span class="source-line-no">122</span><span id="line-122">        RSGroupInfoManager.class.getSimpleName() + " is not online, unable to perform balance");</span>
-<span class="source-line-no">123</span><span id="line-123">    }</span>
-<span class="source-line-no">124</span><span id="line-124"></span>
-<span class="source-line-no">125</span><span id="line-125">    // Calculate correct assignments and a list of RegionPlan for mis-placed regions</span>
-<span class="source-line-no">126</span><span id="line-126">    Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;,</span>
-<span class="source-line-no">127</span><span id="line-127">      List&lt;RegionPlan&gt;&gt; correctedStateAndRegionPlans = correctAssignments(loadOfAllTable);</span>
-<span class="source-line-no">128</span><span id="line-128">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; correctedLoadOfAllTable =</span>
-<span class="source-line-no">129</span><span id="line-129">      correctedStateAndRegionPlans.getFirst();</span>
-<span class="source-line-no">130</span><span id="line-130">    List&lt;RegionPlan&gt; regionPlans = correctedStateAndRegionPlans.getSecond();</span>
-<span class="source-line-no">131</span><span id="line-131">    RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
-<span class="source-line-no">132</span><span id="line-132">    // Add RegionPlan</span>
-<span class="source-line-no">133</span><span id="line-133">    // for the regions which have been placed according to the region server group assignment</span>
-<span class="source-line-no">134</span><span id="line-134">    // into the movement list</span>
-<span class="source-line-no">135</span><span id="line-135">    try {</span>
-<span class="source-line-no">136</span><span id="line-136">      // For each rsgroup</span>
-<span class="source-line-no">137</span><span id="line-137">      for (RSGroupInfo rsgroup : rsGroupInfoManager.listRSGroups()) {</span>
-<span class="source-line-no">138</span><span id="line-138">        LOG.debug("Balancing RSGroup={}", rsgroup.getName());</span>
-<span class="source-line-no">139</span><span id="line-139">        Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfTablesInGroup = new HashMap&lt;&gt;();</span>
-<span class="source-line-no">140</span><span id="line-140">        for (Map.Entry&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; entry : correctedLoadOfAllTable</span>
-<span class="source-line-no">141</span><span id="line-141">          .entrySet()) {</span>
-<span class="source-line-no">142</span><span id="line-142">          TableName tableName = entry.getKey();</span>
-<span class="source-line-no">143</span><span id="line-143">          RSGroupInfo targetRSGInfo = RSGroupUtil</span>
-<span class="source-line-no">144</span><span id="line-144">            .getRSGroupInfo(masterServices, rsGroupInfoManager, tableName).orElse(defaultInfo);</span>
-<span class="source-line-no">145</span><span id="line-145">          if (targetRSGInfo.getName().equals(rsgroup.getName())) {</span>
-<span class="source-line-no">146</span><span id="line-146">            loadOfTablesInGroup.put(tableName, entry.getValue());</span>
-<span class="source-line-no">147</span><span id="line-147">          }</span>
-<span class="source-line-no">148</span><span id="line-148">        }</span>
-<span class="source-line-no">149</span><span id="line-149">        List&lt;RegionPlan&gt; groupPlans = null;</span>
-<span class="source-line-no">150</span><span id="line-150">        if (!loadOfTablesInGroup.isEmpty()) {</span>
-<span class="source-line-no">151</span><span id="line-151">          LOG.info("Start Generate Balance plan for group: " + rsgroup.getName());</span>
-<span class="source-line-no">152</span><span id="line-152">          groupPlans = this.internalBalancer.balanceCluster(loadOfTablesInGroup);</span>
-<span class="source-line-no">153</span><span id="line-153">        }</span>
-<span class="source-line-no">154</span><span id="line-154">        if (groupPlans != null) {</span>
-<span class="source-line-no">155</span><span id="line-155">          regionPlans.addAll(groupPlans);</span>
-<span class="source-line-no">156</span><span id="line-156">        }</span>
-<span class="source-line-no">157</span><span id="line-157">      }</span>
-<span class="source-line-no">158</span><span id="line-158">    } catch (IOException exp) {</span>
-<span class="source-line-no">159</span><span id="line-159">      LOG.warn("Exception while balancing cluster.", exp);</span>
-<span class="source-line-no">160</span><span id="line-160">      regionPlans.clear();</span>
-<span class="source-line-no">161</span><span id="line-161">    }</span>
-<span class="source-line-no">162</span><span id="line-162"></span>
-<span class="source-line-no">163</span><span id="line-163">    // Return the whole movement list</span>
-<span class="source-line-no">164</span><span id="line-164">    return regionPlans;</span>
-<span class="source-line-no">165</span><span id="line-165">  }</span>
-<span class="source-line-no">166</span><span id="line-166"></span>
-<span class="source-line-no">167</span><span id="line-167">  @Override</span>
-<span class="source-line-no">168</span><span id="line-168">  @NonNull</span>
-<span class="source-line-no">169</span><span id="line-169">  public Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; roundRobinAssignment(List&lt;RegionInfo&gt; regions,</span>
-<span class="source-line-no">170</span><span id="line-170">    List&lt;ServerName&gt; servers) throws IOException {</span>
-<span class="source-line-no">171</span><span id="line-171">    Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; assignments = Maps.newHashMap();</span>
-<span class="source-line-no">172</span><span id="line-172">    List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
-<span class="source-line-no">173</span><span id="line-173">      generateGroupAssignments(regions, servers);</span>
-<span class="source-line-no">174</span><span id="line-174">    for (Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt; pair : pairs) {</span>
-<span class="source-line-no">175</span><span id="line-175">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; result =</span>
-<span class="source-line-no">176</span><span id="line-176">        this.internalBalancer.roundRobinAssignment(pair.getFirst(), pair.getSecond());</span>
-<span class="source-line-no">177</span><span id="line-177">      result.forEach((server, regionInfos) -&gt; assignments</span>
-<span class="source-line-no">178</span><span id="line-178">        .computeIfAbsent(server, s -&gt; Lists.newArrayList()).addAll(regionInfos));</span>
-<span class="source-line-no">179</span><span id="line-179">    }</span>
-<span class="source-line-no">180</span><span id="line-180">    return assignments;</span>
-<span class="source-line-no">181</span><span id="line-181">  }</span>
-<span class="source-line-no">182</span><span id="line-182"></span>
-<span class="source-line-no">183</span><span id="line-183">  @Override</span>
-<span class="source-line-no">184</span><span id="line-184">  @NonNull</span>
-<span class="source-line-no">185</span><span id="line-185">  public Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; retainAssignment(Map&lt;RegionInfo, ServerName&gt; regions,</span>
-<span class="source-line-no">186</span><span id="line-186">    List&lt;ServerName&gt; servers) throws HBaseIOException {</span>
-<span class="source-line-no">187</span><span id="line-187">    try {</span>
-<span class="source-line-no">188</span><span id="line-188">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; assignments = new TreeMap&lt;&gt;();</span>
-<span class="source-line-no">189</span><span id="line-189">      List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
-<span class="source-line-no">190</span><span id="line-190">        generateGroupAssignments(Lists.newArrayList(regions.keySet()), servers);</span>
-<span class="source-line-no">191</span><span id="line-191">      for (Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt; pair : pairs) {</span>
-<span class="source-line-no">192</span><span id="line-192">        List&lt;RegionInfo&gt; regionList = pair.getFirst();</span>
-<span class="source-line-no">193</span><span id="line-193">        Map&lt;RegionInfo, ServerName&gt; currentAssignmentMap = Maps.newTreeMap();</span>
-<span class="source-line-no">194</span><span id="line-194">        regionList.forEach(r -&gt; currentAssignmentMap.put(r, regions.get(r)));</span>
-<span class="source-line-no">195</span><span id="line-195">        Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; pairResult =</span>
-<span class="source-line-no">196</span><span id="line-196">          this.internalBalancer.retainAssignment(currentAssignmentMap, pair.getSecond());</span>
-<span class="source-line-no">197</span><span id="line-197">        pairResult.forEach((server, rs) -&gt; assignments</span>
-<span class="source-line-no">198</span><span id="line-198">          .computeIfAbsent(server, s -&gt; Lists.newArrayList()).addAll(rs));</span>
-<span class="source-line-no">199</span><span id="line-199">      }</span>
-<span class="source-line-no">200</span><span id="line-200">      return assignments;</span>
-<span class="source-line-no">201</span><span id="line-201">    } catch (IOException e) {</span>
-<span class="source-line-no">202</span><span id="line-202">      throw new HBaseIOException("Failed to do online retain assignment", e);</span>
-<span class="source-line-no">203</span><span id="line-203">    }</span>
-<span class="source-line-no">204</span><span id="line-204">  }</span>
-<span class="source-line-no">205</span><span id="line-205"></span>
-<span class="source-line-no">206</span><span id="line-206">  @Override</span>
-<span class="source-line-no">207</span><span id="line-207">  public ServerName randomAssignment(RegionInfo region, List&lt;ServerName&gt; servers)</span>
-<span class="source-line-no">208</span><span id="line-208">    throws IOException {</span>
-<span class="source-line-no">209</span><span id="line-209">    List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
-<span class="source-line-no">210</span><span id="line-210">      generateGroupAssignments(Lists.newArrayList(region), servers);</span>
-<span class="source-line-no">211</span><span id="line-211">    List&lt;ServerName&gt; filteredServers = pairs.iterator().next().getSecond();</span>
-<span class="source-line-no">212</span><span id="line-212">    return this.internalBalancer.randomAssignment(region, filteredServers);</span>
-<span class="source-line-no">213</span><span id="line-213">  }</span>
-<span class="source-line-no">214</span><span id="line-214"></span>
-<span class="source-line-no">215</span><span id="line-215">  private List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; generateGroupAssignments(</span>
-<span class="source-line-no">216</span><span id="line-216">    List&lt;RegionInfo&gt; regions, List&lt;ServerName&gt; servers) throws HBaseIOException {</span>
-<span class="source-line-no">217</span><span id="line-217">    try {</span>
-<span class="source-line-no">218</span><span id="line-218">      ListMultimap&lt;String, RegionInfo&gt; regionMap = ArrayListMultimap.create();</span>
-<span class="source-line-no">219</span><span id="line-219">      ListMultimap&lt;String, ServerName&gt; serverMap = ArrayListMultimap.create();</span>
-<span class="source-line-no">220</span><span id="line-220">      RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
-<span class="source-line-no">221</span><span id="line-221">      for (RegionInfo region : regions) {</span>
-<span class="source-line-no">222</span><span id="line-222">        String groupName =</span>
-<span class="source-line-no">223</span><span id="line-223">          RSGroupUtil.getRSGroupInfo(masterServices, rsGroupInfoManager, region.getTable())</span>
-<span class="source-line-no">224</span><span id="line-224">            .orElse(defaultInfo).getName();</span>
-<span class="source-line-no">225</span><span id="line-225">        regionMap.put(groupName, region);</span>
-<span class="source-line-no">226</span><span id="line-226">      }</span>
-<span class="source-line-no">227</span><span id="line-227">      for (String groupKey : regionMap.keySet()) {</span>
-<span class="source-line-no">228</span><span id="line-228">        RSGroupInfo info = rsGroupInfoManager.getRSGroup(groupKey);</span>
-<span class="source-line-no">229</span><span id="line-229">        serverMap.putAll(groupKey, filterOfflineServers(info, servers));</span>
-<span class="source-line-no">230</span><span id="line-230">      }</span>
-<span class="source-line-no">231</span><span id="line-231"></span>
-<span class="source-line-no">232</span><span id="line-232">      List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; result = Lists.newArrayList();</span>
-<span class="source-line-no">233</span><span id="line-233">      List&lt;RegionInfo&gt; fallbackRegions = Lists.newArrayList();</span>
-<span class="source-line-no">234</span><span id="line-234">      for (String groupKey : regionMap.keySet()) {</span>
-<span class="source-line-no">235</span><span id="line-235">        if (serverMap.get(groupKey).isEmpty()) {</span>
-<span class="source-line-no">236</span><span id="line-236">          fallbackRegions.addAll(regionMap.get(groupKey));</span>
-<span class="source-line-no">237</span><span id="line-237">        } else {</span>
-<span class="source-line-no">238</span><span id="line-238">          result.add(Pair.newPair(regionMap.get(groupKey), serverMap.get(groupKey)));</span>
-<span class="source-line-no">239</span><span id="line-239">        }</span>
-<span class="source-line-no">240</span><span id="line-240">      }</span>
-<span class="source-line-no">241</span><span id="line-241">      if (!fallbackRegions.isEmpty()) {</span>
-<span class="source-line-no">242</span><span id="line-242">        List&lt;ServerName&gt; candidates = null;</span>
-<span class="source-line-no">243</span><span id="line-243">        if (isFallbackEnabled()) {</span>
-<span class="source-line-no">244</span><span id="line-244">          if (LOG.isDebugEnabled()) {</span>
-<span class="source-line-no">245</span><span id="line-245">            LOG.debug("Falling back {} regions to servers outside their RSGroup. Regions: {}",</span>
-<span class="source-line-no">246</span><span id="line-246">              fallbackRegions.size(), fallbackRegions.stream()</span>
-<span class="source-line-no">247</span><span id="line-247">                .map(RegionInfo::getRegionNameAsString).collect(Collectors.toSet()));</span>
-<span class="source-line-no">248</span><span id="line-248">          }</span>
-<span class="source-line-no">249</span><span id="line-249">          candidates = getFallBackCandidates(servers);</span>
-<span class="source-line-no">250</span><span id="line-250">        }</span>
-<span class="source-line-no">251</span><span id="line-251">        candidates = (candidates == null || candidates.isEmpty())</span>
-<span class="source-line-no">252</span><span id="line-252">          ? Lists.newArrayList(BOGUS_SERVER_NAME)</span>
-<span class="source-line-no">253</span><span id="line-253">          : candidates;</span>
-<span class="source-line-no">254</span><span id="line-254">        result.add(Pair.newPair(fallbackRegions, candidates));</span>
-<span class="source-line-no">255</span><span id="line-255">      }</span>
-<span class="source-line-no">256</span><span id="line-256">      return result;</span>
-<span class="source-line-no">257</span><span id="line-257">    } catch (IOException e) {</span>
-<span class="source-line-no">258</span><span id="line-258">      throw new HBaseIOException("Failed to generate group assignments", e);</span>
-<span class="source-line-no">259</span><span id="line-259">    }</span>
-<span class="source-line-no">260</span><span id="line-260">  }</span>
-<span class="source-line-no">261</span><span id="line-261"></span>
-<span class="source-line-no">262</span><span id="line-262">  private List&lt;ServerName&gt; filterOfflineServers(RSGroupInfo RSGroupInfo,</span>
-<span class="source-line-no">263</span><span id="line-263">    List&lt;ServerName&gt; onlineServers) {</span>
-<span class="source-line-no">264</span><span id="line-264">    if (RSGroupInfo != null) {</span>
-<span class="source-line-no">265</span><span id="line-265">      return filterServers(RSGroupInfo.getServers(), onlineServers);</span>
-<span class="source-line-no">266</span><span id="line-266">    } else {</span>
-<span class="source-line-no">267</span><span id="line-267">      LOG.warn("RSGroup Information found to be null. Some regions might be unassigned.");</span>
-<span class="source-line-no">268</span><span id="line-268">      return Collections.emptyList();</span>
-<span class="source-line-no">269</span><span id="line-269">    }</span>
-<span class="source-line-no">270</span><span id="line-270">  }</span>
-<span class="source-line-no">271</span><span id="line-271"></span>
-<span class="source-line-no">272</span><span id="line-272">  /**</span>
-<span class="source-line-no">273</span><span id="line-273">   * Filter servers based on the online servers.</span>
-<span class="source-line-no">274</span><span id="line-274">   * &lt;p/&gt;</span>
-<span class="source-line-no">275</span><span id="line-275">   * servers is actually a TreeSet (see {@link org.apache.hadoop.hbase.rsgroup.RSGroupInfo}), having</span>
-<span class="source-line-no">276</span><span id="line-276">   * its contains()'s time complexity as O(logn), which is good enough.</span>
-<span class="source-line-no">277</span><span id="line-277">   * &lt;p/&gt;</span>
-<span class="source-line-no">278</span><span id="line-278">   * TODO: consider using HashSet to pursue O(1) for contains() throughout the calling chain if</span>
-<span class="source-line-no">279</span><span id="line-279">   * needed.</span>
-<span class="source-line-no">280</span><span id="line-280">   * @param servers       the servers</span>
-<span class="source-line-no">281</span><span id="line-281">   * @param onlineServers List of servers which are online.</span>
-<span class="source-line-no">282</span><span id="line-282">   * @return the list</span>
-<span class="source-line-no">283</span><span id="line-283">   */</span>
-<span class="source-line-no">284</span><span id="line-284">  private List&lt;ServerName&gt; filterServers(Set&lt;Address&gt; servers, List&lt;ServerName&gt; onlineServers) {</span>
-<span class="source-line-no">285</span><span id="line-285">    ArrayList&lt;ServerName&gt; finalList = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">286</span><span id="line-286">    for (ServerName onlineServer : onlineServers) {</span>
-<span class="source-line-no">287</span><span id="line-287">      if (servers.contains(onlineServer.getAddress())) {</span>
-<span class="source-line-no">288</span><span id="line-288">        finalList.add(onlineServer);</span>
-<span class="source-line-no">289</span><span id="line-289">      }</span>
-<span class="source-line-no">290</span><span id="line-290">    }</span>
-<span class="source-line-no">291</span><span id="line-291">    return finalList;</span>
-<span class="source-line-no">292</span><span id="line-292">  }</span>
-<span class="source-line-no">293</span><span id="line-293"></span>
-<span class="source-line-no">294</span><span id="line-294">  private Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;, List&lt;RegionPlan&gt;&gt;</span>
-<span class="source-line-no">295</span><span id="line-295">    correctAssignments(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; existingAssignments)</span>
-<span class="source-line-no">296</span><span id="line-296">      throws IOException {</span>
-<span class="source-line-no">297</span><span id="line-297">    // To return</span>
-<span class="source-line-no">298</span><span id="line-298">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; correctAssignments = new HashMap&lt;&gt;();</span>
-<span class="source-line-no">299</span><span id="line-299">    List&lt;RegionPlan&gt; regionPlansForMisplacedRegions = new ArrayList&lt;&gt;();</span>
-<span class="source-line-no">300</span><span id="line-300">    RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
-<span class="source-line-no">301</span><span id="line-301">    for (Map.Entry&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; assignments : existingAssignments</span>
-<span class="source-line-no">302</span><span id="line-302">      .entrySet()) {</span>
-<span class="source-line-no">303</span><span id="line-303">      TableName tableName = assignments.getKey();</span>
-<span class="source-line-no">304</span><span id="line-304">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; clusterLoad = assignments.getValue();</span>
-<span class="source-line-no">305</span><span id="line-305">      RSGroupInfo targetRSGInfo = null;</span>
-<span class="source-line-no">306</span><span id="line-306">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; correctServerRegion = new TreeMap&lt;&gt;();</span>
-<span class="source-line-no">307</span><span id="line-307">      try {</span>
-<span class="source-line-no">308</span><span id="line-308">        targetRSGInfo = RSGroupUtil.getRSGroupInfo(masterServices, rsGroupInfoManager, tableName)</span>
-<span class="source-line-no">309</span><span id="line-309">          .orElse(defaultInfo);</span>
-<span class="source-line-no">310</span><span id="line-310">      } catch (IOException exp) {</span>
-<span class="source-line-no">311</span><span id="line-311">        LOG.debug("RSGroup information null for region of table " + tableName, exp);</span>
-<span class="source-line-no">312</span><span id="line-312">      }</span>
-<span class="source-line-no">313</span><span id="line-313">      for (Map.Entry&lt;ServerName, List&lt;RegionInfo&gt;&gt; serverRegionMap : clusterLoad.entrySet()) {</span>
-<span class="source-line-no">314</span><span id="line-314">        ServerName currentHostServer = serverRegionMap.getKey();</span>
-<span class="source-line-no">315</span><span id="line-315">        List&lt;RegionInfo&gt; regionInfoList = serverRegionMap.getValue();</span>
-<span class="source-line-no">316</span><span id="line-316">        if (</span>
-<span class="source-line-no">317</span><span id="line-317">          targetRSGInfo == null || !targetRSGInfo.containsServer(currentHostServer.getAddress())</span>
-<span class="source-line-no">318</span><span id="line-318">        ) {</span>
-<span class="source-line-no">319</span><span id="line-319">          regionInfoList.forEach(regionInfo -&gt; {</span>
-<span class="source-line-no">320</span><span id="line-320">            regionPlansForMisplacedRegions.add(new RegionPlan(regionInfo, currentHostServer, null));</span>
-<span class="source-line-no">321</span><span id="line-321">          });</span>
-<span class="source-line-no">322</span><span id="line-322">        } else {</span>
-<span class="source-line-no">323</span><span id="line-323">          correctServerRegion.put(currentHostServer, regionInfoList);</span>
-<span class="source-line-no">324</span><span id="line-324">        }</span>
-<span class="source-line-no">325</span><span id="line-325">      }</span>
-<span class="source-line-no">326</span><span id="line-326">      correctAssignments.put(tableName, correctServerRegion);</span>
-<span class="source-line-no">327</span><span id="line-327">    }</span>
-<span class="source-line-no">328</span><span id="line-328"></span>
-<span class="source-line-no">329</span><span id="line-329">    // Return correct assignments and region movement plan for mis-placed regions together</span>
-<span class="source-line-no">330</span><span id="line-330">    return new Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;, List&lt;RegionPlan&gt;&gt;(</span>
-<span class="source-line-no">331</span><span id="line-331">      correctAssignments, regionPlansForMisplacedRegions);</span>
-<span class="source-line-no">332</span><span id="line-332">  }</span>
-<span class="source-line-no">333</span><span id="line-333"></span>
-<span class="source-line-no">334</span><span id="line-334">  @Override</span>
-<span class="source-line-no">335</span><span id="line-335">  public void initialize() throws IOException {</span>
-<span class="source-line-no">336</span><span id="line-336">    if (rsGroupInfoManager == null) {</span>
-<span class="source-line-no">337</span><span id="line-337">      rsGroupInfoManager = masterServices.getRSGroupInfoManager();</span>
-<span class="source-line-no">338</span><span id="line-338">      if (rsGroupInfoManager == null) {</span>
-<span class="source-line-no">339</span><span id="line-339">        String msg = "RSGroupInfoManager hasn't been initialized";</span>
-<span class="source-line-no">340</span><span id="line-340">        LOG.error(msg);</span>
-<span class="source-line-no">341</span><span id="line-341">        throw new HBaseIOException(msg);</span>
-<span class="source-line-no">342</span><span id="line-342">      }</span>
-<span class="source-line-no">343</span><span id="line-343">      rsGroupInfoManager.start();</span>
-<span class="source-line-no">344</span><span id="line-344">    }</span>
+<span class="source-line-no">088</span><span id="line-88">  /**</span>
+<span class="source-line-no">089</span><span id="line-89">   * Holds a configuration update that arrived while a balance run was in progress.</span>
+<span class="source-line-no">090</span><span id="line-90">   */</span>
+<span class="source-line-no">091</span><span id="line-91">  private AtomicReference&lt;Configuration&gt; pendingConfiguration = new AtomicReference&lt;&gt;();</span>
+<span class="source-line-no">092</span><span id="line-92"></span>
+<span class="source-line-no">093</span><span id="line-93">  /**</span>
+<span class="source-line-no">094</span><span id="line-94">   * Set this key to {@code true} to allow region fallback. Fallback to the default rsgroup first,</span>
+<span class="source-line-no">095</span><span id="line-95">   * then fallback to any group if no online servers in default rsgroup. Please keep balancer switch</span>
+<span class="source-line-no">096</span><span id="line-96">   * on at the same time, which is relied on to correct misplaced regions</span>
+<span class="source-line-no">097</span><span id="line-97">   */</span>
+<span class="source-line-no">098</span><span id="line-98">  public static final String FALLBACK_GROUP_ENABLE_KEY = "hbase.rsgroup.fallback.enable";</span>
+<span class="source-line-no">099</span><span id="line-99"></span>
+<span class="source-line-no">100</span><span id="line-100">  private volatile boolean fallbackEnabled = false;</span>
+<span class="source-line-no">101</span><span id="line-101"></span>
+<span class="source-line-no">102</span><span id="line-102">  /**</span>
+<span class="source-line-no">103</span><span id="line-103">   * Used by reflection in {@link org.apache.hadoop.hbase.master.balancer.LoadBalancerFactory}.</span>
+<span class="source-line-no">104</span><span id="line-104">   */</span>
+<span class="source-line-no">105</span><span id="line-105">  @InterfaceAudience.Private</span>
+<span class="source-line-no">106</span><span id="line-106">  public RSGroupBasedLoadBalancer() {</span>
+<span class="source-line-no">107</span><span id="line-107">  }</span>
+<span class="source-line-no">108</span><span id="line-108"></span>
+<span class="source-line-no">109</span><span id="line-109">  // must be called after calling initialize</span>
+<span class="source-line-no">110</span><span id="line-110">  @Override</span>
+<span class="source-line-no">111</span><span id="line-111">  public synchronized void updateClusterMetrics(ClusterMetrics sm) {</span>
+<span class="source-line-no">112</span><span id="line-112">    assert internalBalancer != null;</span>
+<span class="source-line-no">113</span><span id="line-113">    internalBalancer.updateClusterMetrics(sm);</span>
+<span class="source-line-no">114</span><span id="line-114">  }</span>
+<span class="source-line-no">115</span><span id="line-115"></span>
+<span class="source-line-no">116</span><span id="line-116">  @Override</span>
+<span class="source-line-no">117</span><span id="line-117">  public synchronized void</span>
+<span class="source-line-no">118</span><span id="line-118">    updateBalancerLoadInfo(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) {</span>
+<span class="source-line-no">119</span><span id="line-119">    internalBalancer.updateBalancerLoadInfo(loadOfAllTable);</span>
+<span class="source-line-no">120</span><span id="line-120">  }</span>
+<span class="source-line-no">121</span><span id="line-121"></span>
+<span class="source-line-no">122</span><span id="line-122">  public void setMasterServices(MasterServices masterServices) {</span>
+<span class="source-line-no">123</span><span id="line-123">    this.masterServices = masterServices;</span>
+<span class="source-line-no">124</span><span id="line-124">  }</span>
+<span class="source-line-no">125</span><span id="line-125"></span>
+<span class="source-line-no">126</span><span id="line-126">  /**</span>
+<span class="source-line-no">127</span><span id="line-127">   * Balance by RSGroup.</span>
+<span class="source-line-no">128</span><span id="line-128">   */</span>
+<span class="source-line-no">129</span><span id="line-129">  @Override</span>
+<span class="source-line-no">130</span><span id="line-130">  public synchronized List&lt;RegionPlan&gt; balanceCluster(</span>
+<span class="source-line-no">131</span><span id="line-131">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfAllTable) throws IOException {</span>
+<span class="source-line-no">132</span><span id="line-132">    if (!isOnline()) {</span>
+<span class="source-line-no">133</span><span id="line-133">      throw new ConstraintException(</span>
+<span class="source-line-no">134</span><span id="line-134">        RSGroupInfoManager.class.getSimpleName() + " is not online, unable to perform balance");</span>
+<span class="source-line-no">135</span><span id="line-135">    }</span>
+<span class="source-line-no">136</span><span id="line-136"></span>
+<span class="source-line-no">137</span><span id="line-137">    // Calculate correct assignments and a list of RegionPlan for mis-placed regions</span>
+<span class="source-line-no">138</span><span id="line-138">    Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;,</span>
+<span class="source-line-no">139</span><span id="line-139">      List&lt;RegionPlan&gt;&gt; correctedStateAndRegionPlans = correctAssignments(loadOfAllTable);</span>
+<span class="source-line-no">140</span><span id="line-140">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; correctedLoadOfAllTable =</span>
+<span class="source-line-no">141</span><span id="line-141">      correctedStateAndRegionPlans.getFirst();</span>
+<span class="source-line-no">142</span><span id="line-142">    List&lt;RegionPlan&gt; regionPlans = correctedStateAndRegionPlans.getSecond();</span>
+<span class="source-line-no">143</span><span id="line-143">    RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
+<span class="source-line-no">144</span><span id="line-144">    // Add RegionPlan</span>
+<span class="source-line-no">145</span><span id="line-145">    // for the regions which have been placed according to the region server group assignment</span>
+<span class="source-line-no">146</span><span id="line-146">    // into the movement list</span>
+<span class="source-line-no">147</span><span id="line-147">    try {</span>
+<span class="source-line-no">148</span><span id="line-148">      // For each rsgroup</span>
+<span class="source-line-no">149</span><span id="line-149">      for (RSGroupInfo rsgroup : rsGroupInfoManager.listRSGroups()) {</span>
+<span class="source-line-no">150</span><span id="line-150">        LOG.debug("Balancing RSGroup={}", rsgroup.getName());</span>
+<span class="source-line-no">151</span><span id="line-151">        Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; loadOfTablesInGroup = new HashMap&lt;&gt;();</span>
+<span class="source-line-no">152</span><span id="line-152">        for (Map.Entry&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; entry : correctedLoadOfAllTable</span>
+<span class="source-line-no">153</span><span id="line-153">          .entrySet()) {</span>
+<span class="source-line-no">154</span><span id="line-154">          TableName tableName = entry.getKey();</span>
+<span class="source-line-no">155</span><span id="line-155">          RSGroupInfo targetRSGInfo = RSGroupUtil</span>
+<span class="source-line-no">156</span><span id="line-156">            .getRSGroupInfo(masterServices, rsGroupInfoManager, tableName).orElse(defaultInfo);</span>
+<span class="source-line-no">157</span><span id="line-157">          if (targetRSGInfo.getName().equals(rsgroup.getName())) {</span>
+<span class="source-line-no">158</span><span id="line-158">            loadOfTablesInGroup.put(tableName, entry.getValue());</span>
+<span class="source-line-no">159</span><span id="line-159">          }</span>
+<span class="source-line-no">160</span><span id="line-160">        }</span>
+<span class="source-line-no">161</span><span id="line-161">        List&lt;RegionPlan&gt; groupPlans = null;</span>
+<span class="source-line-no">162</span><span id="line-162">        if (!loadOfTablesInGroup.isEmpty()) {</span>
+<span class="source-line-no">163</span><span id="line-163">          LOG.info("Start Generate Balance plan for group: " + rsgroup.getName());</span>
+<span class="source-line-no">164</span><span id="line-164">          groupPlans = this.internalBalancer.balanceCluster(loadOfTablesInGroup);</span>
+<span class="source-line-no">165</span><span id="line-165">        }</span>
+<span class="source-line-no">166</span><span id="line-166">        if (groupPlans != null) {</span>
+<span class="source-line-no">167</span><span id="line-167">          regionPlans.addAll(groupPlans);</span>
+<span class="source-line-no">168</span><span id="line-168">        }</span>
+<span class="source-line-no">169</span><span id="line-169">      }</span>
+<span class="source-line-no">170</span><span id="line-170">    } catch (IOException exp) {</span>
+<span class="source-line-no">171</span><span id="line-171">      LOG.warn("Exception while balancing cluster.", exp);</span>
+<span class="source-line-no">172</span><span id="line-172">      regionPlans.clear();</span>
+<span class="source-line-no">173</span><span id="line-173">    }</span>
+<span class="source-line-no">174</span><span id="line-174"></span>
+<span class="source-line-no">175</span><span id="line-175">    // Return the whole movement list</span>
+<span class="source-line-no">176</span><span id="line-176">    return regionPlans;</span>
+<span class="source-line-no">177</span><span id="line-177">  }</span>
+<span class="source-line-no">178</span><span id="line-178"></span>
+<span class="source-line-no">179</span><span id="line-179">  @Override</span>
+<span class="source-line-no">180</span><span id="line-180">  @NonNull</span>
+<span class="source-line-no">181</span><span id="line-181">  public Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; roundRobinAssignment(List&lt;RegionInfo&gt; regions,</span>
+<span class="source-line-no">182</span><span id="line-182">    List&lt;ServerName&gt; servers) throws IOException {</span>
+<span class="source-line-no">183</span><span id="line-183">    Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; assignments = Maps.newHashMap();</span>
+<span class="source-line-no">184</span><span id="line-184">    List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
+<span class="source-line-no">185</span><span id="line-185">      generateGroupAssignments(regions, servers);</span>
+<span class="source-line-no">186</span><span id="line-186">    for (Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt; pair : pairs) {</span>
+<span class="source-line-no">187</span><span id="line-187">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; result =</span>
+<span class="source-line-no">188</span><span id="line-188">        this.internalBalancer.roundRobinAssignment(pair.getFirst(), pair.getSecond());</span>
+<span class="source-line-no">189</span><span id="line-189">      result.forEach((server, regionInfos) -&gt; assignments</span>
+<span class="source-line-no">190</span><span id="line-190">        .computeIfAbsent(server, s -&gt; Lists.newArrayList()).addAll(regionInfos));</span>
+<span class="source-line-no">191</span><span id="line-191">    }</span>
+<span class="source-line-no">192</span><span id="line-192">    return assignments;</span>
+<span class="source-line-no">193</span><span id="line-193">  }</span>
+<span class="source-line-no">194</span><span id="line-194"></span>
+<span class="source-line-no">195</span><span id="line-195">  @Override</span>
+<span class="source-line-no">196</span><span id="line-196">  @NonNull</span>
+<span class="source-line-no">197</span><span id="line-197">  public Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; retainAssignment(Map&lt;RegionInfo, ServerName&gt; regions,</span>
+<span class="source-line-no">198</span><span id="line-198">    List&lt;ServerName&gt; servers) throws HBaseIOException {</span>
+<span class="source-line-no">199</span><span id="line-199">    try {</span>
+<span class="source-line-no">200</span><span id="line-200">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; assignments = new TreeMap&lt;&gt;();</span>
+<span class="source-line-no">201</span><span id="line-201">      List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
+<span class="source-line-no">202</span><span id="line-202">        generateGroupAssignments(Lists.newArrayList(regions.keySet()), servers);</span>
+<span class="source-line-no">203</span><span id="line-203">      for (Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt; pair : pairs) {</span>
+<span class="source-line-no">204</span><span id="line-204">        List&lt;RegionInfo&gt; regionList = pair.getFirst();</span>
+<span class="source-line-no">205</span><span id="line-205">        Map&lt;RegionInfo, ServerName&gt; currentAssignmentMap = Maps.newTreeMap();</span>
+<span class="source-line-no">206</span><span id="line-206">        regionList.forEach(r -&gt; currentAssignmentMap.put(r, regions.get(r)));</span>
+<span class="source-line-no">207</span><span id="line-207">        Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; pairResult =</span>
+<span class="source-line-no">208</span><span id="line-208">          this.internalBalancer.retainAssignment(currentAssignmentMap, pair.getSecond());</span>
+<span class="source-line-no">209</span><span id="line-209">        pairResult.forEach((server, rs) -&gt; assignments</span>
+<span class="source-line-no">210</span><span id="line-210">          .computeIfAbsent(server, s -&gt; Lists.newArrayList()).addAll(rs));</span>
+<span class="source-line-no">211</span><span id="line-211">      }</span>
+<span class="source-line-no">212</span><span id="line-212">      return assignments;</span>
+<span class="source-line-no">213</span><span id="line-213">    } catch (IOException e) {</span>
+<span class="source-line-no">214</span><span id="line-214">      throw new HBaseIOException("Failed to do online retain assignment", e);</span>
+<span class="source-line-no">215</span><span id="line-215">    }</span>
+<span class="source-line-no">216</span><span id="line-216">  }</span>
+<span class="source-line-no">217</span><span id="line-217"></span>
+<span class="source-line-no">218</span><span id="line-218">  @Override</span>
+<span class="source-line-no">219</span><span id="line-219">  public ServerName randomAssignment(RegionInfo region, List&lt;ServerName&gt; servers)</span>
+<span class="source-line-no">220</span><span id="line-220">    throws IOException {</span>
+<span class="source-line-no">221</span><span id="line-221">    List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; pairs =</span>
+<span class="source-line-no">222</span><span id="line-222">      generateGroupAssignments(Lists.newArrayList(region), servers);</span>
+<span class="source-line-no">223</span><span id="line-223">    List&lt;ServerName&gt; filteredServers = pairs.iterator().next().getSecond();</span>
+<span class="source-line-no">224</span><span id="line-224">    return this.internalBalancer.randomAssignment(region, filteredServers);</span>
+<span class="source-line-no">225</span><span id="line-225">  }</span>
+<span class="source-line-no">226</span><span id="line-226"></span>
+<span class="source-line-no">227</span><span id="line-227">  private List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; generateGroupAssignments(</span>
+<span class="source-line-no">228</span><span id="line-228">    List&lt;RegionInfo&gt; regions, List&lt;ServerName&gt; servers) throws HBaseIOException {</span>
+<span class="source-line-no">229</span><span id="line-229">    try {</span>
+<span class="source-line-no">230</span><span id="line-230">      ListMultimap&lt;String, RegionInfo&gt; regionMap = ArrayListMultimap.create();</span>
+<span class="source-line-no">231</span><span id="line-231">      ListMultimap&lt;String, ServerName&gt; serverMap = ArrayListMultimap.create();</span>
+<span class="source-line-no">232</span><span id="line-232">      RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
+<span class="source-line-no">233</span><span id="line-233">      for (RegionInfo region : regions) {</span>
+<span class="source-line-no">234</span><span id="line-234">        String groupName =</span>
+<span class="source-line-no">235</span><span id="line-235">          RSGroupUtil.getRSGroupInfo(masterServices, rsGroupInfoManager, region.getTable())</span>
+<span class="source-line-no">236</span><span id="line-236">            .orElse(defaultInfo).getName();</span>
+<span class="source-line-no">237</span><span id="line-237">        regionMap.put(groupName, region);</span>
+<span class="source-line-no">238</span><span id="line-238">      }</span>
+<span class="source-line-no">239</span><span id="line-239">      for (String groupKey : regionMap.keySet()) {</span>
+<span class="source-line-no">240</span><span id="line-240">        RSGroupInfo info = rsGroupInfoManager.getRSGroup(groupKey);</span>
+<span class="source-line-no">241</span><span id="line-241">        serverMap.putAll(groupKey, filterOfflineServers(info, servers));</span>
+<span class="source-line-no">242</span><span id="line-242">      }</span>
+<span class="source-line-no">243</span><span id="line-243"></span>
+<span class="source-line-no">244</span><span id="line-244">      List&lt;Pair&lt;List&lt;RegionInfo&gt;, List&lt;ServerName&gt;&gt;&gt; result = Lists.newArrayList();</span>
+<span class="source-line-no">245</span><span id="line-245">      List&lt;RegionInfo&gt; fallbackRegions = Lists.newArrayList();</span>
+<span class="source-line-no">246</span><span id="line-246">      for (String groupKey : regionMap.keySet()) {</span>
+<span class="source-line-no">247</span><span id="line-247">        if (serverMap.get(groupKey).isEmpty()) {</span>
+<span class="source-line-no">248</span><span id="line-248">          fallbackRegions.addAll(regionMap.get(groupKey));</span>
+<span class="source-line-no">249</span><span id="line-249">        } else {</span>
+<span class="source-line-no">250</span><span id="line-250">          result.add(Pair.newPair(regionMap.get(groupKey), serverMap.get(groupKey)));</span>
+<span class="source-line-no">251</span><span id="line-251">        }</span>
+<span class="source-line-no">252</span><span id="line-252">      }</span>
+<span class="source-line-no">253</span><span id="line-253">      if (!fallbackRegions.isEmpty()) {</span>
+<span class="source-line-no">254</span><span id="line-254">        List&lt;ServerName&gt; candidates = null;</span>
+<span class="source-line-no">255</span><span id="line-255">        if (isFallbackEnabled()) {</span>
+<span class="source-line-no">256</span><span id="line-256">          if (LOG.isDebugEnabled()) {</span>
+<span class="source-line-no">257</span><span id="line-257">            LOG.debug("Falling back {} regions to servers outside their RSGroup. Regions: {}",</span>
+<span class="source-line-no">258</span><span id="line-258">              fallbackRegions.size(), fallbackRegions.stream()</span>
+<span class="source-line-no">259</span><span id="line-259">                .map(RegionInfo::getRegionNameAsString).collect(Collectors.toSet()));</span>
+<span class="source-line-no">260</span><span id="line-260">          }</span>
+<span class="source-line-no">261</span><span id="line-261">          candidates = getFallBackCandidates(servers);</span>
+<span class="source-line-no">262</span><span id="line-262">        }</span>
+<span class="source-line-no">263</span><span id="line-263">        candidates = (candidates == null || candidates.isEmpty())</span>
+<span class="source-line-no">264</span><span id="line-264">          ? Lists.newArrayList(BOGUS_SERVER_NAME)</span>
+<span class="source-line-no">265</span><span id="line-265">          : candidates;</span>
+<span class="source-line-no">266</span><span id="line-266">        result.add(Pair.newPair(fallbackRegions, candidates));</span>
+<span class="source-line-no">267</span><span id="line-267">      }</span>
+<span class="source-line-no">268</span><span id="line-268">      return result;</span>
+<span class="source-line-no">269</span><span id="line-269">    } catch (IOException e) {</span>
+<span class="source-line-no">270</span><span id="line-270">      throw new HBaseIOException("Failed to generate group assignments", e);</span>
+<span class="source-line-no">271</span><span id="line-271">    }</span>
+<span class="source-line-no">272</span><span id="line-272">  }</span>
+<span class="source-line-no">273</span><span id="line-273"></span>
+<span class="source-line-no">274</span><span id="line-274">  private List&lt;ServerName&gt; filterOfflineServers(RSGroupInfo RSGroupInfo,</span>
+<span class="source-line-no">275</span><span id="line-275">    List&lt;ServerName&gt; onlineServers) {</span>
+<span class="source-line-no">276</span><span id="line-276">    if (RSGroupInfo != null) {</span>
+<span class="source-line-no">277</span><span id="line-277">      return filterServers(RSGroupInfo.getServers(), onlineServers);</span>
+<span class="source-line-no">278</span><span id="line-278">    } else {</span>
+<span class="source-line-no">279</span><span id="line-279">      LOG.warn("RSGroup Information found to be null. Some regions might be unassigned.");</span>
+<span class="source-line-no">280</span><span id="line-280">      return Collections.emptyList();</span>
+<span class="source-line-no">281</span><span id="line-281">    }</span>
+<span class="source-line-no">282</span><span id="line-282">  }</span>
+<span class="source-line-no">283</span><span id="line-283"></span>
+<span class="source-line-no">284</span><span id="line-284">  /**</span>
+<span class="source-line-no">285</span><span id="line-285">   * Filter servers based on the online servers.</span>
+<span class="source-line-no">286</span><span id="line-286">   * &lt;p/&gt;</span>
+<span class="source-line-no">287</span><span id="line-287">   * servers is actually a TreeSet (see {@link org.apache.hadoop.hbase.rsgroup.RSGroupInfo}), having</span>
+<span class="source-line-no">288</span><span id="line-288">   * its contains()'s time complexity as O(logn), which is good enough.</span>
+<span class="source-line-no">289</span><span id="line-289">   * &lt;p/&gt;</span>
+<span class="source-line-no">290</span><span id="line-290">   * TODO: consider using HashSet to pursue O(1) for contains() throughout the calling chain if</span>
+<span class="source-line-no">291</span><span id="line-291">   * needed.</span>
+<span class="source-line-no">292</span><span id="line-292">   * @param servers       the servers</span>
+<span class="source-line-no">293</span><span id="line-293">   * @param onlineServers List of servers which are online.</span>
+<span class="source-line-no">294</span><span id="line-294">   * @return the list</span>
+<span class="source-line-no">295</span><span id="line-295">   */</span>
+<span class="source-line-no">296</span><span id="line-296">  private List&lt;ServerName&gt; filterServers(Set&lt;Address&gt; servers, List&lt;ServerName&gt; onlineServers) {</span>
+<span class="source-line-no">297</span><span id="line-297">    ArrayList&lt;ServerName&gt; finalList = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">298</span><span id="line-298">    for (ServerName onlineServer : onlineServers) {</span>
+<span class="source-line-no">299</span><span id="line-299">      if (servers.contains(onlineServer.getAddress())) {</span>
+<span class="source-line-no">300</span><span id="line-300">        finalList.add(onlineServer);</span>
+<span class="source-line-no">301</span><span id="line-301">      }</span>
+<span class="source-line-no">302</span><span id="line-302">    }</span>
+<span class="source-line-no">303</span><span id="line-303">    return finalList;</span>
+<span class="source-line-no">304</span><span id="line-304">  }</span>
+<span class="source-line-no">305</span><span id="line-305"></span>
+<span class="source-line-no">306</span><span id="line-306">  private Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;, List&lt;RegionPlan&gt;&gt;</span>
+<span class="source-line-no">307</span><span id="line-307">    correctAssignments(Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; existingAssignments)</span>
+<span class="source-line-no">308</span><span id="line-308">      throws IOException {</span>
+<span class="source-line-no">309</span><span id="line-309">    // To return</span>
+<span class="source-line-no">310</span><span id="line-310">    Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; correctAssignments = new HashMap&lt;&gt;();</span>
+<span class="source-line-no">311</span><span id="line-311">    List&lt;RegionPlan&gt; regionPlansForMisplacedRegions = new ArrayList&lt;&gt;();</span>
+<span class="source-line-no">312</span><span id="line-312">    RSGroupInfo defaultInfo = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
+<span class="source-line-no">313</span><span id="line-313">    for (Map.Entry&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt; assignments : existingAssignments</span>
+<span class="source-line-no">314</span><span id="line-314">      .entrySet()) {</span>
+<span class="source-line-no">315</span><span id="line-315">      TableName tableName = assignments.getKey();</span>
+<span class="source-line-no">316</span><span id="line-316">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; clusterLoad = assignments.getValue();</span>
+<span class="source-line-no">317</span><span id="line-317">      RSGroupInfo targetRSGInfo = null;</span>
+<span class="source-line-no">318</span><span id="line-318">      Map&lt;ServerName, List&lt;RegionInfo&gt;&gt; correctServerRegion = new TreeMap&lt;&gt;();</span>
+<span class="source-line-no">319</span><span id="line-319">      try {</span>
+<span class="source-line-no">320</span><span id="line-320">        targetRSGInfo = RSGroupUtil.getRSGroupInfo(masterServices, rsGroupInfoManager, tableName)</span>
+<span class="source-line-no">321</span><span id="line-321">          .orElse(defaultInfo);</span>
+<span class="source-line-no">322</span><span id="line-322">      } catch (IOException exp) {</span>
+<span class="source-line-no">323</span><span id="line-323">        LOG.debug("RSGroup information null for region of table " + tableName, exp);</span>
+<span class="source-line-no">324</span><span id="line-324">      }</span>
+<span class="source-line-no">325</span><span id="line-325">      for (Map.Entry&lt;ServerName, List&lt;RegionInfo&gt;&gt; serverRegionMap : clusterLoad.entrySet()) {</span>
+<span class="source-line-no">326</span><span id="line-326">        ServerName currentHostServer = serverRegionMap.getKey();</span>
+<span class="source-line-no">327</span><span id="line-327">        List&lt;RegionInfo&gt; regionInfoList = serverRegionMap.getValue();</span>
+<span class="source-line-no">328</span><span id="line-328">        if (</span>
+<span class="source-line-no">329</span><span id="line-329">          targetRSGInfo == null || !targetRSGInfo.containsServer(currentHostServer.getAddress())</span>
+<span class="source-line-no">330</span><span id="line-330">        ) {</span>
+<span class="source-line-no">331</span><span id="line-331">          regionInfoList.forEach(regionInfo -&gt; {</span>
+<span class="source-line-no">332</span><span id="line-332">            regionPlansForMisplacedRegions.add(new RegionPlan(regionInfo, currentHostServer, null));</span>
+<span class="source-line-no">333</span><span id="line-333">          });</span>
+<span class="source-line-no">334</span><span id="line-334">        } else {</span>
+<span class="source-line-no">335</span><span id="line-335">          correctServerRegion.put(currentHostServer, regionInfoList);</span>
+<span class="source-line-no">336</span><span id="line-336">        }</span>
+<span class="source-line-no">337</span><span id="line-337">      }</span>
+<span class="source-line-no">338</span><span id="line-338">      correctAssignments.put(tableName, correctServerRegion);</span>
+<span class="source-line-no">339</span><span id="line-339">    }</span>
+<span class="source-line-no">340</span><span id="line-340"></span>
+<span class="source-line-no">341</span><span id="line-341">    // Return correct assignments and region movement plan for mis-placed regions together</span>
+<span class="source-line-no">342</span><span id="line-342">    return new Pair&lt;Map&lt;TableName, Map&lt;ServerName, List&lt;RegionInfo&gt;&gt;&gt;, List&lt;RegionPlan&gt;&gt;(</span>
+<span class="source-line-no">343</span><span id="line-343">      correctAssignments, regionPlansForMisplacedRegions);</span>
+<span class="source-line-no">344</span><span id="line-344">  }</span>
 <span class="source-line-no">345</span><span id="line-345"></span>
-<span class="source-line-no">346</span><span id="line-346">    // Create the balancer</span>
-<span class="source-line-no">347</span><span id="line-347">    Configuration conf = masterServices.getConfiguration();</span>
-<span class="source-line-no">348</span><span id="line-348">    Class&lt;? extends LoadBalancer&gt; balancerClass;</span>
-<span class="source-line-no">349</span><span id="line-349">    @SuppressWarnings("deprecation")</span>
-<span class="source-line-no">350</span><span id="line-350">    String balancerClassName = conf.get(HBASE_RSGROUP_LOADBALANCER_CLASS);</span>
-<span class="source-line-no">351</span><span id="line-351">    if (balancerClassName == null) {</span>
-<span class="source-line-no">352</span><span id="line-352">      balancerClass = conf.getClass(HConstants.HBASE_MASTER_LOADBALANCER_CLASS,</span>
-<span class="source-line-no">353</span><span id="line-353">        LoadBalancerFactory.getDefaultLoadBalancerClass(), LoadBalancer.class);</span>
-<span class="source-line-no">354</span><span id="line-354">    } else {</span>
-<span class="source-line-no">355</span><span id="line-355">      try {</span>
-<span class="source-line-no">356</span><span id="line-356">        balancerClass = Class.forName(balancerClassName).asSubclass(LoadBalancer.class);</span>
-<span class="source-line-no">357</span><span id="line-357">      } catch (ClassNotFoundException e) {</span>
-<span class="source-line-no">358</span><span id="line-358">        throw new IOException(e);</span>
-<span class="source-line-no">359</span><span id="line-359">      }</span>
-<span class="source-line-no">360</span><span id="line-360">    }</span>
-<span class="source-line-no">361</span><span id="line-361">    this.provider = new MasterClusterInfoProvider(masterServices);</span>
-<span class="source-line-no">362</span><span id="line-362">    // avoid infinite nesting</span>
-<span class="source-line-no">363</span><span id="line-363">    if (getClass().isAssignableFrom(balancerClass)) {</span>
-<span class="source-line-no">364</span><span id="line-364">      balancerClass = LoadBalancerFactory.getDefaultLoadBalancerClass();</span>
-<span class="source-line-no">365</span><span id="line-365">    }</span>
-<span class="source-line-no">366</span><span id="line-366">    internalBalancer = ReflectionUtils.newInstance(balancerClass);</span>
-<span class="source-line-no">367</span><span id="line-367">    internalBalancer.setClusterInfoProvider(provider);</span>
-<span class="source-line-no">368</span><span id="line-368">    // special handling for favor node balancers</span>
-<span class="source-line-no">369</span><span id="line-369">    if (internalBalancer instanceof FavoredNodesPromoter) {</span>
-<span class="source-line-no">370</span><span id="line-370">      favoredNodesManager = new FavoredNodesManager(provider);</span>
-<span class="source-line-no">371</span><span id="line-371">      ((FavoredNodesPromoter) internalBalancer).setFavoredNodesManager(favoredNodesManager);</span>
+<span class="source-line-no">346</span><span id="line-346">  @Override</span>
+<span class="source-line-no">347</span><span id="line-347">  public void initialize() throws IOException {</span>
+<span class="source-line-no">348</span><span id="line-348">    if (rsGroupInfoManager == null) {</span>
+<span class="source-line-no">349</span><span id="line-349">      rsGroupInfoManager = masterServices.getRSGroupInfoManager();</span>
+<span class="source-line-no">350</span><span id="line-350">      if (rsGroupInfoManager == null) {</span>
+<span class="source-line-no">351</span><span id="line-351">        String msg = "RSGroupInfoManager hasn't been initialized";</span>
+<span class="source-line-no">352</span><span id="line-352">        LOG.error(msg);</span>
+<span class="source-line-no">353</span><span id="line-353">        throw new HBaseIOException(msg);</span>
+<span class="source-line-no">354</span><span id="line-354">      }</span>
+<span class="source-line-no">355</span><span id="line-355">      rsGroupInfoManager.start();</span>
+<span class="source-line-no">356</span><span id="line-356">    }</span>
+<span class="source-line-no">357</span><span id="line-357"></span>
+<span class="source-line-no">358</span><span id="line-358">    // Create the balancer</span>
+<span class="source-line-no">359</span><span id="line-359">    Configuration conf = masterServices.getConfiguration();</span>
+<span class="source-line-no">360</span><span id="line-360">    Class&lt;? extends LoadBalancer&gt; balancerClass;</span>
+<span class="source-line-no">361</span><span id="line-361">    @SuppressWarnings("deprecation")</span>
+<span class="source-line-no">362</span><span id="line-362">    String balancerClassName = conf.get(HBASE_RSGROUP_LOADBALANCER_CLASS);</span>
+<span class="source-line-no">363</span><span id="line-363">    if (balancerClassName == null) {</span>
+<span class="source-line-no">364</span><span id="line-364">      balancerClass = conf.getClass(HConstants.HBASE_MASTER_LOADBALANCER_CLASS,</span>
+<span class="source-line-no">365</span><span id="line-365">        LoadBalancerFactory.getDefaultLoadBalancerClass(), LoadBalancer.class);</span>
+<span class="source-line-no">366</span><span id="line-366">    } else {</span>
+<span class="source-line-no">367</span><span id="line-367">      try {</span>
+<span class="source-line-no">368</span><span id="line-368">        balancerClass = Class.forName(balancerClassName).asSubclass(LoadBalancer.class);</span>
+<span class="source-line-no">369</span><span id="line-369">      } catch (ClassNotFoundException e) {</span>
+<span class="source-line-no">370</span><span id="line-370">        throw new IOException(e);</span>
+<span class="source-line-no">371</span><span id="line-371">      }</span>
 <span class="source-line-no">372</span><span id="line-372">    }</span>
-<span class="source-line-no">373</span><span id="line-373">    internalBalancer.initialize();</span>
-<span class="source-line-no">374</span><span id="line-374">    // init fallback groups</span>
-<span class="source-line-no">375</span><span id="line-375">    this.fallbackEnabled = conf.getBoolean(FALLBACK_GROUP_ENABLE_KEY, false);</span>
-<span class="source-line-no">376</span><span id="line-376">  }</span>
-<span class="source-line-no">377</span><span id="line-377"></span>
-<span class="source-line-no">378</span><span id="line-378">  public boolean isOnline() {</span>
-<span class="source-line-no">379</span><span id="line-379">    if (this.rsGroupInfoManager == null) {</span>
-<span class="source-line-no">380</span><span id="line-380">      return false;</span>
-<span class="source-line-no">381</span><span id="line-381">    }</span>
-<span class="source-line-no">382</span><span id="line-382"></span>
-<span class="source-line-no">383</span><span id="line-383">    return this.rsGroupInfoManager.isOnline();</span>
-<span class="source-line-no">384</span><span id="line-384">  }</span>
-<span class="source-line-no">385</span><span id="line-385"></span>
-<span class="source-line-no">386</span><span id="line-386">  public boolean isFallbackEnabled() {</span>
-<span class="source-line-no">387</span><span id="line-387">    return fallbackEnabled;</span>
+<span class="source-line-no">373</span><span id="line-373">    this.provider = new MasterClusterInfoProvider(masterServices);</span>
+<span class="source-line-no">374</span><span id="line-374">    // avoid infinite nesting</span>
+<span class="source-line-no">375</span><span id="line-375">    if (getClass().isAssignableFrom(balancerClass)) {</span>
+<span class="source-line-no">376</span><span id="line-376">      balancerClass = LoadBalancerFactory.getDefaultLoadBalancerClass();</span>
+<span class="source-line-no">377</span><span id="line-377">    }</span>
+<span class="source-line-no">378</span><span id="line-378">    internalBalancer = ReflectionUtils.newInstance(balancerClass);</span>
+<span class="source-line-no">379</span><span id="line-379">    internalBalancer.setClusterInfoProvider(provider);</span>
+<span class="source-line-no">380</span><span id="line-380">    // special handling for favor node balancers</span>
+<span class="source-line-no">381</span><span id="line-381">    if (internalBalancer instanceof FavoredNodesPromoter) {</span>
+<span class="source-line-no">382</span><span id="line-382">      favoredNodesManager = new FavoredNodesManager(provider);</span>
+<span class="source-line-no">383</span><span id="line-383">      ((FavoredNodesPromoter) internalBalancer).setFavoredNodesManager(favoredNodesManager);</span>
+<span class="source-line-no">384</span><span id="line-384">    }</span>
+<span class="source-line-no">385</span><span id="line-385">    internalBalancer.initialize();</span>
+<span class="source-line-no">386</span><span id="line-386">    // init fallback groups</span>
+<span class="source-line-no">387</span><span id="line-387">    this.fallbackEnabled = conf.getBoolean(FALLBACK_GROUP_ENABLE_KEY, false);</span>
 <span class="source-line-no">388</span><span id="line-388">  }</span>
 <span class="source-line-no">389</span><span id="line-389"></span>
-<span class="source-line-no">390</span><span id="line-390">  @Override</span>
-<span class="source-line-no">391</span><span id="line-391">  public void regionOnline(RegionInfo regionInfo, ServerName sn) {</span>
-<span class="source-line-no">392</span><span id="line-392">  }</span>
-<span class="source-line-no">393</span><span id="line-393"></span>
-<span class="source-line-no">394</span><span id="line-394">  @Override</span>
-<span class="source-line-no">395</span><span id="line-395">  public void regionOffline(RegionInfo regionInfo) {</span>
+<span class="source-line-no">390</span><span id="line-390">  public boolean isOnline() {</span>
+<span class="source-line-no">391</span><span id="line-391">    if (this.rsGroupInfoManager == null) {</span>
+<span class="source-line-no">392</span><span id="line-392">      return false;</span>
+<span class="source-line-no">393</span><span id="line-393">    }</span>
+<span class="source-line-no">394</span><span id="line-394"></span>
+<span class="source-line-no">395</span><span id="line-395">    return this.rsGroupInfoManager.isOnline();</span>
 <span class="source-line-no">396</span><span id="line-396">  }</span>
 <span class="source-line-no">397</span><span id="line-397"></span>
-<span class="source-line-no">398</span><span id="line-398">  @Override</span>
-<span class="source-line-no">399</span><span id="line-399">  public synchronized void onConfigurationChange(Configuration conf) {</span>
-<span class="source-line-no">400</span><span id="line-400">    boolean newFallbackEnabled = conf.getBoolean(FALLBACK_GROUP_ENABLE_KEY, false);</span>
-<span class="source-line-no">401</span><span id="line-401">    if (fallbackEnabled != newFallbackEnabled) {</span>
-<span class="source-line-no">402</span><span id="line-402">      LOG.info("Changing the value of {} from {} to {}", FALLBACK_GROUP_ENABLE_KEY, fallbackEnabled,</span>
-<span class="source-line-no">403</span><span id="line-403">        newFallbackEnabled);</span>
-<span class="source-line-no">404</span><span id="line-404">      fallbackEnabled = newFallbackEnabled;</span>
-<span class="source-line-no">405</span><span id="line-405">    }</span>
-<span class="source-line-no">406</span><span id="line-406">    provider.onConfigurationChange(conf);</span>
-<span class="source-line-no">407</span><span id="line-407">    internalBalancer.onConfigurationChange(conf);</span>
+<span class="source-line-no">398</span><span id="line-398">  public boolean isFallbackEnabled() {</span>
+<span class="source-line-no">399</span><span id="line-399">    return fallbackEnabled;</span>
+<span class="source-line-no">400</span><span id="line-400">  }</span>
+<span class="source-line-no">401</span><span id="line-401"></span>
+<span class="source-line-no">402</span><span id="line-402">  @Override</span>
+<span class="source-line-no">403</span><span id="line-403">  public void regionOnline(RegionInfo regionInfo, ServerName sn) {</span>
+<span class="source-line-no">404</span><span id="line-404">  }</span>
+<span class="source-line-no">405</span><span id="line-405"></span>
+<span class="source-line-no">406</span><span id="line-406">  @Override</span>
+<span class="source-line-no">407</span><span id="line-407">  public void regionOffline(RegionInfo regionInfo) {</span>
 <span class="source-line-no">408</span><span id="line-408">  }</span>
 <span class="source-line-no">409</span><span id="line-409"></span>
 <span class="source-line-no">410</span><span id="line-410">  @Override</span>
-<span class="source-line-no">411</span><span id="line-411">  public void stop(String why) {</span>
-<span class="source-line-no">412</span><span id="line-412">    internalBalancer.stop(why);</span>
-<span class="source-line-no">413</span><span id="line-413">  }</span>
-<span class="source-line-no">414</span><span id="line-414"></span>
-<span class="source-line-no">415</span><span id="line-415">  @Override</span>
-<span class="source-line-no">416</span><span id="line-416">  public boolean isStopped() {</span>
-<span class="source-line-no">417</span><span id="line-417">    return internalBalancer.isStopped();</span>
-<span class="source-line-no">418</span><span id="line-418">  }</span>
-<span class="source-line-no">419</span><span id="line-419"></span>
-<span class="source-line-no">420</span><span id="line-420">  public LoadBalancer getInternalBalancer() {</span>
-<span class="source-line-no">421</span><span id="line-421">    return internalBalancer;</span>
-<span class="source-line-no">422</span><span id="line-422">  }</span>
-<span class="source-line-no">423</span><span id="line-423"></span>
-<span class="source-line-no">424</span><span id="line-424">  public FavoredNodesManager getFavoredNodesManager() {</span>
-<span class="source-line-no">425</span><span id="line-425">    return favoredNodesManager;</span>
-<span class="source-line-no">426</span><span id="line-426">  }</span>
-<span class="source-line-no">427</span><span id="line-427"></span>
-<span class="source-line-no">428</span><span id="line-428">  @Override</span>
-<span class="source-line-no">429</span><span id="line-429">  public synchronized void postMasterStartupInitialize() {</span>
-<span class="source-line-no">430</span><span id="line-430">    this.internalBalancer.postMasterStartupInitialize();</span>
-<span class="source-line-no">431</span><span id="line-431">  }</span>
-<span class="source-line-no">432</span><span id="line-432"></span>
-<span class="source-line-no">433</span><span id="line-433">  public void updateBalancerStatus(boolean status) {</span>
-<span class="source-line-no">434</span><span id="line-434">    internalBalancer.updateBalancerStatus(status);</span>
-<span class="source-line-no">435</span><span id="line-435">  }</span>
-<span class="source-line-no">436</span><span id="line-436"></span>
-<span class="source-line-no">437</span><span id="line-437">  private List&lt;ServerName&gt; getFallBackCandidates(List&lt;ServerName&gt; servers) {</span>
-<span class="source-line-no">438</span><span id="line-438">    List&lt;ServerName&gt; serverNames = null;</span>
-<span class="source-line-no">439</span><span id="line-439">    try {</span>
-<span class="source-line-no">440</span><span id="line-440">      RSGroupInfo info = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
-<span class="source-line-no">441</span><span id="line-441">      serverNames = filterOfflineServers(info, servers);</span>
-<span class="source-line-no">442</span><span id="line-442">    } catch (IOException e) {</span>
-<span class="source-line-no">443</span><span id="line-443">      LOG.error("Failed to get default rsgroup info to fallback", e);</span>
-<span class="source-line-no">444</span><span id="line-444">    }</span>
-<span class="source-line-no">445</span><span id="line-445">    return serverNames == null || serverNames.isEmpty() ? servers : serverNames;</span>
-<span class="source-line-no">446</span><span id="line-446">  }</span>
-<span class="source-line-no">447</span><span id="line-447"></span>
-<span class="source-line-no">448</span><span id="line-448">  @Override</span>
-<span class="source-line-no">449</span><span id="line-449">  public void setClusterInfoProvider(ClusterInfoProvider provider) {</span>
-<span class="source-line-no">450</span><span id="line-450">    throw new UnsupportedOperationException("Just call set master service instead");</span>
+<span class="source-line-no">411</span><span id="line-411">  public void onConfigurationChange(Configuration conf) {</span>
+<span class="source-line-no">412</span><span id="line-412">    // Refer to HBASE-29933</span>
+<span class="source-line-no">413</span><span id="line-413">    synchronized (this) {</span>
+<span class="source-line-no">414</span><span id="line-414">      // If balance is running, store configuration in pendingConfiguration and return immediately.</span>
+<span class="source-line-no">415</span><span id="line-415">      // Defer the config update.</span>
+<span class="source-line-no">416</span><span id="line-416">      if (isBalancing.get()) {</span>
+<span class="source-line-no">417</span><span id="line-417">        LOG.debug(</span>
+<span class="source-line-no">418</span><span id="line-418">          "Balance is in progress, defer applying configuration change until balance completed.");</span>
+<span class="source-line-no">419</span><span id="line-419">        pendingConfiguration.set(conf);</span>
+<span class="source-line-no">420</span><span id="line-420">      } else {</span>
+<span class="source-line-no">421</span><span id="line-421">        // Apply configuration change immediately.</span>
+<span class="source-line-no">422</span><span id="line-422">        updateConfiguration(conf);</span>
+<span class="source-line-no">423</span><span id="line-423">      }</span>
+<span class="source-line-no">424</span><span id="line-424">    }</span>
+<span class="source-line-no">425</span><span id="line-425">  }</span>
+<span class="source-line-no">426</span><span id="line-426"></span>
+<span class="source-line-no">427</span><span id="line-427">  /**</span>
+<span class="source-line-no">428</span><span id="line-428">   * Applies the given configuration.</span>
+<span class="source-line-no">429</span><span id="line-429">   */</span>
+<span class="source-line-no">430</span><span id="line-430">  private void updateConfiguration(Configuration conf) {</span>
+<span class="source-line-no">431</span><span id="line-431">    boolean newFallbackEnabled = conf.getBoolean(FALLBACK_GROUP_ENABLE_KEY, false);</span>
+<span class="source-line-no">432</span><span id="line-432">    if (fallbackEnabled != newFallbackEnabled) {</span>
+<span class="source-line-no">433</span><span id="line-433">      LOG.info("Changing the value of {} from {} to {}", FALLBACK_GROUP_ENABLE_KEY, fallbackEnabled,</span>
+<span class="source-line-no">434</span><span id="line-434">        newFallbackEnabled);</span>
+<span class="source-line-no">435</span><span id="line-435">      fallbackEnabled = newFallbackEnabled;</span>
+<span class="source-line-no">436</span><span id="line-436">    }</span>
+<span class="source-line-no">437</span><span id="line-437">    provider.onConfigurationChange(conf);</span>
+<span class="source-line-no">438</span><span id="line-438">    internalBalancer.onConfigurationChange(conf);</span>
+<span class="source-line-no">439</span><span id="line-439">  }</span>
+<span class="source-line-no">440</span><span id="line-440"></span>
+<span class="source-line-no">441</span><span id="line-441">  /**</span>
+<span class="source-line-no">442</span><span id="line-442">   * If a pending configuration was stored during a balance run, apply it and clear the pending</span>
+<span class="source-line-no">443</span><span id="line-443">   * reference.</span>
+<span class="source-line-no">444</span><span id="line-444">   */</span>
+<span class="source-line-no">445</span><span id="line-445">  public void applyPendingConfiguration() {</span>
+<span class="source-line-no">446</span><span id="line-446">    Configuration toApply = pendingConfiguration.getAndSet(null);</span>
+<span class="source-line-no">447</span><span id="line-447">    if (toApply != null) {</span>
+<span class="source-line-no">448</span><span id="line-448">      LOG.info("Applying pending configuration after balance completed.");</span>
+<span class="source-line-no">449</span><span id="line-449">      updateConfiguration(toApply);</span>
+<span class="source-line-no">450</span><span id="line-450">    }</span>
 <span class="source-line-no">451</span><span id="line-451">  }</span>
-<span class="source-line-no">452</span><span id="line-452">}</span>
+<span class="source-line-no">452</span><span id="line-452"></span>
+<span class="source-line-no">453</span><span id="line-453">  /**</span>
+<span class="source-line-no">454</span><span id="line-454">   * Sets {@link #isBalancing} to {@code true} before a balance run starts.</span>
+<span class="source-line-no">455</span><span id="line-455">   */</span>
+<span class="source-line-no">456</span><span id="line-456">  @Override</span>
+<span class="source-line-no">457</span><span id="line-457">  public void onBalancingStart() {</span>
+<span class="source-line-no">458</span><span id="line-458">    LOG.debug("setting isBalancing to true as balance is starting");</span>
+<span class="source-line-no">459</span><span id="line-459">    isBalancing.set(true);</span>
+<span class="source-line-no">460</span><span id="line-460">  }</span>
+<span class="source-line-no">461</span><span id="line-461"></span>
+<span class="source-line-no">462</span><span id="line-462">  /**</span>
+<span class="source-line-no">463</span><span id="line-463">   * Sets {@link #isBalancing} to {@code false} after a balance run completes and applies any</span>
+<span class="source-line-no">464</span><span id="line-464">   * pending configuration that arrived during balancing.</span>
+<span class="source-line-no">465</span><span id="line-465">   */</span>
+<span class="source-line-no">466</span><span id="line-466">  @Override</span>
+<span class="source-line-no">467</span><span id="line-467">  public void onBalancingComplete() {</span>
+<span class="source-line-no">468</span><span id="line-468">    LOG.debug("setting isBalancing to false as balance is completed");</span>
+<span class="source-line-no">469</span><span id="line-469">    isBalancing.set(false);</span>
+<span class="source-line-no">470</span><span id="line-470">    applyPendingConfiguration();</span>
+<span class="source-line-no">471</span><span id="line-471">  }</span>
+<span class="source-line-no">472</span><span id="line-472"></span>
+<span class="source-line-no">473</span><span id="line-473">  @Override</span>
+<span class="source-line-no">474</span><span id="line-474">  public void throttle(RegionPlan plan) throws Exception {</span>
+<span class="source-line-no">475</span><span id="line-475">    long throttlingTime = internalBalancer.getThrottleDurationMs(plan);</span>
+<span class="source-line-no">476</span><span id="line-476">    if (throttlingTime &gt; 0) {</span>
+<span class="source-line-no">477</span><span id="line-477">      try {</span>
+<span class="source-line-no">478</span><span id="line-478">        // Release the monitor while waiting to avoid blocking other threads.</span>
+<span class="source-line-no">479</span><span id="line-479">        wait(throttlingTime);</span>
+<span class="source-line-no">480</span><span id="line-480">      } catch (InterruptedException e) {</span>
+<span class="source-line-no">481</span><span id="line-481">        throw new RuntimeException(e);</span>
+<span class="source-line-no">482</span><span id="line-482">      }</span>
+<span class="source-line-no">483</span><span id="line-483">    }</span>
+<span class="source-line-no">484</span><span id="line-484">  }</span>
+<span class="source-line-no">485</span><span id="line-485"></span>
+<span class="source-line-no">486</span><span id="line-486">  @Override</span>
+<span class="source-line-no">487</span><span id="line-487">  public void stop(String why) {</span>
+<span class="source-line-no">488</span><span id="line-488">    internalBalancer.stop(why);</span>
+<span class="source-line-no">489</span><span id="line-489">  }</span>
+<span class="source-line-no">490</span><span id="line-490"></span>
+<span class="source-line-no">491</span><span id="line-491">  @Override</span>
+<span class="source-line-no">492</span><span id="line-492">  public boolean isStopped() {</span>
+<span class="source-line-no">493</span><span id="line-493">    return internalBalancer.isStopped();</span>
+<span class="source-line-no">494</span><span id="line-494">  }</span>
+<span class="source-line-no">495</span><span id="line-495"></span>
+<span class="source-line-no">496</span><span id="line-496">  public LoadBalancer getInternalBalancer() {</span>
+<span class="source-line-no">497</span><span id="line-497">    return internalBalancer;</span>
+<span class="source-line-no">498</span><span id="line-498">  }</span>
+<span class="source-line-no">499</span><span id="line-499"></span>
+<span class="source-line-no">500</span><span id="line-500">  public FavoredNodesManager getFavoredNodesManager() {</span>
+<span class="source-line-no">501</span><span id="line-501">    return favoredNodesManager;</span>
+<span class="source-line-no">502</span><span id="line-502">  }</span>
+<span class="source-line-no">503</span><span id="line-503"></span>
+<span class="source-line-no">504</span><span id="line-504">  @Override</span>
+<span class="source-line-no">505</span><span id="line-505">  public synchronized void postMasterStartupInitialize() {</span>
+<span class="source-line-no">506</span><span id="line-506">    this.internalBalancer.postMasterStartupInitialize();</span>
+<span class="source-line-no">507</span><span id="line-507">  }</span>
+<span class="source-line-no">508</span><span id="line-508"></span>
+<span class="source-line-no">509</span><span id="line-509">  public void updateBalancerStatus(boolean status) {</span>
+<span class="source-line-no">510</span><span id="line-510">    internalBalancer.updateBalancerStatus(status);</span>
+<span class="source-line-no">511</span><span id="line-511">  }</span>
+<span class="source-line-no">512</span><span id="line-512"></span>
+<span class="source-line-no">513</span><span id="line-513">  private List&lt;ServerName&gt; getFallBackCandidates(List&lt;ServerName&gt; servers) {</span>
+<span class="source-line-no">514</span><span id="line-514">    List&lt;ServerName&gt; serverNames = null;</span>
+<span class="source-line-no">515</span><span id="line-515">    try {</span>
+<span class="source-line-no">516</span><span id="line-516">      RSGroupInfo info = rsGroupInfoManager.getRSGroup(RSGroupInfo.DEFAULT_GROUP);</span>
+<span class="source-line-no">517</span><span id="line-517">      serverNames = filterOfflineServers(info, servers);</span>
+<span class="source-line-no">518</span><span id="line-518">    } catch (IOException e) {</span>
+<span class="source-line-no">519</span><span id="line-519">      LOG.error("Failed to get default rsgroup info to fallback", e);</span>
+<span class="source-line-no">520</span><span id="line-520">    }</span>
+<span class="source-line-no">521</span><span id="line-521">    return serverNames == null || serverNames.isEmpty() ? servers : serverNames;</span>
+<span class="source-line-no">522</span><span id="line-522">  }</span>
+<span class="source-line-no">523</span><span id="line-523"></span>
+<span class="source-line-no">524</span><span id="line-524">  @Override</span>
+<span class="source-line-no">525</span><span id="line-525">  public void setClusterInfoProvider(ClusterInfoProvider provider) {</span>
+<span class="source-line-no">526</span><span id="line-526">    throw new UnsupportedOperationException("Just call set master service instead");</span>
+<span class="source-line-no">527</span><span id="line-527">  }</span>
+<span class="source-line-no">528</span><span id="line-528">}</span>
 
 
 

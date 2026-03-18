@@ -895,38 +895,90 @@
 <span class="source-line-no">882</span><span id="line-882">    }</span>
 <span class="source-line-no">883</span><span id="line-883">  }</span>
 <span class="source-line-no">884</span><span id="line-884"></span>
-<span class="source-line-no">885</span><span id="line-885">  private static class PartialWALEntryFailingWALEntryFilter implements WALEntryFilter {</span>
-<span class="source-line-no">886</span><span id="line-886">    private int filteredWALEntryCount = -1;</span>
-<span class="source-line-no">887</span><span id="line-887">    private int walEntryCount = 0;</span>
-<span class="source-line-no">888</span><span id="line-888">    private int throwExceptionCount = -1;</span>
-<span class="source-line-no">889</span><span id="line-889">    private int maxThrowExceptionCount;</span>
-<span class="source-line-no">890</span><span id="line-890"></span>
-<span class="source-line-no">891</span><span id="line-891">    public PartialWALEntryFailingWALEntryFilter(int throwExceptionLimit, int walEntryCount) {</span>
-<span class="source-line-no">892</span><span id="line-892">      this.maxThrowExceptionCount = throwExceptionLimit;</span>
-<span class="source-line-no">893</span><span id="line-893">      this.walEntryCount = walEntryCount;</span>
-<span class="source-line-no">894</span><span id="line-894">    }</span>
-<span class="source-line-no">895</span><span id="line-895"></span>
-<span class="source-line-no">896</span><span id="line-896">    @Override</span>
-<span class="source-line-no">897</span><span id="line-897">    public WAL.Entry filter(WAL.Entry entry) {</span>
-<span class="source-line-no">898</span><span id="line-898">      filteredWALEntryCount++;</span>
-<span class="source-line-no">899</span><span id="line-899">      if (filteredWALEntryCount &lt; walEntryCount - 1) {</span>
-<span class="source-line-no">900</span><span id="line-900">        return entry;</span>
-<span class="source-line-no">901</span><span id="line-901">      }</span>
-<span class="source-line-no">902</span><span id="line-902"></span>
-<span class="source-line-no">903</span><span id="line-903">      filteredWALEntryCount = -1;</span>
-<span class="source-line-no">904</span><span id="line-904">      throwExceptionCount++;</span>
-<span class="source-line-no">905</span><span id="line-905">      if (throwExceptionCount &lt;= maxThrowExceptionCount - 1) {</span>
-<span class="source-line-no">906</span><span id="line-906">        throw new WALEntryFilterRetryableException("failing filter");</span>
-<span class="source-line-no">907</span><span id="line-907">      }</span>
-<span class="source-line-no">908</span><span id="line-908">      return entry;</span>
-<span class="source-line-no">909</span><span id="line-909">    }</span>
-<span class="source-line-no">910</span><span id="line-910"></span>
-<span class="source-line-no">911</span><span id="line-911">    public int getThrowExceptionCount() {</span>
-<span class="source-line-no">912</span><span id="line-912">      return throwExceptionCount;</span>
-<span class="source-line-no">913</span><span id="line-913">    }</span>
-<span class="source-line-no">914</span><span id="line-914">  }</span>
+<span class="source-line-no">885</span><span id="line-885">  /**</span>
+<span class="source-line-no">886</span><span id="line-886">   * Verify that when a WAL file switch is detected via the switched() check in</span>
+<span class="source-line-no">887</span><span id="line-887">   * ReplicationSourceWALReader.run(), currentPosition is reset so that a subsequent</span>
+<span class="source-line-no">888</span><span id="line-888">   * WALEntryFilterRetryableException does not cause the new file to be opened at the old file's</span>
+<span class="source-line-no">889</span><span id="line-889">   * position.</span>
+<span class="source-line-no">890</span><span id="line-890">   */</span>
+<span class="source-line-no">891</span><span id="line-891">  @Test</span>
+<span class="source-line-no">892</span><span id="line-892">  public void testPositionResetOnFileSwitchWithRetryableFilter() throws Exception {</span>
+<span class="source-line-no">893</span><span id="line-893">    appendEntriesToLogAndSync(3);</span>
+<span class="source-line-no">894</span><span id="line-894">    log.rollWriter();</span>
+<span class="source-line-no">895</span><span id="line-895">    AbstractFSWAL&lt;?&gt; abstractWAL = (AbstractFSWAL&lt;?&gt;) log;</span>
+<span class="source-line-no">896</span><span id="line-896">    Waiter.waitFor(CONF, 5000,</span>
+<span class="source-line-no">897</span><span id="line-897">      (Waiter.Predicate&lt;Exception&gt;) () -&gt; abstractWAL.getInflightWALCloseCount() == 0);</span>
+<span class="source-line-no">898</span><span id="line-898">    appendEntriesToLogAndSync(3);</span>
+<span class="source-line-no">899</span><span id="line-899"></span>
+<span class="source-line-no">900</span><span id="line-900">    // Batch capacity of 1 ensures EOF on WAL A is detected by hasNext() in the run loop</span>
+<span class="source-line-no">901</span><span id="line-901">    // (not inside readWALEntries), which triggers the switched() path.</span>
+<span class="source-line-no">902</span><span id="line-902">    Configuration conf = new Configuration(CONF);</span>
+<span class="source-line-no">903</span><span id="line-903">    conf.setInt("replication.source.nb.capacity", 1);</span>
+<span class="source-line-no">904</span><span id="line-904"></span>
+<span class="source-line-no">905</span><span id="line-905">    AtomicInteger totalFilterCalls = new AtomicInteger(0);</span>
+<span class="source-line-no">906</span><span id="line-906">    AtomicBoolean threwOnce = new AtomicBoolean(false);</span>
+<span class="source-line-no">907</span><span id="line-907">    WALEntryFilter filter = entry -&gt; {</span>
+<span class="source-line-no">908</span><span id="line-908">      int callNum = totalFilterCalls.incrementAndGet();</span>
+<span class="source-line-no">909</span><span id="line-909">      if (callNum &gt; 3 &amp;&amp; !threwOnce.get()) {</span>
+<span class="source-line-no">910</span><span id="line-910">        threwOnce.set(true);</span>
+<span class="source-line-no">911</span><span id="line-911">        throw new WALEntryFilterRetryableException("simulated filter failure after file switch");</span>
+<span class="source-line-no">912</span><span id="line-912">      }</span>
+<span class="source-line-no">913</span><span id="line-913">      return entry;</span>
+<span class="source-line-no">914</span><span id="line-914">    };</span>
 <span class="source-line-no">915</span><span id="line-915"></span>
-<span class="source-line-no">916</span><span id="line-916">}</span>
+<span class="source-line-no">916</span><span id="line-916">    ReplicationSource source = mockReplicationSource(false, conf);</span>
+<span class="source-line-no">917</span><span id="line-917">    when(source.isPeerEnabled()).thenReturn(true);</span>
+<span class="source-line-no">918</span><span id="line-918">    ReplicationSourceWALReader reader =</span>
+<span class="source-line-no">919</span><span id="line-919">      new ReplicationSourceWALReader(fs, conf, logQueue, 0, filter, source, fakeWalGroupId);</span>
+<span class="source-line-no">920</span><span id="line-920">    reader.start();</span>
+<span class="source-line-no">921</span><span id="line-921"></span>
+<span class="source-line-no">922</span><span id="line-922">    int totalEntries = 0;</span>
+<span class="source-line-no">923</span><span id="line-923">    long deadline = System.currentTimeMillis() + 30000;</span>
+<span class="source-line-no">924</span><span id="line-924">    while (totalEntries &lt; 6) {</span>
+<span class="source-line-no">925</span><span id="line-925">      long remaining = deadline - System.currentTimeMillis();</span>
+<span class="source-line-no">926</span><span id="line-926">      assertTrue("Reader appears stuck - likely position corruption. Only got " + totalEntries</span>
+<span class="source-line-no">927</span><span id="line-927">        + " of 6 entries", remaining &gt; 0);</span>
+<span class="source-line-no">928</span><span id="line-928">      WALEntryBatch batch = reader.poll(1);</span>
+<span class="source-line-no">929</span><span id="line-929">      if (batch != null &amp;&amp; batch != WALEntryBatch.NO_MORE_DATA) {</span>
+<span class="source-line-no">930</span><span id="line-930">        totalEntries += batch.getNbEntries();</span>
+<span class="source-line-no">931</span><span id="line-931">      }</span>
+<span class="source-line-no">932</span><span id="line-932">    }</span>
+<span class="source-line-no">933</span><span id="line-933">    assertEquals(6, totalEntries);</span>
+<span class="source-line-no">934</span><span id="line-934">    assertTrue("Filter should have thrown at least once", threwOnce.get());</span>
+<span class="source-line-no">935</span><span id="line-935">  }</span>
+<span class="source-line-no">936</span><span id="line-936"></span>
+<span class="source-line-no">937</span><span id="line-937">  private static class PartialWALEntryFailingWALEntryFilter implements WALEntryFilter {</span>
+<span class="source-line-no">938</span><span id="line-938">    private int filteredWALEntryCount = -1;</span>
+<span class="source-line-no">939</span><span id="line-939">    private int walEntryCount = 0;</span>
+<span class="source-line-no">940</span><span id="line-940">    private int throwExceptionCount = -1;</span>
+<span class="source-line-no">941</span><span id="line-941">    private int maxThrowExceptionCount;</span>
+<span class="source-line-no">942</span><span id="line-942"></span>
+<span class="source-line-no">943</span><span id="line-943">    public PartialWALEntryFailingWALEntryFilter(int throwExceptionLimit, int walEntryCount) {</span>
+<span class="source-line-no">944</span><span id="line-944">      this.maxThrowExceptionCount = throwExceptionLimit;</span>
+<span class="source-line-no">945</span><span id="line-945">      this.walEntryCount = walEntryCount;</span>
+<span class="source-line-no">946</span><span id="line-946">    }</span>
+<span class="source-line-no">947</span><span id="line-947"></span>
+<span class="source-line-no">948</span><span id="line-948">    @Override</span>
+<span class="source-line-no">949</span><span id="line-949">    public WAL.Entry filter(WAL.Entry entry) {</span>
+<span class="source-line-no">950</span><span id="line-950">      filteredWALEntryCount++;</span>
+<span class="source-line-no">951</span><span id="line-951">      if (filteredWALEntryCount &lt; walEntryCount - 1) {</span>
+<span class="source-line-no">952</span><span id="line-952">        return entry;</span>
+<span class="source-line-no">953</span><span id="line-953">      }</span>
+<span class="source-line-no">954</span><span id="line-954"></span>
+<span class="source-line-no">955</span><span id="line-955">      filteredWALEntryCount = -1;</span>
+<span class="source-line-no">956</span><span id="line-956">      throwExceptionCount++;</span>
+<span class="source-line-no">957</span><span id="line-957">      if (throwExceptionCount &lt;= maxThrowExceptionCount - 1) {</span>
+<span class="source-line-no">958</span><span id="line-958">        throw new WALEntryFilterRetryableException("failing filter");</span>
+<span class="source-line-no">959</span><span id="line-959">      }</span>
+<span class="source-line-no">960</span><span id="line-960">      return entry;</span>
+<span class="source-line-no">961</span><span id="line-961">    }</span>
+<span class="source-line-no">962</span><span id="line-962"></span>
+<span class="source-line-no">963</span><span id="line-963">    public int getThrowExceptionCount() {</span>
+<span class="source-line-no">964</span><span id="line-964">      return throwExceptionCount;</span>
+<span class="source-line-no">965</span><span id="line-965">    }</span>
+<span class="source-line-no">966</span><span id="line-966">  }</span>
+<span class="source-line-no">967</span><span id="line-967"></span>
+<span class="source-line-no">968</span><span id="line-968">}</span>
 
 
 
