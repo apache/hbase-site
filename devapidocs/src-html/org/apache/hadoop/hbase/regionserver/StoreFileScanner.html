@@ -38,714 +38,730 @@
 <span class="source-line-no">025</span><span id="line-25">import java.util.List;</span>
 <span class="source-line-no">026</span><span id="line-26">import java.util.Optional;</span>
 <span class="source-line-no">027</span><span id="line-27">import java.util.PriorityQueue;</span>
-<span class="source-line-no">028</span><span id="line-28">import java.util.concurrent.atomic.LongAdder;</span>
-<span class="source-line-no">029</span><span id="line-29">import java.util.function.IntConsumer;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.fs.Path;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.Cell;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.CellComparator;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.ExtendedCell;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.HBaseInterfaceAudience;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.HConstants;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.PrivateCellUtil;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.client.Scan;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.io.TimeRange;</span>
-<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.io.hfile.HFileScanner;</span>
-<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher;</span>
-<span class="source-line-no">041</span><span id="line-41">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">042</span><span id="line-42">import org.apache.yetus.audience.InterfaceStability;</span>
-<span class="source-line-no">043</span><span id="line-43"></span>
-<span class="source-line-no">044</span><span id="line-44">/**</span>
-<span class="source-line-no">045</span><span id="line-45"> * KeyValueScanner adaptor over the Reader. It also provides hooks into bloom filter things.</span>
-<span class="source-line-no">046</span><span id="line-46"> */</span>
-<span class="source-line-no">047</span><span id="line-47">@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.PHOENIX)</span>
-<span class="source-line-no">048</span><span id="line-48">@InterfaceStability.Evolving</span>
-<span class="source-line-no">049</span><span id="line-49">public class StoreFileScanner implements KeyValueScanner {</span>
-<span class="source-line-no">050</span><span id="line-50">  // the reader it comes from:</span>
-<span class="source-line-no">051</span><span id="line-51">  private final StoreFileReader reader;</span>
-<span class="source-line-no">052</span><span id="line-52">  private final HFileScanner hfs;</span>
-<span class="source-line-no">053</span><span id="line-53">  private ExtendedCell cur = null;</span>
-<span class="source-line-no">054</span><span id="line-54">  private boolean closed = false;</span>
-<span class="source-line-no">055</span><span id="line-55"></span>
-<span class="source-line-no">056</span><span id="line-56">  private boolean realSeekDone;</span>
-<span class="source-line-no">057</span><span id="line-57">  private boolean delayedReseek;</span>
-<span class="source-line-no">058</span><span id="line-58">  private ExtendedCell delayedSeekKV;</span>
-<span class="source-line-no">059</span><span id="line-59"></span>
-<span class="source-line-no">060</span><span id="line-60">  private final boolean enforceMVCC;</span>
-<span class="source-line-no">061</span><span id="line-61">  private final boolean hasMVCCInfo;</span>
-<span class="source-line-no">062</span><span id="line-62">  // A flag represents whether could stop skipping KeyValues for MVCC</span>
-<span class="source-line-no">063</span><span id="line-63">  // if have encountered the next row. Only used for reversed scan</span>
-<span class="source-line-no">064</span><span id="line-64">  private boolean stopSkippingKVsIfNextRow = false;</span>
-<span class="source-line-no">065</span><span id="line-65">  // A Cell that represents the row before the most previously seeked to row in seekToPreviousRow</span>
-<span class="source-line-no">066</span><span id="line-66">  // Note: Oftentimes this will contain an instance of a KeyOnly implementation of the Cell as it's</span>
-<span class="source-line-no">067</span><span id="line-67">  // not returned to callers and only used as a hint for seeking (so we can save on</span>
-<span class="source-line-no">068</span><span id="line-68">  // memory/allocations)</span>
-<span class="source-line-no">069</span><span id="line-69">  private ExtendedCell previousRow = null;</span>
-<span class="source-line-no">070</span><span id="line-70">  // Whether the underlying HFile is using a data block encoding that has lower cost for seeking to</span>
-<span class="source-line-no">071</span><span id="line-71">  // a row from the beginning of a block (i.e. RIV1). If the data block encoding has a high cost for</span>
-<span class="source-line-no">072</span><span id="line-72">  // seeks, then we can use a modified reverse scanning algorithm to reduce seeks from the beginning</span>
-<span class="source-line-no">073</span><span id="line-73">  // of the block</span>
-<span class="source-line-no">074</span><span id="line-74">  private final boolean isFastSeekingEncoding;</span>
-<span class="source-line-no">075</span><span id="line-75"></span>
-<span class="source-line-no">076</span><span id="line-76">  private static LongAdder seekCount;</span>
-<span class="source-line-no">077</span><span id="line-77"></span>
-<span class="source-line-no">078</span><span id="line-78">  private final boolean canOptimizeForNonNullColumn;</span>
-<span class="source-line-no">079</span><span id="line-79"></span>
-<span class="source-line-no">080</span><span id="line-80">  private final long readPt;</span>
-<span class="source-line-no">081</span><span id="line-81"></span>
-<span class="source-line-no">082</span><span id="line-82">  // Order of this scanner relative to other scanners when duplicate key-value is found.</span>
-<span class="source-line-no">083</span><span id="line-83">  // Higher values means scanner has newer data.</span>
-<span class="source-line-no">084</span><span id="line-84">  private final long scannerOrder;</span>
-<span class="source-line-no">085</span><span id="line-85"></span>
-<span class="source-line-no">086</span><span id="line-86">  /**</span>
-<span class="source-line-no">087</span><span id="line-87">   * Implements a {@link KeyValueScanner} on top of the specified {@link HFileScanner}</span>
-<span class="source-line-no">088</span><span id="line-88">   * @param useMVCC                     If true, scanner will filter out updates with MVCC larger</span>
-<span class="source-line-no">089</span><span id="line-89">   *                                    than {@code readPt}.</span>
-<span class="source-line-no">090</span><span id="line-90">   * @param readPt                      MVCC value to use to filter out the updates newer than this</span>
-<span class="source-line-no">091</span><span id="line-91">   *                                    scanner.</span>
-<span class="source-line-no">092</span><span id="line-92">   * @param hasMVCC                     Set to true if underlying store file reader has MVCC info.</span>
-<span class="source-line-no">093</span><span id="line-93">   * @param scannerOrder                Order of the scanner relative to other scanners. See</span>
-<span class="source-line-no">094</span><span id="line-94">   *                                    {@link KeyValueScanner#getScannerOrder()}.</span>
-<span class="source-line-no">095</span><span id="line-95">   * @param canOptimizeForNonNullColumn {@code true} if we can make sure there is no null column,</span>
-<span class="source-line-no">096</span><span id="line-96">   *                                    otherwise {@code false}. This is a hint for optimization.</span>
-<span class="source-line-no">097</span><span id="line-97">   * @param isFastSeekingEncoding       {@code true} if the data block encoding can seek quickly</span>
-<span class="source-line-no">098</span><span id="line-98">   *                                    from the beginning of a block (i.e. RIV1), otherwise</span>
-<span class="source-line-no">099</span><span id="line-99">   *                                    {@code false}. This is a hint for optimization.</span>
-<span class="source-line-no">100</span><span id="line-100">   */</span>
-<span class="source-line-no">101</span><span id="line-101">  public StoreFileScanner(StoreFileReader reader, HFileScanner hfs, boolean useMVCC,</span>
-<span class="source-line-no">102</span><span id="line-102">    boolean hasMVCC, long readPt, long scannerOrder, boolean canOptimizeForNonNullColumn,</span>
-<span class="source-line-no">103</span><span id="line-103">    boolean isFastSeekingEncoding) {</span>
-<span class="source-line-no">104</span><span id="line-104">    this.readPt = readPt;</span>
-<span class="source-line-no">105</span><span id="line-105">    this.reader = reader;</span>
-<span class="source-line-no">106</span><span id="line-106">    this.hfs = hfs;</span>
-<span class="source-line-no">107</span><span id="line-107">    this.enforceMVCC = useMVCC;</span>
-<span class="source-line-no">108</span><span id="line-108">    this.hasMVCCInfo = hasMVCC;</span>
-<span class="source-line-no">109</span><span id="line-109">    this.scannerOrder = scannerOrder;</span>
-<span class="source-line-no">110</span><span id="line-110">    this.canOptimizeForNonNullColumn = canOptimizeForNonNullColumn;</span>
-<span class="source-line-no">111</span><span id="line-111">    this.isFastSeekingEncoding = isFastSeekingEncoding;</span>
-<span class="source-line-no">112</span><span id="line-112">    this.reader.incrementRefCount();</span>
-<span class="source-line-no">113</span><span id="line-113">  }</span>
-<span class="source-line-no">114</span><span id="line-114"></span>
-<span class="source-line-no">115</span><span id="line-115">  /**</span>
-<span class="source-line-no">116</span><span id="line-116">   * Return an array of scanners corresponding to the given set of store files.</span>
-<span class="source-line-no">117</span><span id="line-117">   */</span>
-<span class="source-line-no">118</span><span id="line-118">  public static List&lt;StoreFileScanner&gt; getScannersForStoreFiles(Collection&lt;HStoreFile&gt; files,</span>
-<span class="source-line-no">119</span><span id="line-119">    boolean cacheBlocks, boolean usePread, boolean isCompaction, boolean useDropBehind, long readPt)</span>
-<span class="source-line-no">120</span><span id="line-120">    throws IOException {</span>
-<span class="source-line-no">121</span><span id="line-121">    return getScannersForStoreFiles(files, cacheBlocks, usePread, isCompaction, useDropBehind, null,</span>
-<span class="source-line-no">122</span><span id="line-122">      readPt);</span>
-<span class="source-line-no">123</span><span id="line-123">  }</span>
-<span class="source-line-no">124</span><span id="line-124"></span>
-<span class="source-line-no">125</span><span id="line-125">  /**</span>
-<span class="source-line-no">126</span><span id="line-126">   * Return an array of scanners corresponding to the given set of store files, And set the</span>
-<span class="source-line-no">127</span><span id="line-127">   * ScanQueryMatcher for each store file scanner for further optimization</span>
-<span class="source-line-no">128</span><span id="line-128">   */</span>
-<span class="source-line-no">129</span><span id="line-129">  public static List&lt;StoreFileScanner&gt; getScannersForStoreFiles(Collection&lt;HStoreFile&gt; files,</span>
-<span class="source-line-no">130</span><span id="line-130">    boolean cacheBlocks, boolean usePread, boolean isCompaction, boolean canUseDrop,</span>
-<span class="source-line-no">131</span><span id="line-131">    ScanQueryMatcher matcher, long readPt) throws IOException {</span>
-<span class="source-line-no">132</span><span id="line-132">    if (files.isEmpty()) {</span>
-<span class="source-line-no">133</span><span id="line-133">      return Collections.emptyList();</span>
-<span class="source-line-no">134</span><span id="line-134">    }</span>
-<span class="source-line-no">135</span><span id="line-135">    List&lt;StoreFileScanner&gt; scanners = new ArrayList&lt;&gt;(files.size());</span>
-<span class="source-line-no">136</span><span id="line-136">    boolean canOptimizeForNonNullColumn = matcher != null ? !matcher.hasNullColumnInQuery() : false;</span>
-<span class="source-line-no">137</span><span id="line-137">    PriorityQueue&lt;HStoreFile&gt; sortedFiles =</span>
-<span class="source-line-no">138</span><span id="line-138">      new PriorityQueue&lt;&gt;(files.size(), StoreFileComparators.SEQ_ID);</span>
-<span class="source-line-no">139</span><span id="line-139">    for (HStoreFile file : files) {</span>
-<span class="source-line-no">140</span><span id="line-140">      // The sort function needs metadata so we need to open reader first before sorting the list.</span>
-<span class="source-line-no">141</span><span id="line-141">      file.initReader();</span>
-<span class="source-line-no">142</span><span id="line-142">      sortedFiles.add(file);</span>
-<span class="source-line-no">143</span><span id="line-143">    }</span>
-<span class="source-line-no">144</span><span id="line-144">    boolean succ = false;</span>
-<span class="source-line-no">145</span><span id="line-145">    try {</span>
-<span class="source-line-no">146</span><span id="line-146">      for (int i = 0, n = files.size(); i &lt; n; i++) {</span>
-<span class="source-line-no">147</span><span id="line-147">        HStoreFile sf = sortedFiles.remove();</span>
-<span class="source-line-no">148</span><span id="line-148">        StoreFileScanner scanner;</span>
-<span class="source-line-no">149</span><span id="line-149">        if (usePread) {</span>
-<span class="source-line-no">150</span><span id="line-150">          scanner = sf.getPreadScanner(cacheBlocks, readPt, i, canOptimizeForNonNullColumn);</span>
-<span class="source-line-no">151</span><span id="line-151">        } else {</span>
-<span class="source-line-no">152</span><span id="line-152">          scanner = sf.getStreamScanner(canUseDrop, cacheBlocks, isCompaction, readPt, i,</span>
-<span class="source-line-no">153</span><span id="line-153">            canOptimizeForNonNullColumn);</span>
-<span class="source-line-no">154</span><span id="line-154">        }</span>
-<span class="source-line-no">155</span><span id="line-155">        scanners.add(scanner);</span>
-<span class="source-line-no">156</span><span id="line-156">      }</span>
-<span class="source-line-no">157</span><span id="line-157">      succ = true;</span>
-<span class="source-line-no">158</span><span id="line-158">    } finally {</span>
-<span class="source-line-no">159</span><span id="line-159">      if (!succ) {</span>
-<span class="source-line-no">160</span><span id="line-160">        for (StoreFileScanner scanner : scanners) {</span>
-<span class="source-line-no">161</span><span id="line-161">          scanner.close();</span>
-<span class="source-line-no">162</span><span id="line-162">        }</span>
-<span class="source-line-no">163</span><span id="line-163">      }</span>
-<span class="source-line-no">164</span><span id="line-164">    }</span>
-<span class="source-line-no">165</span><span id="line-165">    return scanners;</span>
-<span class="source-line-no">166</span><span id="line-166">  }</span>
-<span class="source-line-no">167</span><span id="line-167"></span>
-<span class="source-line-no">168</span><span id="line-168">  /**</span>
-<span class="source-line-no">169</span><span id="line-169">   * Get scanners for compaction. We will create a separated reader for each store file to avoid</span>
-<span class="source-line-no">170</span><span id="line-170">   * contention with normal read request.</span>
-<span class="source-line-no">171</span><span id="line-171">   */</span>
-<span class="source-line-no">172</span><span id="line-172">  public static List&lt;StoreFileScanner&gt; getScannersForCompaction(Collection&lt;HStoreFile&gt; files,</span>
-<span class="source-line-no">173</span><span id="line-173">    boolean canUseDropBehind, long readPt) throws IOException {</span>
-<span class="source-line-no">174</span><span id="line-174">    List&lt;StoreFileScanner&gt; scanners = new ArrayList&lt;&gt;(files.size());</span>
-<span class="source-line-no">175</span><span id="line-175">    List&lt;HStoreFile&gt; sortedFiles = new ArrayList&lt;&gt;(files);</span>
-<span class="source-line-no">176</span><span id="line-176">    Collections.sort(sortedFiles, StoreFileComparators.SEQ_ID);</span>
-<span class="source-line-no">177</span><span id="line-177">    boolean succ = false;</span>
-<span class="source-line-no">178</span><span id="line-178">    try {</span>
-<span class="source-line-no">179</span><span id="line-179">      for (int i = 0, n = sortedFiles.size(); i &lt; n; i++) {</span>
-<span class="source-line-no">180</span><span id="line-180">        scanners.add(</span>
-<span class="source-line-no">181</span><span id="line-181">          sortedFiles.get(i).getStreamScanner(canUseDropBehind, false, true, readPt, i, false));</span>
-<span class="source-line-no">182</span><span id="line-182">      }</span>
-<span class="source-line-no">183</span><span id="line-183">      succ = true;</span>
-<span class="source-line-no">184</span><span id="line-184">    } finally {</span>
-<span class="source-line-no">185</span><span id="line-185">      if (!succ) {</span>
-<span class="source-line-no">186</span><span id="line-186">        for (StoreFileScanner scanner : scanners) {</span>
-<span class="source-line-no">187</span><span id="line-187">          scanner.close();</span>
-<span class="source-line-no">188</span><span id="line-188">        }</span>
-<span class="source-line-no">189</span><span id="line-189">      }</span>
-<span class="source-line-no">190</span><span id="line-190">    }</span>
-<span class="source-line-no">191</span><span id="line-191">    return scanners;</span>
-<span class="source-line-no">192</span><span id="line-192">  }</span>
-<span class="source-line-no">193</span><span id="line-193"></span>
-<span class="source-line-no">194</span><span id="line-194">  @Override</span>
-<span class="source-line-no">195</span><span id="line-195">  public String toString() {</span>
-<span class="source-line-no">196</span><span id="line-196">    return "StoreFileScanner[" + hfs.toString() + ", cur=" + cur + "]";</span>
-<span class="source-line-no">197</span><span id="line-197">  }</span>
-<span class="source-line-no">198</span><span id="line-198"></span>
-<span class="source-line-no">199</span><span id="line-199">  @Override</span>
-<span class="source-line-no">200</span><span id="line-200">  public ExtendedCell peek() {</span>
-<span class="source-line-no">201</span><span id="line-201">    return cur;</span>
-<span class="source-line-no">202</span><span id="line-202">  }</span>
-<span class="source-line-no">203</span><span id="line-203"></span>
-<span class="source-line-no">204</span><span id="line-204">  @Override</span>
-<span class="source-line-no">205</span><span id="line-205">  public ExtendedCell next() throws IOException {</span>
-<span class="source-line-no">206</span><span id="line-206">    ExtendedCell retKey = cur;</span>
+<span class="source-line-no">028</span><span id="line-28">import java.util.Set;</span>
+<span class="source-line-no">029</span><span id="line-29">import java.util.concurrent.atomic.LongAdder;</span>
+<span class="source-line-no">030</span><span id="line-30">import java.util.function.IntConsumer;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.fs.Path;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.Cell;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.CellComparator;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.ExtendedCell;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.HBaseInterfaceAudience;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.HConstants;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.hbase.PrivateCellUtil;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.apache.hadoop.hbase.client.Scan;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.apache.hadoop.hbase.io.TimeRange;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.apache.hadoop.hbase.io.hfile.HFileScanner;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.apache.hadoop.hbase.regionserver.querymatcher.ScanQueryMatcher;</span>
+<span class="source-line-no">042</span><span id="line-42">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">043</span><span id="line-43">import org.apache.yetus.audience.InterfaceStability;</span>
+<span class="source-line-no">044</span><span id="line-44"></span>
+<span class="source-line-no">045</span><span id="line-45">/**</span>
+<span class="source-line-no">046</span><span id="line-46"> * KeyValueScanner adaptor over the Reader. It also provides hooks into bloom filter things.</span>
+<span class="source-line-no">047</span><span id="line-47"> */</span>
+<span class="source-line-no">048</span><span id="line-48">@InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.PHOENIX)</span>
+<span class="source-line-no">049</span><span id="line-49">@InterfaceStability.Evolving</span>
+<span class="source-line-no">050</span><span id="line-50">public class StoreFileScanner implements KeyValueScanner {</span>
+<span class="source-line-no">051</span><span id="line-51">  // the reader it comes from:</span>
+<span class="source-line-no">052</span><span id="line-52">  private final StoreFileReader reader;</span>
+<span class="source-line-no">053</span><span id="line-53">  private final HFileScanner hfs;</span>
+<span class="source-line-no">054</span><span id="line-54">  private ExtendedCell cur = null;</span>
+<span class="source-line-no">055</span><span id="line-55">  private boolean closed = false;</span>
+<span class="source-line-no">056</span><span id="line-56"></span>
+<span class="source-line-no">057</span><span id="line-57">  private boolean realSeekDone;</span>
+<span class="source-line-no">058</span><span id="line-58">  private boolean delayedReseek;</span>
+<span class="source-line-no">059</span><span id="line-59">  private ExtendedCell delayedSeekKV;</span>
+<span class="source-line-no">060</span><span id="line-60"></span>
+<span class="source-line-no">061</span><span id="line-61">  private final boolean enforceMVCC;</span>
+<span class="source-line-no">062</span><span id="line-62">  private final boolean hasMVCCInfo;</span>
+<span class="source-line-no">063</span><span id="line-63">  // A flag represents whether could stop skipping KeyValues for MVCC</span>
+<span class="source-line-no">064</span><span id="line-64">  // if have encountered the next row. Only used for reversed scan</span>
+<span class="source-line-no">065</span><span id="line-65">  private boolean stopSkippingKVsIfNextRow = false;</span>
+<span class="source-line-no">066</span><span id="line-66">  // A Cell that represents the row before the most previously seeked to row in seekToPreviousRow</span>
+<span class="source-line-no">067</span><span id="line-67">  // Note: Oftentimes this will contain an instance of a KeyOnly implementation of the Cell as it's</span>
+<span class="source-line-no">068</span><span id="line-68">  // not returned to callers and only used as a hint for seeking (so we can save on</span>
+<span class="source-line-no">069</span><span id="line-69">  // memory/allocations)</span>
+<span class="source-line-no">070</span><span id="line-70">  private ExtendedCell previousRow = null;</span>
+<span class="source-line-no">071</span><span id="line-71">  // Whether the underlying HFile is using a data block encoding that has lower cost for seeking to</span>
+<span class="source-line-no">072</span><span id="line-72">  // a row from the beginning of a block (i.e. RIV1). If the data block encoding has a high cost for</span>
+<span class="source-line-no">073</span><span id="line-73">  // seeks, then we can use a modified reverse scanning algorithm to reduce seeks from the beginning</span>
+<span class="source-line-no">074</span><span id="line-74">  // of the block</span>
+<span class="source-line-no">075</span><span id="line-75">  private final boolean isFastSeekingEncoding;</span>
+<span class="source-line-no">076</span><span id="line-76"></span>
+<span class="source-line-no">077</span><span id="line-77">  private static LongAdder seekCount;</span>
+<span class="source-line-no">078</span><span id="line-78"></span>
+<span class="source-line-no">079</span><span id="line-79">  private final boolean canOptimizeForNonNullColumn;</span>
+<span class="source-line-no">080</span><span id="line-80"></span>
+<span class="source-line-no">081</span><span id="line-81">  private final long readPt;</span>
+<span class="source-line-no">082</span><span id="line-82"></span>
+<span class="source-line-no">083</span><span id="line-83">  // Order of this scanner relative to other scanners when duplicate key-value is found.</span>
+<span class="source-line-no">084</span><span id="line-84">  // Higher values means scanner has newer data.</span>
+<span class="source-line-no">085</span><span id="line-85">  private final long scannerOrder;</span>
+<span class="source-line-no">086</span><span id="line-86"></span>
+<span class="source-line-no">087</span><span id="line-87">  // The single file path when this scanner is closed (successfully read).</span>
+<span class="source-line-no">088</span><span id="line-88">  private Path fileRead;</span>
+<span class="source-line-no">089</span><span id="line-89"></span>
+<span class="source-line-no">090</span><span id="line-90">  /**</span>
+<span class="source-line-no">091</span><span id="line-91">   * Implements a {@link KeyValueScanner} on top of the specified {@link HFileScanner}</span>
+<span class="source-line-no">092</span><span id="line-92">   * @param useMVCC                     If true, scanner will filter out updates with MVCC larger</span>
+<span class="source-line-no">093</span><span id="line-93">   *                                    than {@code readPt}.</span>
+<span class="source-line-no">094</span><span id="line-94">   * @param readPt                      MVCC value to use to filter out the updates newer than this</span>
+<span class="source-line-no">095</span><span id="line-95">   *                                    scanner.</span>
+<span class="source-line-no">096</span><span id="line-96">   * @param hasMVCC                     Set to true if underlying store file reader has MVCC info.</span>
+<span class="source-line-no">097</span><span id="line-97">   * @param scannerOrder                Order of the scanner relative to other scanners. See</span>
+<span class="source-line-no">098</span><span id="line-98">   *                                    {@link KeyValueScanner#getScannerOrder()}.</span>
+<span class="source-line-no">099</span><span id="line-99">   * @param canOptimizeForNonNullColumn {@code true} if we can make sure there is no null column,</span>
+<span class="source-line-no">100</span><span id="line-100">   *                                    otherwise {@code false}. This is a hint for optimization.</span>
+<span class="source-line-no">101</span><span id="line-101">   * @param isFastSeekingEncoding       {@code true} if the data block encoding can seek quickly</span>
+<span class="source-line-no">102</span><span id="line-102">   *                                    from the beginning of a block (i.e. RIV1), otherwise</span>
+<span class="source-line-no">103</span><span id="line-103">   *                                    {@code false}. This is a hint for optimization.</span>
+<span class="source-line-no">104</span><span id="line-104">   */</span>
+<span class="source-line-no">105</span><span id="line-105">  public StoreFileScanner(StoreFileReader reader, HFileScanner hfs, boolean useMVCC,</span>
+<span class="source-line-no">106</span><span id="line-106">    boolean hasMVCC, long readPt, long scannerOrder, boolean canOptimizeForNonNullColumn,</span>
+<span class="source-line-no">107</span><span id="line-107">    boolean isFastSeekingEncoding) {</span>
+<span class="source-line-no">108</span><span id="line-108">    this.readPt = readPt;</span>
+<span class="source-line-no">109</span><span id="line-109">    this.reader = reader;</span>
+<span class="source-line-no">110</span><span id="line-110">    this.hfs = hfs;</span>
+<span class="source-line-no">111</span><span id="line-111">    this.enforceMVCC = useMVCC;</span>
+<span class="source-line-no">112</span><span id="line-112">    this.hasMVCCInfo = hasMVCC;</span>
+<span class="source-line-no">113</span><span id="line-113">    this.scannerOrder = scannerOrder;</span>
+<span class="source-line-no">114</span><span id="line-114">    this.canOptimizeForNonNullColumn = canOptimizeForNonNullColumn;</span>
+<span class="source-line-no">115</span><span id="line-115">    this.isFastSeekingEncoding = isFastSeekingEncoding;</span>
+<span class="source-line-no">116</span><span id="line-116">    this.reader.incrementRefCount();</span>
+<span class="source-line-no">117</span><span id="line-117">  }</span>
+<span class="source-line-no">118</span><span id="line-118"></span>
+<span class="source-line-no">119</span><span id="line-119">  /**</span>
+<span class="source-line-no">120</span><span id="line-120">   * Return an array of scanners corresponding to the given set of store files.</span>
+<span class="source-line-no">121</span><span id="line-121">   */</span>
+<span class="source-line-no">122</span><span id="line-122">  public static List&lt;StoreFileScanner&gt; getScannersForStoreFiles(Collection&lt;HStoreFile&gt; files,</span>
+<span class="source-line-no">123</span><span id="line-123">    boolean cacheBlocks, boolean usePread, boolean isCompaction, boolean useDropBehind, long readPt)</span>
+<span class="source-line-no">124</span><span id="line-124">    throws IOException {</span>
+<span class="source-line-no">125</span><span id="line-125">    return getScannersForStoreFiles(files, cacheBlocks, usePread, isCompaction, useDropBehind, null,</span>
+<span class="source-line-no">126</span><span id="line-126">      readPt);</span>
+<span class="source-line-no">127</span><span id="line-127">  }</span>
+<span class="source-line-no">128</span><span id="line-128"></span>
+<span class="source-line-no">129</span><span id="line-129">  /**</span>
+<span class="source-line-no">130</span><span id="line-130">   * Return an array of scanners corresponding to the given set of store files, And set the</span>
+<span class="source-line-no">131</span><span id="line-131">   * ScanQueryMatcher for each store file scanner for further optimization</span>
+<span class="source-line-no">132</span><span id="line-132">   */</span>
+<span class="source-line-no">133</span><span id="line-133">  public static List&lt;StoreFileScanner&gt; getScannersForStoreFiles(Collection&lt;HStoreFile&gt; files,</span>
+<span class="source-line-no">134</span><span id="line-134">    boolean cacheBlocks, boolean usePread, boolean isCompaction, boolean canUseDrop,</span>
+<span class="source-line-no">135</span><span id="line-135">    ScanQueryMatcher matcher, long readPt) throws IOException {</span>
+<span class="source-line-no">136</span><span id="line-136">    if (files.isEmpty()) {</span>
+<span class="source-line-no">137</span><span id="line-137">      return Collections.emptyList();</span>
+<span class="source-line-no">138</span><span id="line-138">    }</span>
+<span class="source-line-no">139</span><span id="line-139">    List&lt;StoreFileScanner&gt; scanners = new ArrayList&lt;&gt;(files.size());</span>
+<span class="source-line-no">140</span><span id="line-140">    boolean canOptimizeForNonNullColumn = matcher != null ? !matcher.hasNullColumnInQuery() : false;</span>
+<span class="source-line-no">141</span><span id="line-141">    PriorityQueue&lt;HStoreFile&gt; sortedFiles =</span>
+<span class="source-line-no">142</span><span id="line-142">      new PriorityQueue&lt;&gt;(files.size(), StoreFileComparators.SEQ_ID);</span>
+<span class="source-line-no">143</span><span id="line-143">    for (HStoreFile file : files) {</span>
+<span class="source-line-no">144</span><span id="line-144">      // The sort function needs metadata so we need to open reader first before sorting the list.</span>
+<span class="source-line-no">145</span><span id="line-145">      file.initReader();</span>
+<span class="source-line-no">146</span><span id="line-146">      sortedFiles.add(file);</span>
+<span class="source-line-no">147</span><span id="line-147">    }</span>
+<span class="source-line-no">148</span><span id="line-148">    boolean succ = false;</span>
+<span class="source-line-no">149</span><span id="line-149">    try {</span>
+<span class="source-line-no">150</span><span id="line-150">      for (int i = 0, n = files.size(); i &lt; n; i++) {</span>
+<span class="source-line-no">151</span><span id="line-151">        HStoreFile sf = sortedFiles.remove();</span>
+<span class="source-line-no">152</span><span id="line-152">        StoreFileScanner scanner;</span>
+<span class="source-line-no">153</span><span id="line-153">        if (usePread) {</span>
+<span class="source-line-no">154</span><span id="line-154">          scanner = sf.getPreadScanner(cacheBlocks, readPt, i, canOptimizeForNonNullColumn);</span>
+<span class="source-line-no">155</span><span id="line-155">        } else {</span>
+<span class="source-line-no">156</span><span id="line-156">          scanner = sf.getStreamScanner(canUseDrop, cacheBlocks, isCompaction, readPt, i,</span>
+<span class="source-line-no">157</span><span id="line-157">            canOptimizeForNonNullColumn);</span>
+<span class="source-line-no">158</span><span id="line-158">        }</span>
+<span class="source-line-no">159</span><span id="line-159">        scanners.add(scanner);</span>
+<span class="source-line-no">160</span><span id="line-160">      }</span>
+<span class="source-line-no">161</span><span id="line-161">      succ = true;</span>
+<span class="source-line-no">162</span><span id="line-162">    } finally {</span>
+<span class="source-line-no">163</span><span id="line-163">      if (!succ) {</span>
+<span class="source-line-no">164</span><span id="line-164">        for (StoreFileScanner scanner : scanners) {</span>
+<span class="source-line-no">165</span><span id="line-165">          scanner.close();</span>
+<span class="source-line-no">166</span><span id="line-166">        }</span>
+<span class="source-line-no">167</span><span id="line-167">      }</span>
+<span class="source-line-no">168</span><span id="line-168">    }</span>
+<span class="source-line-no">169</span><span id="line-169">    return scanners;</span>
+<span class="source-line-no">170</span><span id="line-170">  }</span>
+<span class="source-line-no">171</span><span id="line-171"></span>
+<span class="source-line-no">172</span><span id="line-172">  /**</span>
+<span class="source-line-no">173</span><span id="line-173">   * Get scanners for compaction. We will create a separated reader for each store file to avoid</span>
+<span class="source-line-no">174</span><span id="line-174">   * contention with normal read request.</span>
+<span class="source-line-no">175</span><span id="line-175">   */</span>
+<span class="source-line-no">176</span><span id="line-176">  public static List&lt;StoreFileScanner&gt; getScannersForCompaction(Collection&lt;HStoreFile&gt; files,</span>
+<span class="source-line-no">177</span><span id="line-177">    boolean canUseDropBehind, long readPt) throws IOException {</span>
+<span class="source-line-no">178</span><span id="line-178">    List&lt;StoreFileScanner&gt; scanners = new ArrayList&lt;&gt;(files.size());</span>
+<span class="source-line-no">179</span><span id="line-179">    List&lt;HStoreFile&gt; sortedFiles = new ArrayList&lt;&gt;(files);</span>
+<span class="source-line-no">180</span><span id="line-180">    Collections.sort(sortedFiles, StoreFileComparators.SEQ_ID);</span>
+<span class="source-line-no">181</span><span id="line-181">    boolean succ = false;</span>
+<span class="source-line-no">182</span><span id="line-182">    try {</span>
+<span class="source-line-no">183</span><span id="line-183">      for (int i = 0, n = sortedFiles.size(); i &lt; n; i++) {</span>
+<span class="source-line-no">184</span><span id="line-184">        scanners.add(</span>
+<span class="source-line-no">185</span><span id="line-185">          sortedFiles.get(i).getStreamScanner(canUseDropBehind, false, true, readPt, i, false));</span>
+<span class="source-line-no">186</span><span id="line-186">      }</span>
+<span class="source-line-no">187</span><span id="line-187">      succ = true;</span>
+<span class="source-line-no">188</span><span id="line-188">    } finally {</span>
+<span class="source-line-no">189</span><span id="line-189">      if (!succ) {</span>
+<span class="source-line-no">190</span><span id="line-190">        for (StoreFileScanner scanner : scanners) {</span>
+<span class="source-line-no">191</span><span id="line-191">          scanner.close();</span>
+<span class="source-line-no">192</span><span id="line-192">        }</span>
+<span class="source-line-no">193</span><span id="line-193">      }</span>
+<span class="source-line-no">194</span><span id="line-194">    }</span>
+<span class="source-line-no">195</span><span id="line-195">    return scanners;</span>
+<span class="source-line-no">196</span><span id="line-196">  }</span>
+<span class="source-line-no">197</span><span id="line-197"></span>
+<span class="source-line-no">198</span><span id="line-198">  @Override</span>
+<span class="source-line-no">199</span><span id="line-199">  public String toString() {</span>
+<span class="source-line-no">200</span><span id="line-200">    return "StoreFileScanner[" + hfs.toString() + ", cur=" + cur + "]";</span>
+<span class="source-line-no">201</span><span id="line-201">  }</span>
+<span class="source-line-no">202</span><span id="line-202"></span>
+<span class="source-line-no">203</span><span id="line-203">  @Override</span>
+<span class="source-line-no">204</span><span id="line-204">  public ExtendedCell peek() {</span>
+<span class="source-line-no">205</span><span id="line-205">    return cur;</span>
+<span class="source-line-no">206</span><span id="line-206">  }</span>
 <span class="source-line-no">207</span><span id="line-207"></span>
-<span class="source-line-no">208</span><span id="line-208">    try {</span>
-<span class="source-line-no">209</span><span id="line-209">      // only seek if we aren't at the end. cur == null implies 'end'.</span>
-<span class="source-line-no">210</span><span id="line-210">      if (cur != null) {</span>
-<span class="source-line-no">211</span><span id="line-211">        hfs.next();</span>
-<span class="source-line-no">212</span><span id="line-212">        setCurrentCell(hfs.getCell());</span>
-<span class="source-line-no">213</span><span id="line-213">        if (hasMVCCInfo || this.reader.isBulkLoaded()) {</span>
-<span class="source-line-no">214</span><span id="line-214">          skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">215</span><span id="line-215">        }</span>
-<span class="source-line-no">216</span><span id="line-216">      }</span>
-<span class="source-line-no">217</span><span id="line-217">    } catch (FileNotFoundException e) {</span>
-<span class="source-line-no">218</span><span id="line-218">      throw e;</span>
-<span class="source-line-no">219</span><span id="line-219">    } catch (IOException e) {</span>
-<span class="source-line-no">220</span><span id="line-220">      throw new IOException("Could not iterate " + this, e);</span>
-<span class="source-line-no">221</span><span id="line-221">    }</span>
-<span class="source-line-no">222</span><span id="line-222">    return retKey;</span>
-<span class="source-line-no">223</span><span id="line-223">  }</span>
-<span class="source-line-no">224</span><span id="line-224"></span>
-<span class="source-line-no">225</span><span id="line-225">  @Override</span>
-<span class="source-line-no">226</span><span id="line-226">  public boolean seek(ExtendedCell key) throws IOException {</span>
-<span class="source-line-no">227</span><span id="line-227">    if (seekCount != null) seekCount.increment();</span>
+<span class="source-line-no">208</span><span id="line-208">  @Override</span>
+<span class="source-line-no">209</span><span id="line-209">  public ExtendedCell next() throws IOException {</span>
+<span class="source-line-no">210</span><span id="line-210">    ExtendedCell retKey = cur;</span>
+<span class="source-line-no">211</span><span id="line-211"></span>
+<span class="source-line-no">212</span><span id="line-212">    try {</span>
+<span class="source-line-no">213</span><span id="line-213">      // only seek if we aren't at the end. cur == null implies 'end'.</span>
+<span class="source-line-no">214</span><span id="line-214">      if (cur != null) {</span>
+<span class="source-line-no">215</span><span id="line-215">        hfs.next();</span>
+<span class="source-line-no">216</span><span id="line-216">        setCurrentCell(hfs.getCell());</span>
+<span class="source-line-no">217</span><span id="line-217">        if (hasMVCCInfo || this.reader.isBulkLoaded()) {</span>
+<span class="source-line-no">218</span><span id="line-218">          skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">219</span><span id="line-219">        }</span>
+<span class="source-line-no">220</span><span id="line-220">      }</span>
+<span class="source-line-no">221</span><span id="line-221">    } catch (FileNotFoundException e) {</span>
+<span class="source-line-no">222</span><span id="line-222">      throw e;</span>
+<span class="source-line-no">223</span><span id="line-223">    } catch (IOException e) {</span>
+<span class="source-line-no">224</span><span id="line-224">      throw new IOException("Could not iterate " + this, e);</span>
+<span class="source-line-no">225</span><span id="line-225">    }</span>
+<span class="source-line-no">226</span><span id="line-226">    return retKey;</span>
+<span class="source-line-no">227</span><span id="line-227">  }</span>
 <span class="source-line-no">228</span><span id="line-228"></span>
-<span class="source-line-no">229</span><span id="line-229">    try {</span>
-<span class="source-line-no">230</span><span id="line-230">      try {</span>
-<span class="source-line-no">231</span><span id="line-231">        if (!seekAtOrAfter(hfs, key)) {</span>
-<span class="source-line-no">232</span><span id="line-232">          this.cur = null;</span>
-<span class="source-line-no">233</span><span id="line-233">          return false;</span>
-<span class="source-line-no">234</span><span id="line-234">        }</span>
-<span class="source-line-no">235</span><span id="line-235"></span>
-<span class="source-line-no">236</span><span id="line-236">        setCurrentCell(hfs.getCell());</span>
-<span class="source-line-no">237</span><span id="line-237"></span>
-<span class="source-line-no">238</span><span id="line-238">        if (!hasMVCCInfo &amp;&amp; this.reader.isBulkLoaded()) {</span>
-<span class="source-line-no">239</span><span id="line-239">          return skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">240</span><span id="line-240">        } else {</span>
-<span class="source-line-no">241</span><span id="line-241">          return !hasMVCCInfo ? true : skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">242</span><span id="line-242">        }</span>
-<span class="source-line-no">243</span><span id="line-243">      } finally {</span>
-<span class="source-line-no">244</span><span id="line-244">        realSeekDone = true;</span>
-<span class="source-line-no">245</span><span id="line-245">        previousRow = null;</span>
-<span class="source-line-no">246</span><span id="line-246">      }</span>
-<span class="source-line-no">247</span><span id="line-247">    } catch (FileNotFoundException e) {</span>
-<span class="source-line-no">248</span><span id="line-248">      throw e;</span>
-<span class="source-line-no">249</span><span id="line-249">    } catch (IOException ioe) {</span>
-<span class="source-line-no">250</span><span id="line-250">      throw new IOException("Could not seek " + this + " to key " + key, ioe);</span>
-<span class="source-line-no">251</span><span id="line-251">    }</span>
-<span class="source-line-no">252</span><span id="line-252">  }</span>
-<span class="source-line-no">253</span><span id="line-253"></span>
-<span class="source-line-no">254</span><span id="line-254">  @Override</span>
-<span class="source-line-no">255</span><span id="line-255">  public boolean reseek(ExtendedCell key) throws IOException {</span>
-<span class="source-line-no">256</span><span id="line-256">    if (seekCount != null) seekCount.increment();</span>
+<span class="source-line-no">229</span><span id="line-229">  @Override</span>
+<span class="source-line-no">230</span><span id="line-230">  public boolean seek(ExtendedCell key) throws IOException {</span>
+<span class="source-line-no">231</span><span id="line-231">    if (seekCount != null) seekCount.increment();</span>
+<span class="source-line-no">232</span><span id="line-232"></span>
+<span class="source-line-no">233</span><span id="line-233">    try {</span>
+<span class="source-line-no">234</span><span id="line-234">      try {</span>
+<span class="source-line-no">235</span><span id="line-235">        if (!seekAtOrAfter(hfs, key)) {</span>
+<span class="source-line-no">236</span><span id="line-236">          this.cur = null;</span>
+<span class="source-line-no">237</span><span id="line-237">          return false;</span>
+<span class="source-line-no">238</span><span id="line-238">        }</span>
+<span class="source-line-no">239</span><span id="line-239"></span>
+<span class="source-line-no">240</span><span id="line-240">        setCurrentCell(hfs.getCell());</span>
+<span class="source-line-no">241</span><span id="line-241"></span>
+<span class="source-line-no">242</span><span id="line-242">        if (!hasMVCCInfo &amp;&amp; this.reader.isBulkLoaded()) {</span>
+<span class="source-line-no">243</span><span id="line-243">          return skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">244</span><span id="line-244">        } else {</span>
+<span class="source-line-no">245</span><span id="line-245">          return !hasMVCCInfo ? true : skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">246</span><span id="line-246">        }</span>
+<span class="source-line-no">247</span><span id="line-247">      } finally {</span>
+<span class="source-line-no">248</span><span id="line-248">        realSeekDone = true;</span>
+<span class="source-line-no">249</span><span id="line-249">        previousRow = null;</span>
+<span class="source-line-no">250</span><span id="line-250">      }</span>
+<span class="source-line-no">251</span><span id="line-251">    } catch (FileNotFoundException e) {</span>
+<span class="source-line-no">252</span><span id="line-252">      throw e;</span>
+<span class="source-line-no">253</span><span id="line-253">    } catch (IOException ioe) {</span>
+<span class="source-line-no">254</span><span id="line-254">      throw new IOException("Could not seek " + this + " to key " + key, ioe);</span>
+<span class="source-line-no">255</span><span id="line-255">    }</span>
+<span class="source-line-no">256</span><span id="line-256">  }</span>
 <span class="source-line-no">257</span><span id="line-257"></span>
-<span class="source-line-no">258</span><span id="line-258">    try {</span>
-<span class="source-line-no">259</span><span id="line-259">      try {</span>
-<span class="source-line-no">260</span><span id="line-260">        if (!reseekAtOrAfter(hfs, key)) {</span>
-<span class="source-line-no">261</span><span id="line-261">          this.cur = null;</span>
-<span class="source-line-no">262</span><span id="line-262">          return false;</span>
-<span class="source-line-no">263</span><span id="line-263">        }</span>
-<span class="source-line-no">264</span><span id="line-264">        setCurrentCell(hfs.getCell());</span>
-<span class="source-line-no">265</span><span id="line-265"></span>
-<span class="source-line-no">266</span><span id="line-266">        if (!hasMVCCInfo &amp;&amp; this.reader.isBulkLoaded()) {</span>
-<span class="source-line-no">267</span><span id="line-267">          return skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">268</span><span id="line-268">        } else {</span>
-<span class="source-line-no">269</span><span id="line-269">          return !hasMVCCInfo ? true : skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">270</span><span id="line-270">        }</span>
-<span class="source-line-no">271</span><span id="line-271">      } finally {</span>
-<span class="source-line-no">272</span><span id="line-272">        realSeekDone = true;</span>
-<span class="source-line-no">273</span><span id="line-273">        previousRow = null;</span>
-<span class="source-line-no">274</span><span id="line-274">      }</span>
-<span class="source-line-no">275</span><span id="line-275">    } catch (FileNotFoundException e) {</span>
-<span class="source-line-no">276</span><span id="line-276">      throw e;</span>
-<span class="source-line-no">277</span><span id="line-277">    } catch (IOException ioe) {</span>
-<span class="source-line-no">278</span><span id="line-278">      throw new IOException("Could not reseek " + this + " to key " + key, ioe);</span>
-<span class="source-line-no">279</span><span id="line-279">    }</span>
-<span class="source-line-no">280</span><span id="line-280">  }</span>
-<span class="source-line-no">281</span><span id="line-281"></span>
-<span class="source-line-no">282</span><span id="line-282">  protected void setCurrentCell(ExtendedCell newVal) throws IOException {</span>
-<span class="source-line-no">283</span><span id="line-283">    this.cur = newVal;</span>
-<span class="source-line-no">284</span><span id="line-284">    if (this.cur != null &amp;&amp; this.reader.isBulkLoaded() &amp;&amp; !this.reader.isSkipResetSeqId()) {</span>
-<span class="source-line-no">285</span><span id="line-285">      PrivateCellUtil.setSequenceId(cur, this.reader.getSequenceID());</span>
-<span class="source-line-no">286</span><span id="line-286">    }</span>
-<span class="source-line-no">287</span><span id="line-287">  }</span>
-<span class="source-line-no">288</span><span id="line-288"></span>
-<span class="source-line-no">289</span><span id="line-289">  protected boolean skipKVsNewerThanReadpoint() throws IOException {</span>
-<span class="source-line-no">290</span><span id="line-290">    // We want to ignore all key-values that are newer than our current</span>
-<span class="source-line-no">291</span><span id="line-291">    // readPoint</span>
-<span class="source-line-no">292</span><span id="line-292">    Cell startKV = cur;</span>
-<span class="source-line-no">293</span><span id="line-293">    while (enforceMVCC &amp;&amp; cur != null &amp;&amp; (cur.getSequenceId() &gt; readPt)) {</span>
-<span class="source-line-no">294</span><span id="line-294">      boolean hasNext = hfs.next();</span>
-<span class="source-line-no">295</span><span id="line-295">      setCurrentCell(hfs.getCell());</span>
-<span class="source-line-no">296</span><span id="line-296">      if (</span>
-<span class="source-line-no">297</span><span id="line-297">        hasNext &amp;&amp; this.stopSkippingKVsIfNextRow &amp;&amp; getComparator().compareRows(cur, startKV) &gt; 0</span>
-<span class="source-line-no">298</span><span id="line-298">      ) {</span>
-<span class="source-line-no">299</span><span id="line-299">        return false;</span>
-<span class="source-line-no">300</span><span id="line-300">      }</span>
-<span class="source-line-no">301</span><span id="line-301">    }</span>
-<span class="source-line-no">302</span><span id="line-302"></span>
-<span class="source-line-no">303</span><span id="line-303">    if (cur == null) {</span>
-<span class="source-line-no">304</span><span id="line-304">      return false;</span>
+<span class="source-line-no">258</span><span id="line-258">  @Override</span>
+<span class="source-line-no">259</span><span id="line-259">  public boolean reseek(ExtendedCell key) throws IOException {</span>
+<span class="source-line-no">260</span><span id="line-260">    if (seekCount != null) seekCount.increment();</span>
+<span class="source-line-no">261</span><span id="line-261"></span>
+<span class="source-line-no">262</span><span id="line-262">    try {</span>
+<span class="source-line-no">263</span><span id="line-263">      try {</span>
+<span class="source-line-no">264</span><span id="line-264">        if (!reseekAtOrAfter(hfs, key)) {</span>
+<span class="source-line-no">265</span><span id="line-265">          this.cur = null;</span>
+<span class="source-line-no">266</span><span id="line-266">          return false;</span>
+<span class="source-line-no">267</span><span id="line-267">        }</span>
+<span class="source-line-no">268</span><span id="line-268">        setCurrentCell(hfs.getCell());</span>
+<span class="source-line-no">269</span><span id="line-269"></span>
+<span class="source-line-no">270</span><span id="line-270">        if (!hasMVCCInfo &amp;&amp; this.reader.isBulkLoaded()) {</span>
+<span class="source-line-no">271</span><span id="line-271">          return skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">272</span><span id="line-272">        } else {</span>
+<span class="source-line-no">273</span><span id="line-273">          return !hasMVCCInfo ? true : skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">274</span><span id="line-274">        }</span>
+<span class="source-line-no">275</span><span id="line-275">      } finally {</span>
+<span class="source-line-no">276</span><span id="line-276">        realSeekDone = true;</span>
+<span class="source-line-no">277</span><span id="line-277">        previousRow = null;</span>
+<span class="source-line-no">278</span><span id="line-278">      }</span>
+<span class="source-line-no">279</span><span id="line-279">    } catch (FileNotFoundException e) {</span>
+<span class="source-line-no">280</span><span id="line-280">      throw e;</span>
+<span class="source-line-no">281</span><span id="line-281">    } catch (IOException ioe) {</span>
+<span class="source-line-no">282</span><span id="line-282">      throw new IOException("Could not reseek " + this + " to key " + key, ioe);</span>
+<span class="source-line-no">283</span><span id="line-283">    }</span>
+<span class="source-line-no">284</span><span id="line-284">  }</span>
+<span class="source-line-no">285</span><span id="line-285"></span>
+<span class="source-line-no">286</span><span id="line-286">  protected void setCurrentCell(ExtendedCell newVal) throws IOException {</span>
+<span class="source-line-no">287</span><span id="line-287">    this.cur = newVal;</span>
+<span class="source-line-no">288</span><span id="line-288">    if (this.cur != null &amp;&amp; this.reader.isBulkLoaded() &amp;&amp; !this.reader.isSkipResetSeqId()) {</span>
+<span class="source-line-no">289</span><span id="line-289">      PrivateCellUtil.setSequenceId(cur, this.reader.getSequenceID());</span>
+<span class="source-line-no">290</span><span id="line-290">    }</span>
+<span class="source-line-no">291</span><span id="line-291">  }</span>
+<span class="source-line-no">292</span><span id="line-292"></span>
+<span class="source-line-no">293</span><span id="line-293">  protected boolean skipKVsNewerThanReadpoint() throws IOException {</span>
+<span class="source-line-no">294</span><span id="line-294">    // We want to ignore all key-values that are newer than our current</span>
+<span class="source-line-no">295</span><span id="line-295">    // readPoint</span>
+<span class="source-line-no">296</span><span id="line-296">    Cell startKV = cur;</span>
+<span class="source-line-no">297</span><span id="line-297">    while (enforceMVCC &amp;&amp; cur != null &amp;&amp; (cur.getSequenceId() &gt; readPt)) {</span>
+<span class="source-line-no">298</span><span id="line-298">      boolean hasNext = hfs.next();</span>
+<span class="source-line-no">299</span><span id="line-299">      setCurrentCell(hfs.getCell());</span>
+<span class="source-line-no">300</span><span id="line-300">      if (</span>
+<span class="source-line-no">301</span><span id="line-301">        hasNext &amp;&amp; this.stopSkippingKVsIfNextRow &amp;&amp; getComparator().compareRows(cur, startKV) &gt; 0</span>
+<span class="source-line-no">302</span><span id="line-302">      ) {</span>
+<span class="source-line-no">303</span><span id="line-303">        return false;</span>
+<span class="source-line-no">304</span><span id="line-304">      }</span>
 <span class="source-line-no">305</span><span id="line-305">    }</span>
 <span class="source-line-no">306</span><span id="line-306"></span>
-<span class="source-line-no">307</span><span id="line-307">    return true;</span>
-<span class="source-line-no">308</span><span id="line-308">  }</span>
-<span class="source-line-no">309</span><span id="line-309"></span>
-<span class="source-line-no">310</span><span id="line-310">  @Override</span>
-<span class="source-line-no">311</span><span id="line-311">  public void close() {</span>
-<span class="source-line-no">312</span><span id="line-312">    if (closed) return;</span>
-<span class="source-line-no">313</span><span id="line-313">    cur = null;</span>
-<span class="source-line-no">314</span><span id="line-314">    this.hfs.close();</span>
-<span class="source-line-no">315</span><span id="line-315">    if (this.reader != null) {</span>
-<span class="source-line-no">316</span><span id="line-316">      this.reader.readCompleted();</span>
-<span class="source-line-no">317</span><span id="line-317">    }</span>
-<span class="source-line-no">318</span><span id="line-318">    closed = true;</span>
-<span class="source-line-no">319</span><span id="line-319">  }</span>
-<span class="source-line-no">320</span><span id="line-320"></span>
-<span class="source-line-no">321</span><span id="line-321">  /** Returns false if not found or if k is after the end. */</span>
-<span class="source-line-no">322</span><span id="line-322">  public static boolean seekAtOrAfter(HFileScanner s, ExtendedCell k) throws IOException {</span>
-<span class="source-line-no">323</span><span id="line-323">    int result = s.seekTo(k);</span>
-<span class="source-line-no">324</span><span id="line-324">    if (result &lt; 0) {</span>
-<span class="source-line-no">325</span><span id="line-325">      if (result == HConstants.INDEX_KEY_MAGIC) {</span>
-<span class="source-line-no">326</span><span id="line-326">        // using faked key</span>
-<span class="source-line-no">327</span><span id="line-327">        return true;</span>
-<span class="source-line-no">328</span><span id="line-328">      }</span>
-<span class="source-line-no">329</span><span id="line-329">      // Passed KV is smaller than first KV in file, work from start of file</span>
-<span class="source-line-no">330</span><span id="line-330">      return s.seekTo();</span>
-<span class="source-line-no">331</span><span id="line-331">    } else if (result &gt; 0) {</span>
-<span class="source-line-no">332</span><span id="line-332">      // Passed KV is larger than current KV in file, if there is a next</span>
-<span class="source-line-no">333</span><span id="line-333">      // it is the "after", if not then this scanner is done.</span>
-<span class="source-line-no">334</span><span id="line-334">      return s.next();</span>
-<span class="source-line-no">335</span><span id="line-335">    }</span>
-<span class="source-line-no">336</span><span id="line-336">    // Seeked to the exact key</span>
-<span class="source-line-no">337</span><span id="line-337">    return true;</span>
-<span class="source-line-no">338</span><span id="line-338">  }</span>
-<span class="source-line-no">339</span><span id="line-339"></span>
-<span class="source-line-no">340</span><span id="line-340">  static boolean reseekAtOrAfter(HFileScanner s, ExtendedCell k) throws IOException {</span>
-<span class="source-line-no">341</span><span id="line-341">    // This function is similar to seekAtOrAfter function</span>
-<span class="source-line-no">342</span><span id="line-342">    int result = s.reseekTo(k);</span>
-<span class="source-line-no">343</span><span id="line-343">    if (result &lt;= 0) {</span>
-<span class="source-line-no">344</span><span id="line-344">      if (result == HConstants.INDEX_KEY_MAGIC) {</span>
-<span class="source-line-no">345</span><span id="line-345">        // using faked key</span>
-<span class="source-line-no">346</span><span id="line-346">        return true;</span>
-<span class="source-line-no">347</span><span id="line-347">      }</span>
-<span class="source-line-no">348</span><span id="line-348">      // If up to now scanner is not seeked yet, this means passed KV is smaller</span>
-<span class="source-line-no">349</span><span id="line-349">      // than first KV in file, and it is the first time we seek on this file.</span>
-<span class="source-line-no">350</span><span id="line-350">      // So we also need to work from the start of file.</span>
-<span class="source-line-no">351</span><span id="line-351">      if (!s.isSeeked()) {</span>
-<span class="source-line-no">352</span><span id="line-352">        return s.seekTo();</span>
-<span class="source-line-no">353</span><span id="line-353">      }</span>
-<span class="source-line-no">354</span><span id="line-354">      return true;</span>
-<span class="source-line-no">355</span><span id="line-355">    }</span>
-<span class="source-line-no">356</span><span id="line-356">    // passed KV is larger than current KV in file, if there is a next</span>
-<span class="source-line-no">357</span><span id="line-357">    // it is after, if not then this scanner is done.</span>
-<span class="source-line-no">358</span><span id="line-358">    return s.next();</span>
-<span class="source-line-no">359</span><span id="line-359">  }</span>
-<span class="source-line-no">360</span><span id="line-360"></span>
-<span class="source-line-no">361</span><span id="line-361">  /**</span>
-<span class="source-line-no">362</span><span id="line-362">   * @see KeyValueScanner#getScannerOrder()</span>
-<span class="source-line-no">363</span><span id="line-363">   */</span>
-<span class="source-line-no">364</span><span id="line-364">  @Override</span>
-<span class="source-line-no">365</span><span id="line-365">  public long getScannerOrder() {</span>
-<span class="source-line-no">366</span><span id="line-366">    return scannerOrder;</span>
-<span class="source-line-no">367</span><span id="line-367">  }</span>
-<span class="source-line-no">368</span><span id="line-368"></span>
-<span class="source-line-no">369</span><span id="line-369">  /**</span>
-<span class="source-line-no">370</span><span id="line-370">   * Pretend we have done a seek but don't do it yet, if possible. The hope is that we find</span>
-<span class="source-line-no">371</span><span id="line-371">   * requested columns in more recent files and won't have to seek in older files. Creates a fake</span>
-<span class="source-line-no">372</span><span id="line-372">   * key/value with the given row/column and the highest (most recent) possible timestamp we might</span>
-<span class="source-line-no">373</span><span id="line-373">   * get from this file. When users of such "lazy scanner" need to know the next KV precisely (e.g.</span>
-<span class="source-line-no">374</span><span id="line-374">   * when this scanner is at the top of the heap), they run {@link #enforceSeek()}.</span>
-<span class="source-line-no">375</span><span id="line-375">   * &lt;p&gt;</span>
-<span class="source-line-no">376</span><span id="line-376">   * Note that this function does guarantee that the current KV of this scanner will be advanced to</span>
-<span class="source-line-no">377</span><span id="line-377">   * at least the given KV. Because of this, it does have to do a real seek in cases when the seek</span>
-<span class="source-line-no">378</span><span id="line-378">   * timestamp is older than the highest timestamp of the file, e.g. when we are trying to seek to</span>
-<span class="source-line-no">379</span><span id="line-379">   * the next row/column and use OLDEST_TIMESTAMP in the seek key.</span>
-<span class="source-line-no">380</span><span id="line-380">   */</span>
-<span class="source-line-no">381</span><span id="line-381">  @Override</span>
-<span class="source-line-no">382</span><span id="line-382">  public boolean requestSeek(ExtendedCell kv, boolean forward, boolean useBloom)</span>
-<span class="source-line-no">383</span><span id="line-383">    throws IOException {</span>
-<span class="source-line-no">384</span><span id="line-384">    if (kv.getFamilyLength() == 0) {</span>
-<span class="source-line-no">385</span><span id="line-385">      useBloom = false;</span>
-<span class="source-line-no">386</span><span id="line-386">    }</span>
-<span class="source-line-no">387</span><span id="line-387"></span>
-<span class="source-line-no">388</span><span id="line-388">    boolean haveToSeek = true;</span>
-<span class="source-line-no">389</span><span id="line-389">    if (useBloom) {</span>
-<span class="source-line-no">390</span><span id="line-390">      // check ROWCOL Bloom filter first.</span>
-<span class="source-line-no">391</span><span id="line-391">      if (reader.getBloomFilterType() == BloomType.ROWCOL) {</span>
-<span class="source-line-no">392</span><span id="line-392">        haveToSeek = reader.passesGeneralRowColBloomFilter(kv);</span>
-<span class="source-line-no">393</span><span id="line-393">      } else if (</span>
-<span class="source-line-no">394</span><span id="line-394">        canOptimizeForNonNullColumn</span>
-<span class="source-line-no">395</span><span id="line-395">          &amp;&amp; ((PrivateCellUtil.isDeleteFamily(kv) || PrivateCellUtil.isDeleteFamilyVersion(kv)))</span>
-<span class="source-line-no">396</span><span id="line-396">      ) {</span>
-<span class="source-line-no">397</span><span id="line-397">        // if there is no such delete family kv in the store file,</span>
-<span class="source-line-no">398</span><span id="line-398">        // then no need to seek.</span>
-<span class="source-line-no">399</span><span id="line-399">        haveToSeek = reader.passesDeleteFamilyBloomFilter(kv.getRowArray(), kv.getRowOffset(),</span>
-<span class="source-line-no">400</span><span id="line-400">          kv.getRowLength());</span>
-<span class="source-line-no">401</span><span id="line-401">      }</span>
+<span class="source-line-no">307</span><span id="line-307">    if (cur == null) {</span>
+<span class="source-line-no">308</span><span id="line-308">      return false;</span>
+<span class="source-line-no">309</span><span id="line-309">    }</span>
+<span class="source-line-no">310</span><span id="line-310"></span>
+<span class="source-line-no">311</span><span id="line-311">    return true;</span>
+<span class="source-line-no">312</span><span id="line-312">  }</span>
+<span class="source-line-no">313</span><span id="line-313"></span>
+<span class="source-line-no">314</span><span id="line-314">  @Override</span>
+<span class="source-line-no">315</span><span id="line-315">  public void close() {</span>
+<span class="source-line-no">316</span><span id="line-316">    if (closed) return;</span>
+<span class="source-line-no">317</span><span id="line-317">    cur = null;</span>
+<span class="source-line-no">318</span><span id="line-318">    this.hfs.close();</span>
+<span class="source-line-no">319</span><span id="line-319">    if (this.reader != null) {</span>
+<span class="source-line-no">320</span><span id="line-320">      if (this.reader.getHFileReader() != null) {</span>
+<span class="source-line-no">321</span><span id="line-321">        this.fileRead = this.reader.getHFileReader().getPath();</span>
+<span class="source-line-no">322</span><span id="line-322">      }</span>
+<span class="source-line-no">323</span><span id="line-323">      this.reader.readCompleted();</span>
+<span class="source-line-no">324</span><span id="line-324">    }</span>
+<span class="source-line-no">325</span><span id="line-325">    closed = true;</span>
+<span class="source-line-no">326</span><span id="line-326">  }</span>
+<span class="source-line-no">327</span><span id="line-327"></span>
+<span class="source-line-no">328</span><span id="line-328">  /**</span>
+<span class="source-line-no">329</span><span id="line-329">   * Returns the set of store file paths that were successfully read by this scanner. Contains the</span>
+<span class="source-line-no">330</span><span id="line-330">   * single store file path if this scanner successfully read it; typically set at close.</span>
+<span class="source-line-no">331</span><span id="line-331">   */</span>
+<span class="source-line-no">332</span><span id="line-332">  @Override</span>
+<span class="source-line-no">333</span><span id="line-333">  public Set&lt;Path&gt; getFilesRead() {</span>
+<span class="source-line-no">334</span><span id="line-334">    return fileRead != null ? Collections.singleton(fileRead) : Collections.emptySet();</span>
+<span class="source-line-no">335</span><span id="line-335">  }</span>
+<span class="source-line-no">336</span><span id="line-336"></span>
+<span class="source-line-no">337</span><span id="line-337">  /** Returns false if not found or if k is after the end. */</span>
+<span class="source-line-no">338</span><span id="line-338">  public static boolean seekAtOrAfter(HFileScanner s, ExtendedCell k) throws IOException {</span>
+<span class="source-line-no">339</span><span id="line-339">    int result = s.seekTo(k);</span>
+<span class="source-line-no">340</span><span id="line-340">    if (result &lt; 0) {</span>
+<span class="source-line-no">341</span><span id="line-341">      if (result == HConstants.INDEX_KEY_MAGIC) {</span>
+<span class="source-line-no">342</span><span id="line-342">        // using faked key</span>
+<span class="source-line-no">343</span><span id="line-343">        return true;</span>
+<span class="source-line-no">344</span><span id="line-344">      }</span>
+<span class="source-line-no">345</span><span id="line-345">      // Passed KV is smaller than first KV in file, work from start of file</span>
+<span class="source-line-no">346</span><span id="line-346">      return s.seekTo();</span>
+<span class="source-line-no">347</span><span id="line-347">    } else if (result &gt; 0) {</span>
+<span class="source-line-no">348</span><span id="line-348">      // Passed KV is larger than current KV in file, if there is a next</span>
+<span class="source-line-no">349</span><span id="line-349">      // it is the "after", if not then this scanner is done.</span>
+<span class="source-line-no">350</span><span id="line-350">      return s.next();</span>
+<span class="source-line-no">351</span><span id="line-351">    }</span>
+<span class="source-line-no">352</span><span id="line-352">    // Seeked to the exact key</span>
+<span class="source-line-no">353</span><span id="line-353">    return true;</span>
+<span class="source-line-no">354</span><span id="line-354">  }</span>
+<span class="source-line-no">355</span><span id="line-355"></span>
+<span class="source-line-no">356</span><span id="line-356">  static boolean reseekAtOrAfter(HFileScanner s, ExtendedCell k) throws IOException {</span>
+<span class="source-line-no">357</span><span id="line-357">    // This function is similar to seekAtOrAfter function</span>
+<span class="source-line-no">358</span><span id="line-358">    int result = s.reseekTo(k);</span>
+<span class="source-line-no">359</span><span id="line-359">    if (result &lt;= 0) {</span>
+<span class="source-line-no">360</span><span id="line-360">      if (result == HConstants.INDEX_KEY_MAGIC) {</span>
+<span class="source-line-no">361</span><span id="line-361">        // using faked key</span>
+<span class="source-line-no">362</span><span id="line-362">        return true;</span>
+<span class="source-line-no">363</span><span id="line-363">      }</span>
+<span class="source-line-no">364</span><span id="line-364">      // If up to now scanner is not seeked yet, this means passed KV is smaller</span>
+<span class="source-line-no">365</span><span id="line-365">      // than first KV in file, and it is the first time we seek on this file.</span>
+<span class="source-line-no">366</span><span id="line-366">      // So we also need to work from the start of file.</span>
+<span class="source-line-no">367</span><span id="line-367">      if (!s.isSeeked()) {</span>
+<span class="source-line-no">368</span><span id="line-368">        return s.seekTo();</span>
+<span class="source-line-no">369</span><span id="line-369">      }</span>
+<span class="source-line-no">370</span><span id="line-370">      return true;</span>
+<span class="source-line-no">371</span><span id="line-371">    }</span>
+<span class="source-line-no">372</span><span id="line-372">    // passed KV is larger than current KV in file, if there is a next</span>
+<span class="source-line-no">373</span><span id="line-373">    // it is after, if not then this scanner is done.</span>
+<span class="source-line-no">374</span><span id="line-374">    return s.next();</span>
+<span class="source-line-no">375</span><span id="line-375">  }</span>
+<span class="source-line-no">376</span><span id="line-376"></span>
+<span class="source-line-no">377</span><span id="line-377">  /**</span>
+<span class="source-line-no">378</span><span id="line-378">   * @see KeyValueScanner#getScannerOrder()</span>
+<span class="source-line-no">379</span><span id="line-379">   */</span>
+<span class="source-line-no">380</span><span id="line-380">  @Override</span>
+<span class="source-line-no">381</span><span id="line-381">  public long getScannerOrder() {</span>
+<span class="source-line-no">382</span><span id="line-382">    return scannerOrder;</span>
+<span class="source-line-no">383</span><span id="line-383">  }</span>
+<span class="source-line-no">384</span><span id="line-384"></span>
+<span class="source-line-no">385</span><span id="line-385">  /**</span>
+<span class="source-line-no">386</span><span id="line-386">   * Pretend we have done a seek but don't do it yet, if possible. The hope is that we find</span>
+<span class="source-line-no">387</span><span id="line-387">   * requested columns in more recent files and won't have to seek in older files. Creates a fake</span>
+<span class="source-line-no">388</span><span id="line-388">   * key/value with the given row/column and the highest (most recent) possible timestamp we might</span>
+<span class="source-line-no">389</span><span id="line-389">   * get from this file. When users of such "lazy scanner" need to know the next KV precisely (e.g.</span>
+<span class="source-line-no">390</span><span id="line-390">   * when this scanner is at the top of the heap), they run {@link #enforceSeek()}.</span>
+<span class="source-line-no">391</span><span id="line-391">   * &lt;p&gt;</span>
+<span class="source-line-no">392</span><span id="line-392">   * Note that this function does guarantee that the current KV of this scanner will be advanced to</span>
+<span class="source-line-no">393</span><span id="line-393">   * at least the given KV. Because of this, it does have to do a real seek in cases when the seek</span>
+<span class="source-line-no">394</span><span id="line-394">   * timestamp is older than the highest timestamp of the file, e.g. when we are trying to seek to</span>
+<span class="source-line-no">395</span><span id="line-395">   * the next row/column and use OLDEST_TIMESTAMP in the seek key.</span>
+<span class="source-line-no">396</span><span id="line-396">   */</span>
+<span class="source-line-no">397</span><span id="line-397">  @Override</span>
+<span class="source-line-no">398</span><span id="line-398">  public boolean requestSeek(ExtendedCell kv, boolean forward, boolean useBloom)</span>
+<span class="source-line-no">399</span><span id="line-399">    throws IOException {</span>
+<span class="source-line-no">400</span><span id="line-400">    if (kv.getFamilyLength() == 0) {</span>
+<span class="source-line-no">401</span><span id="line-401">      useBloom = false;</span>
 <span class="source-line-no">402</span><span id="line-402">    }</span>
 <span class="source-line-no">403</span><span id="line-403"></span>
-<span class="source-line-no">404</span><span id="line-404">    delayedReseek = forward;</span>
-<span class="source-line-no">405</span><span id="line-405">    delayedSeekKV = kv;</span>
-<span class="source-line-no">406</span><span id="line-406"></span>
-<span class="source-line-no">407</span><span id="line-407">    if (haveToSeek) {</span>
-<span class="source-line-no">408</span><span id="line-408">      // This row/column might be in this store file (or we did not use the</span>
-<span class="source-line-no">409</span><span id="line-409">      // Bloom filter), so we still need to seek.</span>
-<span class="source-line-no">410</span><span id="line-410">      realSeekDone = false;</span>
-<span class="source-line-no">411</span><span id="line-411">      long maxTimestampInFile = reader.getMaxTimestamp();</span>
-<span class="source-line-no">412</span><span id="line-412">      long seekTimestamp = kv.getTimestamp();</span>
-<span class="source-line-no">413</span><span id="line-413">      if (seekTimestamp &gt; maxTimestampInFile) {</span>
-<span class="source-line-no">414</span><span id="line-414">        // Create a fake key that is not greater than the real next key.</span>
-<span class="source-line-no">415</span><span id="line-415">        // (Lower timestamps correspond to higher KVs.)</span>
-<span class="source-line-no">416</span><span id="line-416">        // To understand this better, consider that we are asked to seek to</span>
-<span class="source-line-no">417</span><span id="line-417">        // a higher timestamp than the max timestamp in this file. We know that</span>
-<span class="source-line-no">418</span><span id="line-418">        // the next point when we have to consider this file again is when we</span>
-<span class="source-line-no">419</span><span id="line-419">        // pass the max timestamp of this file (with the same row/column).</span>
-<span class="source-line-no">420</span><span id="line-420">        setCurrentCell(PrivateCellUtil.createFirstOnRowColTS(kv, maxTimestampInFile));</span>
-<span class="source-line-no">421</span><span id="line-421">      } else {</span>
-<span class="source-line-no">422</span><span id="line-422">        // This will be the case e.g. when we need to seek to the next</span>
-<span class="source-line-no">423</span><span id="line-423">        // row/column, and we don't know exactly what they are, so we set the</span>
-<span class="source-line-no">424</span><span id="line-424">        // seek key's timestamp to OLDEST_TIMESTAMP to skip the rest of this</span>
-<span class="source-line-no">425</span><span id="line-425">        // row/column.</span>
-<span class="source-line-no">426</span><span id="line-426">        enforceSeek();</span>
-<span class="source-line-no">427</span><span id="line-427">      }</span>
-<span class="source-line-no">428</span><span id="line-428">      return cur != null;</span>
-<span class="source-line-no">429</span><span id="line-429">    }</span>
-<span class="source-line-no">430</span><span id="line-430"></span>
-<span class="source-line-no">431</span><span id="line-431">    // Multi-column Bloom filter optimization.</span>
-<span class="source-line-no">432</span><span id="line-432">    // Create a fake key/value, so that this scanner only bubbles up to the top</span>
-<span class="source-line-no">433</span><span id="line-433">    // of the KeyValueHeap in StoreScanner after we scanned this row/column in</span>
-<span class="source-line-no">434</span><span id="line-434">    // all other store files. The query matcher will then just skip this fake</span>
-<span class="source-line-no">435</span><span id="line-435">    // key/value and the store scanner will progress to the next column. This</span>
-<span class="source-line-no">436</span><span id="line-436">    // is obviously not a "real real" seek, but unlike the fake KV earlier in</span>
-<span class="source-line-no">437</span><span id="line-437">    // this method, we want this to be propagated to ScanQueryMatcher.</span>
-<span class="source-line-no">438</span><span id="line-438">    setCurrentCell(PrivateCellUtil.createLastOnRowCol(kv));</span>
-<span class="source-line-no">439</span><span id="line-439"></span>
-<span class="source-line-no">440</span><span id="line-440">    realSeekDone = true;</span>
-<span class="source-line-no">441</span><span id="line-441">    return true;</span>
-<span class="source-line-no">442</span><span id="line-442">  }</span>
-<span class="source-line-no">443</span><span id="line-443"></span>
-<span class="source-line-no">444</span><span id="line-444">  StoreFileReader getReader() {</span>
-<span class="source-line-no">445</span><span id="line-445">    return reader;</span>
-<span class="source-line-no">446</span><span id="line-446">  }</span>
-<span class="source-line-no">447</span><span id="line-447"></span>
-<span class="source-line-no">448</span><span id="line-448">  CellComparator getComparator() {</span>
-<span class="source-line-no">449</span><span id="line-449">    return reader.getComparator();</span>
-<span class="source-line-no">450</span><span id="line-450">  }</span>
-<span class="source-line-no">451</span><span id="line-451"></span>
-<span class="source-line-no">452</span><span id="line-452">  @Override</span>
-<span class="source-line-no">453</span><span id="line-453">  public boolean realSeekDone() {</span>
-<span class="source-line-no">454</span><span id="line-454">    return realSeekDone;</span>
-<span class="source-line-no">455</span><span id="line-455">  }</span>
-<span class="source-line-no">456</span><span id="line-456"></span>
-<span class="source-line-no">457</span><span id="line-457">  @Override</span>
-<span class="source-line-no">458</span><span id="line-458">  public void enforceSeek() throws IOException {</span>
-<span class="source-line-no">459</span><span id="line-459">    if (realSeekDone) return;</span>
-<span class="source-line-no">460</span><span id="line-460"></span>
-<span class="source-line-no">461</span><span id="line-461">    if (delayedReseek) {</span>
-<span class="source-line-no">462</span><span id="line-462">      reseek(delayedSeekKV);</span>
-<span class="source-line-no">463</span><span id="line-463">    } else {</span>
-<span class="source-line-no">464</span><span id="line-464">      seek(delayedSeekKV);</span>
-<span class="source-line-no">465</span><span id="line-465">    }</span>
+<span class="source-line-no">404</span><span id="line-404">    boolean haveToSeek = true;</span>
+<span class="source-line-no">405</span><span id="line-405">    if (useBloom) {</span>
+<span class="source-line-no">406</span><span id="line-406">      // check ROWCOL Bloom filter first.</span>
+<span class="source-line-no">407</span><span id="line-407">      if (reader.getBloomFilterType() == BloomType.ROWCOL) {</span>
+<span class="source-line-no">408</span><span id="line-408">        haveToSeek = reader.passesGeneralRowColBloomFilter(kv);</span>
+<span class="source-line-no">409</span><span id="line-409">      } else if (</span>
+<span class="source-line-no">410</span><span id="line-410">        canOptimizeForNonNullColumn</span>
+<span class="source-line-no">411</span><span id="line-411">          &amp;&amp; ((PrivateCellUtil.isDeleteFamily(kv) || PrivateCellUtil.isDeleteFamilyVersion(kv)))</span>
+<span class="source-line-no">412</span><span id="line-412">      ) {</span>
+<span class="source-line-no">413</span><span id="line-413">        // if there is no such delete family kv in the store file,</span>
+<span class="source-line-no">414</span><span id="line-414">        // then no need to seek.</span>
+<span class="source-line-no">415</span><span id="line-415">        haveToSeek = reader.passesDeleteFamilyBloomFilter(kv.getRowArray(), kv.getRowOffset(),</span>
+<span class="source-line-no">416</span><span id="line-416">          kv.getRowLength());</span>
+<span class="source-line-no">417</span><span id="line-417">      }</span>
+<span class="source-line-no">418</span><span id="line-418">    }</span>
+<span class="source-line-no">419</span><span id="line-419"></span>
+<span class="source-line-no">420</span><span id="line-420">    delayedReseek = forward;</span>
+<span class="source-line-no">421</span><span id="line-421">    delayedSeekKV = kv;</span>
+<span class="source-line-no">422</span><span id="line-422"></span>
+<span class="source-line-no">423</span><span id="line-423">    if (haveToSeek) {</span>
+<span class="source-line-no">424</span><span id="line-424">      // This row/column might be in this store file (or we did not use the</span>
+<span class="source-line-no">425</span><span id="line-425">      // Bloom filter), so we still need to seek.</span>
+<span class="source-line-no">426</span><span id="line-426">      realSeekDone = false;</span>
+<span class="source-line-no">427</span><span id="line-427">      long maxTimestampInFile = reader.getMaxTimestamp();</span>
+<span class="source-line-no">428</span><span id="line-428">      long seekTimestamp = kv.getTimestamp();</span>
+<span class="source-line-no">429</span><span id="line-429">      if (seekTimestamp &gt; maxTimestampInFile) {</span>
+<span class="source-line-no">430</span><span id="line-430">        // Create a fake key that is not greater than the real next key.</span>
+<span class="source-line-no">431</span><span id="line-431">        // (Lower timestamps correspond to higher KVs.)</span>
+<span class="source-line-no">432</span><span id="line-432">        // To understand this better, consider that we are asked to seek to</span>
+<span class="source-line-no">433</span><span id="line-433">        // a higher timestamp than the max timestamp in this file. We know that</span>
+<span class="source-line-no">434</span><span id="line-434">        // the next point when we have to consider this file again is when we</span>
+<span class="source-line-no">435</span><span id="line-435">        // pass the max timestamp of this file (with the same row/column).</span>
+<span class="source-line-no">436</span><span id="line-436">        setCurrentCell(PrivateCellUtil.createFirstOnRowColTS(kv, maxTimestampInFile));</span>
+<span class="source-line-no">437</span><span id="line-437">      } else {</span>
+<span class="source-line-no">438</span><span id="line-438">        // This will be the case e.g. when we need to seek to the next</span>
+<span class="source-line-no">439</span><span id="line-439">        // row/column, and we don't know exactly what they are, so we set the</span>
+<span class="source-line-no">440</span><span id="line-440">        // seek key's timestamp to OLDEST_TIMESTAMP to skip the rest of this</span>
+<span class="source-line-no">441</span><span id="line-441">        // row/column.</span>
+<span class="source-line-no">442</span><span id="line-442">        enforceSeek();</span>
+<span class="source-line-no">443</span><span id="line-443">      }</span>
+<span class="source-line-no">444</span><span id="line-444">      return cur != null;</span>
+<span class="source-line-no">445</span><span id="line-445">    }</span>
+<span class="source-line-no">446</span><span id="line-446"></span>
+<span class="source-line-no">447</span><span id="line-447">    // Multi-column Bloom filter optimization.</span>
+<span class="source-line-no">448</span><span id="line-448">    // Create a fake key/value, so that this scanner only bubbles up to the top</span>
+<span class="source-line-no">449</span><span id="line-449">    // of the KeyValueHeap in StoreScanner after we scanned this row/column in</span>
+<span class="source-line-no">450</span><span id="line-450">    // all other store files. The query matcher will then just skip this fake</span>
+<span class="source-line-no">451</span><span id="line-451">    // key/value and the store scanner will progress to the next column. This</span>
+<span class="source-line-no">452</span><span id="line-452">    // is obviously not a "real real" seek, but unlike the fake KV earlier in</span>
+<span class="source-line-no">453</span><span id="line-453">    // this method, we want this to be propagated to ScanQueryMatcher.</span>
+<span class="source-line-no">454</span><span id="line-454">    setCurrentCell(PrivateCellUtil.createLastOnRowCol(kv));</span>
+<span class="source-line-no">455</span><span id="line-455"></span>
+<span class="source-line-no">456</span><span id="line-456">    realSeekDone = true;</span>
+<span class="source-line-no">457</span><span id="line-457">    return true;</span>
+<span class="source-line-no">458</span><span id="line-458">  }</span>
+<span class="source-line-no">459</span><span id="line-459"></span>
+<span class="source-line-no">460</span><span id="line-460">  StoreFileReader getReader() {</span>
+<span class="source-line-no">461</span><span id="line-461">    return reader;</span>
+<span class="source-line-no">462</span><span id="line-462">  }</span>
+<span class="source-line-no">463</span><span id="line-463"></span>
+<span class="source-line-no">464</span><span id="line-464">  CellComparator getComparator() {</span>
+<span class="source-line-no">465</span><span id="line-465">    return reader.getComparator();</span>
 <span class="source-line-no">466</span><span id="line-466">  }</span>
 <span class="source-line-no">467</span><span id="line-467"></span>
 <span class="source-line-no">468</span><span id="line-468">  @Override</span>
-<span class="source-line-no">469</span><span id="line-469">  public boolean isFileScanner() {</span>
-<span class="source-line-no">470</span><span id="line-470">    return true;</span>
+<span class="source-line-no">469</span><span id="line-469">  public boolean realSeekDone() {</span>
+<span class="source-line-no">470</span><span id="line-470">    return realSeekDone;</span>
 <span class="source-line-no">471</span><span id="line-471">  }</span>
 <span class="source-line-no">472</span><span id="line-472"></span>
 <span class="source-line-no">473</span><span id="line-473">  @Override</span>
-<span class="source-line-no">474</span><span id="line-474">  public void recordBlockSize(IntConsumer blockSizeConsumer) {</span>
-<span class="source-line-no">475</span><span id="line-475">    hfs.recordBlockSize(blockSizeConsumer);</span>
-<span class="source-line-no">476</span><span id="line-476">  }</span>
-<span class="source-line-no">477</span><span id="line-477"></span>
-<span class="source-line-no">478</span><span id="line-478">  @Override</span>
-<span class="source-line-no">479</span><span id="line-479">  public Path getFilePath() {</span>
-<span class="source-line-no">480</span><span id="line-480">    return reader.getHFileReader().getPath();</span>
-<span class="source-line-no">481</span><span id="line-481">  }</span>
-<span class="source-line-no">482</span><span id="line-482"></span>
-<span class="source-line-no">483</span><span id="line-483">  // Test methods</span>
-<span class="source-line-no">484</span><span id="line-484">  static final long getSeekCount() {</span>
-<span class="source-line-no">485</span><span id="line-485">    return seekCount.sum();</span>
-<span class="source-line-no">486</span><span id="line-486">  }</span>
-<span class="source-line-no">487</span><span id="line-487"></span>
-<span class="source-line-no">488</span><span id="line-488">  static final void instrument() {</span>
-<span class="source-line-no">489</span><span id="line-489">    seekCount = new LongAdder();</span>
-<span class="source-line-no">490</span><span id="line-490">  }</span>
-<span class="source-line-no">491</span><span id="line-491"></span>
-<span class="source-line-no">492</span><span id="line-492">  @Override</span>
-<span class="source-line-no">493</span><span id="line-493">  public boolean shouldUseScanner(Scan scan, HStore store, long oldestUnexpiredTS) {</span>
-<span class="source-line-no">494</span><span id="line-494">    // if the file has no entries, no need to validate or create a scanner.</span>
-<span class="source-line-no">495</span><span id="line-495">    byte[] cf = store.getColumnFamilyDescriptor().getName();</span>
-<span class="source-line-no">496</span><span id="line-496">    TimeRange timeRange = scan.getColumnFamilyTimeRange().get(cf);</span>
-<span class="source-line-no">497</span><span id="line-497">    if (timeRange == null) {</span>
-<span class="source-line-no">498</span><span id="line-498">      timeRange = scan.getTimeRange();</span>
-<span class="source-line-no">499</span><span id="line-499">    }</span>
-<span class="source-line-no">500</span><span id="line-500">    return reader.passesTimerangeFilter(timeRange, oldestUnexpiredTS)</span>
-<span class="source-line-no">501</span><span id="line-501">      &amp;&amp; reader.passesKeyRangeFilter(scan)</span>
-<span class="source-line-no">502</span><span id="line-502">      &amp;&amp; reader.passesBloomFilter(scan, scan.getFamilyMap().get(cf));</span>
-<span class="source-line-no">503</span><span id="line-503">  }</span>
-<span class="source-line-no">504</span><span id="line-504"></span>
-<span class="source-line-no">505</span><span id="line-505">  @Override</span>
-<span class="source-line-no">506</span><span id="line-506">  public boolean seekToPreviousRow(ExtendedCell originalKey) throws IOException {</span>
-<span class="source-line-no">507</span><span id="line-507">    try {</span>
-<span class="source-line-no">508</span><span id="line-508">      if (isFastSeekingEncoding) {</span>
-<span class="source-line-no">509</span><span id="line-509">        return seekToPreviousRowStateless(originalKey);</span>
-<span class="source-line-no">510</span><span id="line-510">      } else if (previousRow == null || getComparator().compareRows(previousRow, originalKey) &gt; 0) {</span>
-<span class="source-line-no">511</span><span id="line-511">        return seekToPreviousRowWithoutHint(originalKey);</span>
-<span class="source-line-no">512</span><span id="line-512">      } else {</span>
-<span class="source-line-no">513</span><span id="line-513">        return seekToPreviousRowWithHint();</span>
-<span class="source-line-no">514</span><span id="line-514">      }</span>
-<span class="source-line-no">515</span><span id="line-515">    } catch (FileNotFoundException e) {</span>
-<span class="source-line-no">516</span><span id="line-516">      throw e;</span>
-<span class="source-line-no">517</span><span id="line-517">    } catch (IOException ioe) {</span>
-<span class="source-line-no">518</span><span id="line-518">      throw new IOException("Could not seekToPreviousRow " + this + " to key " + originalKey, ioe);</span>
-<span class="source-line-no">519</span><span id="line-519">    } finally {</span>
-<span class="source-line-no">520</span><span id="line-520">      this.realSeekDone = true;</span>
-<span class="source-line-no">521</span><span id="line-521">    }</span>
-<span class="source-line-no">522</span><span id="line-522">  }</span>
-<span class="source-line-no">523</span><span id="line-523"></span>
-<span class="source-line-no">524</span><span id="line-524">  /**</span>
-<span class="source-line-no">525</span><span id="line-525">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
-<span class="source-line-no">526</span><span id="line-526">   * one seek and one reseek. This method maintains state in {@link StoreFileScanner#previousRow}</span>
-<span class="source-line-no">527</span><span id="line-527">   * which only makes sense in the context of a sequential row-by-row reverse scan.</span>
-<span class="source-line-no">528</span><span id="line-528">   * {@link StoreFileScanner#previousRow} should be reset if that is not the case. The reasoning for</span>
-<span class="source-line-no">529</span><span id="line-529">   * why this method is faster than</span>
-<span class="source-line-no">530</span><span id="line-530">   * {@link StoreFileScanner#seekToPreviousRowStateless(ExtendedCell)} is that seeks are slower as</span>
-<span class="source-line-no">531</span><span id="line-531">   * they need to start from the beginning of the file, while reseeks go forward from the current</span>
-<span class="source-line-no">532</span><span id="line-532">   * position.</span>
-<span class="source-line-no">533</span><span id="line-533">   */</span>
-<span class="source-line-no">534</span><span id="line-534">  private boolean seekToPreviousRowWithHint() throws IOException {</span>
-<span class="source-line-no">535</span><span id="line-535">    do {</span>
-<span class="source-line-no">536</span><span id="line-536">      // Using our existing seek hint, set our next seek hint</span>
-<span class="source-line-no">537</span><span id="line-537">      ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(previousRow);</span>
-<span class="source-line-no">538</span><span id="line-538">      seekBeforeAndSaveKeyToPreviousRow(firstKeyOfPreviousRow);</span>
+<span class="source-line-no">474</span><span id="line-474">  public void enforceSeek() throws IOException {</span>
+<span class="source-line-no">475</span><span id="line-475">    if (realSeekDone) return;</span>
+<span class="source-line-no">476</span><span id="line-476"></span>
+<span class="source-line-no">477</span><span id="line-477">    if (delayedReseek) {</span>
+<span class="source-line-no">478</span><span id="line-478">      reseek(delayedSeekKV);</span>
+<span class="source-line-no">479</span><span id="line-479">    } else {</span>
+<span class="source-line-no">480</span><span id="line-480">      seek(delayedSeekKV);</span>
+<span class="source-line-no">481</span><span id="line-481">    }</span>
+<span class="source-line-no">482</span><span id="line-482">  }</span>
+<span class="source-line-no">483</span><span id="line-483"></span>
+<span class="source-line-no">484</span><span id="line-484">  @Override</span>
+<span class="source-line-no">485</span><span id="line-485">  public boolean isFileScanner() {</span>
+<span class="source-line-no">486</span><span id="line-486">    return true;</span>
+<span class="source-line-no">487</span><span id="line-487">  }</span>
+<span class="source-line-no">488</span><span id="line-488"></span>
+<span class="source-line-no">489</span><span id="line-489">  @Override</span>
+<span class="source-line-no">490</span><span id="line-490">  public void recordBlockSize(IntConsumer blockSizeConsumer) {</span>
+<span class="source-line-no">491</span><span id="line-491">    hfs.recordBlockSize(blockSizeConsumer);</span>
+<span class="source-line-no">492</span><span id="line-492">  }</span>
+<span class="source-line-no">493</span><span id="line-493"></span>
+<span class="source-line-no">494</span><span id="line-494">  @Override</span>
+<span class="source-line-no">495</span><span id="line-495">  public Path getFilePath() {</span>
+<span class="source-line-no">496</span><span id="line-496">    return reader.getHFileReader().getPath();</span>
+<span class="source-line-no">497</span><span id="line-497">  }</span>
+<span class="source-line-no">498</span><span id="line-498"></span>
+<span class="source-line-no">499</span><span id="line-499">  // Test methods</span>
+<span class="source-line-no">500</span><span id="line-500">  static final long getSeekCount() {</span>
+<span class="source-line-no">501</span><span id="line-501">    return seekCount.sum();</span>
+<span class="source-line-no">502</span><span id="line-502">  }</span>
+<span class="source-line-no">503</span><span id="line-503"></span>
+<span class="source-line-no">504</span><span id="line-504">  static final void instrument() {</span>
+<span class="source-line-no">505</span><span id="line-505">    seekCount = new LongAdder();</span>
+<span class="source-line-no">506</span><span id="line-506">  }</span>
+<span class="source-line-no">507</span><span id="line-507"></span>
+<span class="source-line-no">508</span><span id="line-508">  @Override</span>
+<span class="source-line-no">509</span><span id="line-509">  public boolean shouldUseScanner(Scan scan, HStore store, long oldestUnexpiredTS) {</span>
+<span class="source-line-no">510</span><span id="line-510">    // if the file has no entries, no need to validate or create a scanner.</span>
+<span class="source-line-no">511</span><span id="line-511">    byte[] cf = store.getColumnFamilyDescriptor().getName();</span>
+<span class="source-line-no">512</span><span id="line-512">    TimeRange timeRange = scan.getColumnFamilyTimeRange().get(cf);</span>
+<span class="source-line-no">513</span><span id="line-513">    if (timeRange == null) {</span>
+<span class="source-line-no">514</span><span id="line-514">      timeRange = scan.getTimeRange();</span>
+<span class="source-line-no">515</span><span id="line-515">    }</span>
+<span class="source-line-no">516</span><span id="line-516">    return reader.passesTimerangeFilter(timeRange, oldestUnexpiredTS)</span>
+<span class="source-line-no">517</span><span id="line-517">      &amp;&amp; reader.passesKeyRangeFilter(scan)</span>
+<span class="source-line-no">518</span><span id="line-518">      &amp;&amp; reader.passesBloomFilter(scan, scan.getFamilyMap().get(cf));</span>
+<span class="source-line-no">519</span><span id="line-519">  }</span>
+<span class="source-line-no">520</span><span id="line-520"></span>
+<span class="source-line-no">521</span><span id="line-521">  @Override</span>
+<span class="source-line-no">522</span><span id="line-522">  public boolean seekToPreviousRow(ExtendedCell originalKey) throws IOException {</span>
+<span class="source-line-no">523</span><span id="line-523">    try {</span>
+<span class="source-line-no">524</span><span id="line-524">      if (isFastSeekingEncoding) {</span>
+<span class="source-line-no">525</span><span id="line-525">        return seekToPreviousRowStateless(originalKey);</span>
+<span class="source-line-no">526</span><span id="line-526">      } else if (previousRow == null || getComparator().compareRows(previousRow, originalKey) &gt; 0) {</span>
+<span class="source-line-no">527</span><span id="line-527">        return seekToPreviousRowWithoutHint(originalKey);</span>
+<span class="source-line-no">528</span><span id="line-528">      } else {</span>
+<span class="source-line-no">529</span><span id="line-529">        return seekToPreviousRowWithHint();</span>
+<span class="source-line-no">530</span><span id="line-530">      }</span>
+<span class="source-line-no">531</span><span id="line-531">    } catch (FileNotFoundException e) {</span>
+<span class="source-line-no">532</span><span id="line-532">      throw e;</span>
+<span class="source-line-no">533</span><span id="line-533">    } catch (IOException ioe) {</span>
+<span class="source-line-no">534</span><span id="line-534">      throw new IOException("Could not seekToPreviousRow " + this + " to key " + originalKey, ioe);</span>
+<span class="source-line-no">535</span><span id="line-535">    } finally {</span>
+<span class="source-line-no">536</span><span id="line-536">      this.realSeekDone = true;</span>
+<span class="source-line-no">537</span><span id="line-537">    }</span>
+<span class="source-line-no">538</span><span id="line-538">  }</span>
 <span class="source-line-no">539</span><span id="line-539"></span>
-<span class="source-line-no">540</span><span id="line-540">      // Reseek back to our initial seek hint (i.e. what we think is the start of the</span>
-<span class="source-line-no">541</span><span id="line-541">      // previous row)</span>
-<span class="source-line-no">542</span><span id="line-542">      if (!reseekAtOrAfter(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">543</span><span id="line-543">        return false;</span>
-<span class="source-line-no">544</span><span id="line-544">      }</span>
-<span class="source-line-no">545</span><span id="line-545"></span>
-<span class="source-line-no">546</span><span id="line-546">      // If after skipping newer Kvs, we're still in our seek hint row, then we're finished</span>
-<span class="source-line-no">547</span><span id="line-547">      if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">548</span><span id="line-548">        return true;</span>
-<span class="source-line-no">549</span><span id="line-549">      }</span>
-<span class="source-line-no">550</span><span id="line-550"></span>
-<span class="source-line-no">551</span><span id="line-551">      // If the previousRow seek hint is missing, that means that we're at row after the first row</span>
-<span class="source-line-no">552</span><span id="line-552">      // in the storefile. Use the without-hint seek path to process the final row</span>
-<span class="source-line-no">553</span><span id="line-553">      if (previousRow == null) {</span>
-<span class="source-line-no">554</span><span id="line-554">        return seekToPreviousRowWithoutHint(firstKeyOfPreviousRow);</span>
-<span class="source-line-no">555</span><span id="line-555">      }</span>
-<span class="source-line-no">556</span><span id="line-556"></span>
-<span class="source-line-no">557</span><span id="line-557">      // Otherwise, use the previousRow seek hint to continue traversing backwards</span>
-<span class="source-line-no">558</span><span id="line-558">    } while (true);</span>
-<span class="source-line-no">559</span><span id="line-559">  }</span>
-<span class="source-line-no">560</span><span id="line-560"></span>
-<span class="source-line-no">561</span><span id="line-561">  /**</span>
-<span class="source-line-no">562</span><span id="line-562">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
-<span class="source-line-no">563</span><span id="line-563">   * two seeks and one reseek. The extra expense/seek is with the intent of speeding up subsequent</span>
-<span class="source-line-no">564</span><span id="line-564">   * calls by using the {@link StoreFileScanner#seekToPreviousRowWithHint} which this method seeds</span>
-<span class="source-line-no">565</span><span id="line-565">   * the state for by setting {@link StoreFileScanner#previousRow}</span>
-<span class="source-line-no">566</span><span id="line-566">   */</span>
-<span class="source-line-no">567</span><span id="line-567">  private boolean seekToPreviousRowWithoutHint(ExtendedCell originalKey) throws IOException {</span>
-<span class="source-line-no">568</span><span id="line-568">    // Rewind to the cell before the beginning of this row</span>
-<span class="source-line-no">569</span><span id="line-569">    ExtendedCell keyAtBeginningOfRow = PrivateCellUtil.createFirstOnRow(originalKey);</span>
-<span class="source-line-no">570</span><span id="line-570">    if (!seekBefore(keyAtBeginningOfRow)) {</span>
-<span class="source-line-no">571</span><span id="line-571">      return false;</span>
-<span class="source-line-no">572</span><span id="line-572">    }</span>
-<span class="source-line-no">573</span><span id="line-573"></span>
-<span class="source-line-no">574</span><span id="line-574">    // Rewind before this row and save what we find as a seek hint</span>
-<span class="source-line-no">575</span><span id="line-575">    ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(hfs.getKey());</span>
-<span class="source-line-no">576</span><span id="line-576">    seekBeforeAndSaveKeyToPreviousRow(firstKeyOfPreviousRow);</span>
-<span class="source-line-no">577</span><span id="line-577"></span>
-<span class="source-line-no">578</span><span id="line-578">    // Seek back to the start of the previous row</span>
-<span class="source-line-no">579</span><span id="line-579">    if (!reseekAtOrAfter(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">580</span><span id="line-580">      return false;</span>
-<span class="source-line-no">581</span><span id="line-581">    }</span>
-<span class="source-line-no">582</span><span id="line-582"></span>
-<span class="source-line-no">583</span><span id="line-583">    // If after skipping newer Kvs, we're still in what we thought was the previous</span>
-<span class="source-line-no">584</span><span id="line-584">    // row, then we can exit</span>
-<span class="source-line-no">585</span><span id="line-585">    if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">586</span><span id="line-586">      return true;</span>
-<span class="source-line-no">587</span><span id="line-587">    }</span>
-<span class="source-line-no">588</span><span id="line-588"></span>
-<span class="source-line-no">589</span><span id="line-589">    // Skipping newer kvs resulted in skipping the entire row that we thought was the</span>
-<span class="source-line-no">590</span><span id="line-590">    // previous row. If we've set a seek hint, then we can use that to go backwards</span>
-<span class="source-line-no">591</span><span id="line-591">    // further</span>
-<span class="source-line-no">592</span><span id="line-592">    if (previousRow != null) {</span>
-<span class="source-line-no">593</span><span id="line-593">      return seekToPreviousRowWithHint();</span>
-<span class="source-line-no">594</span><span id="line-594">    }</span>
-<span class="source-line-no">595</span><span id="line-595"></span>
-<span class="source-line-no">596</span><span id="line-596">    // If we've made it here, then we weren't able to set a seek hint. This can happen</span>
-<span class="source-line-no">597</span><span id="line-597">    // only if we're at the beginning of the storefile i.e. there is no row before this</span>
-<span class="source-line-no">598</span><span id="line-598">    // one</span>
-<span class="source-line-no">599</span><span id="line-599">    return false;</span>
-<span class="source-line-no">600</span><span id="line-600">  }</span>
-<span class="source-line-no">601</span><span id="line-601"></span>
-<span class="source-line-no">602</span><span id="line-602">  /**</span>
-<span class="source-line-no">603</span><span id="line-603">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
-<span class="source-line-no">604</span><span id="line-604">   * two seeks. It should be used if the cost for seeking is lower i.e. when using a fast seeking</span>
-<span class="source-line-no">605</span><span id="line-605">   * data block encoding like RIV1.</span>
-<span class="source-line-no">606</span><span id="line-606">   */</span>
-<span class="source-line-no">607</span><span id="line-607">  private boolean seekToPreviousRowStateless(ExtendedCell originalKey) throws IOException {</span>
-<span class="source-line-no">608</span><span id="line-608">    ExtendedCell key = originalKey;</span>
-<span class="source-line-no">609</span><span id="line-609">    do {</span>
-<span class="source-line-no">610</span><span id="line-610">      ExtendedCell keyAtBeginningOfRow = PrivateCellUtil.createFirstOnRow(key);</span>
-<span class="source-line-no">611</span><span id="line-611">      if (!seekBefore(keyAtBeginningOfRow)) {</span>
-<span class="source-line-no">612</span><span id="line-612">        return false;</span>
-<span class="source-line-no">613</span><span id="line-613">      }</span>
-<span class="source-line-no">614</span><span id="line-614"></span>
-<span class="source-line-no">615</span><span id="line-615">      ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(hfs.getKey());</span>
-<span class="source-line-no">616</span><span id="line-616">      if (!seekAtOrAfter(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">617</span><span id="line-617">        return false;</span>
-<span class="source-line-no">618</span><span id="line-618">      }</span>
-<span class="source-line-no">619</span><span id="line-619"></span>
-<span class="source-line-no">620</span><span id="line-620">      if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
-<span class="source-line-no">621</span><span id="line-621">        return true;</span>
-<span class="source-line-no">622</span><span id="line-622">      }</span>
-<span class="source-line-no">623</span><span id="line-623">      key = firstKeyOfPreviousRow;</span>
-<span class="source-line-no">624</span><span id="line-624">    } while (true);</span>
-<span class="source-line-no">625</span><span id="line-625">  }</span>
-<span class="source-line-no">626</span><span id="line-626"></span>
-<span class="source-line-no">627</span><span id="line-627">  private boolean seekBefore(ExtendedCell seekKey) throws IOException {</span>
-<span class="source-line-no">628</span><span id="line-628">    if (seekCount != null) {</span>
-<span class="source-line-no">629</span><span id="line-629">      seekCount.increment();</span>
-<span class="source-line-no">630</span><span id="line-630">    }</span>
-<span class="source-line-no">631</span><span id="line-631">    if (!hfs.seekBefore(seekKey)) {</span>
-<span class="source-line-no">632</span><span id="line-632">      this.cur = null;</span>
-<span class="source-line-no">633</span><span id="line-633">      return false;</span>
-<span class="source-line-no">634</span><span id="line-634">    }</span>
+<span class="source-line-no">540</span><span id="line-540">  /**</span>
+<span class="source-line-no">541</span><span id="line-541">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
+<span class="source-line-no">542</span><span id="line-542">   * one seek and one reseek. This method maintains state in {@link StoreFileScanner#previousRow}</span>
+<span class="source-line-no">543</span><span id="line-543">   * which only makes sense in the context of a sequential row-by-row reverse scan.</span>
+<span class="source-line-no">544</span><span id="line-544">   * {@link StoreFileScanner#previousRow} should be reset if that is not the case. The reasoning for</span>
+<span class="source-line-no">545</span><span id="line-545">   * why this method is faster than</span>
+<span class="source-line-no">546</span><span id="line-546">   * {@link StoreFileScanner#seekToPreviousRowStateless(ExtendedCell)} is that seeks are slower as</span>
+<span class="source-line-no">547</span><span id="line-547">   * they need to start from the beginning of the file, while reseeks go forward from the current</span>
+<span class="source-line-no">548</span><span id="line-548">   * position.</span>
+<span class="source-line-no">549</span><span id="line-549">   */</span>
+<span class="source-line-no">550</span><span id="line-550">  private boolean seekToPreviousRowWithHint() throws IOException {</span>
+<span class="source-line-no">551</span><span id="line-551">    do {</span>
+<span class="source-line-no">552</span><span id="line-552">      // Using our existing seek hint, set our next seek hint</span>
+<span class="source-line-no">553</span><span id="line-553">      ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(previousRow);</span>
+<span class="source-line-no">554</span><span id="line-554">      seekBeforeAndSaveKeyToPreviousRow(firstKeyOfPreviousRow);</span>
+<span class="source-line-no">555</span><span id="line-555"></span>
+<span class="source-line-no">556</span><span id="line-556">      // Reseek back to our initial seek hint (i.e. what we think is the start of the</span>
+<span class="source-line-no">557</span><span id="line-557">      // previous row)</span>
+<span class="source-line-no">558</span><span id="line-558">      if (!reseekAtOrAfter(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">559</span><span id="line-559">        return false;</span>
+<span class="source-line-no">560</span><span id="line-560">      }</span>
+<span class="source-line-no">561</span><span id="line-561"></span>
+<span class="source-line-no">562</span><span id="line-562">      // If after skipping newer Kvs, we're still in our seek hint row, then we're finished</span>
+<span class="source-line-no">563</span><span id="line-563">      if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">564</span><span id="line-564">        return true;</span>
+<span class="source-line-no">565</span><span id="line-565">      }</span>
+<span class="source-line-no">566</span><span id="line-566"></span>
+<span class="source-line-no">567</span><span id="line-567">      // If the previousRow seek hint is missing, that means that we're at row after the first row</span>
+<span class="source-line-no">568</span><span id="line-568">      // in the storefile. Use the without-hint seek path to process the final row</span>
+<span class="source-line-no">569</span><span id="line-569">      if (previousRow == null) {</span>
+<span class="source-line-no">570</span><span id="line-570">        return seekToPreviousRowWithoutHint(firstKeyOfPreviousRow);</span>
+<span class="source-line-no">571</span><span id="line-571">      }</span>
+<span class="source-line-no">572</span><span id="line-572"></span>
+<span class="source-line-no">573</span><span id="line-573">      // Otherwise, use the previousRow seek hint to continue traversing backwards</span>
+<span class="source-line-no">574</span><span id="line-574">    } while (true);</span>
+<span class="source-line-no">575</span><span id="line-575">  }</span>
+<span class="source-line-no">576</span><span id="line-576"></span>
+<span class="source-line-no">577</span><span id="line-577">  /**</span>
+<span class="source-line-no">578</span><span id="line-578">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
+<span class="source-line-no">579</span><span id="line-579">   * two seeks and one reseek. The extra expense/seek is with the intent of speeding up subsequent</span>
+<span class="source-line-no">580</span><span id="line-580">   * calls by using the {@link StoreFileScanner#seekToPreviousRowWithHint} which this method seeds</span>
+<span class="source-line-no">581</span><span id="line-581">   * the state for by setting {@link StoreFileScanner#previousRow}</span>
+<span class="source-line-no">582</span><span id="line-582">   */</span>
+<span class="source-line-no">583</span><span id="line-583">  private boolean seekToPreviousRowWithoutHint(ExtendedCell originalKey) throws IOException {</span>
+<span class="source-line-no">584</span><span id="line-584">    // Rewind to the cell before the beginning of this row</span>
+<span class="source-line-no">585</span><span id="line-585">    ExtendedCell keyAtBeginningOfRow = PrivateCellUtil.createFirstOnRow(originalKey);</span>
+<span class="source-line-no">586</span><span id="line-586">    if (!seekBefore(keyAtBeginningOfRow)) {</span>
+<span class="source-line-no">587</span><span id="line-587">      return false;</span>
+<span class="source-line-no">588</span><span id="line-588">    }</span>
+<span class="source-line-no">589</span><span id="line-589"></span>
+<span class="source-line-no">590</span><span id="line-590">    // Rewind before this row and save what we find as a seek hint</span>
+<span class="source-line-no">591</span><span id="line-591">    ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(hfs.getKey());</span>
+<span class="source-line-no">592</span><span id="line-592">    seekBeforeAndSaveKeyToPreviousRow(firstKeyOfPreviousRow);</span>
+<span class="source-line-no">593</span><span id="line-593"></span>
+<span class="source-line-no">594</span><span id="line-594">    // Seek back to the start of the previous row</span>
+<span class="source-line-no">595</span><span id="line-595">    if (!reseekAtOrAfter(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">596</span><span id="line-596">      return false;</span>
+<span class="source-line-no">597</span><span id="line-597">    }</span>
+<span class="source-line-no">598</span><span id="line-598"></span>
+<span class="source-line-no">599</span><span id="line-599">    // If after skipping newer Kvs, we're still in what we thought was the previous</span>
+<span class="source-line-no">600</span><span id="line-600">    // row, then we can exit</span>
+<span class="source-line-no">601</span><span id="line-601">    if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">602</span><span id="line-602">      return true;</span>
+<span class="source-line-no">603</span><span id="line-603">    }</span>
+<span class="source-line-no">604</span><span id="line-604"></span>
+<span class="source-line-no">605</span><span id="line-605">    // Skipping newer kvs resulted in skipping the entire row that we thought was the</span>
+<span class="source-line-no">606</span><span id="line-606">    // previous row. If we've set a seek hint, then we can use that to go backwards</span>
+<span class="source-line-no">607</span><span id="line-607">    // further</span>
+<span class="source-line-no">608</span><span id="line-608">    if (previousRow != null) {</span>
+<span class="source-line-no">609</span><span id="line-609">      return seekToPreviousRowWithHint();</span>
+<span class="source-line-no">610</span><span id="line-610">    }</span>
+<span class="source-line-no">611</span><span id="line-611"></span>
+<span class="source-line-no">612</span><span id="line-612">    // If we've made it here, then we weren't able to set a seek hint. This can happen</span>
+<span class="source-line-no">613</span><span id="line-613">    // only if we're at the beginning of the storefile i.e. there is no row before this</span>
+<span class="source-line-no">614</span><span id="line-614">    // one</span>
+<span class="source-line-no">615</span><span id="line-615">    return false;</span>
+<span class="source-line-no">616</span><span id="line-616">  }</span>
+<span class="source-line-no">617</span><span id="line-617"></span>
+<span class="source-line-no">618</span><span id="line-618">  /**</span>
+<span class="source-line-no">619</span><span id="line-619">   * This variant of the {@link StoreFileScanner#seekToPreviousRow(ExtendedCell)} method requires</span>
+<span class="source-line-no">620</span><span id="line-620">   * two seeks. It should be used if the cost for seeking is lower i.e. when using a fast seeking</span>
+<span class="source-line-no">621</span><span id="line-621">   * data block encoding like RIV1.</span>
+<span class="source-line-no">622</span><span id="line-622">   */</span>
+<span class="source-line-no">623</span><span id="line-623">  private boolean seekToPreviousRowStateless(ExtendedCell originalKey) throws IOException {</span>
+<span class="source-line-no">624</span><span id="line-624">    ExtendedCell key = originalKey;</span>
+<span class="source-line-no">625</span><span id="line-625">    do {</span>
+<span class="source-line-no">626</span><span id="line-626">      ExtendedCell keyAtBeginningOfRow = PrivateCellUtil.createFirstOnRow(key);</span>
+<span class="source-line-no">627</span><span id="line-627">      if (!seekBefore(keyAtBeginningOfRow)) {</span>
+<span class="source-line-no">628</span><span id="line-628">        return false;</span>
+<span class="source-line-no">629</span><span id="line-629">      }</span>
+<span class="source-line-no">630</span><span id="line-630"></span>
+<span class="source-line-no">631</span><span id="line-631">      ExtendedCell firstKeyOfPreviousRow = PrivateCellUtil.createFirstOnRow(hfs.getKey());</span>
+<span class="source-line-no">632</span><span id="line-632">      if (!seekAtOrAfter(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">633</span><span id="line-633">        return false;</span>
+<span class="source-line-no">634</span><span id="line-634">      }</span>
 <span class="source-line-no">635</span><span id="line-635"></span>
-<span class="source-line-no">636</span><span id="line-636">    return true;</span>
-<span class="source-line-no">637</span><span id="line-637">  }</span>
-<span class="source-line-no">638</span><span id="line-638"></span>
-<span class="source-line-no">639</span><span id="line-639">  /**</span>
-<span class="source-line-no">640</span><span id="line-640">   * Seeks before the seek target cell and saves the location to {@link #previousRow}. If there</span>
-<span class="source-line-no">641</span><span id="line-641">   * doesn't exist a KV in this file before the seek target cell, reposition the scanner at the</span>
-<span class="source-line-no">642</span><span id="line-642">   * beginning of the storefile (in preparation to a reseek at or after the seek key) and set the</span>
-<span class="source-line-no">643</span><span id="line-643">   * {@link #previousRow} to null. If {@link #previousRow} is ever non-null and then transitions to</span>
-<span class="source-line-no">644</span><span id="line-644">   * being null again via this method, that's because there doesn't exist a row before the seek</span>
-<span class="source-line-no">645</span><span id="line-645">   * target in the storefile (i.e. we're at the beginning of the storefile)</span>
-<span class="source-line-no">646</span><span id="line-646">   */</span>
-<span class="source-line-no">647</span><span id="line-647">  private void seekBeforeAndSaveKeyToPreviousRow(ExtendedCell seekKey) throws IOException {</span>
-<span class="source-line-no">648</span><span id="line-648">    if (seekCount != null) {</span>
-<span class="source-line-no">649</span><span id="line-649">      seekCount.increment();</span>
+<span class="source-line-no">636</span><span id="line-636">      if (isStillAtSeekTargetAfterSkippingNewerKvs(firstKeyOfPreviousRow)) {</span>
+<span class="source-line-no">637</span><span id="line-637">        return true;</span>
+<span class="source-line-no">638</span><span id="line-638">      }</span>
+<span class="source-line-no">639</span><span id="line-639">      key = firstKeyOfPreviousRow;</span>
+<span class="source-line-no">640</span><span id="line-640">    } while (true);</span>
+<span class="source-line-no">641</span><span id="line-641">  }</span>
+<span class="source-line-no">642</span><span id="line-642"></span>
+<span class="source-line-no">643</span><span id="line-643">  private boolean seekBefore(ExtendedCell seekKey) throws IOException {</span>
+<span class="source-line-no">644</span><span id="line-644">    if (seekCount != null) {</span>
+<span class="source-line-no">645</span><span id="line-645">      seekCount.increment();</span>
+<span class="source-line-no">646</span><span id="line-646">    }</span>
+<span class="source-line-no">647</span><span id="line-647">    if (!hfs.seekBefore(seekKey)) {</span>
+<span class="source-line-no">648</span><span id="line-648">      this.cur = null;</span>
+<span class="source-line-no">649</span><span id="line-649">      return false;</span>
 <span class="source-line-no">650</span><span id="line-650">    }</span>
-<span class="source-line-no">651</span><span id="line-651">    if (!hfs.seekBefore(seekKey)) {</span>
-<span class="source-line-no">652</span><span id="line-652">      // Since the above seek failed, we need to position ourselves back at the start of the</span>
-<span class="source-line-no">653</span><span id="line-653">      // block or else our reseek might fail. seekTo() cannot return false here as at least</span>
-<span class="source-line-no">654</span><span id="line-654">      // one seekBefore will have returned true by the time we get here</span>
-<span class="source-line-no">655</span><span id="line-655">      hfs.seekTo();</span>
-<span class="source-line-no">656</span><span id="line-656">      this.previousRow = null;</span>
-<span class="source-line-no">657</span><span id="line-657">    } else {</span>
-<span class="source-line-no">658</span><span id="line-658">      this.previousRow = hfs.getKey();</span>
-<span class="source-line-no">659</span><span id="line-659">    }</span>
-<span class="source-line-no">660</span><span id="line-660">  }</span>
-<span class="source-line-no">661</span><span id="line-661"></span>
-<span class="source-line-no">662</span><span id="line-662">  private boolean seekAtOrAfter(ExtendedCell seekKey) throws IOException {</span>
-<span class="source-line-no">663</span><span id="line-663">    if (seekCount != null) {</span>
-<span class="source-line-no">664</span><span id="line-664">      seekCount.increment();</span>
-<span class="source-line-no">665</span><span id="line-665">    }</span>
-<span class="source-line-no">666</span><span id="line-666">    if (!seekAtOrAfter(hfs, seekKey)) {</span>
-<span class="source-line-no">667</span><span id="line-667">      this.cur = null;</span>
-<span class="source-line-no">668</span><span id="line-668">      return false;</span>
-<span class="source-line-no">669</span><span id="line-669">    }</span>
-<span class="source-line-no">670</span><span id="line-670"></span>
-<span class="source-line-no">671</span><span id="line-671">    return true;</span>
-<span class="source-line-no">672</span><span id="line-672">  }</span>
-<span class="source-line-no">673</span><span id="line-673"></span>
-<span class="source-line-no">674</span><span id="line-674">  private boolean reseekAtOrAfter(ExtendedCell seekKey) throws IOException {</span>
-<span class="source-line-no">675</span><span id="line-675">    if (seekCount != null) {</span>
-<span class="source-line-no">676</span><span id="line-676">      seekCount.increment();</span>
-<span class="source-line-no">677</span><span id="line-677">    }</span>
-<span class="source-line-no">678</span><span id="line-678">    if (!reseekAtOrAfter(hfs, seekKey)) {</span>
-<span class="source-line-no">679</span><span id="line-679">      this.cur = null;</span>
-<span class="source-line-no">680</span><span id="line-680">      return false;</span>
+<span class="source-line-no">651</span><span id="line-651"></span>
+<span class="source-line-no">652</span><span id="line-652">    return true;</span>
+<span class="source-line-no">653</span><span id="line-653">  }</span>
+<span class="source-line-no">654</span><span id="line-654"></span>
+<span class="source-line-no">655</span><span id="line-655">  /**</span>
+<span class="source-line-no">656</span><span id="line-656">   * Seeks before the seek target cell and saves the location to {@link #previousRow}. If there</span>
+<span class="source-line-no">657</span><span id="line-657">   * doesn't exist a KV in this file before the seek target cell, reposition the scanner at the</span>
+<span class="source-line-no">658</span><span id="line-658">   * beginning of the storefile (in preparation to a reseek at or after the seek key) and set the</span>
+<span class="source-line-no">659</span><span id="line-659">   * {@link #previousRow} to null. If {@link #previousRow} is ever non-null and then transitions to</span>
+<span class="source-line-no">660</span><span id="line-660">   * being null again via this method, that's because there doesn't exist a row before the seek</span>
+<span class="source-line-no">661</span><span id="line-661">   * target in the storefile (i.e. we're at the beginning of the storefile)</span>
+<span class="source-line-no">662</span><span id="line-662">   */</span>
+<span class="source-line-no">663</span><span id="line-663">  private void seekBeforeAndSaveKeyToPreviousRow(ExtendedCell seekKey) throws IOException {</span>
+<span class="source-line-no">664</span><span id="line-664">    if (seekCount != null) {</span>
+<span class="source-line-no">665</span><span id="line-665">      seekCount.increment();</span>
+<span class="source-line-no">666</span><span id="line-666">    }</span>
+<span class="source-line-no">667</span><span id="line-667">    if (!hfs.seekBefore(seekKey)) {</span>
+<span class="source-line-no">668</span><span id="line-668">      // Since the above seek failed, we need to position ourselves back at the start of the</span>
+<span class="source-line-no">669</span><span id="line-669">      // block or else our reseek might fail. seekTo() cannot return false here as at least</span>
+<span class="source-line-no">670</span><span id="line-670">      // one seekBefore will have returned true by the time we get here</span>
+<span class="source-line-no">671</span><span id="line-671">      hfs.seekTo();</span>
+<span class="source-line-no">672</span><span id="line-672">      this.previousRow = null;</span>
+<span class="source-line-no">673</span><span id="line-673">    } else {</span>
+<span class="source-line-no">674</span><span id="line-674">      this.previousRow = hfs.getKey();</span>
+<span class="source-line-no">675</span><span id="line-675">    }</span>
+<span class="source-line-no">676</span><span id="line-676">  }</span>
+<span class="source-line-no">677</span><span id="line-677"></span>
+<span class="source-line-no">678</span><span id="line-678">  private boolean seekAtOrAfter(ExtendedCell seekKey) throws IOException {</span>
+<span class="source-line-no">679</span><span id="line-679">    if (seekCount != null) {</span>
+<span class="source-line-no">680</span><span id="line-680">      seekCount.increment();</span>
 <span class="source-line-no">681</span><span id="line-681">    }</span>
-<span class="source-line-no">682</span><span id="line-682"></span>
-<span class="source-line-no">683</span><span id="line-683">    return true;</span>
-<span class="source-line-no">684</span><span id="line-684">  }</span>
-<span class="source-line-no">685</span><span id="line-685"></span>
-<span class="source-line-no">686</span><span id="line-686">  private boolean isStillAtSeekTargetAfterSkippingNewerKvs(Cell seekKey) throws IOException {</span>
-<span class="source-line-no">687</span><span id="line-687">    setCurrentCell(hfs.getCell());</span>
-<span class="source-line-no">688</span><span id="line-688">    return skipKvsNewerThanReadpointReversed() &amp;&amp; getComparator().compareRows(cur, seekKey) &lt;= 0;</span>
-<span class="source-line-no">689</span><span id="line-689">  }</span>
-<span class="source-line-no">690</span><span id="line-690"></span>
-<span class="source-line-no">691</span><span id="line-691">  private boolean skipKvsNewerThanReadpointReversed() throws IOException {</span>
-<span class="source-line-no">692</span><span id="line-692">    this.stopSkippingKVsIfNextRow = true;</span>
-<span class="source-line-no">693</span><span id="line-693">    boolean resultOfSkipKVs;</span>
-<span class="source-line-no">694</span><span id="line-694">    try {</span>
-<span class="source-line-no">695</span><span id="line-695">      resultOfSkipKVs = skipKVsNewerThanReadpoint();</span>
-<span class="source-line-no">696</span><span id="line-696">    } finally {</span>
-<span class="source-line-no">697</span><span id="line-697">      this.stopSkippingKVsIfNextRow = false;</span>
-<span class="source-line-no">698</span><span id="line-698">    }</span>
-<span class="source-line-no">699</span><span id="line-699"></span>
-<span class="source-line-no">700</span><span id="line-700">    return resultOfSkipKVs;</span>
-<span class="source-line-no">701</span><span id="line-701">  }</span>
-<span class="source-line-no">702</span><span id="line-702"></span>
-<span class="source-line-no">703</span><span id="line-703">  @Override</span>
-<span class="source-line-no">704</span><span id="line-704">  public boolean seekToLastRow() throws IOException {</span>
-<span class="source-line-no">705</span><span id="line-705">    Optional&lt;byte[]&gt; lastRow = reader.getLastRowKey();</span>
-<span class="source-line-no">706</span><span id="line-706">    if (!lastRow.isPresent()) {</span>
-<span class="source-line-no">707</span><span id="line-707">      return false;</span>
-<span class="source-line-no">708</span><span id="line-708">    }</span>
-<span class="source-line-no">709</span><span id="line-709">    ExtendedCell seekKey = PrivateCellUtil.createFirstOnRow(lastRow.get());</span>
-<span class="source-line-no">710</span><span id="line-710">    if (seek(seekKey)) {</span>
-<span class="source-line-no">711</span><span id="line-711">      return true;</span>
-<span class="source-line-no">712</span><span id="line-712">    } else {</span>
-<span class="source-line-no">713</span><span id="line-713">      return seekToPreviousRow(seekKey);</span>
+<span class="source-line-no">682</span><span id="line-682">    if (!seekAtOrAfter(hfs, seekKey)) {</span>
+<span class="source-line-no">683</span><span id="line-683">      this.cur = null;</span>
+<span class="source-line-no">684</span><span id="line-684">      return false;</span>
+<span class="source-line-no">685</span><span id="line-685">    }</span>
+<span class="source-line-no">686</span><span id="line-686"></span>
+<span class="source-line-no">687</span><span id="line-687">    return true;</span>
+<span class="source-line-no">688</span><span id="line-688">  }</span>
+<span class="source-line-no">689</span><span id="line-689"></span>
+<span class="source-line-no">690</span><span id="line-690">  private boolean reseekAtOrAfter(ExtendedCell seekKey) throws IOException {</span>
+<span class="source-line-no">691</span><span id="line-691">    if (seekCount != null) {</span>
+<span class="source-line-no">692</span><span id="line-692">      seekCount.increment();</span>
+<span class="source-line-no">693</span><span id="line-693">    }</span>
+<span class="source-line-no">694</span><span id="line-694">    if (!reseekAtOrAfter(hfs, seekKey)) {</span>
+<span class="source-line-no">695</span><span id="line-695">      this.cur = null;</span>
+<span class="source-line-no">696</span><span id="line-696">      return false;</span>
+<span class="source-line-no">697</span><span id="line-697">    }</span>
+<span class="source-line-no">698</span><span id="line-698"></span>
+<span class="source-line-no">699</span><span id="line-699">    return true;</span>
+<span class="source-line-no">700</span><span id="line-700">  }</span>
+<span class="source-line-no">701</span><span id="line-701"></span>
+<span class="source-line-no">702</span><span id="line-702">  private boolean isStillAtSeekTargetAfterSkippingNewerKvs(Cell seekKey) throws IOException {</span>
+<span class="source-line-no">703</span><span id="line-703">    setCurrentCell(hfs.getCell());</span>
+<span class="source-line-no">704</span><span id="line-704">    return skipKvsNewerThanReadpointReversed() &amp;&amp; getComparator().compareRows(cur, seekKey) &lt;= 0;</span>
+<span class="source-line-no">705</span><span id="line-705">  }</span>
+<span class="source-line-no">706</span><span id="line-706"></span>
+<span class="source-line-no">707</span><span id="line-707">  private boolean skipKvsNewerThanReadpointReversed() throws IOException {</span>
+<span class="source-line-no">708</span><span id="line-708">    this.stopSkippingKVsIfNextRow = true;</span>
+<span class="source-line-no">709</span><span id="line-709">    boolean resultOfSkipKVs;</span>
+<span class="source-line-no">710</span><span id="line-710">    try {</span>
+<span class="source-line-no">711</span><span id="line-711">      resultOfSkipKVs = skipKVsNewerThanReadpoint();</span>
+<span class="source-line-no">712</span><span id="line-712">    } finally {</span>
+<span class="source-line-no">713</span><span id="line-713">      this.stopSkippingKVsIfNextRow = false;</span>
 <span class="source-line-no">714</span><span id="line-714">    }</span>
-<span class="source-line-no">715</span><span id="line-715">  }</span>
-<span class="source-line-no">716</span><span id="line-716"></span>
-<span class="source-line-no">717</span><span id="line-717">  @Override</span>
-<span class="source-line-no">718</span><span id="line-718">  public boolean backwardSeek(ExtendedCell key) throws IOException {</span>
-<span class="source-line-no">719</span><span id="line-719">    seek(key);</span>
-<span class="source-line-no">720</span><span id="line-720">    if (cur == null || getComparator().compareRows(cur, key) &gt; 0) {</span>
-<span class="source-line-no">721</span><span id="line-721">      return seekToPreviousRow(key);</span>
-<span class="source-line-no">722</span><span id="line-722">    }</span>
-<span class="source-line-no">723</span><span id="line-723">    return true;</span>
-<span class="source-line-no">724</span><span id="line-724">  }</span>
-<span class="source-line-no">725</span><span id="line-725"></span>
-<span class="source-line-no">726</span><span id="line-726">  @Override</span>
-<span class="source-line-no">727</span><span id="line-727">  public ExtendedCell getNextIndexedKey() {</span>
-<span class="source-line-no">728</span><span id="line-728">    return hfs.getNextIndexedKey();</span>
-<span class="source-line-no">729</span><span id="line-729">  }</span>
-<span class="source-line-no">730</span><span id="line-730"></span>
-<span class="source-line-no">731</span><span id="line-731">  @Override</span>
-<span class="source-line-no">732</span><span id="line-732">  public void shipped() throws IOException {</span>
-<span class="source-line-no">733</span><span id="line-733">    this.hfs.shipped();</span>
-<span class="source-line-no">734</span><span id="line-734">  }</span>
-<span class="source-line-no">735</span><span id="line-735">}</span>
+<span class="source-line-no">715</span><span id="line-715"></span>
+<span class="source-line-no">716</span><span id="line-716">    return resultOfSkipKVs;</span>
+<span class="source-line-no">717</span><span id="line-717">  }</span>
+<span class="source-line-no">718</span><span id="line-718"></span>
+<span class="source-line-no">719</span><span id="line-719">  @Override</span>
+<span class="source-line-no">720</span><span id="line-720">  public boolean seekToLastRow() throws IOException {</span>
+<span class="source-line-no">721</span><span id="line-721">    Optional&lt;byte[]&gt; lastRow = reader.getLastRowKey();</span>
+<span class="source-line-no">722</span><span id="line-722">    if (!lastRow.isPresent()) {</span>
+<span class="source-line-no">723</span><span id="line-723">      return false;</span>
+<span class="source-line-no">724</span><span id="line-724">    }</span>
+<span class="source-line-no">725</span><span id="line-725">    ExtendedCell seekKey = PrivateCellUtil.createFirstOnRow(lastRow.get());</span>
+<span class="source-line-no">726</span><span id="line-726">    if (seek(seekKey)) {</span>
+<span class="source-line-no">727</span><span id="line-727">      return true;</span>
+<span class="source-line-no">728</span><span id="line-728">    } else {</span>
+<span class="source-line-no">729</span><span id="line-729">      return seekToPreviousRow(seekKey);</span>
+<span class="source-line-no">730</span><span id="line-730">    }</span>
+<span class="source-line-no">731</span><span id="line-731">  }</span>
+<span class="source-line-no">732</span><span id="line-732"></span>
+<span class="source-line-no">733</span><span id="line-733">  @Override</span>
+<span class="source-line-no">734</span><span id="line-734">  public boolean backwardSeek(ExtendedCell key) throws IOException {</span>
+<span class="source-line-no">735</span><span id="line-735">    seek(key);</span>
+<span class="source-line-no">736</span><span id="line-736">    if (cur == null || getComparator().compareRows(cur, key) &gt; 0) {</span>
+<span class="source-line-no">737</span><span id="line-737">      return seekToPreviousRow(key);</span>
+<span class="source-line-no">738</span><span id="line-738">    }</span>
+<span class="source-line-no">739</span><span id="line-739">    return true;</span>
+<span class="source-line-no">740</span><span id="line-740">  }</span>
+<span class="source-line-no">741</span><span id="line-741"></span>
+<span class="source-line-no">742</span><span id="line-742">  @Override</span>
+<span class="source-line-no">743</span><span id="line-743">  public ExtendedCell getNextIndexedKey() {</span>
+<span class="source-line-no">744</span><span id="line-744">    return hfs.getNextIndexedKey();</span>
+<span class="source-line-no">745</span><span id="line-745">  }</span>
+<span class="source-line-no">746</span><span id="line-746"></span>
+<span class="source-line-no">747</span><span id="line-747">  @Override</span>
+<span class="source-line-no">748</span><span id="line-748">  public void shipped() throws IOException {</span>
+<span class="source-line-no">749</span><span id="line-749">    this.hfs.shipped();</span>
+<span class="source-line-no">750</span><span id="line-750">  }</span>
+<span class="source-line-no">751</span><span id="line-751">}</span>
 
 
 
