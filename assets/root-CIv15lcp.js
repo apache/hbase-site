@@ -1,0 +1,15 @@
+import{w as l,a as c,j as e,M as m,b as d,S as h,c as x,O as u,i as f}from"./chunk-EPOLDU6W-B5LwAila.js";import{T as p}from"./theme-provider-BI6ghFmW.js";import{B as o}from"./button-DKPg1edO.js";import"./index-jbG8BFt3.js";import"./utils-Cu_tFavh.js";const g="/assets/app-DeiyQBOk.css",S=()=>[{rel:"preload",as:"font",href:"/fonts/inter-latin-wght-normal.woff2",type:"font/woff2",crossOrigin:"anonymous"},{rel:"prefetch",as:"font",href:"/fonts/inter-latin-wght-italic.woff2",type:"font/woff2",crossOrigin:"anonymous"},{rel:"stylesheet",href:g}];function T({children:s}){return e.jsxs("html",{lang:"en",suppressHydrationWarning:!0,children:[e.jsxs("head",{children:[e.jsx("meta",{charSet:"utf-8"}),e.jsx("meta",{name:"viewport",content:"width=device-width, initial-scale=1"}),e.jsx(m,{}),e.jsx(d,{}),e.jsx("script",{dangerouslySetInnerHTML:{__html:`
+              (function() {
+                const theme = localStorage.getItem('theme');
+                const root = document.documentElement;
+                root.classList.remove('light', 'dark');
+                
+                if (theme && ['light', 'dark'].includes(theme)) {
+                  root.classList.add(theme);
+                } else {
+                  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                  root.classList.add(systemTheme);
+                  localStorage.setItem('theme', systemTheme);
+                }
+              })();
+            `}}),e.jsx("noscript",{children:e.jsx("style",{children:".theme-toggle-wrapper { display: none !important; }"})})]}),e.jsx("body",{className:"font-base",children:e.jsxs(p,{defaultTheme:"light",children:[s,e.jsx(h,{}),e.jsx(x,{})]})})]})}const N=l(function(){return e.jsx(u,{})}),v=c(function({error:t}){let a="Error",n="Something went wrong",r="An unexpected error occurred.",i;return f(t)&&(a=String(t.status),n=t.status===404?"Page not found":"Request failed",r=t.status===404?"The requested page could not be found.":t.statusText||r),e.jsx("main",{className:"grid min-h-screen place-items-center bg-[radial-gradient(circle_at_top,rgba(186,22,12,0.08),transparent_32rem)] px-4 py-16",children:e.jsxs("section",{className:"mx-auto flex w-full max-w-2xl flex-col items-center text-center","aria-labelledby":"error-title",children:[e.jsx("img",{className:"mb-8 h-auto w-36",src:"/images/logo.svg",alt:"Apache HBase"}),e.jsx("p",{className:"text-muted-foreground text-sm font-semibold tracking-[0.3em] uppercase",children:a}),e.jsx("h1",{id:"error-title",className:"mt-4 text-4xl font-semibold tracking-tight text-balance md:text-6xl",children:n}),e.jsx("p",{className:"text-muted-foreground mt-5 max-w-xl text-lg leading-8 text-pretty md:text-xl",children:r}),e.jsxs("div",{className:"mt-8 flex flex-wrap items-center justify-center gap-3",children:[e.jsx(o,{asChild:!0,size:"lg",children:e.jsx("a",{href:"/",children:"Go back home"})}),e.jsx(o,{asChild:!0,variant:"outline",size:"lg",children:e.jsx("a",{href:"/docs/",children:"Read documentation"})})]}),i]})})});export{v as ErrorBoundary,T as Layout,N as default,S as links};
