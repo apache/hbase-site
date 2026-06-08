@@ -1,0 +1,5 @@
+import{j as e}from"./chunk-QUQL4437-Bywy9pC_.js";let r=`[Apache Phoenix](https://phoenix.apache.org)
+
+[Trafodion: Transactional SQL-on-HBase](https://trafodion.incubator.apache.org/)
+`,c={title:"SQL over HBase",description:"The following projects offer some support for SQL over HBase."},i=[{href:"https://phoenix.apache.org"},{href:"https://trafodion.incubator.apache.org/"}],s={contents:[{heading:void 0,content:"Apache Phoenix"},{heading:void 0,content:"Trafodion: Transactional SQL-on-HBase"}],headings:[]};const h=[];function o(t){const n={a:"a",p:"p",...t.components};return e.jsxs(e.Fragment,{children:[e.jsx(n.p,{children:e.jsx(n.a,{href:"https://phoenix.apache.org",children:"Apache Phoenix"})}),`
+`,e.jsx(n.p,{children:e.jsx(n.a,{href:"https://trafodion.incubator.apache.org/",children:"Trafodion: Transactional SQL-on-HBase"})})]})}function p(t={}){const{wrapper:n}=t.components||{};return n?e.jsx(n,{...t,children:e.jsx(o,{...t})}):o(t)}export{r as _markdown,p as default,i as extractedReferences,c as frontmatter,s as structuredData,h as toc};

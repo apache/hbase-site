@@ -1,0 +1,1 @@
+import{j as s,L as e}from"./chunk-QUQL4437-Bywy9pC_.js";const h=t=>{const o=(typeof t.to=="string"?t.to:t.to.pathname)?.startsWith("https://hbase.apache.org");return s.jsx(e,{reloadDocument:o,...t})};export{h as L};
