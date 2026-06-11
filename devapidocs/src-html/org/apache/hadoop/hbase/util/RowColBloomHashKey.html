@@ -36,15 +36,15 @@
 <span class="source-line-no">023</span><span id="line-23">import org.apache.yetus.audience.InterfaceAudience;</span>
 <span class="source-line-no">024</span><span id="line-24"></span>
 <span class="source-line-no">025</span><span id="line-25">/**</span>
-<span class="source-line-no">026</span><span id="line-26"> * An hash key for ROWCOL bloom. This assumes the cells to be serialized in the Keyvalue</span>
+<span class="source-line-no">026</span><span id="line-26"> * A hash key for ROWCOL bloom. This assumes the cells to be serialized in the Keyvalue</span>
 <span class="source-line-no">027</span><span id="line-27"> * serialization format with Empty column family. Note that the byte representing the family length</span>
 <span class="source-line-no">028</span><span id="line-28"> * is considered to be 0</span>
 <span class="source-line-no">029</span><span id="line-29"> */</span>
 <span class="source-line-no">030</span><span id="line-30">@InterfaceAudience.Private</span>
 <span class="source-line-no">031</span><span id="line-31">public class RowColBloomHashKey extends CellHashKey {</span>
-<span class="source-line-no">032</span><span id="line-32"></span>
-<span class="source-line-no">033</span><span id="line-33">  private final int rowLength;</span>
-<span class="source-line-no">034</span><span id="line-34">  private final int qualLength;</span>
+<span class="source-line-no">032</span><span id="line-32">  private final int rowLength;</span>
+<span class="source-line-no">033</span><span id="line-33">  private final int qualLength;</span>
+<span class="source-line-no">034</span><span id="line-34">  private final int totalLength;</span>
 <span class="source-line-no">035</span><span id="line-35"></span>
 <span class="source-line-no">036</span><span id="line-36">  public RowColBloomHashKey(Cell cell) {</span>
 <span class="source-line-no">037</span><span id="line-37">    super(cell);</span>
@@ -52,53 +52,136 @@
 <span class="source-line-no">039</span><span id="line-39">    // We don't consider the family length for ROWCOL bloom. So subtract the famLen from the</span>
 <span class="source-line-no">040</span><span id="line-40">    // length calculation. Timestamp and type are of no relevance here</span>
 <span class="source-line-no">041</span><span id="line-41">    qualLength = cell.getQualifierLength();</span>
-<span class="source-line-no">042</span><span id="line-42">  }</span>
-<span class="source-line-no">043</span><span id="line-43"></span>
-<span class="source-line-no">044</span><span id="line-44">  @Override</span>
-<span class="source-line-no">045</span><span id="line-45">  public byte get(int offset) {</span>
-<span class="source-line-no">046</span><span id="line-46">    // For ROW_COL blooms we use bytes</span>
-<span class="source-line-no">047</span><span id="line-47">    // &lt;RK length&gt; (2 bytes) , &lt;RK&gt;, 0 (one byte CF length), &lt;CQ&gt;, &lt;TS&gt; (8 btes), &lt;TYPE&gt; ( 1 byte)</span>
-<span class="source-line-no">048</span><span id="line-48">    if (offset &lt; Bytes.SIZEOF_SHORT) {</span>
-<span class="source-line-no">049</span><span id="line-49">      // assign locally</span>
-<span class="source-line-no">050</span><span id="line-50">      int rowlen = rowLength;</span>
-<span class="source-line-no">051</span><span id="line-51">      byte b = (byte) rowlen;</span>
-<span class="source-line-no">052</span><span id="line-52">      if (offset == 0) {</span>
-<span class="source-line-no">053</span><span id="line-53">        rowlen &gt;&gt;= 8;</span>
-<span class="source-line-no">054</span><span id="line-54">        b = (byte) rowlen;</span>
-<span class="source-line-no">055</span><span id="line-55">      }</span>
-<span class="source-line-no">056</span><span id="line-56">      return b;</span>
-<span class="source-line-no">057</span><span id="line-57">    }</span>
-<span class="source-line-no">058</span><span id="line-58">    int refLen = Bytes.SIZEOF_SHORT + rowLength;</span>
-<span class="source-line-no">059</span><span id="line-59">    if (offset &lt; refLen) {</span>
-<span class="source-line-no">060</span><span id="line-60">      return PrivateCellUtil.getRowByte(t, offset - Bytes.SIZEOF_SHORT);</span>
-<span class="source-line-no">061</span><span id="line-61">    }</span>
-<span class="source-line-no">062</span><span id="line-62">    if (offset == refLen) {</span>
-<span class="source-line-no">063</span><span id="line-63">      // The fam length should return 0 assuming there is no column family.</span>
-<span class="source-line-no">064</span><span id="line-64">      // Because for ROWCOL blooms family is not considered</span>
-<span class="source-line-no">065</span><span id="line-65">      return 0;</span>
-<span class="source-line-no">066</span><span id="line-66">    }</span>
-<span class="source-line-no">067</span><span id="line-67">    refLen += qualLength + Bytes.SIZEOF_BYTE;</span>
-<span class="source-line-no">068</span><span id="line-68">    // skip the family len because actual cells may have family also</span>
-<span class="source-line-no">069</span><span id="line-69">    if (offset &lt; refLen) {</span>
-<span class="source-line-no">070</span><span id="line-70">      return PrivateCellUtil.getQualifierByte(t,</span>
-<span class="source-line-no">071</span><span id="line-71">        offset - (Bytes.SIZEOF_SHORT + rowLength + Bytes.SIZEOF_BYTE));</span>
+<span class="source-line-no">042</span><span id="line-42">    // ROWCOL Bloom byte layout:</span>
+<span class="source-line-no">043</span><span id="line-43">    // &lt;2B RK length&gt; &lt;RK&gt; &lt;1B CF length&gt; &lt;CQ&gt; &lt;8B TS&gt; &lt;1B TYPE&gt;</span>
+<span class="source-line-no">044</span><span id="line-44">    totalLength = KeyValue.ROW_LENGTH_SIZE + rowLength + KeyValue.FAMILY_LENGTH_SIZE + qualLength</span>
+<span class="source-line-no">045</span><span id="line-45">      + KeyValue.TIMESTAMP_TYPE_SIZE;</span>
+<span class="source-line-no">046</span><span id="line-46">  }</span>
+<span class="source-line-no">047</span><span id="line-47"></span>
+<span class="source-line-no">048</span><span id="line-48">  @Override</span>
+<span class="source-line-no">049</span><span id="line-49">  public byte get(int offset) {</span>
+<span class="source-line-no">050</span><span id="line-50">    return (byte) assembleCrossingLE(offset, Bytes.SIZEOF_BYTE);</span>
+<span class="source-line-no">051</span><span id="line-51">  }</span>
+<span class="source-line-no">052</span><span id="line-52"></span>
+<span class="source-line-no">053</span><span id="line-53">  @Override</span>
+<span class="source-line-no">054</span><span id="line-54">  public int length() {</span>
+<span class="source-line-no">055</span><span id="line-55">    return totalLength;</span>
+<span class="source-line-no">056</span><span id="line-56">  }</span>
+<span class="source-line-no">057</span><span id="line-57"></span>
+<span class="source-line-no">058</span><span id="line-58">  @Override</span>
+<span class="source-line-no">059</span><span id="line-59">  public int getIntLE(int offset) {</span>
+<span class="source-line-no">060</span><span id="line-60">    // Handle fast path that can return the row key as int directly</span>
+<span class="source-line-no">061</span><span id="line-61">    // Compute rowkey section range.</span>
+<span class="source-line-no">062</span><span id="line-62">    final int rowEnd = KeyValue.ROW_LENGTH_SIZE + rowLength;</span>
+<span class="source-line-no">063</span><span id="line-63">    if (offset &gt;= KeyValue.ROW_LENGTH_SIZE &amp;&amp; offset + Bytes.SIZEOF_INT &lt;= rowEnd) {</span>
+<span class="source-line-no">064</span><span id="line-64">      return LittleEndianBytes.getRowAsInt(t, offset - KeyValue.ROW_LENGTH_SIZE);</span>
+<span class="source-line-no">065</span><span id="line-65">    }</span>
+<span class="source-line-no">066</span><span id="line-66"></span>
+<span class="source-line-no">067</span><span id="line-67">    // Compute qualifier section range.</span>
+<span class="source-line-no">068</span><span id="line-68">    final int qualStart = rowEnd + KeyValue.FAMILY_LENGTH_SIZE;</span>
+<span class="source-line-no">069</span><span id="line-69">    final int qualEnd = qualStart + qualLength;</span>
+<span class="source-line-no">070</span><span id="line-70">    if (offset &gt;= qualStart &amp;&amp; offset + Bytes.SIZEOF_INT &lt;= qualEnd) {</span>
+<span class="source-line-no">071</span><span id="line-71">      return LittleEndianBytes.getQualifierAsInt(t, offset - qualStart);</span>
 <span class="source-line-no">072</span><span id="line-72">    }</span>
-<span class="source-line-no">073</span><span id="line-73">    // TODO : check if ts and type can be removed</span>
-<span class="source-line-no">074</span><span id="line-74">    refLen += KeyValue.TIMESTAMP_SIZE;</span>
-<span class="source-line-no">075</span><span id="line-75">    if (offset &lt; refLen) {</span>
-<span class="source-line-no">076</span><span id="line-76">      return LATEST_TS[offset - (Bytes.SIZEOF_SHORT + rowLength + qualLength + Bytes.SIZEOF_BYTE)];</span>
-<span class="source-line-no">077</span><span id="line-77">    }</span>
-<span class="source-line-no">078</span><span id="line-78">    return MAX_TYPE;</span>
-<span class="source-line-no">079</span><span id="line-79">  }</span>
-<span class="source-line-no">080</span><span id="line-80"></span>
-<span class="source-line-no">081</span><span id="line-81">  @Override</span>
-<span class="source-line-no">082</span><span id="line-82">  public int length() {</span>
-<span class="source-line-no">083</span><span id="line-83">    // For ROW_COL blooms we use bytes</span>
-<span class="source-line-no">084</span><span id="line-84">    // &lt;RK length&gt; (2 bytes) , &lt;RK&gt;, 0 (one byte CF length), &lt;CQ&gt;, &lt;TS&gt; (8 btes), &lt;TYPE&gt; ( 1 byte)</span>
-<span class="source-line-no">085</span><span id="line-85">    return KeyValue.ROW_LENGTH_SIZE + this.t.getRowLength() + KeyValue.FAMILY_LENGTH_SIZE</span>
-<span class="source-line-no">086</span><span id="line-86">      + this.t.getQualifierLength() + KeyValue.TIMESTAMP_TYPE_SIZE;</span>
-<span class="source-line-no">087</span><span id="line-87">  }</span>
-<span class="source-line-no">088</span><span id="line-88">}</span>
+<span class="source-line-no">073</span><span id="line-73"></span>
+<span class="source-line-no">074</span><span id="line-74">    // Compute timestamp section range.</span>
+<span class="source-line-no">075</span><span id="line-75">    final int tsEnd = qualEnd + KeyValue.TIMESTAMP_SIZE;</span>
+<span class="source-line-no">076</span><span id="line-76">    if (offset &gt;= qualEnd &amp;&amp; offset + Bytes.SIZEOF_INT &lt;= tsEnd) {</span>
+<span class="source-line-no">077</span><span id="line-77">      return LittleEndianBytes.toInt(LATEST_TS, offset - qualEnd);</span>
+<span class="source-line-no">078</span><span id="line-78">    }</span>
+<span class="source-line-no">079</span><span id="line-79"></span>
+<span class="source-line-no">080</span><span id="line-80">    return (int) assembleCrossingLE(offset, Bytes.SIZEOF_INT);</span>
+<span class="source-line-no">081</span><span id="line-81">  }</span>
+<span class="source-line-no">082</span><span id="line-82"></span>
+<span class="source-line-no">083</span><span id="line-83">  private long assembleCrossingLE(int offset, int wordBytes) {</span>
+<span class="source-line-no">084</span><span id="line-84">    final int rowEnd = KeyValue.ROW_LENGTH_SIZE + rowLength;</span>
+<span class="source-line-no">085</span><span id="line-85">    final int qualStart = rowEnd + KeyValue.FAMILY_LENGTH_SIZE;</span>
+<span class="source-line-no">086</span><span id="line-86">    final int qualEnd = qualStart + qualLength;</span>
+<span class="source-line-no">087</span><span id="line-87">    final int tsEnd = qualEnd + KeyValue.TIMESTAMP_SIZE;</span>
+<span class="source-line-no">088</span><span id="line-88"></span>
+<span class="source-line-no">089</span><span id="line-89">    long result = 0L;</span>
+<span class="source-line-no">090</span><span id="line-90">    int pos = offset;</span>
+<span class="source-line-no">091</span><span id="line-91">    int remaining = wordBytes;</span>
+<span class="source-line-no">092</span><span id="line-92"></span>
+<span class="source-line-no">093</span><span id="line-93">    while (remaining &gt; 0) {</span>
+<span class="source-line-no">094</span><span id="line-94">      // 1) row length field [0,2)</span>
+<span class="source-line-no">095</span><span id="line-95">      if (pos &lt; KeyValue.ROW_LENGTH_SIZE) {</span>
+<span class="source-line-no">096</span><span id="line-96">        if (pos == 0 &amp;&amp; remaining &gt;= KeyValue.ROW_LENGTH_SIZE) {</span>
+<span class="source-line-no">097</span><span id="line-97">          result |= (rowLength &gt;&gt;&gt; 8) &amp; 0xFF;</span>
+<span class="source-line-no">098</span><span id="line-98">          result |= (rowLength &amp; 0xFF) &lt;&lt; 8;</span>
+<span class="source-line-no">099</span><span id="line-99">          pos += 2;</span>
+<span class="source-line-no">100</span><span id="line-100">          remaining -= 2;</span>
+<span class="source-line-no">101</span><span id="line-101">        } else if (pos == 0) {</span>
+<span class="source-line-no">102</span><span id="line-102">          result |= (rowLength &gt;&gt;&gt; 8) &amp; 0xFF;</span>
+<span class="source-line-no">103</span><span id="line-103">          pos += 1;</span>
+<span class="source-line-no">104</span><span id="line-104">          remaining -= 1;</span>
+<span class="source-line-no">105</span><span id="line-105">        } else {</span>
+<span class="source-line-no">106</span><span id="line-106">          result |= rowLength &amp; 0xFF;</span>
+<span class="source-line-no">107</span><span id="line-107">          pos += 1;</span>
+<span class="source-line-no">108</span><span id="line-108">          remaining -= 1;</span>
+<span class="source-line-no">109</span><span id="line-109">        }</span>
+<span class="source-line-no">110</span><span id="line-110">        continue;</span>
+<span class="source-line-no">111</span><span id="line-111">      }</span>
+<span class="source-line-no">112</span><span id="line-112"></span>
+<span class="source-line-no">113</span><span id="line-113">      // 2) row bytes [2, rowEnd)</span>
+<span class="source-line-no">114</span><span id="line-114">      if (pos &lt; rowEnd) {</span>
+<span class="source-line-no">115</span><span id="line-115">        final int take = Math.min(rowEnd - pos, remaining);</span>
+<span class="source-line-no">116</span><span id="line-116">        final int rOffset = pos - KeyValue.ROW_LENGTH_SIZE;</span>
+<span class="source-line-no">117</span><span id="line-117">        for (int i = 0; i &lt; take; i++) {</span>
+<span class="source-line-no">118</span><span id="line-118">          final int shift = (wordBytes - remaining) * 8;</span>
+<span class="source-line-no">119</span><span id="line-119">          final byte b = PrivateCellUtil.getRowByte(t, rOffset + i);</span>
+<span class="source-line-no">120</span><span id="line-120">          result |= ((long) b &amp; 0xFF) &lt;&lt; shift;</span>
+<span class="source-line-no">121</span><span id="line-121">          remaining -= 1;</span>
+<span class="source-line-no">122</span><span id="line-122">        }</span>
+<span class="source-line-no">123</span><span id="line-123">        pos += take;</span>
+<span class="source-line-no">124</span><span id="line-124">        continue;</span>
+<span class="source-line-no">125</span><span id="line-125">      }</span>
+<span class="source-line-no">126</span><span id="line-126"></span>
+<span class="source-line-no">127</span><span id="line-127">      // 3) family length byte (always 0)</span>
+<span class="source-line-no">128</span><span id="line-128">      if (pos == rowEnd) {</span>
+<span class="source-line-no">129</span><span id="line-129">        pos += 1;</span>
+<span class="source-line-no">130</span><span id="line-130">        remaining -= 1;</span>
+<span class="source-line-no">131</span><span id="line-131">        continue;</span>
+<span class="source-line-no">132</span><span id="line-132">      }</span>
+<span class="source-line-no">133</span><span id="line-133"></span>
+<span class="source-line-no">134</span><span id="line-134">      // 4) qualifier bytes [qualStart, qualEnd)</span>
+<span class="source-line-no">135</span><span id="line-135">      if (pos &lt; qualEnd) {</span>
+<span class="source-line-no">136</span><span id="line-136">        final int take = Math.min(qualEnd - pos, remaining);</span>
+<span class="source-line-no">137</span><span id="line-137">        final int qOffset = pos - qualStart;</span>
+<span class="source-line-no">138</span><span id="line-138">        for (int i = 0; i &lt; take; i++) {</span>
+<span class="source-line-no">139</span><span id="line-139">          final int shift = (wordBytes - remaining) * 8;</span>
+<span class="source-line-no">140</span><span id="line-140">          final int b = PrivateCellUtil.getQualifierByte(t, qOffset + i) &amp; 0xFF;</span>
+<span class="source-line-no">141</span><span id="line-141">          result |= ((long) b) &lt;&lt; shift;</span>
+<span class="source-line-no">142</span><span id="line-142">          remaining -= 1;</span>
+<span class="source-line-no">143</span><span id="line-143">        }</span>
+<span class="source-line-no">144</span><span id="line-144">        pos += take;</span>
+<span class="source-line-no">145</span><span id="line-145">        continue;</span>
+<span class="source-line-no">146</span><span id="line-146">      }</span>
+<span class="source-line-no">147</span><span id="line-147"></span>
+<span class="source-line-no">148</span><span id="line-148">      // 5) timestamp bytes [qualEnd, tsEnd) -&gt; LATEST_TS</span>
+<span class="source-line-no">149</span><span id="line-149">      if (pos &lt; tsEnd) {</span>
+<span class="source-line-no">150</span><span id="line-150">        final int take = Math.min(tsEnd - pos, remaining);</span>
+<span class="source-line-no">151</span><span id="line-151">        final int tsOff = pos - qualEnd;</span>
+<span class="source-line-no">152</span><span id="line-152">        for (int i = 0; i &lt; take; i++) {</span>
+<span class="source-line-no">153</span><span id="line-153">          final int shift = (wordBytes - remaining) * 8;</span>
+<span class="source-line-no">154</span><span id="line-154">          final int b = LATEST_TS[tsOff + i] &amp; 0xFF;</span>
+<span class="source-line-no">155</span><span id="line-155">          result |= ((long) b) &lt;&lt; shift;</span>
+<span class="source-line-no">156</span><span id="line-156">          remaining -= 1;</span>
+<span class="source-line-no">157</span><span id="line-157">        }</span>
+<span class="source-line-no">158</span><span id="line-158">        pos += take;</span>
+<span class="source-line-no">159</span><span id="line-159">        continue;</span>
+<span class="source-line-no">160</span><span id="line-160">      }</span>
+<span class="source-line-no">161</span><span id="line-161"></span>
+<span class="source-line-no">162</span><span id="line-162">      // 6) type byte at typePos -&gt; MAX_TYPE</span>
+<span class="source-line-no">163</span><span id="line-163">      final int shift = (wordBytes - remaining) * 8;</span>
+<span class="source-line-no">164</span><span id="line-164">      result |= ((long) MAX_TYPE &amp; 0xFF) &lt;&lt; shift;</span>
+<span class="source-line-no">165</span><span id="line-165">      pos += 1;</span>
+<span class="source-line-no">166</span><span id="line-166">      remaining -= 1;</span>
+<span class="source-line-no">167</span><span id="line-167">    }</span>
+<span class="source-line-no">168</span><span id="line-168"></span>
+<span class="source-line-no">169</span><span id="line-169">    return result;</span>
+<span class="source-line-no">170</span><span id="line-170">  }</span>
+<span class="source-line-no">171</span><span id="line-171">}</span>
 
 
 
