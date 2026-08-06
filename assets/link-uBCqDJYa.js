@@ -1,0 +1,1 @@
+import{j as s}from"./components-BCHf_v1I.js";import{L as e}from"./index-iRMX2DbM.js";const i=t=>{const o=(typeof t.to=="string"?t.to:t.to.pathname)?.startsWith("https://hbase.apache.org");return s.jsx(e,{reloadDocument:o,...t})};export{i as L};

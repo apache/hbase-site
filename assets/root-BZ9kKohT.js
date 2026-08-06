@@ -1,0 +1,15 @@
+import{w as l,a as c,j as e,O as m,i as d}from"./components-BCHf_v1I.js";import{M as h,L as x,S as u}from"./errorBoundaries-BdFLuvV-.js";import{b as f}from"./index-iRMX2DbM.js";import{T as p}from"./theme-provider-eqGhTcE0.js";import{B as n}from"./button-BfmkNV0G.js";import"./utils-BLPMsyIW.js";const g="/assets/app-BIpPujSC.css",T=()=>[{rel:"preload",as:"font",href:"/fonts/inter-latin-wght-normal.woff2",type:"font/woff2",crossOrigin:"anonymous"},{rel:"prefetch",as:"font",href:"/fonts/inter-latin-wght-italic.woff2",type:"font/woff2",crossOrigin:"anonymous"},{rel:"stylesheet",href:g}];function N({children:s}){return e.jsxs("html",{lang:"en",suppressHydrationWarning:!0,children:[e.jsxs("head",{children:[e.jsx("meta",{charSet:"utf-8"}),e.jsx("meta",{name:"viewport",content:"width=device-width, initial-scale=1"}),e.jsx(h,{}),e.jsx(x,{}),e.jsx("script",{dangerouslySetInnerHTML:{__html:`
+              (function() {
+                const theme = localStorage.getItem('theme');
+                const root = document.documentElement;
+                root.classList.remove('light', 'dark');
+                
+                if (theme && ['light', 'dark'].includes(theme)) {
+                  root.classList.add(theme);
+                } else {
+                  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                  root.classList.add(systemTheme);
+                  localStorage.setItem('theme', systemTheme);
+                }
+              })();
+            `}}),e.jsx("noscript",{children:e.jsx("style",{children:".theme-toggle-wrapper { display: none !important; }"})})]}),e.jsx("body",{className:"font-base",children:e.jsxs(p,{defaultTheme:"light",children:[s,e.jsx(f,{}),e.jsx(u,{})]})})]})}const v=l(function(){return e.jsx(m,{})}),B=c(function({error:t}){let a="Error",o="Something went wrong",r="An unexpected error occurred.",i;return d(t)&&(a=String(t.status),o=t.status===404?"Page not found":"Request failed",r=t.status===404?"The requested page could not be found.":t.statusText||r),e.jsx("main",{className:"grid min-h-screen place-items-center bg-[radial-gradient(circle_at_top,rgba(186,22,12,0.08),transparent_32rem)] px-4 py-16",children:e.jsxs("section",{className:"mx-auto flex w-full max-w-2xl flex-col items-center text-center","aria-labelledby":"error-title",children:[e.jsx("img",{className:"mb-8 h-auto w-36",src:"/images/logo.svg",alt:"Apache HBase"}),e.jsx("p",{className:"text-muted-foreground text-sm font-semibold tracking-[0.3em] uppercase",children:a}),e.jsx("h1",{id:"error-title",className:"mt-4 text-4xl font-semibold tracking-tight text-balance md:text-6xl",children:o}),e.jsx("p",{className:"text-muted-foreground mt-5 max-w-xl text-lg leading-8 text-pretty md:text-xl",children:r}),e.jsxs("div",{className:"mt-8 flex flex-wrap items-center justify-center gap-3",children:[e.jsx(n,{asChild:!0,size:"lg",children:e.jsx("a",{href:"/",children:"Go back home"})}),e.jsx(n,{asChild:!0,variant:"outline",size:"lg",children:e.jsx("a",{href:"/docs/",children:"Read documentation"})})]}),i]})})});export{B as ErrorBoundary,N as Layout,v as default,T as links};

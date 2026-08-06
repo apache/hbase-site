@@ -1,0 +1,1 @@
+const n={},s="/";function f(...t){let i="";for(let e of t)i.length>0&&(e.startsWith("/")&&(e=e.slice(1)),i.endsWith("/")||(i+="/")),i+=e;return i}function o(t){return t.startsWith("http://")||t.startsWith("https://")||(t.startsWith("/")||(t="/"+t),t.length>1&&t.endsWith("/")&&(t=t.slice(0,-1))),t}export{s as B,f as j,o as n};
