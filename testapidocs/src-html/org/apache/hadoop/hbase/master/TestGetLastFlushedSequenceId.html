@@ -156,7 +156,61 @@
 <span class="source-line-no">143</span><span id="line-143">      table.close();</span>
 <span class="source-line-no">144</span><span id="line-144">    }</span>
 <span class="source-line-no">145</span><span id="line-145">  }</span>
-<span class="source-line-no">146</span><span id="line-146">}</span>
+<span class="source-line-no">146</span><span id="line-146"></span>
+<span class="source-line-no">147</span><span id="line-147">  /**</span>
+<span class="source-line-no">148</span><span id="line-148">   * HBASE-30335 follow-up: on graceful region CLOSE the RS reports the region's final durable</span>
+<span class="source-line-no">149</span><span id="line-149">   * flushed seqid, and the master must lift its flushedSequenceIdByRegion watermark to that value.</span>
+<span class="source-line-no">150</span><span id="line-150">   * This complements the OPEN-time seed and covers the drain-move / disable window: if the source</span>
+<span class="source-line-no">151</span><span id="line-151">   * RS crashes after the close, a subsequent WAL split must see the already-durable edits as</span>
+<span class="source-line-no">152</span><span id="line-152">   * flushed and not resurrect them as orphaned recovered.edits. Leaves unflushed edits in the</span>
+<span class="source-line-no">153</span><span id="line-153">   * memstore so that the close itself flushes and advances the region's maxFlushedSeqId; a</span>
+<span class="source-line-no">154</span><span id="line-154">   * heartbeat sent before the close cannot carry that value, so only the CLOSE report can deliver</span>
+<span class="source-line-no">155</span><span id="line-155">   * it. Disables the table (a graceful close that keeps the region - unlike delete/split/merge,</span>
+<span class="source-line-no">156</span><span id="line-156">   * disable does not call ServerManager#removeRegion) and asserts the watermark equals the</span>
+<span class="source-line-no">157</span><span id="line-157">   * post-close flushed seqid.</span>
+<span class="source-line-no">158</span><span id="line-158">   */</span>
+<span class="source-line-no">159</span><span id="line-159">  @Test</span>
+<span class="source-line-no">160</span><span id="line-160">  public void testFlushedSequenceIdSeededOnRegionClose() throws IOException, InterruptedException {</span>
+<span class="source-line-no">161</span><span id="line-161">    TableName freshTable = TableName.valueOf(getClass().getSimpleName(), "closeseed");</span>
+<span class="source-line-no">162</span><span id="line-162">    testUtil.getAdmin()</span>
+<span class="source-line-no">163</span><span id="line-163">      .createNamespace(NamespaceDescriptor.create(freshTable.getNamespaceAsString()).build());</span>
+<span class="source-line-no">164</span><span id="line-164">    Table table = testUtil.createTable(freshTable, families);</span>
+<span class="source-line-no">165</span><span id="line-165">    try {</span>
+<span class="source-line-no">166</span><span id="line-166">      SingleProcessHBaseCluster cluster = testUtil.getMiniHBaseCluster();</span>
+<span class="source-line-no">167</span><span id="line-167">      HRegion region = null;</span>
+<span class="source-line-no">168</span><span id="line-168">      for (JVMClusterUtil.RegionServerThread rst : cluster.getRegionServerThreads()) {</span>
+<span class="source-line-no">169</span><span id="line-169">        for (HRegion r : rst.getRegionServer().getRegions(freshTable)) {</span>
+<span class="source-line-no">170</span><span id="line-170">          region = r;</span>
+<span class="source-line-no">171</span><span id="line-171">          break;</span>
+<span class="source-line-no">172</span><span id="line-172">        }</span>
+<span class="source-line-no">173</span><span id="line-173">        if (region != null) {</span>
+<span class="source-line-no">174</span><span id="line-174">          break;</span>
+<span class="source-line-no">175</span><span id="line-175">        }</span>
+<span class="source-line-no">176</span><span id="line-176">      }</span>
+<span class="source-line-no">177</span><span id="line-177">      assertNotNull(region);</span>
+<span class="source-line-no">178</span><span id="line-178">      // Leave the edits unflushed: heartbeats only report the region's maxFlushedSeqId, which</span>
+<span class="source-line-no">179</span><span id="line-179">      // stays put until the close flushes the memstore.</span>
+<span class="source-line-no">180</span><span id="line-180">      for (int i = 0; i &lt; 3; i++) {</span>
+<span class="source-line-no">181</span><span id="line-181">        table.put(new Put(Bytes.toBytes("k" + i)).addColumn(family, Bytes.toBytes("q"),</span>
+<span class="source-line-no">182</span><span id="line-182">          Bytes.toBytes("v" + i)));</span>
+<span class="source-line-no">183</span><span id="line-183">      }</span>
+<span class="source-line-no">184</span><span id="line-184">      long preCloseFlushedSeqId = region.getMaxFlushedSeqId();</span>
+<span class="source-line-no">185</span><span id="line-185">      byte[] encodedName = region.getRegionInfo().getEncodedNameAsBytes();</span>
+<span class="source-line-no">186</span><span id="line-186">      // Gracefully close the region (disable keeps the region entry - it is not removed like a</span>
+<span class="source-line-no">187</span><span id="line-187">      // delete/split/merge would), driving a CLOSED transition that carries the flushed seqid.</span>
+<span class="source-line-no">188</span><span id="line-188">      testUtil.getAdmin().disableTable(freshTable);</span>
+<span class="source-line-no">189</span><span id="line-189">      long closeFlushedSeqId = region.getMaxFlushedSeqId();</span>
+<span class="source-line-no">190</span><span id="line-190">      assertTrue(closeFlushedSeqId &gt; preCloseFlushedSeqId, "test setup: close flush should advance"</span>
+<span class="source-line-no">191</span><span id="line-191">        + " maxFlushedSeqId past " + preCloseFlushedSeqId + ", got " + closeFlushedSeqId);</span>
+<span class="source-line-no">192</span><span id="line-192">      RegionStoreSequenceIds ids = testUtil.getHBaseCluster().getMaster().getServerManager()</span>
+<span class="source-line-no">193</span><span id="line-193">        .getLastFlushedSequenceId(encodedName);</span>
+<span class="source-line-no">194</span><span id="line-194">      assertEquals(closeFlushedSeqId, ids.getLastFlushedSequenceId(),</span>
+<span class="source-line-no">195</span><span id="line-195">        "flushedSequenceIdByRegion should be seeded with the region's flushed seqid on CLOSE");</span>
+<span class="source-line-no">196</span><span id="line-196">    } finally {</span>
+<span class="source-line-no">197</span><span id="line-197">      table.close();</span>
+<span class="source-line-no">198</span><span id="line-198">    }</span>
+<span class="source-line-no">199</span><span id="line-199">  }</span>
+<span class="source-line-no">200</span><span id="line-200">}</span>
 
 
 
