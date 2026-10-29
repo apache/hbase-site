@@ -33,9 +33,9 @@
 <span class="source-line-no">020</span><span id="line-20">import java.io.IOException;</span>
 <span class="source-line-no">021</span><span id="line-21">import java.util.concurrent.CompletableFuture;</span>
 <span class="source-line-no">022</span><span id="line-22">import java.util.concurrent.ExecutorService;</span>
-<span class="source-line-no">023</span><span id="line-23">import java.util.function.Consumer;</span>
-<span class="source-line-no">024</span><span id="line-24">import java.util.function.Supplier;</span>
-<span class="source-line-no">025</span><span id="line-25">import org.apache.commons.lang3.mutable.MutableBoolean;</span>
+<span class="source-line-no">023</span><span id="line-23">import java.util.concurrent.atomic.AtomicInteger;</span>
+<span class="source-line-no">024</span><span id="line-24">import java.util.function.Consumer;</span>
+<span class="source-line-no">025</span><span id="line-25">import java.util.function.Supplier;</span>
 <span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.master.procedure.MasterProcedureEnv;</span>
 <span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.util.FutureUtils;</span>
 <span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.util.IdLock;</span>
@@ -73,71 +73,70 @@
 <span class="source-line-no">060</span><span id="line-60">    Consumer&lt;CompletableFuture&lt;Void&gt;&gt; setFuture, CompletableFuture&lt;Void&gt; future,</span>
 <span class="source-line-no">061</span><span id="line-61">    MasterProcedureEnv env, Runnable actionAfterDone)</span>
 <span class="source-line-no">062</span><span id="line-62">    throws IOException, ProcedureSuspendedException {</span>
-<span class="source-line-no">063</span><span id="line-63">    MutableBoolean completed = new MutableBoolean(false);</span>
-<span class="source-line-no">064</span><span id="line-64">    Thread currentThread = Thread.currentThread();</span>
-<span class="source-line-no">065</span><span id="line-65">    // This is for testing. In ProcedureTestingUtility, we will restart a ProcedureExecutor and</span>
-<span class="source-line-no">066</span><span id="line-66">    // reuse it, for performance, so we need to make sure that all the procedure have been stopped.</span>
-<span class="source-line-no">067</span><span id="line-67">    // But here, the callback of this future is not executed in a PEWorker, so in ProcedureExecutor</span>
-<span class="source-line-no">068</span><span id="line-68">    // we have no way to stop it. So here, we will get the asyncTaskExecutor first, in the PEWorker</span>
-<span class="source-line-no">069</span><span id="line-69">    // thread, where the ProcedureExecutor should have not been stopped yet, then when calling the</span>
-<span class="source-line-no">070</span><span id="line-70">    // callback, if the ProcedureExecutor have already been stopped and restarted, the</span>
-<span class="source-line-no">071</span><span id="line-71">    // asyncTaskExecutor will also be shutdown so we can not add anything back to the scheduler.</span>
-<span class="source-line-no">072</span><span id="line-72">    ExecutorService asyncTaskExecutor = env.getAsyncTaskExecutor();</span>
-<span class="source-line-no">073</span><span id="line-73">    FutureUtils.addListener(future, (r, e) -&gt; {</span>
-<span class="source-line-no">074</span><span id="line-74">      if (Thread.currentThread() == currentThread) {</span>
-<span class="source-line-no">075</span><span id="line-75">        LOG.debug("The future has completed while adding callback, give up suspending procedure {}",</span>
-<span class="source-line-no">076</span><span id="line-76">          proc);</span>
-<span class="source-line-no">077</span><span id="line-77">        // this means the future has already been completed, as we call the callback directly while</span>
-<span class="source-line-no">078</span><span id="line-78">        // calling addListener, so here we just set completed to true without doing anything</span>
-<span class="source-line-no">079</span><span id="line-79">        completed.setTrue();</span>
-<span class="source-line-no">080</span><span id="line-80">        return;</span>
-<span class="source-line-no">081</span><span id="line-81">      }</span>
-<span class="source-line-no">082</span><span id="line-82">      LOG.debug("Going to wake up procedure {} because future has completed", proc);</span>
-<span class="source-line-no">083</span><span id="line-83">      // This callback may be called inside netty's event loop, so we should not block it for a long</span>
-<span class="source-line-no">084</span><span id="line-84">      // time. The worker executor will hold the execution lock while executing the procedure, and</span>
-<span class="source-line-no">085</span><span id="line-85">      // we may persist the procedure state inside the lock, which is a time consuming operation.</span>
-<span class="source-line-no">086</span><span id="line-86">      // And what makes things worse is that, we persist procedure state to master local region,</span>
-<span class="source-line-no">087</span><span id="line-87">      // where the AsyncFSWAL implementation will use the same netty's event loop for dealing with</span>
-<span class="source-line-no">088</span><span id="line-88">      // I/O, which could even cause dead lock.</span>
-<span class="source-line-no">089</span><span id="line-89">      asyncTaskExecutor.execute(() -&gt; wakeUp(proc, env));</span>
-<span class="source-line-no">090</span><span id="line-90">    });</span>
-<span class="source-line-no">091</span><span id="line-91">    if (completed.getValue()) {</span>
-<span class="source-line-no">092</span><span id="line-92">      FutureUtils.get(future);</span>
-<span class="source-line-no">093</span><span id="line-93">      actionAfterDone.run();</span>
-<span class="source-line-no">094</span><span id="line-94">    } else {</span>
-<span class="source-line-no">095</span><span id="line-95">      // suspend the procedure</span>
-<span class="source-line-no">096</span><span id="line-96">      setFuture.accept(future);</span>
-<span class="source-line-no">097</span><span id="line-97">      proc.skipPersistence();</span>
-<span class="source-line-no">098</span><span id="line-98">      suspend(proc);</span>
-<span class="source-line-no">099</span><span id="line-99">    }</span>
-<span class="source-line-no">100</span><span id="line-100">  }</span>
-<span class="source-line-no">101</span><span id="line-101"></span>
-<span class="source-line-no">102</span><span id="line-102">  public static void suspend(Procedure&lt;?&gt; proc) throws ProcedureSuspendedException {</span>
-<span class="source-line-no">103</span><span id="line-103">    proc.skipPersistence();</span>
-<span class="source-line-no">104</span><span id="line-104">    throw new ProcedureSuspendedException();</span>
-<span class="source-line-no">105</span><span id="line-105">  }</span>
-<span class="source-line-no">106</span><span id="line-106"></span>
-<span class="source-line-no">107</span><span id="line-107">  public static void wakeUp(Procedure&lt;?&gt; proc, MasterProcedureEnv env) {</span>
-<span class="source-line-no">108</span><span id="line-108">    // should acquire procedure execution lock to make sure that the procedure executor has</span>
-<span class="source-line-no">109</span><span id="line-109">    // finished putting this procedure to the WAITING_TIMEOUT state, otherwise there could be</span>
-<span class="source-line-no">110</span><span id="line-110">    // race and cause unexpected result</span>
-<span class="source-line-no">111</span><span id="line-111">    IdLock procLock = env.getMasterServices().getMasterProcedureExecutor().getProcExecutionLock();</span>
-<span class="source-line-no">112</span><span id="line-112">    IdLock.Entry lockEntry;</span>
-<span class="source-line-no">113</span><span id="line-113">    try {</span>
-<span class="source-line-no">114</span><span id="line-114">      lockEntry = procLock.getLockEntry(proc.getProcId());</span>
-<span class="source-line-no">115</span><span id="line-115">    } catch (IOException e) {</span>
-<span class="source-line-no">116</span><span id="line-116">      LOG.error("Error while acquiring execution lock for procedure {}"</span>
-<span class="source-line-no">117</span><span id="line-117">        + " when trying to wake it up, aborting...", proc, e);</span>
-<span class="source-line-no">118</span><span id="line-118">      env.getMasterServices().abort("Can not acquire procedure execution lock", e);</span>
-<span class="source-line-no">119</span><span id="line-119">      return;</span>
-<span class="source-line-no">120</span><span id="line-120">    }</span>
-<span class="source-line-no">121</span><span id="line-121">    try {</span>
-<span class="source-line-no">122</span><span id="line-122">      env.getProcedureScheduler().addFront(proc);</span>
-<span class="source-line-no">123</span><span id="line-123">    } finally {</span>
-<span class="source-line-no">124</span><span id="line-124">      procLock.releaseLockEntry(lockEntry);</span>
-<span class="source-line-no">125</span><span id="line-125">    }</span>
-<span class="source-line-no">126</span><span id="line-126">  }</span>
-<span class="source-line-no">127</span><span id="line-127">}</span>
+<span class="source-line-no">063</span><span id="line-63">    AtomicInteger completed = new AtomicInteger(0);</span>
+<span class="source-line-no">064</span><span id="line-64">    // This is for testing. In ProcedureTestingUtility, we will restart a ProcedureExecutor and</span>
+<span class="source-line-no">065</span><span id="line-65">    // reuse it, for performance, so we need to make sure that all the procedure have been stopped.</span>
+<span class="source-line-no">066</span><span id="line-66">    // But here, the callback of this future is not executed in a PEWorker, so in ProcedureExecutor</span>
+<span class="source-line-no">067</span><span id="line-67">    // we have no way to stop it. So here, we will get the asyncTaskExecutor first, in the PEWorker</span>
+<span class="source-line-no">068</span><span id="line-68">    // thread, where the ProcedureExecutor should have not been stopped yet, then when calling the</span>
+<span class="source-line-no">069</span><span id="line-69">    // callback, if the ProcedureExecutor have already been stopped and restarted, the</span>
+<span class="source-line-no">070</span><span id="line-70">    // asyncTaskExecutor will also be shutdown so we can not add anything back to the scheduler.</span>
+<span class="source-line-no">071</span><span id="line-71">    ExecutorService asyncTaskExecutor = env.getAsyncTaskExecutor();</span>
+<span class="source-line-no">072</span><span id="line-72">    FutureUtils.addListener(future, (r, e) -&gt; {</span>
+<span class="source-line-no">073</span><span id="line-73">      if (completed.compareAndSet(0, 1)) {</span>
+<span class="source-line-no">074</span><span id="line-74">        // this means the future has already been completed, as we have not execute the below</span>
+<span class="source-line-no">075</span><span id="line-75">        // compareAndSet(0, 2) yet, so here we just set completed to true without doing anything</span>
+<span class="source-line-no">076</span><span id="line-76">        LOG.debug("The future has completed while adding callback, give up suspending procedure {}",</span>
+<span class="source-line-no">077</span><span id="line-77">          proc);</span>
+<span class="source-line-no">078</span><span id="line-78">        return;</span>
+<span class="source-line-no">079</span><span id="line-79">      }</span>
+<span class="source-line-no">080</span><span id="line-80">      LOG.debug("Going to wake up procedure {} because future has completed", proc);</span>
+<span class="source-line-no">081</span><span id="line-81">      // This callback may be called inside netty's event loop, so we should not block it for a long</span>
+<span class="source-line-no">082</span><span id="line-82">      // time. The worker executor will hold the execution lock while executing the procedure, and</span>
+<span class="source-line-no">083</span><span id="line-83">      // we may persist the procedure state inside the lock, which is a time consuming operation.</span>
+<span class="source-line-no">084</span><span id="line-84">      // And what makes things worse is that, we persist procedure state to master local region,</span>
+<span class="source-line-no">085</span><span id="line-85">      // where the AsyncFSWAL implementation will use the same netty's event loop for dealing with</span>
+<span class="source-line-no">086</span><span id="line-86">      // I/O, which could even cause dead lock.</span>
+<span class="source-line-no">087</span><span id="line-87">      asyncTaskExecutor.execute(() -&gt; wakeUp(proc, env));</span>
+<span class="source-line-no">088</span><span id="line-88">    });</span>
+<span class="source-line-no">089</span><span id="line-89">    if (completed.compareAndSet(0, 2)) {</span>
+<span class="source-line-no">090</span><span id="line-90">      // suspend the procedure</span>
+<span class="source-line-no">091</span><span id="line-91">      setFuture.accept(future);</span>
+<span class="source-line-no">092</span><span id="line-92">      suspend(proc);</span>
+<span class="source-line-no">093</span><span id="line-93">    } else {</span>
+<span class="source-line-no">094</span><span id="line-94">      // if completed has been set to 1, i.e, not 0, it means the future has already been completed,</span>
+<span class="source-line-no">095</span><span id="line-95">      // so we give up suspending and call the done action directly.</span>
+<span class="source-line-no">096</span><span id="line-96">      FutureUtils.get(future);</span>
+<span class="source-line-no">097</span><span id="line-97">      actionAfterDone.run();</span>
+<span class="source-line-no">098</span><span id="line-98">    }</span>
+<span class="source-line-no">099</span><span id="line-99">  }</span>
+<span class="source-line-no">100</span><span id="line-100"></span>
+<span class="source-line-no">101</span><span id="line-101">  public static void suspend(Procedure&lt;?&gt; proc) throws ProcedureSuspendedException {</span>
+<span class="source-line-no">102</span><span id="line-102">    proc.skipPersistence();</span>
+<span class="source-line-no">103</span><span id="line-103">    throw new ProcedureSuspendedException();</span>
+<span class="source-line-no">104</span><span id="line-104">  }</span>
+<span class="source-line-no">105</span><span id="line-105"></span>
+<span class="source-line-no">106</span><span id="line-106">  public static void wakeUp(Procedure&lt;?&gt; proc, MasterProcedureEnv env) {</span>
+<span class="source-line-no">107</span><span id="line-107">    // should acquire procedure execution lock to make sure that the procedure executor has</span>
+<span class="source-line-no">108</span><span id="line-108">    // finished putting this procedure to the WAITING_TIMEOUT state, otherwise there could be</span>
+<span class="source-line-no">109</span><span id="line-109">    // race and cause unexpected result</span>
+<span class="source-line-no">110</span><span id="line-110">    IdLock procLock = env.getMasterServices().getMasterProcedureExecutor().getProcExecutionLock();</span>
+<span class="source-line-no">111</span><span id="line-111">    IdLock.Entry lockEntry;</span>
+<span class="source-line-no">112</span><span id="line-112">    try {</span>
+<span class="source-line-no">113</span><span id="line-113">      lockEntry = procLock.getLockEntry(proc.getProcId());</span>
+<span class="source-line-no">114</span><span id="line-114">    } catch (IOException e) {</span>
+<span class="source-line-no">115</span><span id="line-115">      LOG.error("Error while acquiring execution lock for procedure {}"</span>
+<span class="source-line-no">116</span><span id="line-116">        + " when trying to wake it up, aborting...", proc, e);</span>
+<span class="source-line-no">117</span><span id="line-117">      env.getMasterServices().abort("Can not acquire procedure execution lock", e);</span>
+<span class="source-line-no">118</span><span id="line-118">      return;</span>
+<span class="source-line-no">119</span><span id="line-119">    }</span>
+<span class="source-line-no">120</span><span id="line-120">    try {</span>
+<span class="source-line-no">121</span><span id="line-121">      env.getProcedureScheduler().addFront(proc);</span>
+<span class="source-line-no">122</span><span id="line-122">    } finally {</span>
+<span class="source-line-no">123</span><span id="line-123">      procLock.releaseLockEntry(lockEntry);</span>
+<span class="source-line-no">124</span><span id="line-124">    }</span>
+<span class="source-line-no">125</span><span id="line-125">  }</span>
+<span class="source-line-no">126</span><span id="line-126">}</span>
 
 
 
