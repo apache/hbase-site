@@ -36,148 +36,149 @@
 <span class="source-line-no">023</span><span id="line-23">import java.util.concurrent.Callable;</span>
 <span class="source-line-no">024</span><span id="line-24">import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;</span>
 <span class="source-line-no">025</span><span id="line-25">import org.apache.hadoop.hbase.backup.master.LogRollMasterProcedureManager;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.client.Connection;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.errorhandling.ForeignException;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.procedure.ProcedureMember;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.procedure.Subprocedure;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.regionserver.HRegionServer;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.regionserver.RegionServerServices;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.wal.WAL;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.apache.yetus.audience.InterfaceAudience;</span>
-<span class="source-line-no">037</span><span id="line-37">import org.slf4j.Logger;</span>
-<span class="source-line-no">038</span><span id="line-38">import org.slf4j.LoggerFactory;</span>
-<span class="source-line-no">039</span><span id="line-39"></span>
-<span class="source-line-no">040</span><span id="line-40">/**</span>
-<span class="source-line-no">041</span><span id="line-41"> * This backup sub-procedure implementation forces a WAL rolling on a RS.</span>
-<span class="source-line-no">042</span><span id="line-42"> */</span>
-<span class="source-line-no">043</span><span id="line-43">@InterfaceAudience.Private</span>
-<span class="source-line-no">044</span><span id="line-44">public class LogRollBackupSubprocedure extends Subprocedure {</span>
-<span class="source-line-no">045</span><span id="line-45">  private static final Logger LOG = LoggerFactory.getLogger(LogRollBackupSubprocedure.class);</span>
-<span class="source-line-no">046</span><span id="line-46"></span>
-<span class="source-line-no">047</span><span id="line-47">  private final RegionServerServices rss;</span>
-<span class="source-line-no">048</span><span id="line-48">  private final LogRollBackupSubprocedurePool taskManager;</span>
-<span class="source-line-no">049</span><span id="line-49">  private String backupRoot;</span>
-<span class="source-line-no">050</span><span id="line-50"></span>
-<span class="source-line-no">051</span><span id="line-51">  public LogRollBackupSubprocedure(RegionServerServices rss, ProcedureMember member,</span>
-<span class="source-line-no">052</span><span id="line-52">    ForeignExceptionDispatcher errorListener, long wakeFrequency, long timeout,</span>
-<span class="source-line-no">053</span><span id="line-53">    LogRollBackupSubprocedurePool taskManager, byte[] data) {</span>
-<span class="source-line-no">054</span><span id="line-54">    super(member, LogRollMasterProcedureManager.ROLLLOG_PROCEDURE_NAME, errorListener,</span>
-<span class="source-line-no">055</span><span id="line-55">      wakeFrequency, timeout);</span>
-<span class="source-line-no">056</span><span id="line-56">    LOG.info("Constructing a LogRollBackupSubprocedure.");</span>
-<span class="source-line-no">057</span><span id="line-57">    this.rss = rss;</span>
-<span class="source-line-no">058</span><span id="line-58">    this.taskManager = taskManager;</span>
-<span class="source-line-no">059</span><span id="line-59">    if (data != null) {</span>
-<span class="source-line-no">060</span><span id="line-60">      backupRoot = new String(data, StandardCharsets.UTF_8);</span>
-<span class="source-line-no">061</span><span id="line-61">    }</span>
-<span class="source-line-no">062</span><span id="line-62">  }</span>
-<span class="source-line-no">063</span><span id="line-63"></span>
-<span class="source-line-no">064</span><span id="line-64">  /**</span>
-<span class="source-line-no">065</span><span id="line-65">   * Callable task. TODO. We don't need a thread pool to execute roll log. This can be simplified</span>
-<span class="source-line-no">066</span><span id="line-66">   * with no use of sub-procedure pool.</span>
-<span class="source-line-no">067</span><span id="line-67">   */</span>
-<span class="source-line-no">068</span><span id="line-68">  class RSRollLogTask implements Callable&lt;Void&gt; {</span>
-<span class="source-line-no">069</span><span id="line-69">    RSRollLogTask() {</span>
-<span class="source-line-no">070</span><span id="line-70">    }</span>
-<span class="source-line-no">071</span><span id="line-71"></span>
-<span class="source-line-no">072</span><span id="line-72">    @Override</span>
-<span class="source-line-no">073</span><span id="line-73">    public Void call() throws Exception {</span>
-<span class="source-line-no">074</span><span id="line-74">      if (LOG.isDebugEnabled()) {</span>
-<span class="source-line-no">075</span><span id="line-75">        LOG.debug("DRPC started: " + rss.getServerName());</span>
-<span class="source-line-no">076</span><span id="line-76">      }</span>
-<span class="source-line-no">077</span><span id="line-77"></span>
-<span class="source-line-no">078</span><span id="line-78">      AbstractFSWAL&lt;?&gt; fsWAL = (AbstractFSWAL&lt;?&gt;) rss.getWAL(null);</span>
-<span class="source-line-no">079</span><span id="line-79">      long filenum = fsWAL.getFilenum();</span>
-<span class="source-line-no">080</span><span id="line-80">      List&lt;WAL&gt; wals = rss.getWALs();</span>
-<span class="source-line-no">081</span><span id="line-81">      long highest = -1;</span>
-<span class="source-line-no">082</span><span id="line-82">      for (WAL wal : wals) {</span>
-<span class="source-line-no">083</span><span id="line-83">        if (wal == null) {</span>
-<span class="source-line-no">084</span><span id="line-84">          continue;</span>
-<span class="source-line-no">085</span><span id="line-85">        }</span>
-<span class="source-line-no">086</span><span id="line-86"></span>
-<span class="source-line-no">087</span><span id="line-87">        if (((AbstractFSWAL&lt;?&gt;) wal).getFilenum() &gt; highest) {</span>
-<span class="source-line-no">088</span><span id="line-88">          highest = ((AbstractFSWAL&lt;?&gt;) wal).getFilenum();</span>
-<span class="source-line-no">089</span><span id="line-89">        }</span>
-<span class="source-line-no">090</span><span id="line-90">      }</span>
-<span class="source-line-no">091</span><span id="line-91"></span>
-<span class="source-line-no">092</span><span id="line-92">      LOG.info("Trying to roll log in backup subprocedure, current log number: " + filenum</span>
-<span class="source-line-no">093</span><span id="line-93">        + " highest: " + highest + " on " + rss.getServerName());</span>
-<span class="source-line-no">094</span><span id="line-94">      ((HRegionServer) rss).getWalRoller().requestRollAll();</span>
-<span class="source-line-no">095</span><span id="line-95">      long start = EnvironmentEdgeManager.currentTime();</span>
-<span class="source-line-no">096</span><span id="line-96">      while (!((HRegionServer) rss).getWalRoller().walRollFinished()) {</span>
-<span class="source-line-no">097</span><span id="line-97">        Thread.sleep(20);</span>
-<span class="source-line-no">098</span><span id="line-98">      }</span>
-<span class="source-line-no">099</span><span id="line-99">      LOG.debug("log roll took " + (EnvironmentEdgeManager.currentTime() - start));</span>
-<span class="source-line-no">100</span><span id="line-100">      LOG.info("After roll log in backup subprocedure, current log number: " + fsWAL.getFilenum()</span>
-<span class="source-line-no">101</span><span id="line-101">        + " on " + rss.getServerName());</span>
-<span class="source-line-no">102</span><span id="line-102"></span>
-<span class="source-line-no">103</span><span id="line-103">      Connection connection = rss.getConnection();</span>
-<span class="source-line-no">104</span><span id="line-104">      try (final BackupSystemTable table = new BackupSystemTable(connection)) {</span>
-<span class="source-line-no">105</span><span id="line-105">        // sanity check, good for testing</span>
-<span class="source-line-no">106</span><span id="line-106">        HashMap&lt;String, Long&gt; serverTimestampMap =</span>
-<span class="source-line-no">107</span><span id="line-107">          table.readRegionServerLastLogRollResult(backupRoot);</span>
-<span class="source-line-no">108</span><span id="line-108">        String host = rss.getServerName().getHostname();</span>
-<span class="source-line-no">109</span><span id="line-109">        int port = rss.getServerName().getPort();</span>
-<span class="source-line-no">110</span><span id="line-110">        String server = host + ":" + port;</span>
-<span class="source-line-no">111</span><span id="line-111">        Long sts = serverTimestampMap.get(host);</span>
-<span class="source-line-no">112</span><span id="line-112">        if (sts != null &amp;&amp; sts &gt; highest) {</span>
-<span class="source-line-no">113</span><span id="line-113">          LOG</span>
-<span class="source-line-no">114</span><span id="line-114">            .warn("Won't update server's last roll log result: current=" + sts + " new=" + highest);</span>
-<span class="source-line-no">115</span><span id="line-115">          return null;</span>
-<span class="source-line-no">116</span><span id="line-116">        }</span>
-<span class="source-line-no">117</span><span id="line-117">        // write the log number to backup system table.</span>
-<span class="source-line-no">118</span><span id="line-118">        table.writeRegionServerLastLogRollResult(server, highest, backupRoot);</span>
-<span class="source-line-no">119</span><span id="line-119">        return null;</span>
-<span class="source-line-no">120</span><span id="line-120">      } catch (Exception e) {</span>
-<span class="source-line-no">121</span><span id="line-121">        LOG.error(e.toString(), e);</span>
-<span class="source-line-no">122</span><span id="line-122">        throw e;</span>
-<span class="source-line-no">123</span><span id="line-123">      }</span>
-<span class="source-line-no">124</span><span id="line-124">    }</span>
-<span class="source-line-no">125</span><span id="line-125">  }</span>
-<span class="source-line-no">126</span><span id="line-126"></span>
-<span class="source-line-no">127</span><span id="line-127">  private void rolllog() throws ForeignException {</span>
-<span class="source-line-no">128</span><span id="line-128">    monitor.rethrowException();</span>
-<span class="source-line-no">129</span><span id="line-129"></span>
-<span class="source-line-no">130</span><span id="line-130">    taskManager.submitTask(new RSRollLogTask());</span>
-<span class="source-line-no">131</span><span id="line-131">    monitor.rethrowException();</span>
-<span class="source-line-no">132</span><span id="line-132"></span>
-<span class="source-line-no">133</span><span id="line-133">    // wait for everything to complete.</span>
-<span class="source-line-no">134</span><span id="line-134">    taskManager.waitForOutstandingTasks();</span>
-<span class="source-line-no">135</span><span id="line-135">    monitor.rethrowException();</span>
-<span class="source-line-no">136</span><span id="line-136">  }</span>
-<span class="source-line-no">137</span><span id="line-137"></span>
-<span class="source-line-no">138</span><span id="line-138">  @Override</span>
-<span class="source-line-no">139</span><span id="line-139">  public void acquireBarrier() {</span>
-<span class="source-line-no">140</span><span id="line-140">    // do nothing, executing in inside barrier step.</span>
-<span class="source-line-no">141</span><span id="line-141">  }</span>
-<span class="source-line-no">142</span><span id="line-142"></span>
-<span class="source-line-no">143</span><span id="line-143">  /**</span>
-<span class="source-line-no">144</span><span id="line-144">   * do a log roll.</span>
-<span class="source-line-no">145</span><span id="line-145">   * @return some bytes</span>
-<span class="source-line-no">146</span><span id="line-146">   */</span>
-<span class="source-line-no">147</span><span id="line-147">  @Override</span>
-<span class="source-line-no">148</span><span id="line-148">  public byte[] insideBarrier() throws ForeignException {</span>
-<span class="source-line-no">149</span><span id="line-149">    rolllog();</span>
-<span class="source-line-no">150</span><span id="line-150">    return null;</span>
-<span class="source-line-no">151</span><span id="line-151">  }</span>
-<span class="source-line-no">152</span><span id="line-152"></span>
-<span class="source-line-no">153</span><span id="line-153">  /**</span>
-<span class="source-line-no">154</span><span id="line-154">   * Cancel threads if they haven't finished.</span>
-<span class="source-line-no">155</span><span id="line-155">   */</span>
-<span class="source-line-no">156</span><span id="line-156">  @Override</span>
-<span class="source-line-no">157</span><span id="line-157">  public void cleanup(Exception e) {</span>
-<span class="source-line-no">158</span><span id="line-158">    taskManager.abort("Aborting log roll subprocedure tasks for backup due to error", e);</span>
-<span class="source-line-no">159</span><span id="line-159">  }</span>
-<span class="source-line-no">160</span><span id="line-160"></span>
-<span class="source-line-no">161</span><span id="line-161">  /**</span>
-<span class="source-line-no">162</span><span id="line-162">   * Hooray!</span>
-<span class="source-line-no">163</span><span id="line-163">   */</span>
-<span class="source-line-no">164</span><span id="line-164">  public void releaseBarrier() {</span>
-<span class="source-line-no">165</span><span id="line-165">    // NO OP</span>
-<span class="source-line-no">166</span><span id="line-166">  }</span>
-<span class="source-line-no">167</span><span id="line-167">}</span>
+<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.hbase.backup.util.BackupUtils;</span>
+<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.hbase.client.Connection;</span>
+<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.errorhandling.ForeignException;</span>
+<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.procedure.ProcedureMember;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.procedure.Subprocedure;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.regionserver.HRegionServer;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.regionserver.RegionServerServices;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.wal.WAL;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.yetus.audience.InterfaceAudience;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.slf4j.Logger;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.slf4j.LoggerFactory;</span>
+<span class="source-line-no">040</span><span id="line-40"></span>
+<span class="source-line-no">041</span><span id="line-41">/**</span>
+<span class="source-line-no">042</span><span id="line-42"> * This backup sub-procedure implementation forces a WAL rolling on a RS.</span>
+<span class="source-line-no">043</span><span id="line-43"> */</span>
+<span class="source-line-no">044</span><span id="line-44">@InterfaceAudience.Private</span>
+<span class="source-line-no">045</span><span id="line-45">public class LogRollBackupSubprocedure extends Subprocedure {</span>
+<span class="source-line-no">046</span><span id="line-46">  private static final Logger LOG = LoggerFactory.getLogger(LogRollBackupSubprocedure.class);</span>
+<span class="source-line-no">047</span><span id="line-47"></span>
+<span class="source-line-no">048</span><span id="line-48">  private final RegionServerServices rss;</span>
+<span class="source-line-no">049</span><span id="line-49">  private final LogRollBackupSubprocedurePool taskManager;</span>
+<span class="source-line-no">050</span><span id="line-50">  private String backupRoot;</span>
+<span class="source-line-no">051</span><span id="line-51"></span>
+<span class="source-line-no">052</span><span id="line-52">  public LogRollBackupSubprocedure(RegionServerServices rss, ProcedureMember member,</span>
+<span class="source-line-no">053</span><span id="line-53">    ForeignExceptionDispatcher errorListener, long wakeFrequency, long timeout,</span>
+<span class="source-line-no">054</span><span id="line-54">    LogRollBackupSubprocedurePool taskManager, byte[] data) {</span>
+<span class="source-line-no">055</span><span id="line-55">    super(member, LogRollMasterProcedureManager.ROLLLOG_PROCEDURE_NAME, errorListener,</span>
+<span class="source-line-no">056</span><span id="line-56">      wakeFrequency, timeout);</span>
+<span class="source-line-no">057</span><span id="line-57">    LOG.info("Constructing a LogRollBackupSubprocedure.");</span>
+<span class="source-line-no">058</span><span id="line-58">    this.rss = rss;</span>
+<span class="source-line-no">059</span><span id="line-59">    this.taskManager = taskManager;</span>
+<span class="source-line-no">060</span><span id="line-60">    if (data != null) {</span>
+<span class="source-line-no">061</span><span id="line-61">      backupRoot = new String(data, StandardCharsets.UTF_8);</span>
+<span class="source-line-no">062</span><span id="line-62">    }</span>
+<span class="source-line-no">063</span><span id="line-63">  }</span>
+<span class="source-line-no">064</span><span id="line-64"></span>
+<span class="source-line-no">065</span><span id="line-65">  /**</span>
+<span class="source-line-no">066</span><span id="line-66">   * Callable task. TODO. We don't need a thread pool to execute roll log. This can be simplified</span>
+<span class="source-line-no">067</span><span id="line-67">   * with no use of sub-procedure pool.</span>
+<span class="source-line-no">068</span><span id="line-68">   */</span>
+<span class="source-line-no">069</span><span id="line-69">  class RSRollLogTask implements Callable&lt;Void&gt; {</span>
+<span class="source-line-no">070</span><span id="line-70">    RSRollLogTask() {</span>
+<span class="source-line-no">071</span><span id="line-71">    }</span>
+<span class="source-line-no">072</span><span id="line-72"></span>
+<span class="source-line-no">073</span><span id="line-73">    @Override</span>
+<span class="source-line-no">074</span><span id="line-74">    public Void call() throws Exception {</span>
+<span class="source-line-no">075</span><span id="line-75">      if (LOG.isDebugEnabled()) {</span>
+<span class="source-line-no">076</span><span id="line-76">        LOG.debug("DRPC started: " + rss.getServerName());</span>
+<span class="source-line-no">077</span><span id="line-77">      }</span>
+<span class="source-line-no">078</span><span id="line-78"></span>
+<span class="source-line-no">079</span><span id="line-79">      AbstractFSWAL&lt;?&gt; fsWAL = (AbstractFSWAL&lt;?&gt;) rss.getWAL(null);</span>
+<span class="source-line-no">080</span><span id="line-80">      long filenum = fsWAL.getFilenum();</span>
+<span class="source-line-no">081</span><span id="line-81">      List&lt;WAL&gt; wals = rss.getWALs();</span>
+<span class="source-line-no">082</span><span id="line-82">      long highest = -1;</span>
+<span class="source-line-no">083</span><span id="line-83">      for (WAL wal : wals) {</span>
+<span class="source-line-no">084</span><span id="line-84">        if (wal == null) {</span>
+<span class="source-line-no">085</span><span id="line-85">          continue;</span>
+<span class="source-line-no">086</span><span id="line-86">        }</span>
+<span class="source-line-no">087</span><span id="line-87"></span>
+<span class="source-line-no">088</span><span id="line-88">        if (((AbstractFSWAL&lt;?&gt;) wal).getFilenum() &gt; highest) {</span>
+<span class="source-line-no">089</span><span id="line-89">          highest = ((AbstractFSWAL&lt;?&gt;) wal).getFilenum();</span>
+<span class="source-line-no">090</span><span id="line-90">        }</span>
+<span class="source-line-no">091</span><span id="line-91">      }</span>
+<span class="source-line-no">092</span><span id="line-92"></span>
+<span class="source-line-no">093</span><span id="line-93">      LOG.info("Trying to roll log in backup subprocedure, current log number: " + filenum</span>
+<span class="source-line-no">094</span><span id="line-94">        + " highest: " + highest + " on " + rss.getServerName());</span>
+<span class="source-line-no">095</span><span id="line-95">      ((HRegionServer) rss).getWalRoller().requestRollAll();</span>
+<span class="source-line-no">096</span><span id="line-96">      long start = EnvironmentEdgeManager.currentTime();</span>
+<span class="source-line-no">097</span><span id="line-97">      while (!((HRegionServer) rss).getWalRoller().walRollFinished()) {</span>
+<span class="source-line-no">098</span><span id="line-98">        Thread.sleep(20);</span>
+<span class="source-line-no">099</span><span id="line-99">      }</span>
+<span class="source-line-no">100</span><span id="line-100">      LOG.debug("log roll took " + (EnvironmentEdgeManager.currentTime() - start));</span>
+<span class="source-line-no">101</span><span id="line-101">      LOG.info("After roll log in backup subprocedure, current log number: " + fsWAL.getFilenum()</span>
+<span class="source-line-no">102</span><span id="line-102">        + " on " + rss.getServerName());</span>
+<span class="source-line-no">103</span><span id="line-103"></span>
+<span class="source-line-no">104</span><span id="line-104">      Connection connection = rss.getConnection();</span>
+<span class="source-line-no">105</span><span id="line-105">      try (final BackupSystemTable table = new BackupSystemTable(connection)) {</span>
+<span class="source-line-no">106</span><span id="line-106">        // sanity check, good for testing</span>
+<span class="source-line-no">107</span><span id="line-107">        HashMap&lt;String, Long&gt; serverTimestampMap =</span>
+<span class="source-line-no">108</span><span id="line-108">          table.readRegionServerLastLogRollResult(backupRoot);</span>
+<span class="source-line-no">109</span><span id="line-109">        String host = rss.getServerName().getHostname();</span>
+<span class="source-line-no">110</span><span id="line-110">        int port = rss.getServerName().getPort();</span>
+<span class="source-line-no">111</span><span id="line-111">        String server = BackupUtils.toHostKey(host + ":" + port);</span>
+<span class="source-line-no">112</span><span id="line-112">        Long sts = serverTimestampMap.get(server);</span>
+<span class="source-line-no">113</span><span id="line-113">        if (sts != null &amp;&amp; sts &gt; highest) {</span>
+<span class="source-line-no">114</span><span id="line-114">          LOG</span>
+<span class="source-line-no">115</span><span id="line-115">            .warn("Won't update server's last roll log result: current=" + sts + " new=" + highest);</span>
+<span class="source-line-no">116</span><span id="line-116">          return null;</span>
+<span class="source-line-no">117</span><span id="line-117">        }</span>
+<span class="source-line-no">118</span><span id="line-118">        // write the log number to backup system table.</span>
+<span class="source-line-no">119</span><span id="line-119">        table.writeRegionServerLastLogRollResult(server, highest, backupRoot);</span>
+<span class="source-line-no">120</span><span id="line-120">        return null;</span>
+<span class="source-line-no">121</span><span id="line-121">      } catch (Exception e) {</span>
+<span class="source-line-no">122</span><span id="line-122">        LOG.error(e.toString(), e);</span>
+<span class="source-line-no">123</span><span id="line-123">        throw e;</span>
+<span class="source-line-no">124</span><span id="line-124">      }</span>
+<span class="source-line-no">125</span><span id="line-125">    }</span>
+<span class="source-line-no">126</span><span id="line-126">  }</span>
+<span class="source-line-no">127</span><span id="line-127"></span>
+<span class="source-line-no">128</span><span id="line-128">  private void rolllog() throws ForeignException {</span>
+<span class="source-line-no">129</span><span id="line-129">    monitor.rethrowException();</span>
+<span class="source-line-no">130</span><span id="line-130"></span>
+<span class="source-line-no">131</span><span id="line-131">    taskManager.submitTask(new RSRollLogTask());</span>
+<span class="source-line-no">132</span><span id="line-132">    monitor.rethrowException();</span>
+<span class="source-line-no">133</span><span id="line-133"></span>
+<span class="source-line-no">134</span><span id="line-134">    // wait for everything to complete.</span>
+<span class="source-line-no">135</span><span id="line-135">    taskManager.waitForOutstandingTasks();</span>
+<span class="source-line-no">136</span><span id="line-136">    monitor.rethrowException();</span>
+<span class="source-line-no">137</span><span id="line-137">  }</span>
+<span class="source-line-no">138</span><span id="line-138"></span>
+<span class="source-line-no">139</span><span id="line-139">  @Override</span>
+<span class="source-line-no">140</span><span id="line-140">  public void acquireBarrier() {</span>
+<span class="source-line-no">141</span><span id="line-141">    // do nothing, executing in inside barrier step.</span>
+<span class="source-line-no">142</span><span id="line-142">  }</span>
+<span class="source-line-no">143</span><span id="line-143"></span>
+<span class="source-line-no">144</span><span id="line-144">  /**</span>
+<span class="source-line-no">145</span><span id="line-145">   * do a log roll.</span>
+<span class="source-line-no">146</span><span id="line-146">   * @return some bytes</span>
+<span class="source-line-no">147</span><span id="line-147">   */</span>
+<span class="source-line-no">148</span><span id="line-148">  @Override</span>
+<span class="source-line-no">149</span><span id="line-149">  public byte[] insideBarrier() throws ForeignException {</span>
+<span class="source-line-no">150</span><span id="line-150">    rolllog();</span>
+<span class="source-line-no">151</span><span id="line-151">    return null;</span>
+<span class="source-line-no">152</span><span id="line-152">  }</span>
+<span class="source-line-no">153</span><span id="line-153"></span>
+<span class="source-line-no">154</span><span id="line-154">  /**</span>
+<span class="source-line-no">155</span><span id="line-155">   * Cancel threads if they haven't finished.</span>
+<span class="source-line-no">156</span><span id="line-156">   */</span>
+<span class="source-line-no">157</span><span id="line-157">  @Override</span>
+<span class="source-line-no">158</span><span id="line-158">  public void cleanup(Exception e) {</span>
+<span class="source-line-no">159</span><span id="line-159">    taskManager.abort("Aborting log roll subprocedure tasks for backup due to error", e);</span>
+<span class="source-line-no">160</span><span id="line-160">  }</span>
+<span class="source-line-no">161</span><span id="line-161"></span>
+<span class="source-line-no">162</span><span id="line-162">  /**</span>
+<span class="source-line-no">163</span><span id="line-163">   * Hooray!</span>
+<span class="source-line-no">164</span><span id="line-164">   */</span>
+<span class="source-line-no">165</span><span id="line-165">  public void releaseBarrier() {</span>
+<span class="source-line-no">166</span><span id="line-166">    // NO OP</span>
+<span class="source-line-no">167</span><span id="line-167">  }</span>
+<span class="source-line-no">168</span><span id="line-168">}</span>
 
 
 
