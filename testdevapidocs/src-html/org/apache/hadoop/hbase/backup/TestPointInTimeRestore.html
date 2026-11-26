@@ -31,225 +31,305 @@
 <span class="source-line-no">018</span><span id="line-18">package org.apache.hadoop.hbase.backup;</span>
 <span class="source-line-no">019</span><span id="line-19"></span>
 <span class="source-line-no">020</span><span id="line-20">import static org.apache.hadoop.hbase.backup.BackupRestoreConstants.CONF_CONTINUOUS_BACKUP_WAL_DIR;</span>
-<span class="source-line-no">021</span><span id="line-21">import static org.apache.hadoop.hbase.backup.replication.ContinuousBackupReplicationEndpoint.ONE_DAY_IN_MILLISECONDS;</span>
-<span class="source-line-no">022</span><span id="line-22">import static org.junit.jupiter.api.Assertions.assertEquals;</span>
-<span class="source-line-no">023</span><span id="line-23">import static org.junit.jupiter.api.Assertions.assertNotEquals;</span>
-<span class="source-line-no">024</span><span id="line-24"></span>
-<span class="source-line-no">025</span><span id="line-25">import java.io.IOException;</span>
-<span class="source-line-no">026</span><span id="line-26">import org.apache.hadoop.fs.FileSystem;</span>
-<span class="source-line-no">027</span><span id="line-27">import org.apache.hadoop.fs.Path;</span>
-<span class="source-line-no">028</span><span id="line-28">import org.apache.hadoop.hbase.TableName;</span>
-<span class="source-line-no">029</span><span id="line-29">import org.apache.hadoop.hbase.testclassification.LargeTests;</span>
-<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.hbase.util.Bytes;</span>
-<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
-<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.util.ToolRunner;</span>
-<span class="source-line-no">033</span><span id="line-33">import org.junit.jupiter.api.AfterAll;</span>
-<span class="source-line-no">034</span><span id="line-34">import org.junit.jupiter.api.BeforeAll;</span>
-<span class="source-line-no">035</span><span id="line-35">import org.junit.jupiter.api.Tag;</span>
-<span class="source-line-no">036</span><span id="line-36">import org.junit.jupiter.api.Test;</span>
-<span class="source-line-no">037</span><span id="line-37"></span>
-<span class="source-line-no">038</span><span id="line-38">/**</span>
-<span class="source-line-no">039</span><span id="line-39"> * Integration-style tests for Point-in-Time Restore (PITR).</span>
-<span class="source-line-no">040</span><span id="line-40"> * &lt;p&gt;</span>
-<span class="source-line-no">041</span><span id="line-41"> * These tests exercise the full backup / continuous backup / restore flow: - create backups at</span>
-<span class="source-line-no">042</span><span id="line-42"> * multiple historical points in time (via {@code BackupDriver}) - exercise WAL-based</span>
-<span class="source-line-no">043</span><span id="line-43"> * replication/continuous backup - validate Point-in-Time Restore behavior (successful restores,</span>
-<span class="source-line-no">044</span><span id="line-44"> * failure cases)</span>
-<span class="source-line-no">045</span><span id="line-45"> * &lt;/p&gt;</span>
-<span class="source-line-no">046</span><span id="line-46"> * &lt;p&gt;</span>
-<span class="source-line-no">047</span><span id="line-47"> * NOTE: Some tests also create HFiles and perform HBase bulk-loads (HFile -&gt; table) so the restore</span>
-<span class="source-line-no">048</span><span id="line-48"> * flow is validated when bulk-loaded storefiles are present in WALs. This ensures the</span>
-<span class="source-line-no">049</span><span id="line-49"> * BulkLoadCollector/BulkFilesCollector logic (discovering bulk-loaded store files referenced from</span>
-<span class="source-line-no">050</span><span id="line-50"> * WAL bulk-load descriptors) is exercised by the test suite.</span>
-<span class="source-line-no">051</span><span id="line-51"> * &lt;/p&gt;</span>
-<span class="source-line-no">052</span><span id="line-52"> */</span>
-<span class="source-line-no">053</span><span id="line-53">@Tag(LargeTests.TAG)</span>
-<span class="source-line-no">054</span><span id="line-54">public class TestPointInTimeRestore extends TestBackupBase {</span>
-<span class="source-line-no">055</span><span id="line-55"></span>
-<span class="source-line-no">056</span><span id="line-56">  private static final String backupWalDirName = "TestPointInTimeRestoreWalDir";</span>
-<span class="source-line-no">057</span><span id="line-57">  static Path backupWalDir;</span>
-<span class="source-line-no">058</span><span id="line-58">  static FileSystem fs;</span>
-<span class="source-line-no">059</span><span id="line-59"></span>
-<span class="source-line-no">060</span><span id="line-60">  @BeforeAll</span>
-<span class="source-line-no">061</span><span id="line-61">  public static void setupBeforeClass() throws Exception {</span>
-<span class="source-line-no">062</span><span id="line-62">    Path root = TEST_UTIL.getDataTestDirOnTestFS();</span>
-<span class="source-line-no">063</span><span id="line-63">    backupWalDir = new Path(root, backupWalDirName);</span>
-<span class="source-line-no">064</span><span id="line-64">    fs = FileSystem.get(conf1);</span>
-<span class="source-line-no">065</span><span id="line-65">    fs.mkdirs(backupWalDir);</span>
-<span class="source-line-no">066</span><span id="line-66">    conf1.set(CONF_CONTINUOUS_BACKUP_WAL_DIR, backupWalDir.toString());</span>
-<span class="source-line-no">067</span><span id="line-67"></span>
-<span class="source-line-no">068</span><span id="line-68">    setUpBackups();</span>
-<span class="source-line-no">069</span><span id="line-69">  }</span>
-<span class="source-line-no">070</span><span id="line-70"></span>
-<span class="source-line-no">071</span><span id="line-71">  /**</span>
-<span class="source-line-no">072</span><span id="line-72">   * Sets up multiple backups at different timestamps by: 1. Adjusting the system time to simulate</span>
-<span class="source-line-no">073</span><span id="line-73">   * past backup points. 2. Loading data into tables to create meaningful snapshots. 3. Running full</span>
-<span class="source-line-no">074</span><span id="line-74">   * backups with or without continuous backup enabled. 4. Ensuring replication is complete before</span>
-<span class="source-line-no">075</span><span id="line-75">   * proceeding.</span>
-<span class="source-line-no">076</span><span id="line-76">   */</span>
-<span class="source-line-no">077</span><span id="line-77">  private static void setUpBackups() throws Exception {</span>
-<span class="source-line-no">078</span><span id="line-78">    // Simulate a backup taken 20 days ago</span>
-<span class="source-line-no">079</span><span id="line-79">    EnvironmentEdgeManager</span>
-<span class="source-line-no">080</span><span id="line-80">      .injectEdge(() -&gt; System.currentTimeMillis() - 20 * ONE_DAY_IN_MILLISECONDS);</span>
-<span class="source-line-no">081</span><span id="line-81">    // Insert initial data into table1</span>
-<span class="source-line-no">082</span><span id="line-82">    PITRTestUtil.loadRandomData(TEST_UTIL, table1, famName, 1000);</span>
-<span class="source-line-no">083</span><span id="line-83"></span>
-<span class="source-line-no">084</span><span id="line-84">    // Perform a full backup for table1 with continuous backup enabled</span>
-<span class="source-line-no">085</span><span id="line-85">    String[] args =</span>
-<span class="source-line-no">086</span><span id="line-86">      PITRTestUtil.buildBackupArgs("full", new TableName[] { table1 }, true, BACKUP_ROOT_DIR);</span>
-<span class="source-line-no">087</span><span id="line-87">    int ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
-<span class="source-line-no">088</span><span id="line-88">    assertEquals(0, ret, "Backup should succeed");</span>
-<span class="source-line-no">089</span><span id="line-89"></span>
-<span class="source-line-no">090</span><span id="line-90">    // Move time forward to simulate 15 days ago</span>
-<span class="source-line-no">091</span><span id="line-91">    EnvironmentEdgeManager</span>
-<span class="source-line-no">092</span><span id="line-92">      .injectEdge(() -&gt; System.currentTimeMillis() - 15 * ONE_DAY_IN_MILLISECONDS);</span>
-<span class="source-line-no">093</span><span id="line-93">    PITRTestUtil.loadRandomData(TEST_UTIL, table1, famName, 1000); // Add more data to table1</span>
+<span class="source-line-no">021</span><span id="line-21">import static org.apache.hadoop.hbase.backup.BackupRestoreConstants.OPTION_SET;</span>
+<span class="source-line-no">022</span><span id="line-22">import static org.apache.hadoop.hbase.backup.BackupRestoreConstants.OPTION_TABLE;</span>
+<span class="source-line-no">023</span><span id="line-23">import static org.apache.hadoop.hbase.backup.BackupRestoreConstants.OPTION_TABLE_MAPPING;</span>
+<span class="source-line-no">024</span><span id="line-24">import static org.apache.hadoop.hbase.backup.BackupRestoreConstants.OPTION_TO_DATETIME;</span>
+<span class="source-line-no">025</span><span id="line-25">import static org.apache.hadoop.hbase.backup.replication.ContinuousBackupReplicationEndpoint.ONE_DAY_IN_MILLISECONDS;</span>
+<span class="source-line-no">026</span><span id="line-26">import static org.junit.jupiter.api.Assertions.assertEquals;</span>
+<span class="source-line-no">027</span><span id="line-27">import static org.junit.jupiter.api.Assertions.assertNotEquals;</span>
+<span class="source-line-no">028</span><span id="line-28"></span>
+<span class="source-line-no">029</span><span id="line-29">import java.io.IOException;</span>
+<span class="source-line-no">030</span><span id="line-30">import org.apache.hadoop.fs.FileSystem;</span>
+<span class="source-line-no">031</span><span id="line-31">import org.apache.hadoop.fs.Path;</span>
+<span class="source-line-no">032</span><span id="line-32">import org.apache.hadoop.hbase.TableName;</span>
+<span class="source-line-no">033</span><span id="line-33">import org.apache.hadoop.hbase.backup.impl.BackupSystemTable;</span>
+<span class="source-line-no">034</span><span id="line-34">import org.apache.hadoop.hbase.testclassification.LargeTests;</span>
+<span class="source-line-no">035</span><span id="line-35">import org.apache.hadoop.hbase.util.Bytes;</span>
+<span class="source-line-no">036</span><span id="line-36">import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;</span>
+<span class="source-line-no">037</span><span id="line-37">import org.apache.hadoop.util.ToolRunner;</span>
+<span class="source-line-no">038</span><span id="line-38">import org.junit.jupiter.api.AfterAll;</span>
+<span class="source-line-no">039</span><span id="line-39">import org.junit.jupiter.api.BeforeAll;</span>
+<span class="source-line-no">040</span><span id="line-40">import org.junit.jupiter.api.Tag;</span>
+<span class="source-line-no">041</span><span id="line-41">import org.junit.jupiter.api.Test;</span>
+<span class="source-line-no">042</span><span id="line-42"></span>
+<span class="source-line-no">043</span><span id="line-43">/**</span>
+<span class="source-line-no">044</span><span id="line-44"> * Integration-style tests for Point-in-Time Restore (PITR).</span>
+<span class="source-line-no">045</span><span id="line-45"> * &lt;p&gt;</span>
+<span class="source-line-no">046</span><span id="line-46"> * These tests exercise the full backup / continuous backup / restore flow: - create backups at</span>
+<span class="source-line-no">047</span><span id="line-47"> * multiple historical points in time (via {@code BackupDriver}) - exercise WAL-based</span>
+<span class="source-line-no">048</span><span id="line-48"> * replication/continuous backup - validate Point-in-Time Restore behavior (successful restores,</span>
+<span class="source-line-no">049</span><span id="line-49"> * failure cases)</span>
+<span class="source-line-no">050</span><span id="line-50"> * &lt;/p&gt;</span>
+<span class="source-line-no">051</span><span id="line-51"> * &lt;p&gt;</span>
+<span class="source-line-no">052</span><span id="line-52"> * NOTE: Some tests also create HFiles and perform HBase bulk-loads (HFile -&gt; table) so the restore</span>
+<span class="source-line-no">053</span><span id="line-53"> * flow is validated when bulk-loaded storefiles are present in WALs. This ensures the</span>
+<span class="source-line-no">054</span><span id="line-54"> * BulkLoadCollector/BulkFilesCollector logic (discovering bulk-loaded store files referenced from</span>
+<span class="source-line-no">055</span><span id="line-55"> * WAL bulk-load descriptors) is exercised by the test suite.</span>
+<span class="source-line-no">056</span><span id="line-56"> * &lt;/p&gt;</span>
+<span class="source-line-no">057</span><span id="line-57"> */</span>
+<span class="source-line-no">058</span><span id="line-58">@Tag(LargeTests.TAG)</span>
+<span class="source-line-no">059</span><span id="line-59">public class TestPointInTimeRestore extends TestBackupBase {</span>
+<span class="source-line-no">060</span><span id="line-60"></span>
+<span class="source-line-no">061</span><span id="line-61">  private static final String backupWalDirName = "TestPointInTimeRestoreWalDir";</span>
+<span class="source-line-no">062</span><span id="line-62">  static Path backupWalDir;</span>
+<span class="source-line-no">063</span><span id="line-63">  static FileSystem fs;</span>
+<span class="source-line-no">064</span><span id="line-64"></span>
+<span class="source-line-no">065</span><span id="line-65">  @BeforeAll</span>
+<span class="source-line-no">066</span><span id="line-66">  public static void setupBeforeClass() throws Exception {</span>
+<span class="source-line-no">067</span><span id="line-67">    Path root = TEST_UTIL.getDataTestDirOnTestFS();</span>
+<span class="source-line-no">068</span><span id="line-68">    backupWalDir = new Path(root, backupWalDirName);</span>
+<span class="source-line-no">069</span><span id="line-69">    fs = FileSystem.get(conf1);</span>
+<span class="source-line-no">070</span><span id="line-70">    fs.mkdirs(backupWalDir);</span>
+<span class="source-line-no">071</span><span id="line-71">    conf1.set(CONF_CONTINUOUS_BACKUP_WAL_DIR, backupWalDir.toString());</span>
+<span class="source-line-no">072</span><span id="line-72"></span>
+<span class="source-line-no">073</span><span id="line-73">    setUpBackups();</span>
+<span class="source-line-no">074</span><span id="line-74">  }</span>
+<span class="source-line-no">075</span><span id="line-75"></span>
+<span class="source-line-no">076</span><span id="line-76">  /**</span>
+<span class="source-line-no">077</span><span id="line-77">   * Sets up multiple backups at different timestamps by: 1. Adjusting the system time to simulate</span>
+<span class="source-line-no">078</span><span id="line-78">   * past backup points. 2. Loading data into tables to create meaningful snapshots. 3. Running full</span>
+<span class="source-line-no">079</span><span id="line-79">   * backups with or without continuous backup enabled. 4. Ensuring replication is complete before</span>
+<span class="source-line-no">080</span><span id="line-80">   * proceeding.</span>
+<span class="source-line-no">081</span><span id="line-81">   */</span>
+<span class="source-line-no">082</span><span id="line-82">  private static void setUpBackups() throws Exception {</span>
+<span class="source-line-no">083</span><span id="line-83">    // Simulate a backup taken 20 days ago</span>
+<span class="source-line-no">084</span><span id="line-84">    EnvironmentEdgeManager</span>
+<span class="source-line-no">085</span><span id="line-85">      .injectEdge(() -&gt; System.currentTimeMillis() - 20 * ONE_DAY_IN_MILLISECONDS);</span>
+<span class="source-line-no">086</span><span id="line-86">    // Insert initial data into table1</span>
+<span class="source-line-no">087</span><span id="line-87">    PITRTestUtil.loadRandomData(TEST_UTIL, table1, famName, 1000);</span>
+<span class="source-line-no">088</span><span id="line-88"></span>
+<span class="source-line-no">089</span><span id="line-89">    // Perform a full backup for table1 with continuous backup enabled</span>
+<span class="source-line-no">090</span><span id="line-90">    String[] args =</span>
+<span class="source-line-no">091</span><span id="line-91">      PITRTestUtil.buildBackupArgs("full", new TableName[] { table1 }, true, BACKUP_ROOT_DIR);</span>
+<span class="source-line-no">092</span><span id="line-92">    int ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
+<span class="source-line-no">093</span><span id="line-93">    assertEquals(0, ret, "Backup should succeed");</span>
 <span class="source-line-no">094</span><span id="line-94"></span>
-<span class="source-line-no">095</span><span id="line-95">    Path dir = TEST_UTIL.getDataTestDirOnTestFS("testBulkLoadByFamily");</span>
-<span class="source-line-no">096</span><span id="line-96">    PITRTestUtil.generateHFiles(dir, TEST_UTIL.getConfiguration(), Bytes.toString(famName));</span>
-<span class="source-line-no">097</span><span id="line-97">    PITRTestUtil.bulkLoadHFiles(table1, dir, TEST_UTIL.getConnection(),</span>
-<span class="source-line-no">098</span><span id="line-98">      TEST_UTIL.getConfiguration());</span>
+<span class="source-line-no">095</span><span id="line-95">    // Move time forward to simulate 15 days ago</span>
+<span class="source-line-no">096</span><span id="line-96">    EnvironmentEdgeManager</span>
+<span class="source-line-no">097</span><span id="line-97">      .injectEdge(() -&gt; System.currentTimeMillis() - 15 * ONE_DAY_IN_MILLISECONDS);</span>
+<span class="source-line-no">098</span><span id="line-98">    PITRTestUtil.loadRandomData(TEST_UTIL, table1, famName, 1000); // Add more data to table1</span>
 <span class="source-line-no">099</span><span id="line-99"></span>
-<span class="source-line-no">100</span><span id="line-100">    PITRTestUtil.loadRandomData(TEST_UTIL, table2, famName, 500); // Insert data into table2</span>
-<span class="source-line-no">101</span><span id="line-101"></span>
-<span class="source-line-no">102</span><span id="line-102">    PITRTestUtil.waitForReplication(); // Ensure replication is complete</span>
-<span class="source-line-no">103</span><span id="line-103"></span>
-<span class="source-line-no">104</span><span id="line-104">    // Perform a full backup for table2 with continuous backup enabled</span>
-<span class="source-line-no">105</span><span id="line-105">    args = PITRTestUtil.buildBackupArgs("full", new TableName[] { table2 }, true, BACKUP_ROOT_DIR);</span>
-<span class="source-line-no">106</span><span id="line-106">    ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
-<span class="source-line-no">107</span><span id="line-107">    assertEquals(0, ret, "Backup should succeed");</span>
+<span class="source-line-no">100</span><span id="line-100">    Path dir = TEST_UTIL.getDataTestDirOnTestFS("testBulkLoadByFamily");</span>
+<span class="source-line-no">101</span><span id="line-101">    PITRTestUtil.generateHFiles(dir, TEST_UTIL.getConfiguration(), Bytes.toString(famName));</span>
+<span class="source-line-no">102</span><span id="line-102">    PITRTestUtil.bulkLoadHFiles(table1, dir, TEST_UTIL.getConnection(),</span>
+<span class="source-line-no">103</span><span id="line-103">      TEST_UTIL.getConfiguration());</span>
+<span class="source-line-no">104</span><span id="line-104"></span>
+<span class="source-line-no">105</span><span id="line-105">    PITRTestUtil.loadRandomData(TEST_UTIL, table2, famName, 500); // Insert data into table2</span>
+<span class="source-line-no">106</span><span id="line-106"></span>
+<span class="source-line-no">107</span><span id="line-107">    PITRTestUtil.waitForReplication(); // Ensure replication is complete</span>
 <span class="source-line-no">108</span><span id="line-108"></span>
-<span class="source-line-no">109</span><span id="line-109">    // Move time forward to simulate 10 days ago</span>
-<span class="source-line-no">110</span><span id="line-110">    EnvironmentEdgeManager</span>
-<span class="source-line-no">111</span><span id="line-111">      .injectEdge(() -&gt; System.currentTimeMillis() - 10 * ONE_DAY_IN_MILLISECONDS);</span>
-<span class="source-line-no">112</span><span id="line-112">    PITRTestUtil.loadRandomData(TEST_UTIL, table2, famName, 500); // Add more data to table2</span>
-<span class="source-line-no">113</span><span id="line-113">    PITRTestUtil.loadRandomData(TEST_UTIL, table3, famName, 500); // Insert data into table3</span>
-<span class="source-line-no">114</span><span id="line-114"></span>
-<span class="source-line-no">115</span><span id="line-115">    // Perform a full backup for table3 and table4 (without continuous backup)</span>
-<span class="source-line-no">116</span><span id="line-116">    args = PITRTestUtil.buildBackupArgs("full", new TableName[] { table3, table4 }, false,</span>
-<span class="source-line-no">117</span><span id="line-117">      BACKUP_ROOT_DIR);</span>
-<span class="source-line-no">118</span><span id="line-118">    ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
-<span class="source-line-no">119</span><span id="line-119">    assertEquals(0, ret, "Backup should succeed");</span>
-<span class="source-line-no">120</span><span id="line-120"></span>
-<span class="source-line-no">121</span><span id="line-121">    PITRTestUtil.waitForReplication(); // Ensure replication is complete before concluding setup</span>
-<span class="source-line-no">122</span><span id="line-122"></span>
-<span class="source-line-no">123</span><span id="line-123">    // Reset time mocking to avoid affecting other tests</span>
-<span class="source-line-no">124</span><span id="line-124">    EnvironmentEdgeManager.reset();</span>
-<span class="source-line-no">125</span><span id="line-125">  }</span>
-<span class="source-line-no">126</span><span id="line-126"></span>
-<span class="source-line-no">127</span><span id="line-127">  @AfterAll</span>
-<span class="source-line-no">128</span><span id="line-128">  public static void setupAfterClass() throws IOException {</span>
-<span class="source-line-no">129</span><span id="line-129">    Path root = TEST_UTIL.getDataTestDirOnTestFS();</span>
-<span class="source-line-no">130</span><span id="line-130">    Path backupWalDir = new Path(root, backupWalDirName);</span>
-<span class="source-line-no">131</span><span id="line-131">    FileSystem fs = FileSystem.get(conf1);</span>
-<span class="source-line-no">132</span><span id="line-132"></span>
-<span class="source-line-no">133</span><span id="line-133">    if (fs.exists(backupWalDir)) {</span>
-<span class="source-line-no">134</span><span id="line-134">      fs.delete(backupWalDir, true);</span>
-<span class="source-line-no">135</span><span id="line-135">    }</span>
-<span class="source-line-no">136</span><span id="line-136"></span>
-<span class="source-line-no">137</span><span id="line-137">    conf1.unset(CONF_CONTINUOUS_BACKUP_WAL_DIR);</span>
-<span class="source-line-no">138</span><span id="line-138">  }</span>
-<span class="source-line-no">139</span><span id="line-139"></span>
-<span class="source-line-no">140</span><span id="line-140">  /**</span>
-<span class="source-line-no">141</span><span id="line-141">   * Verifies that PITR (Point-in-Time Restore) fails when the requested restore time is either in</span>
-<span class="source-line-no">142</span><span id="line-142">   * the future or outside the allowed retention window.</span>
-<span class="source-line-no">143</span><span id="line-143">   */</span>
-<span class="source-line-no">144</span><span id="line-144">  @Test</span>
-<span class="source-line-no">145</span><span id="line-145">  public void testPITR_FailsOutsideWindow() throws Exception {</span>
-<span class="source-line-no">146</span><span id="line-146">    // Case 1: Requested restore time is in the future (should fail)</span>
-<span class="source-line-no">147</span><span id="line-147">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table1 },</span>
-<span class="source-line-no">148</span><span id="line-148">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
-<span class="source-line-no">149</span><span id="line-149">      EnvironmentEdgeManager.currentTime() + ONE_DAY_IN_MILLISECONDS, null);</span>
-<span class="source-line-no">150</span><span id="line-150"></span>
-<span class="source-line-no">151</span><span id="line-151">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">152</span><span id="line-152">    assertNotEquals(0, ret,</span>
-<span class="source-line-no">153</span><span id="line-153">      "Restore should fail since the requested restore time is in the future");</span>
-<span class="source-line-no">154</span><span id="line-154"></span>
-<span class="source-line-no">155</span><span id="line-155">    // Case 2: Requested restore time is too old (beyond the retention window, should fail)</span>
-<span class="source-line-no">156</span><span id="line-156">    args = PITRTestUtil.buildPITRArgs(new TableName[] { table1 },</span>
-<span class="source-line-no">157</span><span id="line-157">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
-<span class="source-line-no">158</span><span id="line-158">      EnvironmentEdgeManager.currentTime() - 40 * ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">109</span><span id="line-109">    // Perform a full backup for table2 with continuous backup enabled</span>
+<span class="source-line-no">110</span><span id="line-110">    args = PITRTestUtil.buildBackupArgs("full", new TableName[] { table2 }, true, BACKUP_ROOT_DIR);</span>
+<span class="source-line-no">111</span><span id="line-111">    ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
+<span class="source-line-no">112</span><span id="line-112">    assertEquals(0, ret, "Backup should succeed");</span>
+<span class="source-line-no">113</span><span id="line-113"></span>
+<span class="source-line-no">114</span><span id="line-114">    // Move time forward to simulate 10 days ago</span>
+<span class="source-line-no">115</span><span id="line-115">    EnvironmentEdgeManager</span>
+<span class="source-line-no">116</span><span id="line-116">      .injectEdge(() -&gt; System.currentTimeMillis() - 10 * ONE_DAY_IN_MILLISECONDS);</span>
+<span class="source-line-no">117</span><span id="line-117">    PITRTestUtil.loadRandomData(TEST_UTIL, table2, famName, 500); // Add more data to table2</span>
+<span class="source-line-no">118</span><span id="line-118">    PITRTestUtil.loadRandomData(TEST_UTIL, table3, famName, 500); // Insert data into table3</span>
+<span class="source-line-no">119</span><span id="line-119"></span>
+<span class="source-line-no">120</span><span id="line-120">    // Perform a full backup for table3 and table4 (without continuous backup)</span>
+<span class="source-line-no">121</span><span id="line-121">    args = PITRTestUtil.buildBackupArgs("full", new TableName[] { table3, table4 }, false,</span>
+<span class="source-line-no">122</span><span id="line-122">      BACKUP_ROOT_DIR);</span>
+<span class="source-line-no">123</span><span id="line-123">    ret = ToolRunner.run(conf1, new BackupDriver(), args);</span>
+<span class="source-line-no">124</span><span id="line-124">    assertEquals(0, ret, "Backup should succeed");</span>
+<span class="source-line-no">125</span><span id="line-125"></span>
+<span class="source-line-no">126</span><span id="line-126">    PITRTestUtil.waitForReplication(); // Ensure replication is complete before concluding setup</span>
+<span class="source-line-no">127</span><span id="line-127"></span>
+<span class="source-line-no">128</span><span id="line-128">    // Reset time mocking to avoid affecting other tests</span>
+<span class="source-line-no">129</span><span id="line-129">    EnvironmentEdgeManager.reset();</span>
+<span class="source-line-no">130</span><span id="line-130">  }</span>
+<span class="source-line-no">131</span><span id="line-131"></span>
+<span class="source-line-no">132</span><span id="line-132">  @AfterAll</span>
+<span class="source-line-no">133</span><span id="line-133">  public static void setupAfterClass() throws IOException {</span>
+<span class="source-line-no">134</span><span id="line-134">    Path root = TEST_UTIL.getDataTestDirOnTestFS();</span>
+<span class="source-line-no">135</span><span id="line-135">    Path backupWalDir = new Path(root, backupWalDirName);</span>
+<span class="source-line-no">136</span><span id="line-136">    FileSystem fs = FileSystem.get(conf1);</span>
+<span class="source-line-no">137</span><span id="line-137"></span>
+<span class="source-line-no">138</span><span id="line-138">    if (fs.exists(backupWalDir)) {</span>
+<span class="source-line-no">139</span><span id="line-139">      fs.delete(backupWalDir, true);</span>
+<span class="source-line-no">140</span><span id="line-140">    }</span>
+<span class="source-line-no">141</span><span id="line-141"></span>
+<span class="source-line-no">142</span><span id="line-142">    conf1.unset(CONF_CONTINUOUS_BACKUP_WAL_DIR);</span>
+<span class="source-line-no">143</span><span id="line-143">  }</span>
+<span class="source-line-no">144</span><span id="line-144"></span>
+<span class="source-line-no">145</span><span id="line-145">  /**</span>
+<span class="source-line-no">146</span><span id="line-146">   * Verifies that PITR (Point-in-Time Restore) fails when the requested restore time is either in</span>
+<span class="source-line-no">147</span><span id="line-147">   * the future or outside the allowed retention window.</span>
+<span class="source-line-no">148</span><span id="line-148">   */</span>
+<span class="source-line-no">149</span><span id="line-149">  @Test</span>
+<span class="source-line-no">150</span><span id="line-150">  public void testPITR_FailsOutsideWindow() throws Exception {</span>
+<span class="source-line-no">151</span><span id="line-151">    // Case 1: Requested restore time is in the future (should fail)</span>
+<span class="source-line-no">152</span><span id="line-152">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table1 },</span>
+<span class="source-line-no">153</span><span id="line-153">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
+<span class="source-line-no">154</span><span id="line-154">      EnvironmentEdgeManager.currentTime() + ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">155</span><span id="line-155"></span>
+<span class="source-line-no">156</span><span id="line-156">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">157</span><span id="line-157">    assertNotEquals(0, ret,</span>
+<span class="source-line-no">158</span><span id="line-158">      "Restore should fail since the requested restore time is in the future");</span>
 <span class="source-line-no">159</span><span id="line-159"></span>
-<span class="source-line-no">160</span><span id="line-160">    ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">161</span><span id="line-161">    assertNotEquals(0, ret,</span>
-<span class="source-line-no">162</span><span id="line-162">      "Restore should fail since the requested restore time is outside the retention window");</span>
-<span class="source-line-no">163</span><span id="line-163">  }</span>
+<span class="source-line-no">160</span><span id="line-160">    // Case 2: Requested restore time is too old (beyond the retention window, should fail)</span>
+<span class="source-line-no">161</span><span id="line-161">    args = PITRTestUtil.buildPITRArgs(new TableName[] { table1 },</span>
+<span class="source-line-no">162</span><span id="line-162">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
+<span class="source-line-no">163</span><span id="line-163">      EnvironmentEdgeManager.currentTime() - 40 * ONE_DAY_IN_MILLISECONDS, null);</span>
 <span class="source-line-no">164</span><span id="line-164"></span>
-<span class="source-line-no">165</span><span id="line-165">  /**</span>
-<span class="source-line-no">166</span><span id="line-166">   * Ensures that PITR fails when attempting to restore tables where continuous backup was not</span>
-<span class="source-line-no">167</span><span id="line-167">   * enabled.</span>
-<span class="source-line-no">168</span><span id="line-168">   */</span>
-<span class="source-line-no">169</span><span id="line-169">  @Test</span>
-<span class="source-line-no">170</span><span id="line-170">  public void testPointInTimeRestore_ContinuousBackupNotEnabledTables() throws Exception {</span>
-<span class="source-line-no">171</span><span id="line-171">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table3 },</span>
-<span class="source-line-no">172</span><span id="line-172">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
-<span class="source-line-no">173</span><span id="line-173">      EnvironmentEdgeManager.currentTime() - 10 * ONE_DAY_IN_MILLISECONDS, null);</span>
-<span class="source-line-no">174</span><span id="line-174"></span>
-<span class="source-line-no">175</span><span id="line-175">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">176</span><span id="line-176">    assertNotEquals(0, ret,</span>
-<span class="source-line-no">177</span><span id="line-177">      "Restore should fail since continuous backup is not enabled for the table");</span>
-<span class="source-line-no">178</span><span id="line-178">  }</span>
+<span class="source-line-no">165</span><span id="line-165">    ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">166</span><span id="line-166">    assertNotEquals(0, ret,</span>
+<span class="source-line-no">167</span><span id="line-167">      "Restore should fail since the requested restore time is outside the retention window");</span>
+<span class="source-line-no">168</span><span id="line-168">  }</span>
+<span class="source-line-no">169</span><span id="line-169"></span>
+<span class="source-line-no">170</span><span id="line-170">  /**</span>
+<span class="source-line-no">171</span><span id="line-171">   * Ensures that PITR fails when attempting to restore tables where continuous backup was not</span>
+<span class="source-line-no">172</span><span id="line-172">   * enabled.</span>
+<span class="source-line-no">173</span><span id="line-173">   */</span>
+<span class="source-line-no">174</span><span id="line-174">  @Test</span>
+<span class="source-line-no">175</span><span id="line-175">  public void testPointInTimeRestore_ContinuousBackupNotEnabledTables() throws Exception {</span>
+<span class="source-line-no">176</span><span id="line-176">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table3 },</span>
+<span class="source-line-no">177</span><span id="line-177">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
+<span class="source-line-no">178</span><span id="line-178">      EnvironmentEdgeManager.currentTime() - 10 * ONE_DAY_IN_MILLISECONDS, null);</span>
 <span class="source-line-no">179</span><span id="line-179"></span>
-<span class="source-line-no">180</span><span id="line-180">  /**</span>
-<span class="source-line-no">181</span><span id="line-181">   * Ensures that PITR fails when trying to restore from a point before continuous backup started.</span>
-<span class="source-line-no">182</span><span id="line-182">   */</span>
-<span class="source-line-no">183</span><span id="line-183">  @Test</span>
-<span class="source-line-no">184</span><span id="line-184">  public void testPointInTimeRestore_TablesWithNoProperBackupOrWals() throws Exception {</span>
-<span class="source-line-no">185</span><span id="line-185">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table2 },</span>
-<span class="source-line-no">186</span><span id="line-186">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
-<span class="source-line-no">187</span><span id="line-187">      EnvironmentEdgeManager.currentTime() - 16 * ONE_DAY_IN_MILLISECONDS, null);</span>
-<span class="source-line-no">188</span><span id="line-188"></span>
-<span class="source-line-no">189</span><span id="line-189">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">190</span><span id="line-190">    assertNotEquals(0, ret,</span>
-<span class="source-line-no">191</span><span id="line-191">      "Restore should fail since the requested restore point is before the start of continuous backup");</span>
-<span class="source-line-no">192</span><span id="line-192">  }</span>
+<span class="source-line-no">180</span><span id="line-180">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">181</span><span id="line-181">    assertNotEquals(0, ret,</span>
+<span class="source-line-no">182</span><span id="line-182">      "Restore should fail since continuous backup is not enabled for the table");</span>
+<span class="source-line-no">183</span><span id="line-183">  }</span>
+<span class="source-line-no">184</span><span id="line-184"></span>
+<span class="source-line-no">185</span><span id="line-185">  /**</span>
+<span class="source-line-no">186</span><span id="line-186">   * Ensures that PITR fails when trying to restore from a point before continuous backup started.</span>
+<span class="source-line-no">187</span><span id="line-187">   */</span>
+<span class="source-line-no">188</span><span id="line-188">  @Test</span>
+<span class="source-line-no">189</span><span id="line-189">  public void testPointInTimeRestore_TablesWithNoProperBackupOrWals() throws Exception {</span>
+<span class="source-line-no">190</span><span id="line-190">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table2 },</span>
+<span class="source-line-no">191</span><span id="line-191">      new TableName[] { TableName.valueOf("restoredTable1") },</span>
+<span class="source-line-no">192</span><span id="line-192">      EnvironmentEdgeManager.currentTime() - 16 * ONE_DAY_IN_MILLISECONDS, null);</span>
 <span class="source-line-no">193</span><span id="line-193"></span>
-<span class="source-line-no">194</span><span id="line-194">  /**</span>
-<span class="source-line-no">195</span><span id="line-195">   * Verifies that PITR successfully restores data for a single table.</span>
-<span class="source-line-no">196</span><span id="line-196">   */</span>
-<span class="source-line-no">197</span><span id="line-197">  @Test</span>
-<span class="source-line-no">198</span><span id="line-198">  public void testPointInTimeRestore_SuccessfulRestoreForOneTable() throws Exception {</span>
-<span class="source-line-no">199</span><span id="line-199">    TableName restoredTable = TableName.valueOf("restoredTable");</span>
-<span class="source-line-no">200</span><span id="line-200"></span>
-<span class="source-line-no">201</span><span id="line-201">    // Perform restore operation</span>
-<span class="source-line-no">202</span><span id="line-202">    String[] args =</span>
-<span class="source-line-no">203</span><span id="line-203">      PITRTestUtil.buildPITRArgs(new TableName[] { table1 }, new TableName[] { restoredTable },</span>
-<span class="source-line-no">204</span><span id="line-204">        EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">194</span><span id="line-194">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">195</span><span id="line-195">    assertNotEquals(0, ret,</span>
+<span class="source-line-no">196</span><span id="line-196">      "Restore should fail since the requested restore point is before the start of continuous backup");</span>
+<span class="source-line-no">197</span><span id="line-197">  }</span>
+<span class="source-line-no">198</span><span id="line-198"></span>
+<span class="source-line-no">199</span><span id="line-199">  /**</span>
+<span class="source-line-no">200</span><span id="line-200">   * Verifies that PITR successfully restores data for a single table.</span>
+<span class="source-line-no">201</span><span id="line-201">   */</span>
+<span class="source-line-no">202</span><span id="line-202">  @Test</span>
+<span class="source-line-no">203</span><span id="line-203">  public void testPointInTimeRestore_SuccessfulRestoreForOneTable() throws Exception {</span>
+<span class="source-line-no">204</span><span id="line-204">    TableName restoredTable = TableName.valueOf("restoredTable");</span>
 <span class="source-line-no">205</span><span id="line-205"></span>
-<span class="source-line-no">206</span><span id="line-206">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">207</span><span id="line-207">    assertEquals(0, ret, "Restore should succeed");</span>
-<span class="source-line-no">208</span><span id="line-208"></span>
-<span class="source-line-no">209</span><span id="line-209">    // Validate that the restored table contains the same number of rows as the original table</span>
-<span class="source-line-no">210</span><span id="line-210">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table1),</span>
-<span class="source-line-no">211</span><span id="line-211">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable),</span>
-<span class="source-line-no">212</span><span id="line-212">      "Restored table should have the same row count as the original");</span>
-<span class="source-line-no">213</span><span id="line-213">  }</span>
-<span class="source-line-no">214</span><span id="line-214"></span>
-<span class="source-line-no">215</span><span id="line-215">  /**</span>
-<span class="source-line-no">216</span><span id="line-216">   * Verifies that PITR successfully restores multiple tables at once.</span>
-<span class="source-line-no">217</span><span id="line-217">   */</span>
-<span class="source-line-no">218</span><span id="line-218">  @Test</span>
-<span class="source-line-no">219</span><span id="line-219">  public void testPointInTimeRestore_SuccessfulRestoreForMultipleTables() throws Exception {</span>
-<span class="source-line-no">220</span><span id="line-220">    TableName restoredTable1 = TableName.valueOf("restoredTable1");</span>
-<span class="source-line-no">221</span><span id="line-221">    TableName restoredTable2 = TableName.valueOf("restoredTable2");</span>
-<span class="source-line-no">222</span><span id="line-222"></span>
-<span class="source-line-no">223</span><span id="line-223">    // Perform restore operation for multiple tables</span>
-<span class="source-line-no">224</span><span id="line-224">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table1, table2 },</span>
-<span class="source-line-no">225</span><span id="line-225">      new TableName[] { restoredTable1, restoredTable2 },</span>
-<span class="source-line-no">226</span><span id="line-226">      EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">206</span><span id="line-206">    // Perform restore operation</span>
+<span class="source-line-no">207</span><span id="line-207">    String[] args =</span>
+<span class="source-line-no">208</span><span id="line-208">      PITRTestUtil.buildPITRArgs(new TableName[] { table1 }, new TableName[] { restoredTable },</span>
+<span class="source-line-no">209</span><span id="line-209">        EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">210</span><span id="line-210"></span>
+<span class="source-line-no">211</span><span id="line-211">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">212</span><span id="line-212">    assertEquals(0, ret, "Restore should succeed");</span>
+<span class="source-line-no">213</span><span id="line-213"></span>
+<span class="source-line-no">214</span><span id="line-214">    // Validate that the restored table contains the same number of rows as the original table</span>
+<span class="source-line-no">215</span><span id="line-215">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table1),</span>
+<span class="source-line-no">216</span><span id="line-216">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable),</span>
+<span class="source-line-no">217</span><span id="line-217">      "Restored table should have the same row count as the original");</span>
+<span class="source-line-no">218</span><span id="line-218">  }</span>
+<span class="source-line-no">219</span><span id="line-219"></span>
+<span class="source-line-no">220</span><span id="line-220">  /**</span>
+<span class="source-line-no">221</span><span id="line-221">   * Verifies that PITR successfully restores multiple tables at once.</span>
+<span class="source-line-no">222</span><span id="line-222">   */</span>
+<span class="source-line-no">223</span><span id="line-223">  @Test</span>
+<span class="source-line-no">224</span><span id="line-224">  public void testPointInTimeRestore_SuccessfulRestoreForMultipleTables() throws Exception {</span>
+<span class="source-line-no">225</span><span id="line-225">    TableName restoredTable1 = TableName.valueOf("restoredTable1");</span>
+<span class="source-line-no">226</span><span id="line-226">    TableName restoredTable2 = TableName.valueOf("restoredTable2");</span>
 <span class="source-line-no">227</span><span id="line-227"></span>
-<span class="source-line-no">228</span><span id="line-228">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
-<span class="source-line-no">229</span><span id="line-229">    assertEquals(0, ret, "Restore should succeed");</span>
-<span class="source-line-no">230</span><span id="line-230"></span>
-<span class="source-line-no">231</span><span id="line-231">    // Validate that the restored tables contain the same number of rows as the originals</span>
-<span class="source-line-no">232</span><span id="line-232">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table1),</span>
-<span class="source-line-no">233</span><span id="line-233">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable1),</span>
-<span class="source-line-no">234</span><span id="line-234">      "Restored table1 should have the same row count as the original");</span>
-<span class="source-line-no">235</span><span id="line-235">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table2),</span>
-<span class="source-line-no">236</span><span id="line-236">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable2),</span>
-<span class="source-line-no">237</span><span id="line-237">      "Restored table2 should have the same row count as the original");</span>
-<span class="source-line-no">238</span><span id="line-238">  }</span>
-<span class="source-line-no">239</span><span id="line-239">}</span>
+<span class="source-line-no">228</span><span id="line-228">    // Perform restore operation for multiple tables</span>
+<span class="source-line-no">229</span><span id="line-229">    String[] args = PITRTestUtil.buildPITRArgs(new TableName[] { table1, table2 },</span>
+<span class="source-line-no">230</span><span id="line-230">      new TableName[] { restoredTable1, restoredTable2 },</span>
+<span class="source-line-no">231</span><span id="line-231">      EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS, null);</span>
+<span class="source-line-no">232</span><span id="line-232"></span>
+<span class="source-line-no">233</span><span id="line-233">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">234</span><span id="line-234">    assertEquals(0, ret, "Restore should succeed");</span>
+<span class="source-line-no">235</span><span id="line-235"></span>
+<span class="source-line-no">236</span><span id="line-236">    // Validate that the restored tables contain the same number of rows as the originals</span>
+<span class="source-line-no">237</span><span id="line-237">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table1),</span>
+<span class="source-line-no">238</span><span id="line-238">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable1),</span>
+<span class="source-line-no">239</span><span id="line-239">      "Restored table1 should have the same row count as the original");</span>
+<span class="source-line-no">240</span><span id="line-240">    assertEquals(PITRTestUtil.getRowCount(TEST_UTIL, table2),</span>
+<span class="source-line-no">241</span><span id="line-241">      PITRTestUtil.getRowCount(TEST_UTIL, restoredTable2),</span>
+<span class="source-line-no">242</span><span id="line-242">      "Restored table2 should have the same row count as the original");</span>
+<span class="source-line-no">243</span><span id="line-243">  }</span>
+<span class="source-line-no">244</span><span id="line-244"></span>
+<span class="source-line-no">245</span><span id="line-245">  /**</span>
+<span class="source-line-no">246</span><span id="line-246">   * Verifies PITR successfully restores all tables in a backup set when the set name (-s) is used</span>
+<span class="source-line-no">247</span><span id="line-247">   * instead of a table list (-t).</span>
+<span class="source-line-no">248</span><span id="line-248">   */</span>
+<span class="source-line-no">249</span><span id="line-249">  @Test</span>
+<span class="source-line-no">250</span><span id="line-250">  public void testPointInTimeRestore_SuccessfulRestoreUsingBackupSet() throws Exception {</span>
+<span class="source-line-no">251</span><span id="line-251">    String setName = "pitrBackupSet";</span>
+<span class="source-line-no">252</span><span id="line-252">    TableName restoredTable1 = TableName.valueOf("restoredSetTable1");</span>
+<span class="source-line-no">253</span><span id="line-253">    TableName restoredTable2 = TableName.valueOf("restoredSetTable2");</span>
+<span class="source-line-no">254</span><span id="line-254"></span>
+<span class="source-line-no">255</span><span id="line-255">    int rowCountTable1 = PITRTestUtil.getRowCount(TEST_UTIL, table1);</span>
+<span class="source-line-no">256</span><span id="line-256">    int rowCountTable2 = PITRTestUtil.getRowCount(TEST_UTIL, table2);</span>
+<span class="source-line-no">257</span><span id="line-257"></span>
+<span class="source-line-no">258</span><span id="line-258">    // table2 includes rows written 10 days ago, which a restore to 11 days ago must exclude</span>
+<span class="source-line-no">259</span><span id="line-259">    assertEquals(3099, rowCountTable1, "table1 should contain all rows written up to 15 days ago");</span>
+<span class="source-line-no">260</span><span id="line-260">    assertEquals(1099, rowCountTable2, "table2 should include rows written 10 days ago");</span>
+<span class="source-line-no">261</span><span id="line-261"></span>
+<span class="source-line-no">262</span><span id="line-262">    try (BackupSystemTable sysTable = new BackupSystemTable(TEST_UTIL.getConnection())) {</span>
+<span class="source-line-no">263</span><span id="line-263">      sysTable.addToBackupSet(setName,</span>
+<span class="source-line-no">264</span><span id="line-264">        new String[] { table1.getNameAsString(), table2.getNameAsString() });</span>
+<span class="source-line-no">265</span><span id="line-265"></span>
+<span class="source-line-no">266</span><span id="line-266">      String[] args = new String[] { "-" + OPTION_SET, setName, "-" + OPTION_TABLE_MAPPING,</span>
+<span class="source-line-no">267</span><span id="line-267">        restoredTable1.getNameAsString() + "," + restoredTable2.getNameAsString(),</span>
+<span class="source-line-no">268</span><span id="line-268">        "-" + OPTION_TO_DATETIME,</span>
+<span class="source-line-no">269</span><span id="line-269">        String.valueOf(EnvironmentEdgeManager.currentTime() - 11 * ONE_DAY_IN_MILLISECONDS) };</span>
+<span class="source-line-no">270</span><span id="line-270"></span>
+<span class="source-line-no">271</span><span id="line-271">      int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">272</span><span id="line-272">      assertEquals(0, ret, "Restore using backup set should succeed");</span>
+<span class="source-line-no">273</span><span id="line-273"></span>
+<span class="source-line-no">274</span><span id="line-274">      // Verify the restored tables have row counts from 11 days ago</span>
+<span class="source-line-no">275</span><span id="line-275">      assertEquals(3099, PITRTestUtil.getRowCount(TEST_UTIL, restoredTable1),</span>
+<span class="source-line-no">276</span><span id="line-276">        "restoredSetTable1 should have table1's row count from 11 days ago "</span>
+<span class="source-line-no">277</span><span id="line-277">          + "(no writes since 15 days ago)");</span>
+<span class="source-line-no">278</span><span id="line-278">      assertEquals(599, PITRTestUtil.getRowCount(TEST_UTIL, restoredTable2),</span>
+<span class="source-line-no">279</span><span id="line-279">        "restoredSetTable2 should exclude data written less than 11 days ago");</span>
+<span class="source-line-no">280</span><span id="line-280"></span>
+<span class="source-line-no">281</span><span id="line-281">      // Verify the row count for each original table is unchanged because PITR restored to new</span>
+<span class="source-line-no">282</span><span id="line-282">      // tables</span>
+<span class="source-line-no">283</span><span id="line-283">      assertEquals(rowCountTable1, PITRTestUtil.getRowCount(TEST_UTIL, table1),</span>
+<span class="source-line-no">284</span><span id="line-284">        "table1 row count should be unchanged after PITR");</span>
+<span class="source-line-no">285</span><span id="line-285">      assertEquals(rowCountTable2, PITRTestUtil.getRowCount(TEST_UTIL, table2),</span>
+<span class="source-line-no">286</span><span id="line-286">        "table2 row count should be unchanged after PITR");</span>
+<span class="source-line-no">287</span><span id="line-287">    } finally {</span>
+<span class="source-line-no">288</span><span id="line-288">      try (BackupSystemTable sysTable = new BackupSystemTable(TEST_UTIL.getConnection())) {</span>
+<span class="source-line-no">289</span><span id="line-289">        sysTable.deleteBackupSet(setName);</span>
+<span class="source-line-no">290</span><span id="line-290">      }</span>
+<span class="source-line-no">291</span><span id="line-291">    }</span>
+<span class="source-line-no">292</span><span id="line-292">  }</span>
+<span class="source-line-no">293</span><span id="line-293"></span>
+<span class="source-line-no">294</span><span id="line-294">  /**</span>
+<span class="source-line-no">295</span><span id="line-295">   * Verifies that PITR fails when the specified backup set does not exist.</span>
+<span class="source-line-no">296</span><span id="line-296">   */</span>
+<span class="source-line-no">297</span><span id="line-297">  @Test</span>
+<span class="source-line-no">298</span><span id="line-298">  public void testPointInTimeRestore_FailsWithNonExistentBackupSet() throws Exception {</span>
+<span class="source-line-no">299</span><span id="line-299">    String[] args =</span>
+<span class="source-line-no">300</span><span id="line-300">      new String[] { "-" + OPTION_SET, "nonExistentPitrBackupSet", "-" + OPTION_TO_DATETIME,</span>
+<span class="source-line-no">301</span><span id="line-301">        String.valueOf(EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS) };</span>
+<span class="source-line-no">302</span><span id="line-302"></span>
+<span class="source-line-no">303</span><span id="line-303">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">304</span><span id="line-304">    assertNotEquals(0, ret, "Restore should fail for a non-existent backup set");</span>
+<span class="source-line-no">305</span><span id="line-305">  }</span>
+<span class="source-line-no">306</span><span id="line-306"></span>
+<span class="source-line-no">307</span><span id="line-307">  /**</span>
+<span class="source-line-no">308</span><span id="line-308">   * Verifies that PITR fails when both a backup set (-s) and a table list (-t) are specified.</span>
+<span class="source-line-no">309</span><span id="line-309">   */</span>
+<span class="source-line-no">310</span><span id="line-310">  @Test</span>
+<span class="source-line-no">311</span><span id="line-311">  public void testPointInTimeRestore_FailsWithBothBackupSetAndTableList() throws Exception {</span>
+<span class="source-line-no">312</span><span id="line-312">    String[] args = new String[] { "-" + OPTION_SET, "anyPitrBackupSet", "-" + OPTION_TABLE,</span>
+<span class="source-line-no">313</span><span id="line-313">      table1.getNameAsString(), "-" + OPTION_TO_DATETIME,</span>
+<span class="source-line-no">314</span><span id="line-314">      String.valueOf(EnvironmentEdgeManager.currentTime() - 5 * ONE_DAY_IN_MILLISECONDS) };</span>
+<span class="source-line-no">315</span><span id="line-315"></span>
+<span class="source-line-no">316</span><span id="line-316">    int ret = ToolRunner.run(conf1, new PointInTimeRestoreDriver(), args);</span>
+<span class="source-line-no">317</span><span id="line-317">    assertNotEquals(0, ret, "Restore should fail when both -s and -t are specified");</span>
+<span class="source-line-no">318</span><span id="line-318">  }</span>
+<span class="source-line-no">319</span><span id="line-319">}</span>
 
 
 
